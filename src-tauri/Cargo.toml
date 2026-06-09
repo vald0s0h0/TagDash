@@ -1,0 +1,43 @@
+[package]
+name = "tagdash"
+version = "0.1.0"
+description = "TagDash — scanner live Alpaca + Tauri + TradeTally"
+authors = ["Etienne Fabre"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "tagdash_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri        = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+thiserror    = "1"
+chrono       = { version = "0.4", features = ["serde"] }
+rusqlite     = { version = "0.32", features = ["bundled"] }
+toml         = "0.8"
+dirs         = "5"
+reqwest      = { version = "0.12", features = ["json", "rustls-tls", "multipart", "gzip"], default-features = false }
+rand         = "0.8"
+futures-util = "0.3"
+# Alpaca live market-data WebSocket. rustls (webpki roots) — no native TLS, matches reqwest.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+# Incremental compilation is disabled for the dev profile: the project lives on a
+# cloud-synced folder (SynologyDrive), which intermittently corrupts the
+# target/debug/incremental cache and makes rustc panic with an ICE
+# (SerializedDepGraph::decode assertion) on `tauri dev`. Turning it off trades a
+# little rebuild speed for a reliable dev build.
+[profile.dev]
+incremental = false
