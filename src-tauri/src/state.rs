@@ -47,6 +47,12 @@ pub struct AppState {
     pub scanner_running: Arc<AtomicBool>,
     /// Controls the Perfect Pullback engine task lifecycle.
     pub perfect_pullback_running: Arc<AtomicBool>,
+    /// Controls the Micro Pullback engine task lifecycle (premarket dormancy →
+    /// ignition → confirmation state machine; see `crate::micro_pullback`).
+    pub micro_pullback_running: Arc<AtomicBool>,
+    /// Controls the Panic Mean Reversion watchlist scheduler (builds the day's
+    /// two-list watchlist at 09:00 ET; see `crate::panic_watchlist`).
+    pub panic_watchlist_running: Arc<AtomicBool>,
     /// Controls the internal trading loop (pending limit/stop fills, bracket SL/TP
     /// reconciliation, TradeTally mirroring) — driven by market data, not UI polls.
     pub trading_loop_running: Arc<AtomicBool>,
@@ -73,4 +79,8 @@ pub struct AppState {
     /// Progressive per-symbol alert enrichment (float, country, classification,
     /// split, news, LLM reads), filled async when an alert is shown in a zone.
     pub enrichments: Arc<RwLock<HashMap<String, AlertEnrichment>>>,
+    /// Market Replay shared handle: status polled by the toolbar + command
+    /// channel to the (single) replay engine task. The simulated clock itself is
+    /// global (see `replay::clock` / `time::now`).
+    pub replay: Arc<crate::replay::ReplayShared>,
 }

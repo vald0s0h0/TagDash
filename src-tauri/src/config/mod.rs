@@ -66,6 +66,24 @@ pub struct UiConfig {
     pub pre_open_zones_per_tab: u8,
     pub open_zones_per_tab: u8,
     pub auto_create_tabs: bool,
+    /// Send a native OS notification (Windows toast / macOS Notification Center)
+    /// whenever a scanner alert fires, regardless of the active tab. Opt-in.
+    /// `#[serde(default)]` so configs written before this field still load.
+    #[serde(default)]
+    pub desktop_alerts: bool,
+    /// When to flash the full-screen white overlay on a new scanner alert, so the
+    /// user notices it even with other windows covering TagDash. One of
+    /// "off" | "premarket" | "open" | "both" (matched against the alert's session).
+    #[serde(default = "default_attention_mode")]
+    pub flash_alerts: String,
+    /// When to force the TagDash window back to the foreground on a new scanner
+    /// alert. Same scale as `flash_alerts`.
+    #[serde(default = "default_attention_mode")]
+    pub foreground_alerts: String,
+}
+
+fn default_attention_mode() -> String {
+    "off".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +156,9 @@ impl Default for AppConfig {
                 pre_open_zones_per_tab: 1,
                 open_zones_per_tab: 4,
                 auto_create_tabs: true,
+                desktop_alerts: false,
+                flash_alerts: default_attention_mode(),
+                foreground_alerts: default_attention_mode(),
             },
             latency: LatencyConfig {
                 warn_ms: 1_000,

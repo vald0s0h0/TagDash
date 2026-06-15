@@ -11,15 +11,14 @@ use std::sync::{
 };
 use std::time::Instant;
 
-use chrono::Utc;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 use crate::local_db::{
     alarm_repository, alarm_repository::PriceAlarm, scoring_repository,
     scoring_repository::ScoreRow, universe_repository,
 };
 use crate::market_state::MarketState;
-use crate::strategies::{micro_pullback, panic_mean_reversion, registry, StrategyKind};
+use crate::strategies::{panic_mean_reversion, registry, StrategyKind};
 use crate::types::{AlertSignal, ScreenerMatch, Session, StrategyContext};
 use self::alert_engine::AlertEngine;
 
@@ -47,7 +46,11 @@ impl ScannerEngine {
     ) {
         tokio::spawn(async move {
             let strategies = registry::all_strategies();
-            let engine     = AlertEngine::new();
+            let mut engine = AlertEngine::new();
+            // Market Replay reset watch: on a replay start / backward seek / new
+            // day, drop the per-session state (cooldowns, alarm crossings) so the
+            // replayed day starts clean.
+            let mut replay_gen = crate::replay::clock::generation();
 
             // Per-symbol float (shares) + average daily volume, used by in-script
             // float/rvol filters. Refreshed periodically.
@@ -55,9 +58,9 @@ impl ScannerEngine {
             let mut avg_volumes = load_avg_volumes(&db);
             let mut floats_loaded = Instant::now();
 
-            // Top-30 mean-reversion scores (Panic Mean Reversion pre-open screener).
-            // Recomputed once a day by the startup pipeline; reloaded on the float
-            // cadence so the day's new ranking is picked up. The Panic strategy's
+            // Panic Mean Reversion watchlist rows (pre-open screener). Built once a
+            // day at 09:00 ET by `crate::panic_watchlist`; reloaded on the float
+            // cadence so the day's new list is picked up. The Panic strategy's
             // display name + priority come from the registry.
             let mut mr_scores = load_top_scores(&db);
             let panic_priority = strategies
@@ -74,34 +77,36 @@ impl ScannerEngine {
             let mut alarms_loaded = Instant::now();
             let mut alarm_prev: HashMap<String, f64> = HashMap::new();
 
-            // Per-symbol timestamp of the last significant trade acceleration
-            // ("price event"), so a news headline that lands shortly *after* a
-            // price move can still correlate (micro_pullback). Pruned each pass
-            // once entries fall outside the correlation window.
-            let mut last_price_event_seen: HashMap<String, chrono::DateTime<chrono::Utc>> =
-                HashMap::new();
-
             while running.load(Ordering::Relaxed) {
+                {
+                    let g = crate::replay::clock::generation();
+                    if g != replay_gen {
+                        replay_gen = g;
+                        engine = AlertEngine::new();
+                        alarm_prev.clear();
+                        mr_scores = load_top_scores(&db);
+                    }
+                }
                 if floats_loaded.elapsed() >= FLOAT_REFRESH {
                     floats      = load_floats(&db);
                     avg_volumes = load_avg_volumes(&db);
                     mr_scores   = load_top_scores(&db);
                     floats_loaded = Instant::now();
                 } else if mr_scores.is_empty() {
-                    // First launch of the day: the startup pipeline writes the
-                    // daily mean-reversion scores near the END of its run (after
-                    // the daily backfill), often well after the scanner task has
-                    // started with an empty list. Poll cheaply (one indexed
-                    // SELECT LIMIT 30) while empty so the pre-open screener fills
-                    // the instant the scores land — rather than waiting up to the
-                    // full 5-min FLOAT_REFRESH. Stops as soon as it's populated.
+                    // The watchlist is built at 09:00 ET by `crate::panic_watchlist`,
+                    // typically well after the scanner task started with an empty
+                    // list. Poll cheaply (one indexed SELECT LIMIT 30) while empty so
+                    // the pre-open screener fills the instant the list lands — rather
+                    // than waiting up to the full 5-min FLOAT_REFRESH. Stops once
+                    // populated.
                     mr_scores = load_top_scores(&db);
                 }
                 if alarms_loaded.elapsed() >= ALARM_REFRESH {
                     alarms = load_untriggered_alarms(&db);
                     alarms_loaded = Instant::now();
                 }
-                let now = Utc::now();
+                // App clock: simulated instant during a Market Replay.
+                let now = crate::time::now();
                 let session = crate::time::session_at(now);
                 // Snapshot the runtime on/off map once per pass (cheap clone; a
                 // handful of entries) so toggling a strategy in Settings takes
@@ -109,46 +114,15 @@ impl ScannerEngine {
                 let enabled_now = strategy_enabled.read().unwrap().clone();
 
                 // Snapshot tickers with a brief read lock — no strategy logic inside.
-                // Trade-acceleration counts and live-news correlation are computed
-                // here, while the lock is held, so should_alert() stays lock-free.
                 // Also read mock_running: in mock mode skip the session gate so the
-                // feed can trigger alerts at any time of day.
-                // Drop price events that have aged out of the correlation window.
-                last_price_event_seen
-                    .retain(|_, t| (now - *t).num_seconds() <= micro_pullback::NEWS_WINDOW_SECS);
-                let (tickers, accel_inputs, news_inputs, is_mock) = {
+                // feed can trigger alerts at any time of day. (Trade-acceleration and
+                // news correlation used to be precomputed here for the old
+                // micro_pullback; it is now a stateful engine — see
+                // `crate::micro_pullback` — so the scanner no longer carries that.)
+                let (tickers, is_mock) = {
                     let ms = market.read().unwrap();
                     let tickers = ms.tickers.values().cloned().collect::<Vec<_>>();
-                    // Trade-acceleration: prints over the recent vs baseline window
-                    // (windows defined by micro_pullback so all accel tunables live
-                    // in one place).
-                    let accel: HashMap<String, (Option<u64>, Option<u64>)> = tickers
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.symbol.clone(),
-                                (
-                                    ms.trades_in_last(&t.symbol, micro_pullback::ACCEL_RECENT_SECS, now),
-                                    ms.trades_in_last(&t.symbol, micro_pullback::ACCEL_BASELINE_SECS, now),
-                                ),
-                            )
-                        })
-                        .collect();
-                    // Live news correlation (Alpaca news WebSocket, premarket).
-                    // Per-symbol headlines within ~2× the correlation window, so
-                    // micro_pullback can match one to the price event in either
-                    // order (news before or after). Each list is keyed by symbol,
-                    // so every headline genuinely references that ticker.
-                    let news: HashMap<String, Vec<crate::types::NewsRef>> = tickers
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.symbol.clone(),
-                                ms.recent_news(&t.symbol, now, 2 * micro_pullback::NEWS_WINDOW_SECS),
-                            )
-                        })
-                        .collect();
-                    (tickers, accel, news, ms.mock_running)
+                    (tickers, ms.mock_running)
                 };
 
                 // Current price per symbol — feeds the alarm-crossing watcher.
@@ -162,26 +136,6 @@ impl ScannerEngine {
                 let mut screener_now: Vec<ScreenerMatch> = Vec::new();
 
                 for ticker in &tickers {
-                    let (trades_recent, trades_baseline) = accel_inputs
-                        .get(&ticker.symbol)
-                        .copied()
-                        .unwrap_or((None, None));
-                    let news = news_inputs
-                        .get(&ticker.symbol)
-                        .cloned()
-                        .unwrap_or_default();
-                    // Most recent significant trade acceleration ("price event")
-                    // seen on a previous pass, kept only while inside the
-                    // correlation window. Read before recording this pass's event
-                    // (below) so it reflects a strictly prior move — that's what
-                    // lets a headline landing *after* the move still correlate.
-                    let last_price_event = last_price_event_seen
-                        .get(&ticker.symbol)
-                        .copied()
-                        .filter(|t| (now - *t).num_seconds() <= micro_pullback::NEWS_WINDOW_SECS);
-                    if micro_pullback::is_accelerating(trades_recent, trades_baseline) {
-                        last_price_event_seen.insert(ticker.symbol.clone(), now);
-                    }
                     // Relative volume = day volume / average daily volume (universe
                     // table). None when the average isn't known yet.
                     let rvol = avg_volumes
@@ -202,10 +156,6 @@ impl ScannerEngine {
                         change_day_pct: ticker.change_day_pct,
                         rvol,
                         float_shares: floats.get(&ticker.symbol).copied(),
-                        trades_recent,
-                        trades_baseline,
-                        news,
-                        last_price_event,
                     };
 
                     for strategy in strategies {
@@ -237,7 +187,7 @@ impl ScannerEngine {
                                         float_shares:  ctx.float_shares,
                                         score:         None,
                                         score_label:   None,
-                                        updated_at:    Utc::now(),
+                                        updated_at:    now,
                                     });
                                 }
                             }
@@ -257,10 +207,10 @@ impl ScannerEngine {
                     }
                 }
 
-                // ── Panic Mean Reversion: precomputed daily top-30 by score ─────
-                // Sourced from `mean_reversion_scores` (not per-tick), so the
-                // watchlist shows even for symbols quiet in the premarket. Live
-                // price / volume / gap are filled from RAM when available.
+                // ── Panic Mean Reversion: precomputed daily watchlist ───────────
+                // Sourced from `panic_watchlist` (not per-tick), so the watchlist
+                // shows even for symbols quiet right now. Live price / volume / gap
+                // are filled from RAM when available.
                 let panic_on = enabled_now
                     .get(panic_mean_reversion::ID)
                     .copied()
@@ -286,19 +236,18 @@ impl ScannerEngine {
                             float_shares:  floats.get(&row.symbol).copied(),
                             score:         Some(row.display_score),
                             score_label:   {
-                                // Composite score + run direction/length, e.g. "92 ▲4".
-                                let arrow = match row.run_dir {
-                                    d if d > 0 => "▲",
-                                    d if d < 0 => "▼",
+                                // List tag + metric value + direction, e.g. "BB 4.2 ▲"
+                                // / "MA 3.1 ▼". The list ("BB" Bollinger area, "MA"
+                                // move since SMA20 contact) tells the user WHY the
+                                // ticker is on the watchlist.
+                                let arrow = match row.direction {
+                                    d if d > 0 => " ▲",
+                                    d if d < 0 => " ▼",
                                     _ => "",
                                 };
-                                Some(if row.run_len > 0 {
-                                    format!("{:.0} {}{}", row.display_score, arrow, row.run_len)
-                                } else {
-                                    format!("{:.0}", row.display_score)
-                                })
+                                Some(format!("{} {:.1}{}", row.list_kind, row.value, arrow))
                             },
-                            updated_at:    Utc::now(),
+                            updated_at:    now,
                         });
                     }
                 }
@@ -330,7 +279,10 @@ impl ScannerEngine {
                     &active_alerts, &alert_history,
                 );
 
-                sleep(Duration::from_millis(500)).await;
+                // 500 ms of market time: real 500 ms live, divided by the speed
+                // during an accelerated replay so the scan cadence in simulated
+                // seconds matches the live cadence.
+                crate::replay::clock::scaled_sleep(500).await;
             }
         });
     }
@@ -342,6 +294,10 @@ pub fn push_alert(
     alert_history: &Arc<RwLock<Vec<AlertSignal>>>,
     alert: AlertSignal,
 ) {
+    // Every strategy + the alarm watcher funnel through here, already cooldown-
+    // gated, so this is the right place to fire the low-latency desktop attention
+    // cue (white flash / foreground) for a genuinely new alert.
+    let session = alert.session;
     {
         let mut active = active_alerts.write().unwrap();
         // Keep only one entry per (symbol, strategy) in the active list
@@ -360,6 +316,7 @@ pub fn push_alert(
             history.truncate(500);
         }
     }
+    crate::notify::on_alert(session);
 }
 
 /// Load the per-symbol float (shares) map from the universe table. Symbols with
@@ -384,14 +341,13 @@ fn load_avg_volumes(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, u6
         .collect()
 }
 
-/// Load the top-N mean-reversion scores (highest display score first, ties broken
-/// by previous-day volume) for the Panic Mean Reversion pre-open screener, keeping
-/// only tickers whose previous-day volume clears the liquidity gate. Empty until
-/// the daily compute has run.
+/// Load the Panic Mean Reversion watchlist rows (interleaved BB/MA order) for the
+/// pre-open screener. Empty until the 09:00 ET daily build has run.
 fn load_top_scores(db: &Arc<Mutex<rusqlite::Connection>>) -> Vec<ScoreRow> {
     let conn = db.lock().unwrap();
-    scoring_repository::get_top(&conn, MR_TOP_N, panic_mean_reversion::MIN_PREV_VOLUME)
-        .unwrap_or_default()
+    // No volume gate here: the premarket pre-filter (see `crate::scoring`) is the
+    // liquidity filter now, and the table already holds only the merged ≤20 rows.
+    scoring_repository::get_top(&conn, MR_TOP_N, 0).unwrap_or_default()
 }
 
 /// Load armed (not-yet-triggered) price alarms from the DB.
@@ -436,7 +392,7 @@ fn watch_alarms(
                 })
                 .unwrap_or_else(|| ("Alarme".to_string(), 5));
 
-            let now = Utc::now();
+            let now = crate::time::now();
             let alert = AlertSignal {
                 alert_id:       format!("alarm-{}-{}", alarm.id, now.timestamp_millis()),
                 timestamp:      now,
@@ -466,7 +422,12 @@ fn watch_alarms(
     }
 
     if !triggered_ids.is_empty() {
-        {
+        // During a Market Replay the alert fires normally but the REAL armed
+        // alarm is not stamped in the DB: a replayed price crossing must never
+        // consume an alarm the user armed for the live market. (It is still
+        // removed from the in-RAM list so it doesn't refire in this replay; the
+        // periodic DB reload re-arms it after the session reset.)
+        if !crate::replay::clock::is_active() {
             let conn = db.lock().unwrap();
             for id in &triggered_ids {
                 let _ = alarm_repository::mark_triggered(&conn, id);

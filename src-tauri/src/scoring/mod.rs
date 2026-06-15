@@ -1,109 +1,87 @@
-// Mean-reversion scoring engine (used by the "Panic Mean Reversion" pre-open
-// strategy, and reusable by future ones). Computed once per day at startup from
-// the daily-bar cache, persisted to `mean_reversion_scores`, then served as the
-// pre-open screener's top-30 watchlist.
+// Panic Mean Reversion watchlist engine.
 //
-// The display_score is a CONTINUOUS, magnitude-aware composite of four components
-// (each transformed to a bounded 0..1 magnitude, never a saturating percentile):
+// Builds the pre-open watchlist for the "Panic Mean Reversion" screener, once per
+// trading day (triggered at 09:00 ET by `crate::panic_watchlist`, persisted to the
+// `panic_watchlist` DB table so a crash/restart reuses the day's list). The job has
+// three stages:
 //
-//   score = 100 · (0.60·B + 0.40·P) · (0.60 + 0.25·V + 0.15·R)
+//   1. HARD PRE-FILTER (universe entry gate). A ticker is a candidate only if its
+//      latest daily close is > $1 AND it shows real liquidity, via ANY of:
+//        • premarket volume        > 100k shares, OR
+//        • premarket dollar volume > $500k,        OR
+//        • average daily $ volume over 20 days > $5M.
+//      Premarket volume/$volume are aggregated from today's 1-minute bars
+//      (04:00 ET → 09:30 cap) fetched from Alpaca; the 20-day average $ volume comes
+//      from the local daily cache. (Names already clearing the $5M average don't
+//      need a premarket fetch, so we only fetch premarket bars for the rest.)
 //
-//   B — Bollinger event score / 100 (priority 1). Self-relative, 3-year history:
-//       is the CURRENT move exceptional vs the ticker's OWN past, any duration?
-//       Per horizon h: BB_Z_Return = (Return_h − mean)/std over the 3y Return_h
-//       series; PR_BB_Return = rank of |current Z| vs history; BB_Area_h = Σ over
-//       the last h days of max(0,|BB_Z_Close|−2) (area beyond either band);
-//       BB_Score_h = 0.75·PR_BB_Return + 0.25·PR_BB_Area; BB = 0.80·best + 0.20·2nd.
-//   P — Parabolic (priority 2, strongly weighted). Daily true ranges EXPANDING ×
-//       directional efficiency (net displacement / path). Rewards a clean parabola.
-//   V — Volume (priority 3). Log-scaled previous-day dollar volume ($10M→0, $2B→1).
-//   R — Run (priority 4). Consecutive same-colour candles (close vs open),
-//       1−exp(−L/3); its sign gives the direction (▲/▼).
+//   2. TWO RANKINGS over the surviving candidates (daily bars only):
+//        • BB AREA — cumulative Bollinger extension. BBZ = (Close − SMA20)/StdDev20.
+//          With a SOFT band of 1.7 (not 2): BBZ_Excess_UP = max(0, BBZ − 1.7),
+//          BBZ_Excess_DOWN = max(0, −BBZ − 1.7). BBZ_Area_{UP,DOWN}_6D = the sum of
+//          those excesses over the 6 most recent completed days (J-1..J-6). The list
+//          value = max(area_up, area_down); direction = the dominant side. This
+//          surfaces tickers that stayed STRETCHED for several days, not just a single
+//          big last-day BBZ, and catches the move earlier than a strict 2σ break.
+//        • MOVE SINCE LAST SMA20 CONTACT — how far price has travelled since it last
+//          touched (or gapped through) its SMA20, normalised by ATR20 (true range,
+//          gaps included). We scan back to the last bar that touched the SMA20
+//          (low ≤ SMA20 ≤ high) OR crossed it in a gap (the franchissement bar serves
+//          as the implicit contact); the reference is that bar's SMA20 value. The
+//          list value = |close − reference_SMA20| / ATR20; direction = its sign.
 //
-// The (B,P) core is the extreme/directional signal; V and R only MODULATE it
-// (×0.60..1.0) — they refine ordering but never rescue a name with no core. 100 is
-// reached only if B=P=V=R=1 at once (≈never), so the top-30 spreads out instead of
-// all pinning at 100. See the composite-tunables block for weights/constants.
+//   3. MERGE — take the top 10 of each list. A ticker counted in both appears once,
+//      in the list where it ranks better. The final set (≤20 rows) is ordered by
+//      interleaving the two lists 1-for-1 by rank (BB#1, MA#1, BB#2, MA#2, …) via a
+//      `display_score`, and each row keeps its own metric value + list tag for the UI
+//      ("BB 4.2 ▲" / "MA 3.1 ▲").
 //
-// A cross-sectional Percent-Rank momentum score (pr_score, folded extremeness
-// 2·|PR−50| over horizons 1..6) is still computed and persisted as a DIAGNOSTIC,
-// but is NO LONGER part of the display/ranking: as a percentile it saturated at 100
-// every day and systematically over-weighted noisy tails (glitches, illiquid names,
-// split artefacts), which produced false signals and an untie-able top-30.
-//
-// Rules honoured: no future data (every series uses only closes ≤ t), per-ticker
-// isolation (histories are never mixed), guards on zero/NaN std, scores clamped
-// to 0..100. Tickers with less than 3 years of history are NOT excluded — they
-// are still scored on whatever history they have; only a small `MIN_HISTORY_DAYS`
-// floor is required to avoid pure noise (their self-relative scores are coarser).
+// Rules honoured: no future data (every series uses only closes ≤ t, today's forming
+// bar is absent pre-open), per-ticker isolation (histories never mixed), guards on
+// zero/NaN std and degenerate ATR.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
+
+use crate::config::secrets::Secrets;
 use crate::local_db::{cache_repository, scoring_repository, universe_repository};
 use crate::local_db::scoring_repository::ScoreRow;
 
 // ─── Tunables (recompile to apply) ────────────────────────────────────────────
 
-/// Cumulative-return horizons, in trading days.
-pub const HORIZONS: &[usize] = &[1, 2, 3, 4, 5, 6];
-/// Classic Bollinger window + multiplier used for the BB_Z_Close / BB_Area part.
-const BB_PERIOD: usize = 20;
-const BB_BAND_K: f64 = 2.0;
-/// Minimum usable daily closes for a ticker to be scored at all. Deliberately a
-/// LOW floor: tickers with less than 3 years of history are NOT excluded (a
-/// recent listing is still ranked) — this only rejects series too short for any
-/// statistical meaning (the Bollinger window needs ~20, the return distribution a
-/// few more). Thin-history names get coarser self-relative scores.
-pub const MIN_HISTORY_DAYS: usize = 30;
-/// How many trading days of history to feed the engine (≈3 years + headroom for
-/// the longest horizon and the SMA20 warm-up).
-pub const HISTORY_DAYS: u32 = 800;
-/// Weighting of the two best per-horizon BB scores into the final event score.
-const BB_BEST_WEIGHT: f64 = 0.80;
-const BB_SECOND_WEIGHT: f64 = 0.20;
-/// Within one horizon, the BB_Z_Return vs BB_Area split.
-const BB_RETURN_WEIGHT: f64 = 0.75;
-const BB_AREA_WEIGHT: f64 = 0.25;
+/// How many trailing daily bars to load per candidate. Must comfortably exceed the
+/// SMA20 warm-up + the longest realistic "days since last SMA20 contact" run.
+pub const HISTORY_DAYS: u32 = 120;
+/// Minimum usable daily bars for a ticker to be evaluated (SMA20 warm-up + the
+/// 6-day Bollinger area window).
+pub const MIN_BARS: usize = SMA_PERIOD + AREA_DAYS;
+/// Bollinger / SMA window.
+const SMA_PERIOD: usize = 20;
+/// Soft Bollinger band (σ) used for the area excess — earlier than a strict 2σ.
+const BBZ_SOFT: f64 = 1.7;
+/// Number of trailing days summed for the Bollinger area (J-1..J-6).
+const AREA_DAYS: usize = 6;
+/// ATR window (true range, gaps included) normalising the move-since-contact.
+const ATR_PERIOD: usize = 20;
 
-// ─── Composite-score tunables ───────────────────────────────────────────────────
-//
-// The display score is a CONTINUOUS, magnitude-aware composite (not a percentile),
-// so the top-30 spreads out instead of all pinning at 100:
-//
-//   score = 100 · (W_BOLLINGER·B + W_PARABOLIC·P) · (MULT_BASE + MULT_VOLUME·V + MULT_RUN·R)
-//
-//   B — Bollinger event score / 100 (self-relative; engine unchanged).   priority 1
-//   P — parabolic: expanding daily true ranges × directional efficiency.  priority 2
-//   V — log-scaled previous-day dollar volume.                            priority 3
-//   R — consecutive same-colour candle run (close vs open).               priority 4
-//
-// The (B,P) core is the extreme/directional signal (Bollinger-dominant, parabolic
-// strongly weighted); V and R only MODULATE it (×MULT_BASE..1.0) — they refine the
-// ordering but never rescue a name with no core. 100 needs B=P=V=R=1 at once
-// (≈never), so the score never saturates.
+// Hard pre-filter thresholds.
+/// Minimum latest daily close (USD).
+pub const MIN_PRICE: f64 = 1.0;
+/// Minimum premarket volume (shares).
+pub const PM_VOLUME_MIN: i64 = 100_000;
+/// Minimum premarket dollar volume (USD).
+pub const PM_DOLLAR_MIN: f64 = 500_000.0;
+/// Minimum 20-day average dollar volume (USD) — the liquidity branch that needs no
+/// premarket data.
+pub const AVG_DOLLAR_MIN: f64 = 5_000_000.0;
 
-/// Parabolic window in trading days (true range uses each day's prior close, so the
-/// engine reads PARA_WINDOW+1 bars).
-const PARA_WINDOW: usize = 4;
-/// tanh reference for the true-range expansion ratio: R_exp−1 of E_REF → tanh(1)≈0.76.
-const PARA_E_REF: f64 = 1.0;
-/// Dollar-volume log-scale anchors: ≈$10M → 0, ≈$2B → 1.
-const VOL_DOLLAR_MIN: f64 = 10e6;
-const VOL_DOLLAR_MAX: f64 = 2e9;
-/// Consecutive-run reference length: 1−exp(−L/REF). L=3 → 0.63, L=6 → 0.86.
-const RUN_REF: f64 = 3.0;
-/// Core weights (sum to 1): Bollinger dominant, parabolic strongly rewarded.
-const W_BOLLINGER: f64 = 0.60;
-const W_PARABOLIC: f64 = 0.40;
-/// Liquidity+persistence multiplier ∈ [MULT_BASE, MULT_BASE+MULT_VOLUME+MULT_RUN].
-const MULT_BASE: f64 = 0.60;
-const MULT_VOLUME: f64 = 0.25;
-const MULT_RUN: f64 = 0.15;
+/// How many tickers each of the two lists contributes before the merge.
+pub const TOP_PER_LIST: usize = 10;
 
-// ─── Input ───────────────────────────────────────────────────────────────────────
+// ─── Input shapes ──────────────────────────────────────────────────────────────
 
-/// One day's OHLCV. The scorer reads date-ASCENDING series of these.
+/// One day's OHLCV (date-ASCENDING series). `volume` in shares.
 #[derive(Debug, Clone, Copy)]
 pub struct Bar {
     pub open:   f64,
@@ -113,63 +91,20 @@ pub struct Bar {
     pub volume: i64,
 }
 
-// ─── Output ────────────────────────────────────────────────────────────────────
-
-/// One ticker's computed scores. Persisted to `mean_reversion_scores`.
-#[derive(Debug, Clone)]
-pub struct MeanReversionScore {
-    pub symbol:          String,
-    /// Cross-sectional percent-rank momentum score (0..100). DIAGNOSTIC ONLY — no
-    /// longer part of the display/ranking (it saturates at 100 and over-weights
-    /// noisy tails); kept for comparison/debug.
-    pub pr_score:        f64,
-    /// Horizon (days) that achieved the best percent rank (diagnostic).
-    pub pr_best_days:    u8,
-    /// Self-relative Bollinger event score (0..100). Composite component B.
-    pub bb_event_score:  f64,
-    /// Horizon (days) that achieved the best per-horizon BB score.
-    pub bb_best_horizon: u8,
-    /// Parabolic component P (0..1): expanding true ranges × directional efficiency.
-    pub parabolic_score: f64,
-    /// Volume component V (0..1): log-scaled previous-day dollar volume.
-    pub volume_score:    f64,
-    /// Run component R (0..1): consecutive same-colour candle run.
-    pub run_score:       f64,
-    /// Length of the current same-colour run (days).
-    pub run_len:         u8,
-    /// Run direction: +1 bullish (green), −1 bearish (red), 0 none.
-    pub run_dir:         i8,
-    /// The continuous composite (0..100) — what the screener ranks + shows.
-    pub display_score:   f64,
-    /// "MR" — composite kind tag (kept for the existing label/UI plumbing).
-    pub score_kind:      String,
+/// Aggregated premarket activity for one ticker (04:00 ET → 09:30 cap, today).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PremarketStat {
+    pub volume:        i64,
+    pub dollar_volume: f64,
 }
+
+/// Which list a ticker ranked in.
+const LIST_BB: &str = "BB";
+const LIST_MA: &str = "MA";
 
 // ─── Math helpers ──────────────────────────────────────────────────────────────
 
-/// Percent rank of `x` within `values`: share of values ≤ x, in 0..100. Returns
-/// 0.0 when the set is empty. Ties count as ≤ (so the max value ranks 100).
-fn percent_rank(values: &[f64], x: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let le = values.iter().filter(|&&v| v <= x).count();
-    (le as f64 / values.len() as f64) * 100.0
-}
-
-/// Percent rank of `x` within an ASCENDING-sorted slice (binary search). Same
-/// semantics as `percent_rank` but O(log n) — used for the cross-sectional pools
-/// which are pre-sorted once per pass.
-fn percent_rank_sorted(sorted: &[f64], x: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let le = sorted.partition_point(|&v| v <= x);
-    (le as f64 / sorted.len() as f64) * 100.0
-}
-
-/// Mean + population standard deviation of a slice. Returns None on empty input or
-/// a non-finite / zero std (so callers can skip a degenerate horizon).
+/// Mean + population standard deviation of a slice; None on empty/zero/NaN std.
 fn mean_std(values: &[f64]) -> Option<(f64, f64)> {
     if values.is_empty() {
         return None;
@@ -184,411 +119,369 @@ fn mean_std(values: &[f64]) -> Option<(f64, f64)> {
     Some((mean, std))
 }
 
-/// Cumulative log-return over `h` days ending at index `t`: ln(close_t / close_{t-h}).
-/// CLOSE-to-CLOSE, so it measures the full move amplitude from the close `h` days
-/// earlier — overnight gaps are inherently included (the gap is part of the move
-/// from the prior close to the current close). None when out of range or a close
-/// is non-positive.
-fn log_return_at(closes: &[f64], t: usize, h: usize) -> Option<f64> {
-    if t < h {
-        return None;
-    }
-    let (a, b) = (closes[t - h], closes[t]);
-    if a <= 0.0 || b <= 0.0 {
-        return None;
-    }
-    let r = (b / a).ln();
-    if r.is_finite() {
-        Some(r)
-    } else {
-        None
-    }
-}
-
-/// Rolling SMA + population std of `closes` over `period`, aligned to each index
-/// (None for the first `period-1` warm-up bars or when std is degenerate).
-fn rolling_bbz_close(closes: &[f64], period: usize) -> Vec<Option<f64>> {
+/// Rolling (SMA, population std) over `period` aligned to each index — None for the
+/// first `period-1` warm-up bars or a degenerate window.
+fn rolling_sma_std(closes: &[f64], period: usize) -> Vec<Option<(f64, f64)>> {
     let n = closes.len();
     let mut out = vec![None; n];
     if n < period {
         return out;
     }
     for t in (period - 1)..n {
-        let window = &closes[t + 1 - period..=t];
-        if let Some((mean, std)) = mean_std(window) {
-            out[t] = Some((closes[t] - mean) / std);
-        }
+        out[t] = mean_std(&closes[t + 1 - period..=t]);
     }
     out
 }
 
-// ─── Per-ticker Bollinger event score ──────────────────────────────────────────
+/// BBZ at index t given its (sma, std): (close − sma) / std.
+fn bbz_at(close: f64, sma: f64, std: f64) -> f64 {
+    (close - sma) / std
+}
 
-/// Compute the self-relative Bollinger event score for one ticker from its
-/// date-ascending daily closes. Returns (score 0..100, best horizon days) or None
-/// when there isn't enough usable history.
-pub fn bb_event_score(closes: &[f64]) -> Option<(f64, u8)> {
-    if closes.len() < MIN_HISTORY_DAYS {
+/// Current Bollinger Z of `price` against the SMA20/σ20 of the last `SMA_PERIOD`
+/// daily closes (date-ASCENDING). None with fewer than `SMA_PERIOD` closes or a
+/// degenerate σ. Used by the common chart info bar to show how stretched the live
+/// price is versus its 20-day Bollinger basis, for every strategy.
+pub fn current_bbz(closes_asc: &[f64], price: f64) -> Option<f64> {
+    let n = closes_asc.len();
+    if n < SMA_PERIOD {
         return None;
     }
+    let (sma, std) = mean_std(&closes_asc[n - SMA_PERIOD..])?;
+    Some(bbz_at(price, sma, std))
+}
+
+// ─── BB area (cumulative Bollinger extension over 6 days) ───────────────────────
+
+/// Cumulative soft-Bollinger excess over the last `AREA_DAYS` completed bars, both
+/// directions. Returns (area_up, area_down) or None when the SMA isn't defined for
+/// every one of those bars. Excess uses the soft band: max(0, |BBZ| − 1.7) split by
+/// sign.
+pub fn bbz_area_6d(closes: &[f64]) -> Option<(f64, f64)> {
     let n = closes.len();
-    let last = n - 1;
-
-    // Rolling |BB_Z_Close| once (shared by every horizon's area).
-    let bbz_close = rolling_bbz_close(closes, BB_PERIOD);
-    let abs_bbz_close: Vec<Option<f64>> =
-        bbz_close.iter().map(|o| o.map(|z| z.abs())).collect();
-
-    let mut per_horizon: Vec<(f64, u8)> = Vec::new(); // (BB_Score_h, h)
-
-    for &h in HORIZONS {
-        // ── BB_Z_Return: standardize the 3y Return_h series, rank |current|. ──
-        let returns_h: Vec<f64> = (h..n)
-            .filter_map(|t| log_return_at(closes, t, h))
-            .collect();
-        let Some(current_return) = log_return_at(closes, last, h) else { continue };
-        let Some((mean_r, std_r)) = mean_std(&returns_h) else { continue };
-        let abs_z_hist: Vec<f64> = returns_h
-            .iter()
-            .map(|r| ((r - mean_r) / std_r).abs())
-            .collect();
-        let current_abs_z = ((current_return - mean_r) / std_r).abs();
-        let pr_bb_return = percent_rank(&abs_z_hist, current_abs_z);
-
-        // ── BB_Area_h: rolling h-day sum of max(0, |BB_Z_Close| − 2). ─────────
-        // Built only where every bar in the window has a defined |BB_Z_Close|.
-        let mut area_series: Vec<f64> = Vec::new();
-        let excess = |z: f64| (z - BB_BAND_K).max(0.0);
-        for t in 0..n {
-            if t + 1 < h {
-                continue;
-            }
-            let window = &abs_bbz_close[t + 1 - h..=t];
-            if window.iter().any(|o| o.is_none()) {
-                continue;
-            }
-            let area: f64 = window.iter().map(|o| excess(o.unwrap())).sum();
-            area_series.push(area);
-        }
-        let pr_bb_area = match area_series.last() {
-            Some(&current_area) => percent_rank(&area_series, current_area),
-            None => 0.0,
-        };
-
-        let bb_score_h = BB_RETURN_WEIGHT * pr_bb_return + BB_AREA_WEIGHT * pr_bb_area;
-        per_horizon.push((bb_score_h.clamp(0.0, 100.0), h as u8));
-    }
-
-    if per_horizon.is_empty() {
+    if n < SMA_PERIOD + AREA_DAYS {
         return None;
     }
-    // Best + second-best horizon scores → the weighted event score.
-    per_horizon.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let (best, best_h) = per_horizon[0];
-    let second = per_horizon.get(1).map(|x| x.0).unwrap_or(best);
-    let event = (BB_BEST_WEIGHT * best + BB_SECOND_WEIGHT * second).clamp(0.0, 100.0);
-    Some((event, best_h))
+    let sma_std = rolling_sma_std(closes, SMA_PERIOD);
+    let mut up = 0.0;
+    let mut down = 0.0;
+    for t in (n - AREA_DAYS)..n {
+        let (sma, std) = sma_std[t]?;
+        let z = bbz_at(closes[t], sma, std);
+        up += (z - BBZ_SOFT).max(0.0);
+        down += (-z - BBZ_SOFT).max(0.0);
+    }
+    Some((up, down))
 }
 
-// ─── Parabolic / volume / run components ────────────────────────────────────────
+// ─── ATR20 (true range, gaps included) ──────────────────────────────────────────
 
-/// Parabolic score ∈ [0,1] from date-ascending bars: rewards daily true ranges that
-/// EXPAND while the move PROGRESSES in one direction (a clean parabola), and is low
-/// for either flat-range trends or choppy moves. Needs PARA_WINDOW+1 bars (each TR
-/// uses the prior close). Returns 0 on thin/degenerate input.
-pub fn parabolic_score(bars: &[Bar]) -> f64 {
-    let k = PARA_WINDOW;
-    if bars.len() < k + 1 {
-        return 0.0;
-    }
+/// Average true range over the last `ATR_PERIOD` bars. TR = max(H−L, |H−Cprev|,
+/// |L−Cprev|), so overnight gaps inflate the range. None on thin/degenerate input.
+pub fn atr20(bars: &[Bar]) -> Option<f64> {
     let n = bars.len();
-
-    // TR% for each of the last k days (normalised by the prior close).
-    let mut trp: Vec<f64> = Vec::with_capacity(k);
-    for t in (n - k)..n {
-        let prev_close = bars[t - 1].close;
-        if prev_close <= 0.0 {
-            return 0.0;
-        }
-        let (hi, lo) = (bars[t].high, bars[t].low);
-        let tr = (hi - lo)
-            .max((hi - prev_close).abs())
-            .max((lo - prev_close).abs());
-        trp.push(tr / prev_close);
+    if n < ATR_PERIOD + 1 {
+        return None;
     }
-
-    // Expansion: recent half vs earlier half of the window.
-    let half = k / 2;
-    if half == 0 {
-        return 0.0;
+    let mut sum = 0.0;
+    for t in (n - ATR_PERIOD)..n {
+        let pc = bars[t - 1].close;
+        let (h, l) = (bars[t].high, bars[t].low);
+        let tr = (h - l).max((h - pc).abs()).max((l - pc).abs());
+        sum += tr;
     }
-    let earlier: f64 = trp[..half].iter().sum::<f64>() / half as f64;
-    let recent: f64 = trp[k - half..].iter().sum::<f64>() / half as f64;
-    if earlier <= 0.0 {
-        return 0.0;
-    }
-    let r_exp = recent / earlier;
-    let e_exp = (((r_exp - 1.0).max(0.0)) / PARA_E_REF).tanh();
-
-    // Directional efficiency (Kaufman): net displacement / total path over the
-    // window's closes. 1 = perfectly straight move, →0 = chop.
-    let first_close = bars[n - k - 1].close;
-    let last_close = bars[n - 1].close;
-    let net = (last_close - first_close).abs();
-    let mut path = 0.0;
-    for t in (n - k)..n {
-        path += (bars[t].close - bars[t - 1].close).abs();
-    }
-    let dir = if path > 0.0 { (net / path).clamp(0.0, 1.0) } else { 0.0 };
-
-    (e_exp * dir).clamp(0.0, 1.0)
+    let atr = sum / ATR_PERIOD as f64;
+    if atr.is_finite() && atr > 0.0 { Some(atr) } else { None }
 }
 
-/// Consecutive same-colour candle run ending at the last bar. Colour =
-/// sign(close − open) (the literal chandelier colour). Returns
-/// (run_score 0..1, direction +1/−1/0, run length days).
-pub fn run_score(bars: &[Bar]) -> (f64, i8, u8) {
-    let color = |b: &Bar| -> i8 {
-        if b.close > b.open {
-            1
-        } else if b.close < b.open {
-            -1
-        } else {
-            0
-        }
-    };
-    let Some(last) = bars.last() else { return (0.0, 0, 0) };
-    let dir = color(last);
-    if dir == 0 {
-        return (0.0, 0, 0);
+// ─── Move since last SMA20 contact ───────────────────────────────────────────────
+
+/// Signed price move from the SMA20 value at the last contact bar to the latest
+/// close. "Contact" = the most recent bar (scanning back) that either touches the
+/// SMA20 (low ≤ SMA20 ≤ high) OR is the bar on which price crossed onto its current
+/// side from the opposite side — which, for a price that gapped over the SMA20
+/// without touching it, is the franchissement bar (its SMA20 is the reference).
+/// Returns (signed_move, direction) or None when the SMA isn't defined / price sits
+/// exactly on the SMA.
+pub fn move_since_sma20_contact(bars: &[Bar]) -> Option<(f64, i8)> {
+    let n = bars.len();
+    if n < SMA_PERIOD + 1 {
+        return None;
     }
-    let mut len: u8 = 0;
-    for b in bars.iter().rev() {
-        if color(b) == dir {
-            len = len.saturating_add(1);
-        } else {
+    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let sma_std = rolling_sma_std(&closes, SMA_PERIOD);
+
+    // sign of (close − sma) at index t, when the SMA is defined.
+    let side = |t: usize| -> Option<i8> {
+        let (sma, _) = sma_std[t]?;
+        let d = closes[t] - sma;
+        Some(if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 })
+    };
+
+    let last = n - 1;
+    let cur = side(last)?;
+    if cur == 0 {
+        return None; // exactly on the SMA → no measurable extension
+    }
+
+    let first = SMA_PERIOD - 1; // earliest index with a (possibly defined) SMA
+    // Scan back from the latest bar. The contact is the most recent bar that touches
+    // the SMA20, or the bar on which price crossed onto its current side (gap-over
+    // included). Bars whose SMA is undefined (a degenerate, zero-std window) are
+    // skipped; the earliest DEFINED bar reached is the fallback reference.
+    let mut contact: Option<usize> = None;
+    for t in (first..=last).rev() {
+        let Some((sma_t, _)) = sma_std[t] else { continue };
+        contact = Some(t); // earliest defined bar seen so far (fallback)
+        let touch = bars[t].low <= sma_t && sma_t <= bars[t].high;
+        if touch {
             break;
         }
+        // Crossing onto the current side happened at t when the previous bar was on
+        // the opposite side. `side(t-1)` is None for a degenerate window — then keep
+        // scanning back rather than declaring a crossing.
+        if let Some(s) = side(t.saturating_sub(1)) {
+            if t > first && s != cur {
+                break;
+            }
+        }
     }
-    let score = 1.0 - (-(len as f64) / RUN_REF).exp();
-    (score.clamp(0.0, 1.0), dir, len)
+
+    let contact = contact?; // None only if no bar in range had a defined SMA
+    let ref_sma = sma_std[contact].expect("contact index is defined").0;
+    let mv = closes[last] - ref_sma;
+    let dir = if mv > 0.0 { 1 } else if mv < 0.0 { -1 } else { 0 };
+    Some((mv, dir))
 }
 
-/// Dollar-volume score ∈ [0,1]: log-scaled previous-day dollar volume between
-/// VOL_DOLLAR_MIN (→0) and VOL_DOLLAR_MAX (→1).
-pub fn volume_score(dollar_volume: f64) -> f64 {
-    if dollar_volume <= 0.0 {
-        return 0.0;
+// ─── Pre-filter ─────────────────────────────────────────────────────────────────
+
+/// Hard universe gate: latest close > $1 AND any liquidity branch clears.
+pub fn passes_prefilter(price: f64, pm: Option<&PremarketStat>, avg_dollar: f64) -> bool {
+    if !(price > MIN_PRICE) {
+        return false;
     }
-    let lo = VOL_DOLLAR_MIN.log10();
-    let hi = VOL_DOLLAR_MAX.log10();
-    ((dollar_volume.log10() - lo) / (hi - lo)).clamp(0.0, 1.0)
+    let pm_vol = pm.map(|p| p.volume).unwrap_or(0);
+    let pm_dol = pm.map(|p| p.dollar_volume).unwrap_or(0.0);
+    pm_vol > PM_VOLUME_MIN || pm_dol > PM_DOLLAR_MIN || avg_dollar > AVG_DOLLAR_MIN
 }
 
-// ─── Universe-wide computation ──────────────────────────────────────────────────
+// ─── Watchlist build (pure) ──────────────────────────────────────────────────────
 
-/// Compute every ticker's mean-reversion scores from the universe's daily bars.
-///
-/// `bars_by_symbol` maps symbol → date-ASCENDING daily OHLCV. Symbols with fewer
-/// than `MIN_HISTORY_DAYS` usable bars (a small floor) are skipped; short (<3y)
-/// histories are otherwise scored on whatever data they have.
-///
-/// Two passes: (1) per-ticker Bollinger event score + parabolic/volume/run
-/// components + each ticker's signed current return per horizon; (2) cross-
-/// sectional percent rank of those returns (DIAGNOSTIC pr_score), then the
-/// continuous composite display score (see the composite-tunables header).
-pub fn compute_universe(
-    bars_by_symbol: &HashMap<String, Vec<Bar>>,
-) -> Vec<MeanReversionScore> {
-    // Pass 1 — per ticker: BB score, P/V/R components + signed current return.
-    struct Partial {
-        symbol:          String,
-        bb_event_score:  f64,
-        bb_best_horizon: u8,
-        parabolic_score: f64,
-        volume_score:    f64,
-        run_score:       f64,
-        run_len:         u8,
-        run_dir:         i8,
-        signed_returns:  Vec<Option<f64>>, // indexed parallel to HORIZONS
-    }
-    let mut partials: Vec<Partial> = Vec::new();
-    // Per-horizon pool of SIGNED current returns across the universe (ranked).
-    let mut pools: Vec<Vec<f64>> = vec![Vec::new(); HORIZONS.len()];
+/// A pre-merge ranking entry.
+struct Entry {
+    symbol:    String,
+    value:     f64,
+    direction: i8,
+}
 
-    for (symbol, bars) in bars_by_symbol {
-        if bars.len() < MIN_HISTORY_DAYS {
+/// Build the final ≤2·TOP_PER_LIST watchlist rows from the candidate daily bars,
+/// premarket stats and 20-day average dollar volumes. Pure (no I/O) so it's unit
+/// testable; the orchestration around it lives in `build_and_store`.
+pub fn compute_watchlist(
+    candidates: &HashMap<String, Vec<Bar>>,
+    premarket:  &HashMap<String, PremarketStat>,
+    avg_dollar: &HashMap<String, f64>,
+    prev_vol:   &HashMap<String, i64>,
+) -> Vec<ScoreRow> {
+    let mut bb: Vec<Entry> = Vec::new();
+    let mut ma: Vec<Entry> = Vec::new();
+
+    for (symbol, bars) in candidates {
+        if bars.len() < MIN_BARS {
+            continue;
+        }
+        let price = bars.last().map(|b| b.close).unwrap_or(0.0);
+        let adv = avg_dollar.get(symbol).copied().unwrap_or(0.0);
+        if !passes_prefilter(price, premarket.get(symbol), adv) {
             continue;
         }
         let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-        let last = closes.len() - 1;
-        let signed_returns: Vec<Option<f64>> = HORIZONS
-            .iter()
-            .map(|&h| log_return_at(&closes, last, h))
-            .collect();
-        // Need at least one usable horizon to rank cross-sectionally.
-        if signed_returns.iter().all(|o| o.is_none()) {
-            continue;
-        }
-        // BB may be unavailable on very thin / degenerate history → contributes 0
-        // (the ticker is still scored on the other components).
-        let (bb, bb_h) = bb_event_score(&closes).unwrap_or((0.0, HORIZONS[0] as u8));
-        let parabolic = parabolic_score(bars);
-        let (run, run_dir, run_len) = run_score(bars);
-        // Previous-day dollar volume = latest cached bar's volume × its close.
-        let last_bar = bars[last];
-        let dollar_volume = (last_bar.volume.max(0) as f64) * last_bar.close;
-        let volume = volume_score(dollar_volume);
-        for (i, r) in signed_returns.iter().enumerate() {
-            if let Some(v) = r {
-                pools[i].push(*v);
+
+        // BB area list.
+        if let Some((up, down)) = bbz_area_6d(&closes) {
+            let (value, direction) = if up >= down { (up, 1i8) } else { (down, -1i8) };
+            if value > 0.0 {
+                bb.push(Entry { symbol: symbol.clone(), value, direction });
             }
         }
-        partials.push(Partial {
-            symbol: symbol.clone(),
-            bb_event_score: bb,
-            bb_best_horizon: bb_h,
-            parabolic_score: parabolic,
-            volume_score: volume,
-            run_score: run,
-            run_len,
-            run_dir,
-            signed_returns,
-        });
+
+        // Move-since-SMA20-contact list (normalised by ATR20).
+        if let (Some((mv, dir)), Some(atr)) = (move_since_sma20_contact(bars), atr20(bars)) {
+            let value = mv.abs() / atr;
+            if value > 0.0 && dir != 0 {
+                ma.push(Entry { symbol: symbol.clone(), value, direction: dir });
+            }
+        }
     }
 
-    // Pre-sort each horizon pool for the O(log n) percent-rank binary search.
-    for pool in &mut pools {
-        pool.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    }
+    // Rank each list by value (desc), keep the top N.
+    let sort_desc = |v: &mut Vec<Entry>| {
+        v.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(TOP_PER_LIST);
+    };
+    sort_desc(&mut bb);
+    sort_desc(&mut ma);
 
-    // Pass 2 — cross-sectional PR (diagnostic) + continuous composite.
-    partials
-        .into_iter()
-        .map(|p| {
-            // Diagnostic PR: best signed extremeness across horizons.
-            let mut pr_score = 0.0_f64;
-            let mut pr_best_days = HORIZONS[0] as u8;
-            for (i, r) in p.signed_returns.iter().enumerate() {
-                if let Some(v) = r {
-                    let pr = percent_rank_sorted(&pools[i], *v);
-                    let extremeness = 2.0 * (pr - 50.0).abs();
-                    if extremeness > pr_score {
-                        pr_score = extremeness;
-                        pr_best_days = HORIZONS[i] as u8;
-                    }
+    // Merge: a ticker in both lists keeps the better (lower) rank; BB wins exact
+    // ties (inserted first). Stores the winning (kind, value, direction, rank).
+    struct Winner { kind: &'static str, value: f64, direction: i8, rank: usize }
+    let mut winners: HashMap<String, Winner> = HashMap::new();
+    let consider = |entries: &[Entry], kind: &'static str, winners: &mut HashMap<String, Winner>| {
+        for (i, e) in entries.iter().enumerate() {
+            let rank = i + 1; // 1-based
+            match winners.get(&e.symbol) {
+                Some(w) if w.rank <= rank => {} // existing rank is at least as good
+                _ => {
+                    winners.insert(e.symbol.clone(), Winner {
+                        kind, value: e.value, direction: e.direction, rank,
+                    });
                 }
             }
+        }
+    };
+    consider(&bb, LIST_BB, &mut winners);
+    consider(&ma, LIST_MA, &mut winners);
 
-            // Continuous composite (the ranking score).
-            let b = (p.bb_event_score / 100.0).clamp(0.0, 1.0);
-            let core = W_BOLLINGER * b + W_PARABOLIC * p.parabolic_score;
-            let mult = MULT_BASE + MULT_VOLUME * p.volume_score + MULT_RUN * p.run_score;
-            let display_score = (100.0 * core * mult).clamp(0.0, 100.0);
-
-            MeanReversionScore {
-                symbol:          p.symbol,
-                pr_score,
-                pr_best_days,
-                bb_event_score:  p.bb_event_score,
-                bb_best_horizon: p.bb_best_horizon,
-                parabolic_score: p.parabolic_score,
-                volume_score:    p.volume_score,
-                run_score:       p.run_score,
-                run_len:         p.run_len,
-                run_dir:         p.run_dir,
-                display_score,
-                score_kind:      "MR".to_string(),
+    // Emit rows. display_score interleaves the two lists 1-for-1 by rank
+    // (BB#1, MA#1, BB#2, MA#2 …): higher display_score sorts first.
+    winners
+        .into_iter()
+        .map(|(symbol, w)| {
+            let kind_offset = if w.kind == LIST_BB { 2 } else { 1 };
+            let sort_key = (2 * w.rank) as i64 - kind_offset; // smaller = better
+            ScoreRow {
+                symbol:        symbol.clone(),
+                list_kind:     w.kind.to_string(),
+                value:         w.value,
+                direction:     w.direction,
+                rank:          w.rank as u32,
+                display_score: -(sort_key as f64),
+                prev_volume:   prev_vol.get(&symbol).copied(),
             }
         })
         .collect()
 }
 
-// ─── DB orchestration ──────────────────────────────────────────────────────────
+// ─── Orchestration (I/O) ────────────────────────────────────────────────────────
 
-/// Read the universe's daily closes from the cache, compute every ticker's
-/// mean-reversion scores, and replace the `mean_reversion_scores` table. Returns
-/// the number of scored tickers. The (brief) read holds the DB lock; the heavy
-/// per-ticker math runs lock-free; a final lock writes the result. Safe to call
-/// at startup or on demand (force-recompute command).
-pub fn compute_and_store(db: &Arc<Mutex<rusqlite::Connection>>) -> Result<usize, String> {
-    // 1. Collect each active symbol's date-ascending OHLCV (≥ MIN_HISTORY_DAYS)
-    //    plus the previous trading day's volume (latest cached bar) for the gate /
-    //    tie-break / display.
-    let (mut bars_by_symbol, volume_by_symbol): (HashMap<String, Vec<Bar>>, HashMap<String, i64>) = {
+/// Aggregate today's premarket volume / dollar volume per symbol from Alpaca
+/// 1-minute bars (04:00 ET → 09:30 ET cap). Returns an empty map when Alpaca keys
+/// aren't configured (the pre-filter then relies on the 20-day average branch).
+async fn fetch_premarket(
+    secrets: &Arc<RwLock<Secrets>>,
+    symbols: &[String],
+) -> HashMap<String, PremarketStat> {
+    let (key, secret) = {
+        let s = secrets.read().unwrap();
+        (s.alpaca_key.clone(), s.alpaca_secret.clone())
+    };
+    let (Some(key), Some(secret)) = (key, secret) else { return HashMap::new() };
+    if key.is_empty() || secret.is_empty() || symbols.is_empty() {
+        return HashMap::new();
+    }
+
+    // App clock: simulated instant during a Market Replay (the fetch start lands
+    // on the replayed day's premarket; the bars call itself is end-clamped).
+    let now = crate::time::now();
+    let start = crate::time::et_clock_utc(now, 4, 0)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    // Cap premarket at the 09:30 cash open so a late-day rebuild still measures only
+    // the true premarket session, not the regular session.
+    let cap = crate::time::et_session_open_utc(now);
+
+    let bars = match crate::alpaca::bars::fetch_minute_bars_since(&key, &secret, symbols, &start).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[tagdash] panic watchlist: premarket fetch failed: {e}");
+            return HashMap::new();
+        }
+    };
+
+    let mut out: HashMap<String, PremarketStat> = HashMap::new();
+    for (sym, mbars) in bars {
+        let mut stat = PremarketStat::default();
+        for b in mbars {
+            if b.time >= cap {
+                continue; // beyond the premarket window
+            }
+            let v = b.volume as i64;
+            stat.volume += v;
+            // Minute VWAP × volume is the best per-bar dollar estimate; fall back to
+            // the close when VWAP is absent.
+            let px = b.vwap.unwrap_or(b.close);
+            stat.dollar_volume += px * b.volume as f64;
+        }
+        if stat.volume > 0 {
+            out.insert(sym, stat);
+        }
+    }
+    out
+}
+
+/// Read the candidate universe + premarket activity, build the two-list watchlist,
+/// and replace the `panic_watchlist` table. Returns the number of rows persisted.
+/// Heavy (reads ~120 daily bars per symbol + a premarket minute-bar fetch), so it's
+/// called once per day by `crate::panic_watchlist` (or on demand for testing).
+pub async fn build_and_store(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    secrets: &Arc<RwLock<Secrets>>,
+) -> Result<usize, String> {
+    // 1. Candidate daily bars + 20-day average $ volume + previous-day volume.
+    let (candidates, avg_dollar, prev_vol): (
+        HashMap<String, Vec<Bar>>,
+        HashMap<String, f64>,
+        HashMap<String, i64>,
+    ) = {
+        // Daily window bounded at the app-clock "today" (exclusive): inert in
+        // live mode (the cache holds nothing for today pre-open), and the leak
+        // guard during a Market Replay (the cache DOES hold bars after the
+        // replayed day — they must stay invisible).
+        let today = crate::time::et_date(crate::time::now());
         let conn = db.lock().unwrap();
         let symbols = universe_repository::get_active_symbols(&conn).map_err(|e| e.to_string())?;
+        let avg_dollar: HashMap<String, f64> = cache_repository::avg_dollar_volumes(&conn, 20, &today)
+            .unwrap_or_default().into_iter().collect();
+        let prev_vol: HashMap<String, i64> = cache_repository::latest_volumes(&conn, &today)
+            .unwrap_or_default().into_iter().collect();
         let mut map = HashMap::with_capacity(symbols.len());
         for sym in symbols {
-            if let Ok(rows) = cache_repository::ohlcv_ascending(&conn, &sym, HISTORY_DAYS) {
-                if rows.len() >= MIN_HISTORY_DAYS {
-                    let bars: Vec<Bar> = rows
-                        .into_iter()
-                        .map(|(open, high, low, close, volume)| Bar { open, high, low, close, volume })
-                        .collect();
-                    map.insert(sym, bars);
+            if let Ok(rows) = cache_repository::ohlcv_ascending(&conn, &sym, HISTORY_DAYS, &today) {
+                if rows.len() >= MIN_BARS {
+                    // Drop sub-$1 names here already (cheap; avoids a premarket fetch).
+                    if rows.last().map(|r| r.3 > MIN_PRICE).unwrap_or(false) {
+                        let bars: Vec<Bar> = rows.into_iter()
+                            .map(|(open, high, low, close, volume)| Bar { open, high, low, close, volume })
+                            .collect();
+                        map.insert(sym, bars);
+                    }
                 }
             }
         }
-        let volumes: HashMap<String, i64> = cache_repository::latest_volumes(&conn)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        (map, volumes)
+        (map, avg_dollar, prev_vol)
     };
-    eprintln!(
-        "[tagdash] scoring: {} symbols with >= {} daily bars",
-        bars_by_symbol.len(),
-        MIN_HISTORY_DAYS,
-    );
 
-    // Hard pre-filter (Panic Mean Reversion entry gate): keep only genuine
-    // multi-day movers (c0 > $1 and a ≥70% cumulative 2..6-day move in EITHER
-    // direction — runner or crash) BEFORE the Bollinger composite ranks anything.
-    // The scoring criteria are unchanged — only the entry pool is filtered. See
-    // `panic_mean_reversion::passes_prefilter`.
-    let before = bars_by_symbol.len();
-    bars_by_symbol.retain(|_sym, bars| {
-        let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-        crate::strategies::panic_mean_reversion::passes_prefilter(&closes)
-    });
-    eprintln!(
-        "[tagdash] scoring: pre-filter kept {} / {} movers (c0 > ${:.0}, |move| ≥{:.0}% over {}..{}d)",
-        bars_by_symbol.len(),
-        before,
-        crate::strategies::panic_mean_reversion::MIN_PRICE,
-        crate::strategies::panic_mean_reversion::MIN_CUM_MOVE_PCT,
-        crate::strategies::panic_mean_reversion::MIN_MOVE_DAYS,
-        crate::strategies::panic_mean_reversion::MAX_MOVE_DAYS,
-    );
-
-    // 2. Compute (CPU-bound, no DB lock held), then attach the previous-day volume.
-    let rows: Vec<ScoreRow> = compute_universe(&bars_by_symbol)
-        .into_iter()
-        .map(|s| {
-            let prev_volume = volume_by_symbol.get(&s.symbol).copied();
-            ScoreRow {
-                symbol:          s.symbol,
-                pr_score:        s.pr_score,
-                pr_best_days:    s.pr_best_days,
-                bb_event_score:  s.bb_event_score,
-                bb_best_horizon: s.bb_best_horizon,
-                parabolic_score: s.parabolic_score,
-                volume_score:    s.volume_score,
-                run_score:       s.run_score,
-                run_len:         s.run_len,
-                run_dir:         s.run_dir,
-                display_score:   s.display_score,
-                score_kind:      s.score_kind,
-                prev_volume,
-            }
-        })
+    // 2. Premarket fetch — only for names that DON'T already clear the $5M average
+    //    branch (they qualify regardless, and BB/MA use daily bars only, so their
+    //    premarket activity is never needed downstream). Cuts the fetch set.
+    let pm_symbols: Vec<String> = candidates
+        .keys()
+        .filter(|s| avg_dollar.get(*s).copied().unwrap_or(0.0) <= AVG_DOLLAR_MIN)
+        .cloned()
         .collect();
+    let premarket = fetch_premarket(secrets, &pm_symbols).await;
+    eprintln!(
+        "[tagdash] panic watchlist: {} candidates, premarket fetched for {} (got {} active)",
+        candidates.len(), pm_symbols.len(), premarket.len(),
+    );
+
+    // 3. Build the two ranked lists + merge.
+    let rows = compute_watchlist(&candidates, &premarket, &avg_dollar, &prev_vol);
     let n = rows.len();
+    eprintln!("[tagdash] panic watchlist: {n} rows after merge (top {TOP_PER_LIST}/list)");
 
-    eprintln!("[tagdash] scoring: {n} tickers scored");
-
-    // 3. Persist (replace the whole table atomically).
+    // 4. Persist (atomic replace).
     {
         let conn = db.lock().unwrap();
         scoring_repository::replace_all(&conn, &rows).map_err(|e| e.to_string())?;
@@ -600,154 +493,108 @@ pub fn compute_and_store(db: &Arc<Mutex<rusqlite::Connection>>) -> Result<usize,
 mod tests {
     use super::*;
 
-    /// Doji bars (open=high=low=close) from a close series — lets the close-driven
-    /// BB/PR tests run through `compute_universe` without exercising parabolic/run
-    /// (both 0 for a doji), which are tested directly below.
-    fn dojis_from_closes(closes: &[f64]) -> Vec<Bar> {
-        closes
-            .iter()
-            .map(|&c| Bar { open: c, high: c, low: c, close: c, volume: 1_000_000 })
-            .collect()
+    fn bar(o: f64, h: f64, l: f64, c: f64) -> Bar {
+        Bar { open: o, high: h, low: l, close: c, volume: 1_000_000 }
     }
 
     #[test]
-    fn percent_rank_basics() {
-        let v = vec![1.0, 2.0, 3.0, 4.0];
-        assert_eq!(percent_rank(&v, 4.0), 100.0);
-        assert_eq!(percent_rank(&v, 1.0), 25.0);
-        assert_eq!(percent_rank(&[], 1.0), 0.0);
+    fn prefilter_branches() {
+        let pm_big_vol = PremarketStat { volume: 150_000, dollar_volume: 0.0 };
+        let pm_big_dol = PremarketStat { volume: 1_000, dollar_volume: 600_000.0 };
+        let pm_small   = PremarketStat { volume: 1_000, dollar_volume: 1_000.0 };
+        assert!(passes_prefilter(5.0, Some(&pm_big_vol), 0.0));
+        assert!(passes_prefilter(5.0, Some(&pm_big_dol), 0.0));
+        assert!(passes_prefilter(5.0, None, 6_000_000.0)); // avg $ vol branch
+        assert!(!passes_prefilter(5.0, Some(&pm_small), 1_000_000.0)); // none clear
+        assert!(!passes_prefilter(0.50, Some(&pm_big_vol), 9e9)); // sub-$1 rejected
     }
 
     #[test]
-    fn mean_std_guards_zero() {
-        assert!(mean_std(&[5.0, 5.0, 5.0]).is_none()); // zero std
-        assert!(mean_std(&[]).is_none());
-        let (m, s) = mean_std(&[1.0, 3.0]).unwrap();
-        assert!((m - 2.0).abs() < 1e-9);
-        assert!(s > 0.0);
-    }
-
-    #[test]
-    fn below_floor_history_is_skipped() {
-        // Below MIN_HISTORY_DAYS → no BB score (pure noise guard). A <3y but
-        // above-floor history is NOT skipped (covered by short_history_is_scored).
-        let closes: Vec<f64> = (0..MIN_HISTORY_DAYS - 5).map(|i| 10.0 + i as f64 * 0.1).collect();
-        assert!(bb_event_score(&closes).is_none());
-    }
-
-    #[test]
-    fn short_history_is_scored() {
-        // Just above the floor (well under 3 years) still produces scores — short
-        // histories are included, not excluded.
-        let mut closes: Vec<f64> = (0..MIN_HISTORY_DAYS + 5)
-            .map(|i| 10.0 + ((i as f64) * 0.1).sin() * 0.2)
-            .collect();
-        *closes.last_mut().unwrap() = 18.0;
-        let map: HashMap<String, Vec<Bar>> =
-            [("AAA".to_string(), dojis_from_closes(&closes))].into_iter().collect();
-        assert_eq!(compute_universe(&map).len(), 1, "short history must be scored");
-    }
-
-    #[test]
-    fn a_recent_spike_scores_high() {
-        // Flat history then a violent final-day jump → exceptional move.
-        let mut closes: Vec<f64> = (0..MIN_HISTORY_DAYS + 200)
-            .map(|i| 10.0 + ((i as f64) * 0.01).sin() * 0.05)
-            .collect();
-        *closes.last_mut().unwrap() = 20.0; // +100% on the last day
-        let (score, _h) = bb_event_score(&closes).expect("should score");
-        assert!(score > 90.0, "expected exceptional score, got {score}");
-    }
-
-    #[test]
-    fn percent_rank_is_bidirectional() {
-        // Diagnostic PR (still computed, out of the display). Universe of names
-        // whose only move is on the last day, spanning a smooth −1%..+1% range,
-        // plus a crash and a rip far outside it. The mid name (~0% move) sits at the
-        // median → low extremeness; BOTH the crash and the rip land at a tail →
-        // high extremeness (the percent rank works both directions).
-        const N: usize = 99;
-        let len = MIN_HISTORY_DAYS + 50;
-        let make = |last: f64| -> Vec<Bar> {
-            let mut c = vec![10.0; len];
-            *c.last_mut().unwrap() = last;
-            dojis_from_closes(&c)
-        };
-        let mut map: HashMap<String, Vec<Bar>> = HashMap::new();
-        for k in 0..N {
-            let pct = (k as f64 - (N as f64 - 1.0) / 2.0) / ((N as f64 - 1.0) / 2.0) * 0.01;
-            map.insert(format!("M{k}"), make(10.0 * (1.0 + pct)));
+    fn bbz_area_rewards_sustained_extension() {
+        // 20 flat days then 6 rising days well above the band → area_up > 0.
+        let mut closes = vec![10.0; SMA_PERIOD];
+        for i in 0..AREA_DAYS {
+            closes.push(11.0 + i as f64 * 0.5);
         }
-        map.insert("CRASH".into(), make(5.0));  // −50% last day
-        map.insert("RIP".into(), make(20.0));   // +100% last day
-
-        let scores: HashMap<String, f64> = compute_universe(&map)
-            .into_iter()
-            .map(|s| (s.symbol, s.pr_score))
-            .collect();
-        let mid = scores["M49"]; // ~0% move → median
-        assert!(scores["CRASH"] > 90.0, "crash must rank extreme (got {})", scores["CRASH"]);
-        assert!(scores["RIP"] > 90.0, "rip must rank extreme (got {})", scores["RIP"]);
-        assert!(mid < 20.0, "a near-zero mover must rank low (got {mid})");
+        let (up, down) = bbz_area_6d(&closes).expect("defined");
+        assert!(up > 0.0, "expected upward area, got {up}");
+        assert_eq!(down, 0.0);
     }
 
     #[test]
-    fn parabolic_rewards_expanding_directional_move() {
-        // Strictly rising closes with each day's range bigger than the prior →
-        // expansion high, directional efficiency = 1 → high parabolic score.
-        let mut bars = vec![Bar { open: 10.0, high: 10.0, low: 9.9, close: 10.0, volume: 0 }];
-        let mut price = 10.0;
-        for r in [0.2, 0.4, 0.8, 1.6] {
-            let open = price;
-            let close = price + r;
-            bars.push(Bar { open, high: close, low: open, close, volume: 0 });
-            price = close;
+    fn bbz_area_symmetric_down() {
+        let mut closes = vec![10.0; SMA_PERIOD];
+        for i in 0..AREA_DAYS {
+            closes.push(9.0 - i as f64 * 0.5);
         }
-        let p = parabolic_score(&bars);
-        assert!(p > 0.6, "expanding directional move should score high, got {p}");
+        let (up, down) = bbz_area_6d(&closes).expect("defined");
+        assert_eq!(up, 0.0);
+        assert!(down > 0.0, "expected downward area, got {down}");
     }
 
     #[test]
-    fn parabolic_low_for_chop() {
-        // Alternating up/down of equal size → net≈0, path large → efficiency ≈ 0.
-        let mut bars = vec![Bar { open: 10.0, high: 10.1, low: 9.9, close: 10.0, volume: 0 }];
-        for i in 0..6 {
-            let open = bars.last().unwrap().close;
-            let close = if i % 2 == 0 { open + 0.2 } else { open - 0.2 };
-            bars.push(Bar {
-                open,
-                high: open.max(close) + 0.05,
-                low: open.min(close) - 0.05,
-                close,
-                volume: 0,
-            });
+    fn move_measures_from_touch() {
+        // 20 flat bars at 10 (SMA≈10), then a clean run up that never returns to the
+        // SMA. The last bar that touched the SMA is around the breakout; the move is
+        // measured from ~10 to the latest close.
+        let mut bars: Vec<Bar> = (0..SMA_PERIOD).map(|_| bar(10.0, 10.1, 9.9, 10.0)).collect();
+        let mut px = 10.0;
+        for _ in 0..8 {
+            let open = px;
+            let close = px + 1.0;
+            bars.push(bar(open, close + 0.1, open - 0.05, close));
+            px = close;
         }
-        assert!(parabolic_score(&bars) < 0.3, "choppy move should score low");
-    }
-
-    #[test]
-    fn run_counts_consecutive_same_colour() {
-        let green = |o: f64, c: f64| Bar { open: o, high: c, low: o, close: c, volume: 0 };
-        let red = |o: f64, c: f64| Bar { open: o, high: o, low: c, close: c, volume: 0 };
-        // Two red days then five green days → run = 5 green, ending bullish.
-        let mut bars = vec![red(11.0, 10.0), red(10.5, 10.0)];
-        for _ in 0..5 {
-            bars.push(green(10.0, 10.5));
-        }
-        let (score, dir, len) = run_score(&bars);
+        let (mv, dir) = move_since_sma20_contact(&bars).expect("defined");
         assert_eq!(dir, 1);
-        assert_eq!(len, 5);
-        let expected = 1.0 - (-(5.0_f64) / RUN_REF).exp();
-        assert!((score - expected).abs() < 1e-9, "got {score}, expected {expected}");
+        assert!(mv > 5.0, "expected a large up move from the SMA, got {mv}");
     }
 
     #[test]
-    fn volume_score_log_scaled() {
-        assert_eq!(volume_score(0.0), 0.0);
-        assert_eq!(volume_score(5e6), 0.0, "below the floor clamps to 0");
-        assert_eq!(volume_score(5e9), 1.0, "above the ceiling clamps to 1");
-        // Geometric mid of the $10M..$2B log range → ~0.5.
-        let mid = volume_score((VOL_DOLLAR_MIN * VOL_DOLLAR_MAX).sqrt());
-        assert!((mid - 0.5).abs() < 0.02, "geometric mid should be ~0.5, got {mid}");
+    fn move_handles_gap_over_sma() {
+        // Flat below-ish, then a GAP that jumps clear over the SMA without the candle
+        // touching it, then continues up. Contact = the gap (franchissement) bar; the
+        // move is still measured (positive) and never panics.
+        let mut bars: Vec<Bar> = (0..SMA_PERIOD).map(|_| bar(10.0, 10.05, 9.95, 10.0)).collect();
+        // Gap bar: opens and stays well above the SMA (~10) — low 12 > sma.
+        bars.push(bar(12.0, 13.0, 12.0, 12.8));
+        bars.push(bar(12.8, 14.0, 12.7, 13.8));
+        let (mv, dir) = move_since_sma20_contact(&bars).expect("defined");
+        assert_eq!(dir, 1);
+        assert!(mv > 0.0, "gap-over move should be positive, got {mv}");
+    }
+
+    #[test]
+    fn atr_includes_gaps() {
+        // A gap makes TR exceed the intraday range.
+        let mut bars: Vec<Bar> = (0..ATR_PERIOD).map(|_| bar(10.0, 10.2, 9.8, 10.0)).collect();
+        bars.push(bar(12.0, 12.2, 11.9, 12.0)); // gap up: |H−Cprev|≈2.2 ≫ H−L=0.3
+        let atr = atr20(&bars).expect("defined");
+        assert!(atr > 0.3, "ATR should reflect the gap, got {atr}");
+    }
+
+    #[test]
+    fn merge_dedupes_to_better_rank() {
+        // Build candidates so AAA tops BB and is #2 in MA, BBB tops MA. AAA must
+        // appear once, tagged BB (its better rank).
+        let mut candidates: HashMap<String, Vec<Bar>> = HashMap::new();
+        // AAA — strong sustained up extension + big move.
+        let mut aaa: Vec<Bar> = (0..SMA_PERIOD).map(|_| bar(10.0, 10.1, 9.9, 10.0)).collect();
+        let mut p = 10.0;
+        for _ in 0..AREA_DAYS { p += 1.0; aaa.push(bar(p - 1.0, p + 0.1, p - 1.05, p)); }
+        candidates.insert("AAA".into(), aaa);
+        // BBB — moderate.
+        let mut bbb: Vec<Bar> = (0..SMA_PERIOD).map(|_| bar(10.0, 10.1, 9.9, 10.0)).collect();
+        let mut q = 10.0;
+        for _ in 0..AREA_DAYS { q += 0.6; bbb.push(bar(q - 0.6, q + 0.1, q - 0.65, q)); }
+        candidates.insert("BBB".into(), bbb);
+
+        let avg_dollar: HashMap<String, f64> =
+            [("AAA".into(), 9e9), ("BBB".into(), 9e9)].into_iter().collect();
+        let rows = compute_watchlist(&candidates, &HashMap::new(), &avg_dollar, &HashMap::new());
+        // Each symbol appears exactly once.
+        let aaa_rows = rows.iter().filter(|r| r.symbol == "AAA").count();
+        assert_eq!(aaa_rows, 1, "a symbol in both lists must appear once");
+        assert!(rows.iter().all(|r| r.value > 0.0));
     }
 }

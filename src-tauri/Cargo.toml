@@ -14,8 +14,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri        = { version = "2", features = [] }
+tauri        = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-shell = "2"
+# Native OS notifications (Windows toast / macOS Notification Center) — opt-in
+# desktop alert when a scanner alert fires (gated by ui.desktop_alerts).
+tauri-plugin-notification = "2"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

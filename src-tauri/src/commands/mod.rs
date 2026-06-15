@@ -9,12 +9,12 @@ use serde::Serialize;
 
 use std::collections::HashMap;
 
-use crate::chart_state::ZoneTradeContext;
+use crate::chart_state::{ChartState, ZoneTradeContext};
 use crate::config::{self, AppConfig};
 use crate::config::secrets::{Secrets, SecretsStatus};
 use crate::internal_trading::InternalBook;
 use crate::local_db::{
-    alarm_repository, bug_repository, cache_repository, company_meta_repository,
+    alarm_repository, book_repository, bug_repository, cache_repository, company_meta_repository,
     drawing_repository, execution_repository, get_recent_logs, journal_repository,
     universe_repository, BugReport, JournalEntry, LocalLogEntry, PriceAlarm, SyncQueueStatus,
     tradetally_queue_repository,
@@ -176,7 +176,7 @@ pub fn save_screenshot_local(
                 .get_trade_lifecycle(tid).map(|lc| !lc.fills.is_empty()).unwrap_or(false);
             if has_creds && has_activity {
                 let symbol = state.chart.read().unwrap()
-                    .get_context(&zone_id).map(|c| c.symbol).unwrap_or_default();
+                    .get_context_for_zone(&zone_id).map(|c| c.symbol).unwrap_or_default();
                 Some((tid.clone(), symbol))
             } else {
                 None
@@ -319,6 +319,17 @@ pub fn get_all_alarms(state: tauri::State<'_, AppState>) -> Vec<AlarmView> {
         .collect()
 }
 
+/// Move an alarm to a new price (chart-drag from the chart area).
+#[tauri::command(rename_all = "snake_case")]
+pub fn update_alarm_price(
+    id:    String,
+    price: f64,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    alarm_repository::update_price(&db, &id, price).map_err(|e| e.to_string())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub fn delete_alarm(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db = state.db.lock().unwrap();
@@ -329,6 +340,11 @@ pub fn delete_alarm(id: String, state: tauri::State<'_, AppState>) -> Result<(),
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn run_startup_pipeline(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // The pipeline writes the daily cache from "now"-relative windows — running
+    // it under the simulated clock would store a truncated history.
+    if crate::replay::clock::is_active() {
+        return Err("Market Replay actif — termine le replay avant de relancer le pipeline".into());
+    }
     {
         let mut s = state.startup.write().unwrap();
         *s = StartupState::default();
@@ -483,6 +499,12 @@ pub fn spawn_live_feed(
     if running.load(Ordering::Relaxed) {
         return Ok(0);
     }
+    // While a Market Replay is active the live feed must stay down — it would
+    // mix real-time data into the simulated MarketState. (The replay engine
+    // restarts the feed itself after deactivating the simulated clock.)
+    if crate::replay::clock::is_active() {
+        return Err("Market Replay actif — flux live indisponible".into());
+    }
 
     let (key, secret) = {
         let s = secrets.read().unwrap();
@@ -564,6 +586,10 @@ pub fn spawn_news_feed(
 ) -> Result<(), String> {
     if running.load(Ordering::Relaxed) {
         return Ok(());
+    }
+    // Same guard as the data feed: no live news into a simulated session.
+    if crate::replay::clock::is_active() {
+        return Err("Market Replay actif — flux news indisponible".into());
     }
     let (key, secret) = {
         let s = secrets.read().unwrap();
@@ -722,6 +748,45 @@ pub async fn load_older_bars(
     }
 }
 
+/// Historical stock-split day markers for ONE symbol over the last 2 years
+/// (Alpaca corporate-actions) — red dots on the daily pane. Surfaced for EVERY
+/// daily chart (not only enriched alerts, which got them via the enrichment
+/// payload): the daily pane fetches this directly. We only need the ex-dates (the
+/// day the price adjusts); the ratio is kept solely as the marker label. Returns
+/// an empty list on missing credentials / fetch error so the chart still renders.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_split_markers(
+    symbol: String,
+    state:  tauri::State<'_, AppState>,
+) -> Result<Vec<crate::types::SplitMarker>, String> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+
+    let (key, secret) = {
+        let s = state.secrets.read().unwrap();
+        (s.alpaca_key.clone(), s.alpaca_secret.clone())
+    };
+    let (Some(key), Some(secret)) = (key, secret) else {
+        return Ok(vec![]); // no credentials (e.g. mock mode)
+    };
+
+    match crate::alpaca::corporate_actions::fetch_splits(&key, &secret, &symbol, 2).await {
+        Ok(splits) => Ok(splits
+            .into_iter()
+            .filter_map(|s| {
+                // Stamp the marker at UTC midnight of the ex-date; the chart snaps
+                // it to the nearest daily bar (which carries Alpaca's own stamp).
+                let d = NaiveDate::parse_from_str(&s.date, "%Y-%m-%d").ok()?;
+                let time = Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?).timestamp();
+                Some(crate::types::SplitMarker { time, label: s.label })
+            })
+            .collect()),
+        Err(e) => {
+            eprintln!("[tagdash] get_split_markers {symbol} failed: {e}");
+            Ok(vec![])
+        }
+    }
+}
+
 /// Previous trading day's reference levels (close / high / low) for a symbol,
 /// relative to TODAY's date (ET). Drawn as the PDC/PDH/PDL lines on intraday
 /// panes. Sourced from the daily cache and filtered to the most recent bar whose
@@ -740,13 +805,15 @@ pub fn get_previous_day_levels(
     symbol: String,
     state:  tauri::State<'_, AppState>,
 ) -> Option<PrevDayLevels> {
-    // ET date (DST-aware, matching the rest of the app). The previous trading
-    // day is simply the most recent cached daily bar dated before this.
-    let today = crate::time::et_date(chrono::Utc::now());
+    // ET date (DST-aware, matching the rest of the app; the SIMULATED day during
+    // a Market Replay). The previous trading day is the most recent cached daily
+    // bar dated strictly before this — queried with the date bound so a replay
+    // of an older day still finds ITS previous session (not just the last 10).
+    let today = crate::time::et_date(crate::time::now());
 
     let rows = {
         let conn = state.db.lock().unwrap();
-        cache_repository::get_daily_bars(&conn, &symbol, 10).unwrap_or_default()
+        cache_repository::get_daily_bars_before(&conn, &symbol, &today, 10).unwrap_or_default()
     };
     // Rows are date DESC → the first one before today is the previous trading day.
     rows.into_iter().find_map(|d| {
@@ -934,9 +1001,10 @@ pub fn get_screener_matches(state: tauri::State<'_, AppState>) -> Vec<ScreenerMa
 }
 
 /// Today's ET trading date (DST-aware, matching the rest of the app), used to
-/// scope screener dismissals to a single day.
+/// scope screener dismissals to a single day. App clock: the simulated day
+/// during a Market Replay.
 fn et_today() -> String {
-    crate::time::et_date(Utc::now())
+    crate::time::et_date(crate::time::now())
 }
 
 /// Persist a pre-open screener dismissal for TODAY so the ticker stays hidden
@@ -1016,10 +1084,27 @@ pub fn get_mean_reversion_scores(
 pub struct CardInfo {
     pub market_cap:    Option<i64>,
     pub float_shares:  Option<i64>,
+    /// The watchlist metric value (BB area sum, or |move|/ATR20). None when off-list.
     pub mr_score:      Option<f64>,
+    /// Which list retained the ticker: "BB" or "MA".
     pub mr_score_kind: Option<String>,
-    /// Horizon (days) of the winning score (pr_best_days for PR, bb_best_horizon for BB).
-    pub mr_best_days:  Option<u8>,
+    /// Extension direction: +1 up, −1 down, 0 none.
+    pub mr_direction:  Option<i8>,
+    /// SIC industry + country of origin (sec-api company metadata). Surfaced in
+    /// the manual ticker-search info band.
+    pub industry:      Option<String>,
+    pub country:       Option<String>,
+    // ── Common chart info-bar fields (same for every strategy) ────────────────
+    /// Bollinger Z of the live price vs its 20-day daily basis: (price − SMA20)/σ20.
+    /// None until ≥20 daily bars are cached. Updates as the live price moves.
+    pub bbz:               Option<f64>,
+    /// Today's premarket cumulative volume (04:00–09:30 ET), summed from the live
+    /// 1-minute ring buffer. None when no premarket bars are on file.
+    pub premarket_volume:  Option<i64>,
+    /// Whether a live news headline is on file for the symbol (Alpaca news feed).
+    pub has_news:          bool,
+    /// The most recent live headline text, if any (for the common "News" chip).
+    pub news_title:        Option<String>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1027,32 +1112,74 @@ pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardI
     let db = state.db.lock().unwrap();
     let asset = universe_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
     let score = crate::local_db::scoring_repository::get_one(&db, &symbol).unwrap_or(None);
-    let (mr_score, mr_score_kind, mr_best_days) = match score {
-        Some(s) => {
-            // The composite is anchored on the Bollinger event, so its winning
-            // horizon is the meaningful "days" to surface.
-            (Some(s.display_score), Some(s.score_kind), Some(s.bb_best_horizon))
-        }
+    let meta  = company_meta_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
+    let (mr_score, mr_score_kind, mr_direction) = match score {
+        Some(s) => (Some(s.value), Some(s.list_kind), Some(s.direction)),
         None => (None, None, None),
     };
+
+    // Daily closes (ASC) for the current Bollinger Z. Cache returns newest-first.
+    let daily = cache_repository::get_daily_bars(&db, &symbol, 30).unwrap_or_default();
+    let closes_asc: Vec<f64> = daily.iter().rev().filter_map(|b| b.close).collect();
+
+    // One market lock for the live price (BBZ), premarket volume and news.
+    let (bbz, premarket_volume, news_title) = {
+        let market = state.market.read().unwrap();
+        // Live price drives the BBZ; fall back to the last cached daily close.
+        let price = market.last_price(&symbol).or_else(|| closes_asc.last().copied());
+        let bbz = price.and_then(|p| crate::scoring::current_bbz(&closes_asc, p));
+
+        // Premarket volume: sum today's 1-minute bars inside 04:00–09:30 ET.
+        let now    = crate::time::now();
+        let today  = crate::time::et_date(now);
+        let m1     = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
+        let mut pm_sum: i64 = 0;
+        let mut pm_any = false;
+        for b in &m1 {
+            if crate::time::et_date(b.time) != today {
+                continue;
+            }
+            let mins = crate::time::et_minutes(b.time);
+            if (240..570).contains(&mins) {
+                pm_sum += b.volume as i64;
+                pm_any = true;
+            }
+        }
+        let premarket_volume = if pm_any { Some(pm_sum) } else { None };
+
+        let news_title = market.latest_news(&symbol).map(|h| h.headline);
+        (bbz, premarket_volume, news_title)
+    };
+
     CardInfo {
         market_cap:    asset.as_ref().and_then(|a| a.market_cap),
         float_shares:  asset.as_ref().and_then(|a| a.float_shares),
         mr_score,
         mr_score_kind,
-        mr_best_days,
+        mr_direction,
+        industry:      meta.as_ref().and_then(|m| m.industry.clone()),
+        country:       meta.as_ref().and_then(|m| m.country.clone()),
+        bbz,
+        premarket_volume,
+        has_news:      news_title.is_some(),
+        news_title,
     }
 }
 
-/// Force an immediate full recompute of the mean-reversion scores (ignores the
-/// once-per-day gate) — for testing. Runs off-thread (it reads ~3y of closes per
-/// symbol) so the command returns at once.
+/// Force an immediate rebuild of the Panic Mean Reversion watchlist (ignores the
+/// 09:00 ET / once-per-day gate) — for testing. Runs off the async runtime (it
+/// fetches premarket minute bars + reads daily history) so the command returns at
+/// once. Note: before ~09:00 ET there's little/no premarket data, so the premarket
+/// liquidity branches won't contribute yet.
 #[tauri::command(rename_all = "snake_case")]
 pub fn force_recompute_scores(state: tauri::State<'_, AppState>) {
     let db = state.db.clone();
-    std::thread::spawn(move || match crate::scoring::compute_and_store(&db) {
-        Ok(n) => eprintln!("[tagdash] mean-reversion scores recomputed: {n} tickers"),
-        Err(e) => eprintln!("[tagdash] score recompute failed: {e}"),
+    let secrets = state.secrets.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::scoring::build_and_store(&db, &secrets).await {
+            Ok(n) => eprintln!("[tagdash] panic watchlist rebuilt: {n} rows"),
+            Err(e) => eprintln!("[tagdash] panic watchlist rebuild failed: {e}"),
+        }
     });
 }
 
@@ -1061,9 +1188,13 @@ pub fn force_recompute_scores(state: tauri::State<'_, AppState>) {
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_zone_trade_context(
     zone_id: String,
+    symbol:  String,
     state:   tauri::State<'_, AppState>,
 ) -> Option<ZoneTradeContext> {
-    state.chart.read().unwrap().get_context(&zone_id)
+    // Context is per-ticker: record the zone's current ticker and return that
+    // ticker's SL/TP/tradeID, so it follows the ticker across zone swaps (and is
+    // restored when the ticker comes back).
+    state.chart.write().unwrap().load_zone_context(&zone_id, &symbol)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1078,6 +1209,7 @@ pub fn create_or_get_trade_id_for_zone(
         .write()
         .unwrap()
         .create_or_get_trade_id(&zone_id, &symbol, &strategy_id);
+    persist_chart(&state.chart, &state.db);
     Ok(id)
 }
 
@@ -1101,6 +1233,11 @@ pub fn update_zone_sl(
     state.internal_book.write().unwrap()
         .update_protective_levels(&symbol, ctx.stop_loss, ctx.take_profit);
 
+    // Persist the moved level: the chart line (context) and any re-armed bracket
+    // order must both come back identically after a restart.
+    persist_chart(&state.chart, &state.db);
+    persist_book(&state.internal_book, &state.db);
+
     // Push levels to TradeTally only once the trade exists there (≥1 fill).
     // Before that, SL/TP are local and ride along in the trade_created payload.
     if let Some(ref trade_id) = ctx.trade_id {
@@ -1109,8 +1246,11 @@ pub fn update_zone_sl(
             .map(|lc| !lc.fills.is_empty())
             .unwrap_or(false);
         if has_activity {
+            // Push the TP only. The journal SL stays at its opening value
+            // (stamped in trade_created); post-entry SL moves only drive the
+            // local bracket order and must not reach TradeTally.
             let db = state.db.lock().unwrap();
-            tradetally::enqueue_levels_updated(&db, trade_id, &symbol, ctx.stop_loss, ctx.take_profit);
+            tradetally::enqueue_levels_updated(&db, trade_id, &symbol, ctx.take_profit);
         }
     }
 
@@ -1137,6 +1277,10 @@ pub fn update_zone_tp(
     state.internal_book.write().unwrap()
         .update_protective_levels(&symbol, ctx.stop_loss, ctx.take_profit);
 
+    // Persist the moved level (chart line + re-armed bracket) so it survives a restart.
+    persist_chart(&state.chart, &state.db);
+    persist_book(&state.internal_book, &state.db);
+
     if let Some(ref trade_id) = ctx.trade_id {
         let has_activity = state.internal_book.read().unwrap()
             .get_trade_lifecycle(trade_id)
@@ -1144,7 +1288,7 @@ pub fn update_zone_tp(
             .unwrap_or(false);
         if has_activity {
             let db = state.db.lock().unwrap();
-            tradetally::enqueue_levels_updated(&db, trade_id, &symbol, ctx.stop_loss, ctx.take_profit);
+            tradetally::enqueue_levels_updated(&db, trade_id, &symbol, ctx.take_profit);
         }
     }
 
@@ -1210,7 +1354,7 @@ fn size_for_zone(
     percent: u8,
 ) -> Result<(i64, Side, f64, f64, ZoneTradeContext), String> {
     let ctx = state.chart.read().unwrap()
-        .get_context(zone_id)
+        .get_context_for_zone(zone_id)
         .ok_or_else(|| "zone has no trade context".to_string())?;
 
     let sl = ctx.stop_loss.ok_or_else(|| "SL is required".to_string())?;
@@ -1257,6 +1401,9 @@ pub fn create_internal_order_percent(
         ctx.stop_loss,
         ctx.take_profit,
     );
+    // A resting entry order is part of the day's state — persist so it survives a
+    // restart and the trading loop can still fill it on a price cross.
+    persist_book(&state.internal_book, &state.db);
     Ok(order)
 }
 
@@ -1264,6 +1411,31 @@ pub fn create_internal_order_percent(
 /// close), which hold a `tauri::State`.
 fn tt_sync_fill(state: &tauri::State<'_, AppState>, fill: &Fill) {
     sync_fill(&state.internal_book, &state.db, &state.config, &state.chart, fill);
+}
+
+/// Snapshot the trading book to SQLite so an open multi-day position and its
+/// resting orders survive a restart. Called after every state-changing book
+/// mutation (fills, order create/cancel, level changes). Takes a fresh snapshot
+/// under a short read lock, then writes — book and db locks are never held nested.
+fn persist_book(
+    internal_book: &Arc<RwLock<InternalBook>>,
+    db:            &Arc<Mutex<rusqlite::Connection>>,
+) {
+    let snapshot = internal_book.read().unwrap().persistable_snapshot();
+    let db = db.lock().unwrap();
+    book_repository::save_book(&db, &snapshot);
+}
+
+/// Snapshot the per-ticker chart trade contexts (SL/TP/tradeID lines) to SQLite
+/// so they reappear on the chart after a restart. Called after every context
+/// mutation.
+fn persist_chart(
+    chart: &Arc<RwLock<ChartState>>,
+    db:    &Arc<Mutex<rusqlite::Connection>>,
+) {
+    let ctxs = chart.read().unwrap().export_contexts();
+    let db = db.lock().unwrap();
+    book_repository::save_chart_contexts(&db, &ctxs);
 }
 
 /// Reconcile a freshly-produced fill with TradeTally and persist its execution.
@@ -1337,7 +1509,12 @@ fn sync_fill(
     // and a re-entry in the same zone starts a brand-new trade.
     if closing {
         chart.write().unwrap().reset_closed_trade(&fill.trade_id);
+        persist_chart(chart, db);
     }
+
+    // Checkpoint the book after every fill (entry, scale, exit) so positions and
+    // resting orders are restorable identically after a restart.
+    persist_book(internal_book, db);
 }
 
 /// Backend trading loop: drives the internal order book off market data instead
@@ -1359,7 +1536,6 @@ pub fn spawn_trading_loop(
     }
     running.store(true, Ordering::Relaxed);
     tauri::async_runtime::spawn(async move {
-        use tokio::time::{sleep, Duration};
         while running.load(Ordering::Relaxed) {
             let prices = all_market_prices(&market);
             let new_fills = {
@@ -1377,7 +1553,9 @@ pub fn spawn_trading_loop(
             for f in &new_fills {
                 sync_fill(&internal_book, &db, &config, &chart, f);
             }
-            sleep(Duration::from_millis(500)).await;
+            // 500 ms of market time (scaled during an accelerated replay so
+            // pending orders / brackets fill at the live-equivalent cadence).
+            crate::replay::clock::scaled_sleep(500).await;
         }
     });
 }
@@ -1417,7 +1595,11 @@ pub fn cancel_internal_order(
     order_id: String,
     state:    tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    state.internal_book.write().unwrap().cancel_order(&order_id)
+    let res = state.internal_book.write().unwrap().cancel_order(&order_id);
+    if res.is_ok() {
+        persist_book(&state.internal_book, &state.db);
+    }
+    res
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1430,7 +1612,7 @@ pub fn close_internal_position(
     if bid < 1e-6 { return Err("no market price available".into()); }
 
     let strategy_id = state.chart.read().unwrap()
-        .get_context(&zone_id)
+        .get_context_for_zone(&zone_id)
         .map(|c| c.strategy_id)
         .unwrap_or_default();
 
@@ -1578,6 +1760,17 @@ pub fn get_drawings_for_symbol(
     drawing_repository::get_for_symbol(&conn, &symbol).unwrap_or_default()
 }
 
+/// Update an existing drawing (position after a drag, or style after an edit).
+/// Same INSERT OR REPLACE path as create — the full row is sent each time.
+#[tauri::command(rename_all = "snake_case")]
+pub fn update_drawing(
+    drawing: Drawing,
+    state:   tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    drawing_repository::insert(&conn, &drawing).map_err(|e| e.to_string())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub fn delete_drawing(
     id:    String,
@@ -1585,4 +1778,103 @@ pub fn delete_drawing(
 ) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     drawing_repository::delete(&conn, &id).map_err(|e| e.to_string())
+}
+
+// ─── Market Replay ────────────────────────────────────────────────────────────
+
+/// Start replaying `day` (YYYY-MM-DD, ET trading date) from `start_hm`
+/// ("04:00" | "07:00" | "09:30"). Stops the live feeds, switches the app clock
+/// to simulated time and loads the day's data (progress via get_replay_status).
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_start(
+    day:      String,
+    start_hm: String,
+    app:      tauri::AppHandle,
+    state:    tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let start_min = parse_hm(&start_hm)?;
+    let deps = crate::replay::ReplayDeps {
+        app_dir:           state.app_dir.clone(),
+        market:            state.market.clone(),
+        db:                state.db.clone(),
+        config:            state.config.clone(),
+        secrets:           state.secrets.clone(),
+        live_feed_running: state.live_feed_running.clone(),
+        news_feed_running: state.news_feed_running.clone(),
+        focus_rx:          state.focus_symbols_tx.subscribe(),
+        focus_rx_restart:  state.focus_symbols_tx.subscribe(),
+        active_alerts:     state.active_alerts.clone(),
+        alert_history:     state.alert_history.clone(),
+        app,
+    };
+    crate::replay::start(state.replay.clone(), deps, day, start_min)
+}
+
+fn parse_hm(hm: &str) -> Result<u32, String> {
+    let (h, m) = hm.split_once(':').ok_or("heure invalide (HH:MM)")?;
+    let h: u32 = h.parse().map_err(|_| "heure invalide")?;
+    let m: u32 = m.parse().map_err(|_| "heure invalide")?;
+    if h > 23 || m > 59 {
+        return Err("heure invalide".into());
+    }
+    Ok(h * 60 + m)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.replay.send(crate::replay::ReplayCmd::Stop)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_set_playing(
+    playing: bool,
+    state:   tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state.replay.send(if playing {
+        crate::replay::ReplayCmd::Play
+    } else {
+        crate::replay::ReplayCmd::Pause
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_set_speed(speed: f64, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if !speed.is_finite() || speed <= 0.0 {
+        return Err("vitesse invalide".into());
+    }
+    state.replay.send(crate::replay::ReplayCmd::SetSpeed(speed))
+}
+
+/// Avance/recule le temps simulé de `delta_secs` secondes (négatif = retour en
+/// arrière → l'état du marché est rejoué depuis le début de journée).
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_seek_relative(
+    delta_secs: i64,
+    state:      tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state.replay.send(crate::replay::ReplayCmd::SeekRelative(delta_secs))
+}
+
+/// Saute à une heure ET du jour rejoué ("04:00", "07:00", "09:30"…).
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_seek_clock(hm: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let minutes = parse_hm(&hm)?;
+    state.replay.send(crate::replay::ReplayCmd::SeekClock { minutes })
+}
+
+/// Avance en accéléré jusqu'à la prochaine alerte scanner, puis met en pause.
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_next_alert(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.replay.send(crate::replay::ReplayCmd::NextAlert)
+}
+
+/// Charge la séance suivante (jour ouvré suivant) à la même heure de départ.
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_next_day(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.replay.send(crate::replay::ReplayCmd::NextDay)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_replay_status(state: tauri::State<'_, AppState>) -> crate::replay::ReplayStatus {
+    state.replay.status.read().unwrap().clone()
 }

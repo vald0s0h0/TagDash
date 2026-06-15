@@ -72,12 +72,11 @@ pub async fn run(
     }
 
     // Snapshot the secrets we need (don't hold the lock across awaits).
-    let (alpaca_key, alpaca_secret, massive_key, deepseek_key) = {
+    let (alpaca_key, alpaca_secret, deepseek_key) = {
         let s = secrets.read().unwrap();
         (
             s.alpaca_key.clone(),
             s.alpaca_secret.clone(),
-            s.massive_api_key.clone(),
             s.deepseek_api_key.clone(),
         )
     };
@@ -118,20 +117,30 @@ pub async fn run(
         e.daily_done = true;
     });
 
-    // ── Step 3: most recent split (Massive) ──
-    if let Some(mk) = &massive_key {
-        if let Ok(Some(split)) = crate::massive::splits::fetch_latest_split(mk, &symbol).await {
-            let label = split.label();
-            let days = days_since(&split.date);
-            let marker = parse_date(&split.date).map(|d| SplitMarker {
-                time: d.timestamp(),
-                label: label.clone(),
-            });
+    // ── Step 3: historical splits (Alpaca corporate-actions, last 2 years) ──
+    // One red marker per split day on the daily pane; the info band shows the most
+    // recent split's label + age. Alpaca serves real ex-dates (the Massive endpoint
+    // was a guessed shape that returned nothing), and 2y covers what's chart-visible.
+    if let (Some(k), Some(sec)) = (&alpaca_key, &alpaca_secret) {
+        if let Ok(splits) = crate::alpaca::corporate_actions::fetch_splits(k, sec, &symbol, 2).await {
+            let markers: Vec<SplitMarker> = splits
+                .iter()
+                .filter_map(|s| {
+                    parse_date(&s.date).map(|d| SplitMarker {
+                        time:  d.timestamp(),
+                        label: s.label.clone(),
+                    })
+                })
+                .collect();
+            // fetch_splits returns newest first, so splits[0] is the most recent.
+            let latest = splits.first().cloned();
             update(&store, &symbol, |e| {
-                e.split_label = Some(label.clone());
-                e.days_since_split = days;
-                if let Some(m) = marker.clone() {
-                    e.split_markers.push(m);
+                if let Some(s) = &latest {
+                    e.split_label = Some(s.label.clone());
+                    e.days_since_split = days_since(&s.date);
+                }
+                if !markers.is_empty() {
+                    e.split_markers = markers.clone();
                 }
             });
         }
@@ -228,10 +237,15 @@ pub async fn run_panic_llm(
     }
 
     // ── 2. Last 5 daily OHLC bars (date-ascending), from the local cache ──
+    // Bounded at the app-clock "today" so a Market Replay never feeds the model
+    // bars from the simulated future (inert in live mode).
     let ohlc_block = {
+        let today = crate::time::et_date(crate::time::now());
         let conn = db.lock().unwrap();
-        let mut bars = cache_repository::get_daily_bars(&conn, &symbol, PANIC_NEWS_DAYS as u32)
-            .unwrap_or_default();
+        let mut bars = cache_repository::get_daily_bars_before(
+            &conn, &symbol, &today, PANIC_NEWS_DAYS as u32,
+        )
+        .unwrap_or_default();
         drop(conn);
         bars.reverse(); // get_daily_bars is date-DESC → make ascending
         format_ohlc(&bars)
@@ -427,7 +441,8 @@ fn parse_date(d: &str) -> Option<DateTime<Utc>> {
 
 fn days_since(date: &str) -> Option<i64> {
     let dt = parse_date(date)?;
-    Some((Utc::now() - dt).num_days())
+    // App clock: split age is relative to the simulated day during a replay.
+    Some((crate::time::now() - dt).num_days())
 }
 
 fn bardata_to_bar(b: &BarData) -> Option<Bar> {

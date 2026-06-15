@@ -135,6 +135,12 @@ fn commission_for(shares: i64, cfg: &AppConfig) -> f64 {
     shares.unsigned_abs() as f64 * cfg.trading.commission_per_share
 }
 
+/// Round a price level to 2 decimals for the journal (e.g. 12.2315 → 12.23).
+/// `None` (no level set) passes through untouched.
+fn round_level(price: Option<f64>) -> Option<f64> {
+    price.map(|p| (p * 100.0).round() / 100.0)
+}
+
 /// Build the `executions` array from the internal fills. Side maps directly:
 /// Long fill = "buy", Short fill = "sell". Commission is per-share.
 fn executions_json(fills: &[Fill], cfg: &AppConfig) -> Vec<serde_json::Value> {
@@ -179,8 +185,8 @@ pub fn enqueue_trade_created(
         "quantity":       quantity,
         "commission":     commission_for(quantity, cfg),
         "fees":           cfg.trading.default_fees,
-        "stopLoss":       stop_loss,
-        "takeProfit":     take_profit,
+        "stopLoss":       round_level(stop_loss),
+        "takeProfit":     round_level(take_profit),
         "notes":          format!("TagDash {trade_id}"),
         "setup":          strategy_name,
         "broker":         cfg.trading.default_broker,
@@ -236,15 +242,20 @@ pub fn enqueue_trade_closed(
     enqueue_event(conn, "trade_closed", trade_id, symbol, V1_UPDATE, payload);
 }
 
-/// SL/TP line moved → update protective levels.
+/// TP line moved after entry → update the take-profit only.
+///
+/// The journal's `stopLoss` is intentionally frozen at the value recorded in
+/// `trade_created` (the SL at the exact moment the position opened). The SL may
+/// still be moved on the chart afterwards to drive the live bracket order, but
+/// that later value must never reach TradeTally — so this partial PUT carries
+/// `takeProfit` only and deliberately omits `stopLoss`.
 pub fn enqueue_levels_updated(
     conn:        &Connection,
     trade_id:    &str,
     symbol:      &str,
-    stop_loss:   Option<f64>,
     take_profit: Option<f64>,
 ) {
-    let payload = json!({ "stopLoss": stop_loss, "takeProfit": take_profit });
+    let payload = json!({ "takeProfit": round_level(take_profit) });
     enqueue_event(conn, "levels_updated", trade_id, symbol, V1_UPDATE, payload);
 }
 

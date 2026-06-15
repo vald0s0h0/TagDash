@@ -37,9 +37,11 @@ pub struct FillPayload {
 
 // ─── SL / TP levels (PATCH /api/trade-management/trades/:id/levels) ──────────
 
+// Note: SL is intentionally absent. The journal stop-loss is frozen at the
+// value recorded when the trade opened (see `enqueue_trade_created`); only the
+// take-profit is updated after entry.
 #[derive(Debug, Serialize)]
 pub struct UpdateLevelsPayload {
-    pub stop_loss:   Option<f64>,
     pub take_profit: Option<f64>,
 }
 

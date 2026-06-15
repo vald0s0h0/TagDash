@@ -72,9 +72,24 @@ export interface ScreenerMatch {
 export interface CardInfo {
   market_cap:    number | null;
   float_shares:  number | null;
+  /** Watchlist metric value (BB area sum, or |move|/ATR20). */
   mr_score:      number | null;
+  /** Which list retained the ticker: "BB" or "MA". */
   mr_score_kind: string | null;
-  mr_best_days:  number | null;
+  /** Extension direction: +1 up, −1 down, 0 none. */
+  mr_direction:  number | null;
+  /** SIC industry + country of origin (sec-api), for the manual search info band. */
+  industry:      string | null;
+  country:       string | null;
+  // ── Common chart info-bar fields (same for every strategy) ──────────────────
+  /** Bollinger Z of the live price vs its 20-day daily basis: (price−SMA20)/σ20. */
+  bbz:               number | null;
+  /** Today's premarket cumulative volume (04:00–09:30 ET). */
+  premarket_volume:  number | null;
+  /** A live news headline is on file for the symbol. */
+  has_news:          boolean;
+  /** Most recent live headline text, if any. */
+  news_title:        string | null;
 }
 
 // ─── Strategy display config ──────────────────────────────────────────────────
@@ -239,6 +254,9 @@ export interface LatencyStatus {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+/** When a desktop attention cue (flash / foreground) fires, by trading session. */
+export type AttentionMode = "off" | "premarket" | "open" | "both";
+
 export interface AppConfig {
   trading: {
     default_broker: string;
@@ -259,6 +277,13 @@ export interface AppConfig {
     pre_open_zones_per_tab: number;
     open_zones_per_tab: number;
     auto_create_tabs: boolean;
+    /** Send a native OS notification (Windows toast / macOS Notification Center)
+     *  whenever a scanner alert fires, regardless of the active tab. */
+    desktop_alerts: boolean;
+    /** When to flash the full-screen white overlay on a new scanner alert. */
+    flash_alerts: AttentionMode;
+    /** When to force the TagDash window back to the foreground on a new alert. */
+    foreground_alerts: AttentionMode;
   };
   latency: { warn_ms: number; critical_ms: number };
   tradetally: { api_base_url: string };
@@ -477,12 +502,19 @@ export interface PrevDayLevels {
 export interface ChartDrawing {
   id: string;
   symbol: string;
-  kind: "line" | "text";
+  kind: "line" | "text" | "emoji";
   t1: number;
   p1: number;
   t2: number | null;
   p2: number | null;
   text: string | null;
+  /** Timeframe class the drawing belongs to: shown only on matching panes. */
+  scope: "intraday" | "daily";
+  color?: string | null;
+  opacity?: number | null;
+  width?: number | null;
+  line_style?: "solid" | "dashed" | "dotted" | null;
+  font_size?: number | null;
 }
 
 /** One execution (fill) drawn on the chart as a triangle at (time, price). */
@@ -620,4 +652,26 @@ export interface NewsDiagnostics {
   updated_at: string;
   /** Newest-first recent headlines for the debug panel. */
   recent: NewsHeadline[];
+}
+
+// ─── Market Replay ─────────────────────────────────────────────────────────────
+
+/** Mirrors ReplayStatus in replay/mod.rs (polled by the replay toolbar). */
+export interface ReplayStatus {
+  active: boolean;
+  state: "idle" | "loading" | "playing" | "paused" | "ended" | "error";
+  /** ET date being replayed (YYYY-MM-DD). */
+  day: string | null;
+  /** "tape" (recorded real trades) | "minutes" (synthesized from 1-min bars). */
+  source: string | null;
+  sim_time: string | null;
+  speed: number;
+  playing: boolean;
+  /** 0..1 while loading. */
+  progress: number;
+  symbols: number;
+  events_total: number;
+  events_done: number;
+  error: string | null;
+  next_alert_armed: boolean;
 }

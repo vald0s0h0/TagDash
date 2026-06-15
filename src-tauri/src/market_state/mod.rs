@@ -8,7 +8,7 @@ pub mod ring_buffer;
 
 use std::collections::{HashMap, VecDeque};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{LatencyLevel, LatencyStatus, NewsHeadline, NewsRef};
@@ -16,6 +16,13 @@ use self::aggregators::{Bar, CandleAggregator, Timeframe};
 use self::ring_buffer::RingBuffer;
 
 const RING_CAP: usize = 600;
+
+/// NY trading-day bucket for a UTC instant (DST-aware). Daily candles are keyed
+/// by this so one trading day is always one bar, regardless of the (DST-varying)
+/// time-of-day Alpaca stamps its daily bars at.
+fn ny_date(t: DateTime<Utc>) -> NaiveDate {
+    crate::time::to_et(t).date_naive()
+}
 
 /// How long a live news headline stays on file for correlation (covers a whole
 /// premarket session). Older entries are pruned on each new arrival.
@@ -189,12 +196,13 @@ struct TradeCounter {
 }
 
 impl TradeCounter {
-    /// Record one print at `sec` (unix seconds), dropping buckets older than the
-    /// retention window.
-    fn record(&mut self, sec: i64) {
+    /// Record `n` prints at `sec` (unix seconds), dropping buckets older than the
+    /// retention window. Live trades record 1; replay slices record the share of
+    /// the minute bar's trade count they carry.
+    fn record(&mut self, sec: i64, n: u32) {
         match self.buckets.back_mut() {
-            Some((s, c)) if *s == sec => *c += 1,
-            _ => self.buckets.push_back((sec, 1)),
+            Some((s, c)) if *s == sec => *c += n,
+            _ => self.buckets.push_back((sec, n)),
         }
         let cutoff = sec - TRADE_COUNT_RETAIN_SECS;
         while matches!(self.buckets.front(), Some((s, _)) if *s < cutoff) {
@@ -352,6 +360,36 @@ impl MarketState {
         warn_ms:      u32,
         critical_ms:  u32,
     ) {
+        self.ingest_trade(symbol, price, size, 1, event_time, now, warn_ms, critical_ms);
+    }
+
+    /// Market Replay ingestion: identical to `on_trade` but the print may stand
+    /// for `prints` real trades (synthetic 10s slices built from minute bars
+    /// carry the bar's `n` spread across the slices). `now` = the simulated
+    /// instant (latency is meaningless in replay and reads as ~0).
+    pub fn on_replay_trade(
+        &mut self,
+        symbol:     &str,
+        price:      f64,
+        size:       u64,
+        prints:     u64,
+        event_time: DateTime<Utc>,
+    ) {
+        self.ingest_trade(symbol, price, size, prints.max(1), event_time, event_time, 1_000, 2_000);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_trade(
+        &mut self,
+        symbol:       &str,
+        price:        f64,
+        size:         u64,
+        prints:       u64,
+        event_time:   DateTime<Utc>,
+        now:          DateTime<Utc>,
+        warn_ms:      u32,
+        critical_ms:  u32,
+    ) {
         self.ensure_ticker_buffers(symbol);
 
         let latency_ms = (now - event_time)
@@ -392,16 +430,30 @@ impl MarketState {
         let agg_map = self.aggregators.get_mut(symbol).unwrap();
         let bar_map = self.bars.get_mut(symbol).unwrap();
         for (&tf, agg) in agg_map.iter_mut() {
-            if let Some(closed) = agg.on_trade(price, size, event_time) {
+            if let Some(closed) = agg.on_trade_n(price, size, prints, event_time) {
                 bar_map.get_mut(&tf).unwrap().push(closed);
             }
         }
 
-        // Record the print in the rolling trade-rate counter (acceleration).
+        // Record the print(s) in the rolling trade-rate counter (acceleration).
         self.trade_counts
             .entry(symbol.to_string())
             .or_default()
-            .record(event_time.timestamp());
+            .record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+    }
+
+    /// Wipe every piece of market DATA (tickers, candles, VWAP/trade counters,
+    /// news) while keeping the feed/news diagnostics structs. Used by Market
+    /// Replay on start, backward seek and stop, so the simulated day never mixes
+    /// with live data (and vice-versa).
+    pub fn reset_data(&mut self) {
+        self.tickers.clear();
+        self.aggregators.clear();
+        self.bars.clear();
+        self.vwap_acc.clear();
+        self.trade_counts.clear();
+        self.news_by_symbol.clear();
+        self.news_log.clear();
     }
 
     /// Number of trade prints for `symbol` over the last `secs` seconds. None
@@ -469,6 +521,12 @@ impl MarketState {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Latest live trade price for `symbol`, or None if unseen. Cheap accessor
+    /// (no snapshot clone) for callers that just need the current price.
+    pub fn last_price(&self, symbol: &str) -> Option<f64> {
+        self.tickers.get(symbol).and_then(|t| t.last_price)
     }
 
     /// The single most recent live news headline on file for `symbol` (Alpaca
@@ -540,66 +598,77 @@ impl MarketState {
             .map(|rb| rb.as_vec())
             .unwrap_or_default();
 
-        // Dedup by bar open time (last write wins) and keep the series strictly
-        // ascending. The ring can transiently hold two bars at the same timestamp
-        // — e.g. a partial current-minute bar spliced in by `load_chart_bars`,
-        // then the final closed bar pushed by the aggregator/stream — which would
-        // otherwise make the chart's `setData` reject the whole series.
+        let forming = self
+            .aggregators
+            .get(symbol)
+            .and_then(|m| m.get(&tf))
+            .and_then(|a| a.current_bar());
+
+        if tf == Timeframe::Daily {
+            // EXACTLY one candle per NY trading day. The ring can transiently hold
+            // a day at two slightly different UTC stamps — Alpaca daily bars carry
+            // a DST-varying time-of-day (04:00Z in summer / 05:00Z in winter), and
+            // a re-stamped forming bar may not match — which a timestamp-keyed
+            // dedup would render as two bars for the same day (the premarket "day
+            // shown twice" bug). Keying by NY date collapses them to one.
+            let mut by_day: std::collections::BTreeMap<NaiveDate, Bar> =
+                std::collections::BTreeMap::new();
+            for b in raw { by_day.insert(ny_date(b.time), b); }
+
+            if let Some(forming) = forming {
+                // The forming daily candle is bucketed to UTC MIDNIGHT (≠ a NY
+                // date), so its day is taken from the app clock, not its own stamp.
+                // Only fold it when it actually covers today's UTC day (a fresh
+                // trade today): during NY trading hours the bucket's UTC date equals
+                // today's, while a stale older bucket (no trade yet today) is
+                // ignored so it can't paint a bogus current candle.
+                let now = crate::time::now();
+                if forming.time.date_naive() == now.date_naive() {
+                    let fday = ny_date(now);
+                    if let Some(existing) = by_day.get_mut(&fday) {
+                        // (a) Today's authoritative bar is already here → fold the
+                        // live values in so the current candle moves with each trade
+                        // (latest close + any new high/low). Alpaca's open + volume
+                        // are kept.
+                        existing.high  = existing.high.max(forming.high);
+                        existing.low   = existing.low.min(forming.low);
+                        existing.close = forming.close;
+                    } else {
+                        // (b) No bar for today yet (premarket / Alpaca lag) → append
+                        // the live candle AS today's bar so the chart shows the
+                        // current day instead of a gap. Stamp it by shifting the last
+                        // bar's timestamp forward by the whole-day gap, so it
+                        // inherits the series' own time-of-day (and DST quirk) and
+                        // lands on the right NY-day axis label; Alpaca's later
+                        // authoritative bar — at the same stamp — replaces it cleanly.
+                        let last = by_day.iter().next_back().map(|(d, b)| (*d, b.time));
+                        if last.map_or(true, |(d, _)| fday > d) {
+                            let mut today = forming;
+                            if let Some((last_day, last_time)) = last {
+                                today.time = last_time + Duration::days((fday - last_day).num_days());
+                            }
+                            by_day.insert(fday, today);
+                        }
+                        // else: a stale forming bar older than the series → ignore.
+                    }
+                }
+            }
+            return by_day.into_values().collect();
+        }
+
+        // Intraday: dedup by bar open time (multiple bars per day), keeping the
+        // series strictly ascending. The ring can transiently hold two bars at the
+        // same timestamp — e.g. a partial current-minute bar spliced in by
+        // `load_chart_bars`, then the final closed bar pushed by the
+        // aggregator/stream — which would otherwise make `setData` reject the series.
         let mut by_time: std::collections::BTreeMap<i64, Bar> = std::collections::BTreeMap::new();
         for b in raw { by_time.insert(b.time.timestamp(), b); }
         let mut bars: Vec<Bar> = by_time.into_values().collect();
 
-        if let Some(forming) = self
-            .aggregators
-            .get(symbol)
-            .and_then(|m| m.get(&tf))
-            .and_then(|a| a.current_bar())
-        {
-            if tf == Timeframe::Daily {
-                // The daily bar comes authoritative from Alpaca (today's full
-                // OHLCV, refreshed by `load_chart_bars`). The trade-built forming
-                // candle only holds ticks seen since connect AND is keyed to a
-                // UTC-midnight bucket (≠ the daily bar's open time), so we never
-                // splice it in as-is. Two cases:
-                let last_date = bars.last().map(|b| b.time.date_naive());
-                let fday      = forming.time.date_naive();
-                match last_date {
-                    // (a) Today's authoritative bar is already here (same trading
-                    // day) → fold the live values into it so the current daily
-                    // candle moves with each trade: latest close + any new
-                    // high/low. Alpaca's open + volume are kept.
-                    Some(d) if d == fday => {
-                        if let Some(last) = bars.last_mut() {
-                            last.high  = last.high.max(forming.high);
-                            last.low   = last.low.min(forming.low);
-                            last.close = forming.close;
-                        }
-                    }
-                    // (b) Today's authoritative bar isn't here yet (premarket, or
-                    // Alpaca/IEX lag) → append the live forming candle AS today's
-                    // bar so the chart shows the current day instead of a gap
-                    // between the last history bar and the live price. We re-stamp
-                    // it to the daily series' own UTC time-of-day (Alpaca daily
-                    // bars aren't at UTC-midnight) so axis day-labels stay
-                    // consistent and Alpaca's later authoritative bar — which lands
-                    // at the very same timestamp — replaces it cleanly.
-                    Some(_) if fday > last_date.unwrap() => {
-                        let tod = bars.last().map(|b| b.time.time());
-                        let mut today = forming;
-                        if let Some(tod) = tod {
-                            today.time = Utc.from_utc_datetime(&today.time.date_naive().and_time(tod));
-                        }
-                        bars.push(today);
-                    }
-                    // No daily history at all yet → show the forming day as-is.
-                    None => bars.push(forming),
-                    _ => {}
-                }
-            } else {
-                match bars.last() {
-                    Some(last) if last.time == forming.time => *bars.last_mut().unwrap() = forming,
-                    _ => bars.push(forming),
-                }
+        if let Some(forming) = forming {
+            match bars.last() {
+                Some(last) if last.time == forming.time => *bars.last_mut().unwrap() = forming,
+                _ => bars.push(forming),
             }
         }
         bars
@@ -678,16 +747,26 @@ impl MarketState {
             .map(|rb| rb.as_vec())
             .unwrap_or_default();
 
-        // Merge by timestamp. Alpaca's REST history is authoritative for CLOSED
-        // bars (it has no gaps and carries the final OHLCV), so it wins over any
-        // colliding bar already in RAM — this both fills gaps and refreshes stale
-        // partial bars on every chart open. The in-progress forming candle lives
-        // in the aggregator (not this ring) and is appended later by `get_bars`,
-        // so it is unaffected by the overwrite here.
-        let mut by_time: std::collections::BTreeMap<i64, Bar> = std::collections::BTreeMap::new();
-        for b in existing { by_time.insert(b.time.timestamp(), b); }
-        for b in history  { by_time.insert(b.time.timestamp(), b); }
-        let merged: Vec<Bar> = by_time.into_values().collect();
+        // Merge. Alpaca's REST history is authoritative for CLOSED bars (it has no
+        // gaps and carries the final OHLCV), so it wins over any colliding bar
+        // already in RAM — this both fills gaps and refreshes stale partial bars on
+        // every chart open. The in-progress forming candle lives in the aggregator
+        // (not this ring) and is appended later by `get_bars`, so it is unaffected
+        // by the overwrite here. Daily bars are keyed by NY trading day so the same
+        // day can never sit in the ring twice (DST-varying stamps); intraday bars
+        // are keyed by exact open time (many bars per day).
+        let merged: Vec<Bar> = if tf == Timeframe::Daily {
+            let mut by_day: std::collections::BTreeMap<NaiveDate, Bar> =
+                std::collections::BTreeMap::new();
+            for b in existing { by_day.insert(ny_date(b.time), b); }
+            for b in history  { by_day.insert(ny_date(b.time), b); }
+            by_day.into_values().collect()
+        } else {
+            let mut by_time: std::collections::BTreeMap<i64, Bar> = std::collections::BTreeMap::new();
+            for b in existing { by_time.insert(b.time.timestamp(), b); }
+            for b in history  { by_time.insert(b.time.timestamp(), b); }
+            by_time.into_values().collect()
+        };
 
         if let Some(rb) = self.bars.get_mut(symbol).and_then(|m| m.get_mut(&tf)) {
             rb.replace_with(merged);

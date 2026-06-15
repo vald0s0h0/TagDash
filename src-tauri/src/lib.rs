@@ -10,7 +10,11 @@ pub mod llm;
 pub mod local_db;
 pub mod market_state;
 pub mod massive;
+pub mod micro_pullback;
+pub mod notify;
+pub mod panic_watchlist;
 pub mod perfect_pullback;
+pub mod replay;
 pub mod scanner;
 pub mod scoring;
 pub mod screenshot;
@@ -79,6 +83,30 @@ pub fn run() {
         m
     };
 
+    // ── Restore the internal trading book + chart contexts ───────────────────
+    // Positions can be held across several days, so the book (positions, resting
+    // orders, trades, fills) and the per-ticker chart SL/TP/tradeID lines are
+    // reloaded from SQLite — closing and reopening the app restores them as they
+    // were. The backend trading loop then resumes filling/bracketing off live
+    // prices against these restored orders.
+    let internal_book = {
+        let mut book = local_db::book_repository::load_book(&db);
+        // Re-arm protective bracket orders for every restored open position so the
+        // SL/TP exits are live the moment the trading loop starts — guarantees the
+        // "open position with SL/TP ⇒ live bracket" invariant regardless of what
+        // the persisted snapshot held (idempotent: cancels + recreates).
+        let symbols: Vec<String> = book.positions.keys().cloned().collect();
+        for sym in symbols {
+            book.sync_bracket_orders(&sym);
+        }
+        book
+    };
+    let chart_state = {
+        let mut cs = chart_state::ChartState::new();
+        cs.import_contexts(local_db::book_repository::load_chart_contexts(&db));
+        cs
+    };
+
     // Focus symbols (displayed in chart zones) — the frontend updates this; the
     // live feed tick-streams them on top of the broad surveillance tier.
     let (focus_symbols_tx, _) = tokio::sync::watch::channel::<Vec<String>>(Vec::new());
@@ -95,21 +123,25 @@ pub fn run() {
         news_feed_running: Arc::new(AtomicBool::new(false)),
         scanner_running:   Arc::new(AtomicBool::new(false)),
         perfect_pullback_running: Arc::new(AtomicBool::new(false)),
+        micro_pullback_running: Arc::new(AtomicBool::new(false)),
+        panic_watchlist_running: Arc::new(AtomicBool::new(false)),
         trading_loop_running: Arc::new(AtomicBool::new(false)),
         strategy_enabled:  Arc::new(RwLock::new(strategy_enabled)),
         strategy_risk:     Arc::new(RwLock::new(strategy_risk)),
         active_alerts:     Arc::new(RwLock::new(Vec::new())),
         alert_history:     Arc::new(RwLock::new(Vec::new())),
         screener:          Arc::new(RwLock::new(Vec::new())),
-        chart:             Arc::new(RwLock::new(chart_state::ChartState::new())),
-        internal_book:     Arc::new(RwLock::new(internal_trading::InternalBook::new())),
+        chart:             Arc::new(RwLock::new(chart_state)),
+        internal_book:     Arc::new(RwLock::new(internal_book)),
         enrichments:       Arc::new(RwLock::new(std::collections::HashMap::new())),
         focus_symbols_tx,
+        replay:            Arc::new(replay::ReplayShared::default()),
     };
 
     // ── Start Tauri ───────────────────────────────────────────────────────
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state)
         // Spawn background workers once the app is set up.
         .setup(|app| {
@@ -117,6 +149,45 @@ pub fn run() {
             let db      = state.db.clone();
             let config  = state.config.clone();
             let secrets = state.secrets.clone();
+
+            // 0. Desktop attention cues for new alerts (flash overlay + foreground).
+            //    Build the full-screen white flash overlay: always-on-top, transparent,
+            //    click-through, no taskbar entry, NOT focused. It stays up permanently
+            //    (invisible while transparent) and just pulses white on a notify event,
+            //    so it never steals focus. `push_alert` reaches it through the AppHandle
+            //    stashed by `notify::init`.
+            {
+                use tauri::{WebviewUrl, WebviewWindowBuilder};
+                // Same SPA entry; main.tsx renders the flash overlay (not the app)
+                // when it detects it's running in the window labelled "flash".
+                match WebviewWindowBuilder::new(app.handle(), "flash", WebviewUrl::App("index.html".into()))
+                    .title("")
+                    .decorations(false)
+                    .transparent(true)
+                    .always_on_top(true)
+                    .skip_taskbar(true)
+                    .focused(false)
+                    .visible(true)
+                    .resizable(false)
+                    .build()
+                {
+                    Ok(win) => {
+                        let _ = win.set_ignore_cursor_events(true);
+                        // Cover the whole primary monitor (work area + taskbar).
+                        if let Ok(Some(mon)) = win.primary_monitor() {
+                            let _ = win.set_size(*mon.size());
+                            let _ = win.set_position(tauri::PhysicalPosition::new(0, 0));
+                        }
+                    }
+                    Err(e) => eprintln!("[tagdash] flash overlay window not created: {e}"),
+                }
+            }
+            notify::init(app.handle().clone());
+
+            // 0b. Trade tape recorder: persists every live trade print (and the
+            //     focus quotes) into one SQLite file per ET day, so the day can
+            //     later be replayed tick-by-tick by the Market Replay module.
+            replay::tape::init(state.app_dir.clone());
 
             // 1. TradeTally background sync worker.
             {
@@ -166,6 +237,37 @@ pub fn run() {
                 perfect_pullback::PerfectPullbackEngine::start(
                     pp_running, market, db, secrets, active_alerts, alert_history, strategy_enabled,
                 );
+            }
+
+            // 3b. Micro Pullback engine (stateful, per-ticker): watches every dormant
+            //    low-float small cap in the premarket window for the first state change
+            //    of the session (silence → 10s ignition → 30s confirmation) and fires
+            //    one locked alert per ticker. Auto-started; idles outside premarket and
+            //    honours the Settings toggle.
+            {
+                let mp_running       = state.micro_pullback_running.clone();
+                let market           = state.market.clone();
+                let db               = state.db.clone();
+                let secrets          = state.secrets.clone();
+                let active_alerts    = state.active_alerts.clone();
+                let alert_history    = state.alert_history.clone();
+                let strategy_enabled = state.strategy_enabled.clone();
+                mp_running.store(true, std::sync::atomic::Ordering::Relaxed);
+                micro_pullback::MicroPullbackEngine::start(
+                    mp_running, market, db, secrets, active_alerts, alert_history, strategy_enabled,
+                );
+            }
+
+            // 3c. Panic Mean Reversion watchlist scheduler: builds the day's two-list
+            //     pre-open watchlist at 09:00 ET (premarket pre-filter + BB-area /
+            //     move-since-SMA20 rankings), persisted for the scanner to surface.
+            //     Runs immediately on a late launch; reuses a list already built today.
+            {
+                let pw_running = state.panic_watchlist_running.clone();
+                let db         = state.db.clone();
+                let secrets    = state.secrets.clone();
+                pw_running.store(true, std::sync::atomic::Ordering::Relaxed);
+                panic_watchlist::PanicWatchlistEngine::start(pw_running, db, secrets);
             }
 
             // 4. Internal trading loop: drives the order book (pending limit/stop
@@ -230,6 +332,7 @@ pub fn run() {
             commands::get_ticker_bars,
             commands::load_chart_bars,
             commands::load_older_bars,
+            commands::get_split_markers,
             commands::get_previous_day_levels,
             commands::get_latency_status,
             commands::get_feed_diagnostics,
@@ -269,7 +372,19 @@ pub fn run() {
             commands::get_executions_for_symbol,
             commands::create_drawing,
             commands::get_drawings_for_symbol,
+            commands::update_drawing,
             commands::delete_drawing,
+            commands::update_alarm_price,
+            // Market Replay
+            commands::replay_start,
+            commands::replay_stop,
+            commands::replay_set_playing,
+            commands::replay_set_speed,
+            commands::replay_seek_relative,
+            commands::replay_seek_clock,
+            commands::replay_next_alert,
+            commands::replay_next_day,
+            commands::get_replay_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

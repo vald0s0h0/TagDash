@@ -31,7 +31,7 @@ use std::sync::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 use crate::config::secrets::Secrets;
 use crate::local_db::universe_repository;
@@ -235,8 +235,23 @@ impl PerfectPullbackEngine {
             // "right side of the 20MA" gate has a valid SMA from the very first live
             // bar (~09:35 on 5m) instead of waiting ~100 min to accrue 20 live bars.
             let mut sma_seeds: HashMap<(String, String), Vec<f64>> = HashMap::new();
+            // Market Replay reset watch: replay start / backward seek / new day →
+            // drop gate machines, the gap map and the SMA seeds so the replayed
+            // session is rebuilt from the simulated clock.
+            let mut replay_gen = crate::replay::clock::generation();
 
             while running.load(Ordering::Relaxed) {
+                {
+                    let g = crate::replay::clock::generation();
+                    if g != replay_gen {
+                        replay_gen = g;
+                        gates.clear();
+                        gaps.clear();
+                        sma_seeds.clear();
+                        gap_day = None;
+                        last_gap_attempt = None;
+                    }
+                }
                 // Respect the Settings on/off toggle (compiled default if absent).
                 let enabled = strategy_enabled
                     .read()
@@ -245,7 +260,7 @@ impl PerfectPullbackEngine {
                     .copied()
                     .unwrap_or(true);
                 if !enabled {
-                    sleep(Duration::from_secs(2)).await;
+                    crate::replay::clock::scaled_sleep(2_000).await;
                     continue;
                 }
 
@@ -254,7 +269,8 @@ impl PerfectPullbackEngine {
                     avg_vol_loaded = std::time::Instant::now();
                 }
 
-                let now = Utc::now();
+                // App clock: simulated instant during a Market Replay.
+                let now = crate::time::now();
                 let mock = market.read().unwrap().mock_running;
                 let in_session = mock
                     || {
@@ -262,7 +278,7 @@ impl PerfectPullbackEngine {
                         m >= SESSION_START_MIN && m < SESSION_END_MIN
                     };
                 if !in_session {
-                    sleep(Duration::from_secs(LOOP_INTERVAL_SECS)).await;
+                    crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
                     continue;
                 }
 
@@ -380,7 +396,7 @@ impl PerfectPullbackEngine {
                     push_alert(&active_alerts, &alert_history, fire);
                 }
 
-                sleep(Duration::from_secs(LOOP_INTERVAL_SECS)).await;
+                crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
             }
         });
     }

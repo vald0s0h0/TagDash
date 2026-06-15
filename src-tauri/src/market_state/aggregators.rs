@@ -83,6 +83,7 @@ pub struct CandleAggregator {
     close:  f64,
     volume: u64,
     pv_sum: f64, // price × volume, for VWAP
+    trades: u64, // number of prints folded into the current bucket
 }
 
 impl CandleAggregator {
@@ -96,47 +97,64 @@ impl CandleAggregator {
             close:  0.0,
             volume: 0,
             pv_sum: 0.0,
+            trades: 0,
         }
     }
 
     /// Feed one trade. Returns a closed Bar when the bucket flips.
     pub fn on_trade(&mut self, price: f64, size: u64, trade_time: DateTime<Utc>) -> Option<Bar> {
+        self.on_trade_n(price, size, 1, trade_time)
+    }
+
+    /// Feed one print that stands for `prints` real trades (Market Replay's
+    /// synthetic 10-second slices carry the minute bar's `n` spread across the
+    /// slices, so the per-bar trade counts stay truthful). Live path uses
+    /// `on_trade` (prints = 1).
+    pub fn on_trade_n(
+        &mut self,
+        price: f64,
+        size: u64,
+        prints: u64,
+        trade_time: DateTime<Utc>,
+    ) -> Option<Bar> {
         let bar_secs  = self.timeframe.seconds();
         let bar_start = bucket_start(trade_time, bar_secs);
 
         match self.bar_open_time {
             None => {
-                self.reset(price, size, bar_start);
+                self.reset(price, size, prints, bar_start);
                 None
             }
             Some(current_start) if bar_start > current_start => {
                 let closed = self.close_bar(current_start);
-                self.reset(price, size, bar_start);
+                self.reset(price, size, prints, bar_start);
                 Some(closed)
             }
             _ => {
-                self.update(price, size);
+                self.update(price, size, prints);
                 None
             }
         }
     }
 
-    fn reset(&mut self, price: f64, size: u64, bar_start: DateTime<Utc>) {
+    fn reset(&mut self, price: f64, size: u64, prints: u64, bar_start: DateTime<Utc>) {
         self.open         = price;
         self.high         = price;
         self.low          = price;
         self.close        = price;
         self.volume       = size;
         self.pv_sum       = price * size as f64;
+        self.trades       = prints;
         self.bar_open_time = Some(bar_start);
     }
 
-    fn update(&mut self, price: f64, size: u64) {
+    fn update(&mut self, price: f64, size: u64, prints: u64) {
         self.high   = self.high.max(price);
         self.low    = self.low.min(price);
         self.close  = price;
         self.volume += size;
         self.pv_sum += price * size as f64;
+        self.trades += prints;
     }
 
     /// The in-progress (not-yet-closed) bar, if any trades have arrived in the
@@ -159,9 +177,11 @@ impl CandleAggregator {
                     } else {
                         None
                     },
-            // Trade ticks don't carry a per-bar trade count; only Alpaca minute
-            // bars (via on_bar) populate this.
-            trade_count: None,
+            // Number of prints folded into this bucket. Lets the per-bar print
+            // rate be read straight off the trade-built candles (the micro_pullback
+            // dormancy/ignition engine reads it from the 10s ring); Alpaca minute
+            // bars carry their own `n` via on_bar instead.
+            trade_count: Some(self.trades),
         }
     }
 }

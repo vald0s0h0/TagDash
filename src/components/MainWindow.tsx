@@ -2,6 +2,7 @@ import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { cn } from "@/lib/utils";
 import { ChartZone } from "@/components/ChartZone";
+import { SessionClock } from "@/components/SessionClock";
 import type { Session } from "@/types";
 
 export function MainWindow() {
@@ -55,6 +56,7 @@ export function MainWindow() {
               </button>
             );
           })}
+          <SessionClock />
         </div>
       )}
 
@@ -68,6 +70,7 @@ export function MainWindow() {
             ·{" "}
             {isOpen ? "4 zones" : "1 zone"}
           </span>
+          <SessionClock />
         </div>
       )}
 

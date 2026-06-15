@@ -3,13 +3,24 @@ import { LeftRail } from "@/components/LeftRail";
 import { Sidebar } from "@/components/Sidebar";
 import { MainWindow } from "@/components/MainWindow";
 import { LogsPanel } from "@/components/LogsPanel";
+import { ReplayToolbar } from "@/components/ReplayToolbar";
+import { TickerSpotlight } from "@/components/TickerSpotlight";
 import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
+import { useAlertNotifications } from "@/queries/useAlertNotifications";
+import { useHotkeys } from "@/hooks/useHotkeys";
 import { api } from "@/lib/tauri";
 
 export default function App() {
   const logsOpen = useUiStore((s) => s.logsOpen);
   const setDismissedScreener = useUiStore((s) => s.setDismissedScreener);
+
+  // App-level OS notifications on every new scanner alert (opt-in in Settings).
+  useAlertNotifications();
+
+  // Global chart hotkeys (keyboard chords / extra mouse buttons → the zone under
+  // the cursor). User-configured in Settings → Hotkeys.
+  useHotkeys();
 
   // Hydrate today's pre-open screener dismissals from the DB so cards the user
   // removed stay hidden across restarts (until the next trading day).
@@ -47,9 +58,12 @@ export default function App() {
       <LeftRail />
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
+        {/* Market Replay transport bar — rendered only when activated (menu). */}
+        <ReplayToolbar />
         <MainWindow />
         {logsOpen && <LogsPanel />}
       </div>
+      <TickerSpotlight />
     </div>
   );
 }

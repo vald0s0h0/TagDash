@@ -2,6 +2,7 @@ import {
   Activity,
   Bug,
   CircleDot,
+  History,
   MoreVertical,
   Newspaper,
   Play,
@@ -40,6 +41,7 @@ export function LeftRail() {
   const active     = useUiStore((s) => s.activeSession);
   const setActive  = useUiStore((s) => s.setActiveSession);
   const toggleLogs = useUiStore((s) => s.toggleLogs);
+  const toggleReplay = useUiStore((s) => s.toggleReplay);
   const showModal  = useUiStore((s) => s.showModal);
   const openModal  = useUiStore((s) => s.openModal);
   const closeModal = useUiStore((s) => s.closeModal);
@@ -109,6 +111,11 @@ export function LeftRail() {
               <DropdownMenuItem onClick={() => showModal("news-debug")}>
                 <Newspaper className="mr-2 h-4 w-4" />
                 Debug news premarket
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={toggleReplay}>
+                <History className="mr-2 h-4 w-4" />
+                Market Replay
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={() => showModal("settings")}>

@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 
 use crate::strategies::ScanStrategy;
 use crate::types::{
@@ -107,7 +106,7 @@ impl ScanStrategy for BacksideParabolic {
             return None;
         }
 
-        let now = Utc::now();
+        let now = crate::time::now();
         Some(AlertSignal {
             alert_id:      format!("{}-{}-{}", now.timestamp_millis(), ctx.symbol, self.id()),
             timestamp:     now,

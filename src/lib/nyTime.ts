@@ -57,6 +57,14 @@ export function nyDayMonth(input: TimeInput): string {
   return `${nyParts(d).day} ${nyMonth(d)}`;
 }
 
+/** NY calendar date key "YYYY-MM-DD" — the trading-day bucket used to anchor a
+ *  daily (session) VWAP, so the cumulative sum resets at each NY day boundary
+ *  (DST-aware) rather than at UTC midnight. */
+export function nyDateKey(input: TimeInput): string {
+  const p = nyParts(toDate(input));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
 /** Filename-safe NY stamp "YYYY-MM-DD-HH-mm-ss" (screenshots). */
 export function nyFilenameStamp(input: TimeInput = new Date()): string {
   const p = nyParts(toDate(input));

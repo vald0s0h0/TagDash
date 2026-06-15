@@ -16,7 +16,12 @@ import { Badge } from "@/components/ui/badge";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
 import { useSecretsStatus } from "@/queries/useSecretsStatus";
 import { useStrategies, useSetStrategyEnabled, useSetStrategyRisk } from "@/queries/useScanner";
-import type { AppConfig, Session } from "@/types";
+import {
+  useHotkeyStore, HOTKEY_ACTIONS, HOTKEY_GROUPS, bindingLabel, bindingFromEvent,
+  setRecordingActive, type Binding, type HotkeyActionDef, type HotkeyGroup,
+} from "@/stores/hotkeyStore";
+import { cn } from "@/lib/utils";
+import type { AppConfig, AttentionMode, Session } from "@/types";
 
 const SESSION_LABELS: Record<Session, string> = {
   premarket:  "Premarket",
@@ -24,6 +29,36 @@ const SESSION_LABELS: Record<Session, string> = {
   open:       "Open",
   afterhours: "Afterhours",
 };
+
+const ATTENTION_OPTIONS: { value: AttentionMode; label: string }[] = [
+  { value: "off",       label: "Désactivé" },
+  { value: "premarket", label: "Prémarket seulement" },
+  { value: "open",      label: "Open seulement (après 9h30)" },
+  { value: "both",      label: "Prémarket + Open" },
+];
+
+/** Native select for an attention-cue schedule (off / premarket / open / both). */
+function AttentionSelect({
+  value,
+  onChange,
+}: {
+  value: AttentionMode;
+  onChange: (v: AttentionMode) => void;
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value as AttentionMode)}
+      className="h-7 shrink-0 rounded-md border border-border bg-background px-2 text-xs"
+    >
+      {ATTENTION_OPTIONS.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  );
+}
 
 interface Props {
   open: boolean;
@@ -112,6 +147,80 @@ function RiskInput({
   );
 }
 
+const HOTKEY_GROUP_LABELS: Record<HotkeyGroup, string> = {
+  Toolbar:    "Barre d'outils",
+  Ordres:     "Ordres",
+  Analyse:    "Analyse IA",
+  Timeframes: "Timeframes (pane de gauche)",
+};
+
+/** One bindable action row: shows the current chord and records a new one (the
+ *  next key/mouse-button press while armed). Mouse buttons capture the extra
+ *  buttons of a multi-button mouse (left/right are reserved). */
+function HotkeyRow({ action }: { action: HotkeyActionDef }) {
+  const binding      = useHotkeyStore((s) => s.bindings[action.id]);
+  const setBinding   = useHotkeyStore((s) => s.setBinding);
+  const clearBinding = useHotkeyStore((s) => s.clearBinding);
+  const [recording, setRecording] = useState(false);
+
+  useEffect(() => {
+    if (!recording) return;
+    setRecordingActive(true);
+
+    function commit(b: Binding) { setBinding(action.id, b); setRecording(false); }
+    function onKey(e: KeyboardEvent) {
+      e.preventDefault(); e.stopPropagation();
+      if (e.code === "Escape") { setRecording(false); return; }
+      const b = bindingFromEvent(e); // null for a lone modifier → keep waiting
+      if (b) commit(b);
+    }
+    function onMouse(e: MouseEvent) {
+      const b = bindingFromEvent(e); // null for left/right click → ignored
+      if (b) { e.preventDefault(); e.stopPropagation(); commit(b); }
+    }
+    function onAux(e: MouseEvent) { e.preventDefault(); }
+
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("mousedown", onMouse, true);
+    window.addEventListener("auxclick", onAux, true);
+    return () => {
+      setRecordingActive(false);
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("mousedown", onMouse, true);
+      window.removeEventListener("auxclick", onAux, true);
+    };
+  }, [recording, action.id, setBinding]);
+
+  return (
+    <div className="flex items-center justify-between gap-2 py-0.5">
+      <span className="text-xs">{action.label}</span>
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={() => setRecording((r) => !r)}
+          className={cn(
+            "min-w-[7.5rem] rounded border px-2 py-1 text-center text-[11px] font-mono transition-colors",
+            recording
+              ? "animate-pulse border-blue-500 text-blue-300"
+              : binding
+              ? "border-border text-foreground/80 hover:bg-accent"
+              : "border-dashed border-border/60 text-muted-foreground/50 hover:bg-accent",
+          )}
+        >
+          {recording ? "Appuyez…" : binding ? bindingLabel(binding) : "non assigné"}
+        </button>
+        <button
+          onClick={() => clearBinding(action.id)}
+          disabled={!binding || recording}
+          className="text-muted-foreground hover:text-red-400 disabled:opacity-20"
+          title="Effacer"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsModal({ open, onClose }: Props) {
   const { data: config } = useLocalConfig();
   const { data: secrets } = useSecretsStatus();
@@ -168,6 +277,8 @@ export function SettingsModal({ open, onClose }: Props) {
           <TabsList className="w-full">
             <TabsTrigger value="trading" className="flex-1 text-xs">Trading</TabsTrigger>
             <TabsTrigger value="strategies" className="flex-1 text-xs">Stratégies</TabsTrigger>
+            <TabsTrigger value="hotkeys" className="flex-1 text-xs">Hotkeys</TabsTrigger>
+            <TabsTrigger value="notifs" className="flex-1 text-xs">Notifs</TabsTrigger>
             <TabsTrigger value="latency" className="flex-1 text-xs">Latency</TabsTrigger>
             <TabsTrigger value="tags" className="flex-1 text-xs">Tags</TabsTrigger>
             <TabsTrigger value="tradetally" className="flex-1 text-xs">TradeTally</TabsTrigger>
@@ -256,6 +367,92 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               ))}
             </div>
+          </TabsContent>
+
+          {/* ── Hotkeys (keyboard chords / extra mouse buttons → hovered zone) ── */}
+          <TabsContent value="hotkeys" className="mt-4 space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Assigne une touche, une combinaison clavier ou un bouton de souris
+              (boutons latéraux d'une souris multi-boutons) à chaque commande.
+              Clique sur le champ puis appuie sur la touche/bouton voulu&nbsp;;
+              <kbd className="mx-1 rounded bg-muted px-1 text-[10px]">Échap</kbd>
+              annule. Le raccourci agit sur la zone <strong>survolée par la
+              souris</strong> (son pane de gauche), sinon sur la zone active. Clic
+              gauche/droit réservés.
+            </p>
+            <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+              {HOTKEY_GROUPS.map((group) => (
+                <div key={group}>
+                  <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                    {HOTKEY_GROUP_LABELS[group]}
+                  </div>
+                  <div className="rounded-md border border-border px-3 py-1.5">
+                    {HOTKEY_ACTIONS.filter((a) => a.group === group).map((a) => (
+                      <HotkeyRow key={a.id} action={a} />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </TabsContent>
+
+          {/* ── Notifications (native OS desktop alerts) ── */}
+          <TabsContent value="notifs" className="mt-4 space-y-3">
+            <div className="flex items-center justify-between rounded-md border border-border px-3 py-2.5">
+              <div className="min-w-0 pr-4">
+                <div className="text-sm font-medium">Alertes système</div>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Envoie une notification Windows / macOS à chaque alerte du scanner,
+                  quelle que soit la stratégie et l'onglet actif.
+                </p>
+              </div>
+              <Switch
+                checked={draft.ui.desktop_alerts}
+                onCheckedChange={(v) => set("ui", "desktop_alerts", v)}
+              />
+            </div>
+
+            <div className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">Flash blanc à l'écran</div>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Un flash blanc plein écran (500&nbsp;ms) à chaque alerte — visible
+                  même si TagDash est caché derrière d'autres fenêtres.
+                </p>
+              </div>
+              <AttentionSelect
+                value={draft.ui.flash_alerts}
+                onChange={(v) => set("ui", "flash_alerts", v)}
+              />
+            </div>
+
+            <div className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">Forcer au premier plan</div>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Ramène la fenêtre TagDash au premier plan et fait clignoter son
+                  icône dans la barre des tâches à chaque alerte.
+                </p>
+              </div>
+              <AttentionSelect
+                value={draft.ui.foreground_alerts}
+                onChange={(v) => set("ui", "foreground_alerts", v)}
+              />
+            </div>
+
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              Réglages côté système&nbsp;:
+              <br />
+              <span className="text-foreground">Windows</span> — autorise les
+              notifications pour TagDash (Paramètres → Système → Notifications) et
+              désactive l'Assistant de concentration / «&nbsp;Ne pas déranger&nbsp;».
+              En mode dev les toasts peuvent ne pas s'afficher&nbsp;; elles
+              fonctionnent une fois l'app installée.
+              <br />
+              <span className="text-foreground">macOS</span> — à la première
+              activation, autorise les notifications dans la fenêtre système (ou
+              Réglages → Notifications → TagDash).
+            </p>
           </TabsContent>
 
           {/* ── Latency ── */}

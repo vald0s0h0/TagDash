@@ -399,28 +399,13 @@ pub struct StrategyContext {
     pub rvol:           Option<f64>,
     /// Float shares from FMP/cache. None in mock mode.
     pub float_shares:   Option<u64>,
-    /// Number of trade prints over the recent acceleration window
-    /// (micro_pullback::ACCEL_RECENT_SECS). Drives the trade-acceleration trigger.
-    pub trades_recent:  Option<u64>,
-    /// Number of trade prints over the baseline window
-    /// (micro_pullback::ACCEL_BASELINE_SECS), used as the acceleration reference.
-    pub trades_baseline: Option<u64>,
-    /// Live news headlines on file for THIS ticker (Alpaca news WebSocket,
-    /// premarket), keyed by symbol so each entry genuinely references the
-    /// ticker. Trimmed to roughly twice the correlation window around `now`;
-    /// micro_pullback matches one to the price event by time (±10 min, in
-    /// either order).
-    pub news:           Vec<NewsRef>,
-    /// Timestamp of the most recent significant trade acceleration ("price
-    /// event") seen for this ticker on a *previous* scan pass, when still inside
-    /// the news-correlation window. Lets a headline that lands shortly AFTER the
-    /// price move still correlate. None when there is no recent prior event.
-    pub last_price_event: Option<DateTime<Utc>>,
 }
 
-/// A live news headline reduced to what the news↔price correlation needs: when
-/// it arrived and its text. Always tied to a specific ticker by the per-symbol
-/// store it comes from (see MarketState::recent_news).
+/// A live news headline reduced to what news↔price correlation needs: when it
+/// arrived and its text. Always tied to a specific ticker by the per-symbol store
+/// it comes from (see MarketState::recent_news). Still produced by MarketState and
+/// consumed by the news debug surfaces; the micro_pullback engine reads the live
+/// store directly rather than through StrategyContext.
 #[derive(Debug, Clone)]
 pub struct NewsRef {
     /// When the headline arrived in our system (used for the ±window match).

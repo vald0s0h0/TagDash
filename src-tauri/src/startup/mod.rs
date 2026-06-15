@@ -98,7 +98,6 @@ fn default_steps() -> Vec<StartupStep> {
         StartupStep::new("fetch_sec",        "Fetch SEC company data (country · industry)"),
         StartupStep::new("load_daily",       "Load daily / historical data (250d)"),
         StartupStep::new("compute_universe", "Persist float & average volume"),
-        StartupStep::new("compute_scores",   "Compute mean-reversion scores (PR · Bollinger)"),
         StartupStep::new("build_universe",   "Finalize universe (all US stocks)"),
         StartupStep::new("ready",            "Ready for WebSocket"),
     ]
@@ -394,7 +393,17 @@ pub async fn run_pipeline(
             cache_repository::earliest_bar_date(&db_guard).unwrap_or(None),
         )
     };
-    let need_backfill = match earliest_cached.as_deref() {
+    // One-time migration to split-adjusted bars. The cache used to store raw
+    // (unadjusted) bars, where every past split shows up as a fake gap. The first
+    // run on the new code force-fetches the full window with adjustment=split so
+    // the whole cache is internally consistent; the `bars_adjustment` marker keeps
+    // it from repeating. (Mock runs keep their synthetic bars untouched.)
+    let split_adjusted = {
+        let db_guard = db.lock().unwrap();
+        cache_repository::get_app_meta(&db_guard, "bars_adjustment").as_deref() == Some("split")
+    };
+    let force_readjust = !split_adjusted && !mock_alpaca;
+    let need_backfill = force_readjust || match earliest_cached.as_deref() {
         Some(d) if !d.is_empty() => d > backfill_threshold.as_str(), // shallow → backfill
         _ => true,                                                   // empty → backfill
     };
@@ -408,6 +417,7 @@ pub async fn run_pipeline(
             .unwrap_or_else(|| desired_start.clone())
     };
     let incremental = !need_backfill;
+    let mut daily_fetch_ok = true;
     let daily_bars = if mock_alpaca {
         crate::alpaca::bars::mock_daily_bars(&symbols_for_bars)
     } else {
@@ -420,7 +430,44 @@ pub async fn run_pipeline(
                 // cache untouched rather than injecting synthetic mock bars over
                 // real symbols (which would corrupt the daily history and make the
                 // scorer rank garbage). Nothing new is committed this run.
+                daily_fetch_ok = false;
                 push_warning(&state, &format!("Alpaca bars fetch failed: {e} — keeping cached bars"));
+                std::collections::HashMap::new()
+            }
+        }
+    };
+
+    // ── Split reconciliation ──────────────────────────────────────────────────
+    // adjustment=split rescales the whole series to the LATEST split factor, so a
+    // split that goes ex after our last cached bar leaves the older cached bars at
+    // the old scale (a fake gap). On incremental runs, find symbols that split
+    // since the last check and refetch their full window so the series stays
+    // consistent; these override the incremental rows below. Backfill runs already
+    // fetched a consistent full series, so they skip this.
+    let readjusted_bars = if mock_alpaca || need_backfill || !daily_fetch_ok {
+        std::collections::HashMap::new()
+    } else {
+        let key = sec.alpaca_key.as_deref().unwrap_or_default();
+        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
+        let last_check = {
+            let db_guard = db.lock().unwrap();
+            cache_repository::get_app_meta(&db_guard, "splits_checked_through")
+        }
+        .unwrap_or_else(|| start_date.clone());
+        match crate::alpaca::corporate_actions::fetch_recent_split_symbols(key, secret, &symbols_for_bars, &last_check).await {
+            Ok(syms) if !syms.is_empty() => {
+                let _ = log(&db, "info", &format!("startup: {} symbol(s) split since {last_check} — refetching split-adjusted history", syms.len()));
+                match crate::alpaca::bars::fetch_daily_bars_since(key, secret, &syms, &desired_start).await {
+                    Ok(bars) => bars,
+                    Err(e) => {
+                        push_warning(&state, &format!("split refetch failed: {e}"));
+                        std::collections::HashMap::new()
+                    }
+                }
+            }
+            Ok(_) => std::collections::HashMap::new(),
+            Err(e) => {
+                push_warning(&state, &format!("split check failed: {e}"));
                 std::collections::HashMap::new()
             }
         }
@@ -438,7 +485,13 @@ pub async fn run_pipeline(
         // every startup — so this step was thousands of fsyncs even on an
         // incremental run that fetched almost no new bars. One commit instead.
         let _ = db_guard.execute_batch("BEGIN");
-        for (_symbol, bars) in &daily_bars {
+        // Purge the symbols we're about to rewrite with a fresh split-adjusted
+        // series so old-scale rows don't linger; the readjusted bars (chained
+        // last) then override any incremental rows just fetched for them.
+        for sym in readjusted_bars.keys() {
+            let _ = cache_repository::delete_symbol_bars(&db_guard, sym);
+        }
+        for (_symbol, bars) in daily_bars.iter().chain(readjusted_bars.iter()) {
             for bar in bars {
                 let db_bar = cache_repository::DailyBar {
                     symbol: bar.symbol.clone(),
@@ -465,6 +518,15 @@ pub async fn run_pipeline(
                 "UPDATE universe_assets SET avg_volume=?1 WHERE symbol=?2",
                 rusqlite::params![avg_vol, sym],
             );
+        }
+        // Record that the cache is now split-adjusted (suppresses the one-time
+        // re-backfill) and the date through which splits have been reconciled, so
+        // only newer splits are checked next run. Guarded on a successful real
+        // fetch so a transient Alpaca outage doesn't falsely mark the cache fixed.
+        if !mock_alpaca && daily_fetch_ok {
+            let today = Utc::now().format("%Y-%m-%d").to_string();
+            let _ = cache_repository::set_app_meta(&db_guard, "bars_adjustment", "split");
+            let _ = cache_repository::set_app_meta(&db_guard, "splits_checked_through", &today);
         }
         let _ = db_guard.execute_batch("COMMIT");
         (volume_map, prev_close_map)
@@ -531,53 +593,9 @@ pub async fn run_pipeline(
         Some(&format!("{us_stocks_count} US stocks · {with_float} with float")));
     let _ = log(&db, "info", &format!("startup: persisted {us_stocks_count} US stocks ({with_float} with float)"));
 
-    // ── Step 8b: compute mean-reversion scores (once per calendar day) ────────
-    // Percent-rank momentum + self-relative Bollinger event score for the whole
-    // universe, persisted to `mean_reversion_scores`. Drives the Panic Mean
-    // Reversion pre-open screener. Heavy (reads ~3y of closes per symbol), so it
-    // runs only on the first launch of the day — gated by a date marker.
-    set_step(&state, "compute_scores", StepStatus::Running, None);
-    // Versioned key: bump the suffix whenever the score schema/content changes so
-    // a stale same-day marker can't suppress the first recompute on the new shape
-    // (v2 added prev_volume; v3 added the hard multi-day-runner pre-filter — the v2
-    // table held the WHOLE unfiltered universe). Old markers are simply ignored.
-    const SCORES_DATE_KEY: &str = "scores_compute_date_v3";
-    // "Fresh today" requires BOTH the date marker AND a non-empty table. The
-    // table check is what makes this self-healing: if a prior run stamped today's
-    // date but produced no rows (e.g. an earlier build with a stricter history
-    // requirement), we still recompute instead of staying empty all day.
-    let scores_fresh_today = {
-        let db_guard = db.lock().unwrap();
-        let marked = cache_repository::get_app_meta(&db_guard, SCORES_DATE_KEY).as_deref()
-            == Some(today.as_str());
-        let have_rows = crate::local_db::scoring_repository::count(&db_guard).unwrap_or(0) > 0;
-        marked && have_rows
-    };
-    if scores_fresh_today {
-        let n = { let db_guard = db.lock().unwrap(); crate::local_db::scoring_repository::count(&db_guard).unwrap_or(0) };
-        set_step(&state, "compute_scores", StepStatus::Success, Some(&format!("{n} scored (cached today)")));
-    } else {
-        match crate::scoring::compute_and_store(&db) {
-            Ok(n) => {
-                // Only mark "done for today" when we actually scored something, so
-                // a launch with no usable daily history yet retries next time
-                // instead of being locked out for the day.
-                if n > 0 {
-                    let db_guard = db.lock().unwrap();
-                    let _ = cache_repository::set_app_meta(&db_guard, SCORES_DATE_KEY, &today);
-                    drop(db_guard);
-                    set_step(&state, "compute_scores", StepStatus::Success, Some(&format!("{n} tickers scored")));
-                    let _ = log(&db, "info", &format!("startup: mean-reversion scores computed for {n} tickers"));
-                } else {
-                    set_step(&state, "compute_scores", StepStatus::Warning, Some("0 tickers scored (no daily history yet — will retry next launch)"));
-                }
-            }
-            Err(e) => {
-                push_warning(&state, &format!("scoring failed: {e}"));
-                set_step(&state, "compute_scores", StepStatus::Warning, Some(&format!("error: {e}")));
-            }
-        }
-    }
+    // The Panic Mean Reversion watchlist is no longer built here: it depends on the
+    // premarket session's volume, so it's built once at 09:00 ET by a dedicated
+    // scheduler (`crate::panic_watchlist`) — independent of when the app launched.
 
     // ── Step 9: finalize ──────────────────────────────────────────────────────
     // Nothing more to build — the streamable set is the whole US market.

@@ -255,16 +255,23 @@ pub fn latest_closes(conn: &Connection) -> Result<Vec<(String, f64)>> {
     rows.collect()
 }
 
-/// Latest cached daily VOLUME per symbol (the previous trading day's volume,
-/// since today's bar isn't cached pre-open). Mirrors `latest_closes`. Used by the
-/// mean-reversion scoring to gate (>20M), tie-break and display.
-pub fn latest_volumes(conn: &Connection) -> Result<Vec<(String, i64)>> {
+/// Latest cached daily VOLUME per symbol STRICTLY BEFORE `before_date`
+/// (YYYY-MM-DD) — i.e. the previous trading day's volume relative to that date.
+/// Mirrors `latest_closes`. Used by the mean-reversion scoring to gate, tie-break
+/// and display. The date bound makes the query correct during a Market Replay
+/// (the cache holds bars AFTER the replayed day, which must not leak); in live
+/// mode `before_date` = today, which the pre-open cache never contains anyway.
+pub fn latest_volumes(conn: &Connection, before_date: &str) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT d.symbol, d.volume FROM daily_cache d
-         WHERE d.date = (SELECT MAX(x.date) FROM daily_cache x WHERE x.symbol = d.symbol)
+         WHERE d.date = (SELECT MAX(x.date) FROM daily_cache x
+                         WHERE x.symbol = d.symbol AND x.date < ?1)
+           AND d.date < ?1
            AND d.volume IS NOT NULL",
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let rows = stmt.query_map(params![before_date], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
     rows.collect()
 }
 
@@ -291,6 +298,14 @@ pub fn symbols_with_bars(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(DISTINCT symbol) FROM daily_cache", [], |r| r.get(0))
 }
 
+/// Delete every cached daily bar for one symbol. Used when a split invalidates
+/// the symbol's split-adjusted history (adjustment=split rescales the whole
+/// series to the latest factor) so it can be refetched in full at the new scale.
+pub fn delete_symbol_bars(conn: &Connection, symbol: &str) -> Result<usize> {
+    let n = conn.execute("DELETE FROM daily_cache WHERE symbol = ?1", params![symbol])?;
+    Ok(n)
+}
+
 /// Drop bars older than `cutoff_date` (YYYY-MM-DD) to bound the cache to the
 /// recent window we actually use (~50 trading days).
 pub fn prune_before(conn: &Connection, cutoff_date: &str) -> Result<usize> {
@@ -315,6 +330,31 @@ pub fn avg_volumes(conn: &Connection, days: u32) -> Result<Vec<(String, i64)>> {
     rows.collect()
 }
 
+/// Average daily DOLLAR volume per symbol over the most recent `days` cached bars
+/// (close × volume, averaged). Computed in SQL alongside `avg_volumes`. Used by
+/// the Panic Mean Reversion premarket pre-filter (the "avg $ volume 20d > 5M"
+/// liquidity branch). Symbols with no usable bars are omitted.
+/// Window bounded to bars dated strictly before `before_date` (Market Replay
+/// correctness — see `latest_volumes`).
+pub fn avg_dollar_volumes(
+    conn: &Connection,
+    days: u32,
+    before_date: &str,
+) -> Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT symbol, AVG(close * volume) FROM (
+             SELECT symbol, close, volume,
+                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
+             FROM daily_cache
+             WHERE volume IS NOT NULL AND close IS NOT NULL AND date < ?2
+         ) WHERE rn <= ?1 GROUP BY symbol",
+    )?;
+    let rows = stmt.query_map(params![days, before_date], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    rows.collect()
+}
+
 /// Date-ASCENDING daily closes for one symbol, most recent `limit` bars. Used by
 /// the mean-reversion scoring engine (which wants oldest→newest series). Skips
 /// rows with a NULL close.
@@ -335,21 +375,25 @@ pub fn closes_ascending(conn: &Connection, symbol: &str, limit: u32) -> Result<V
 /// the mean-reversion scoring can compute candle colour (close vs open), daily true
 /// range (parabolic expansion) and dollar volume. Rows with any NULL OHLC are
 /// skipped (a missing close already excludes the bar); a NULL volume becomes 0.
+/// Window bounded to bars dated strictly before `before_date` (Market Replay
+/// correctness — see `latest_volumes`).
 pub fn ohlcv_ascending(
     conn: &Connection,
     symbol: &str,
     limit: u32,
+    before_date: &str,
 ) -> Result<Vec<(f64, f64, f64, f64, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT open, high, low, close, volume FROM (
              SELECT open, high, low, close, volume, date FROM daily_cache
              WHERE symbol = ?1
+               AND date < ?3
                AND open IS NOT NULL AND high IS NOT NULL
                AND low IS NOT NULL AND close IS NOT NULL
              ORDER BY date DESC LIMIT ?2
          ) ORDER BY date ASC",
     )?;
-    let rows = stmt.query_map(params![symbol, limit], |row| {
+    let rows = stmt.query_map(params![symbol, limit, before_date], |row| {
         Ok((
             row.get::<_, f64>(0)?,
             row.get::<_, f64>(1)?,
@@ -357,6 +401,36 @@ pub fn ohlcv_ascending(
             row.get::<_, f64>(3)?,
             row.get::<_, Option<i64>>(4)?.unwrap_or(0),
         ))
+    })?;
+    rows.collect()
+}
+
+/// Most recent `limit` daily bars dated strictly BEFORE `before_date`
+/// (YYYY-MM-DD), date-descending. The replay-safe variant of `get_daily_bars`:
+/// callers pass the app-clock "today" so a Market Replay never reads bars from
+/// the simulated future (in live mode the bound is inert — the cache holds
+/// nothing for today pre-open).
+pub fn get_daily_bars_before(
+    conn: &Connection,
+    symbol: &str,
+    before_date: &str,
+    limit: u32,
+) -> Result<Vec<DailyBar>> {
+    let mut stmt = conn.prepare(
+        "SELECT symbol,date,open,high,low,close,volume,updated_at
+         FROM daily_cache WHERE symbol=?1 AND date < ?2 ORDER BY date DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![symbol, before_date, limit], |row| {
+        Ok(DailyBar {
+            symbol: row.get(0)?,
+            date: row.get(1)?,
+            open: row.get(2)?,
+            high: row.get(3)?,
+            low: row.get(4)?,
+            close: row.get(5)?,
+            volume: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
     })?;
     rows.collect()
 }

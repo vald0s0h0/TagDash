@@ -172,33 +172,24 @@ CREATE TABLE IF NOT EXISTS price_alarms (
 CREATE INDEX IF NOT EXISTS idx_price_alarms_symbol ON price_alarms(symbol);
 
 -- Daily mean-reversion scores per ticker (Panic Mean Reversion pre-open screener).
--- Recomputed once per calendar day from daily_cache (see `scoring` module). The
--- display_score is a CONTINUOUS composite of the Bollinger event score, a parabolic
--- (true-range expansion × direction) score, a log-scaled dollar-volume score and a
--- consecutive-candle run score — not a saturating percentile. The cross-sectional
--- percent rank (pr_score) is kept as a diagnostic only. Top 30 by display_score
--- feed the pre-open watchlist.
-CREATE TABLE IF NOT EXISTS mean_reversion_scores (
-    symbol          TEXT PRIMARY KEY NOT NULL,
-    -- Cross-sectional percent rank: DIAGNOSTIC ONLY (no longer part of display).
-    pr_score        REAL NOT NULL DEFAULT 0,
-    pr_best_days    INTEGER NOT NULL DEFAULT 0,
-    bb_event_score  REAL NOT NULL DEFAULT 0,
-    bb_best_horizon INTEGER NOT NULL DEFAULT 0,
-    -- Continuous composite components (0..1) feeding display_score.
-    parabolic_score REAL NOT NULL DEFAULT 0,
-    volume_score    REAL NOT NULL DEFAULT 0,
-    run_score       REAL NOT NULL DEFAULT 0,
-    run_len         INTEGER NOT NULL DEFAULT 0,
-    run_dir         INTEGER NOT NULL DEFAULT 0,
-    display_score   REAL NOT NULL DEFAULT 0,
-    score_kind      TEXT NOT NULL DEFAULT 'MR',
-    -- Previous trading day's volume (shares). Used to gate (>20M) and to tie-break
-    -- equal scores; also shown as the screener card's volume.
-    prev_volume     INTEGER,
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+-- Panic Mean Reversion pre-open watchlist, rebuilt once per trading day at 09:00 ET
+-- (see `crate::scoring::build_and_store` / `crate::panic_watchlist`). Each row is a
+-- ticker retained by one of two rankings over a premarket-liquidity-filtered
+-- universe: "BB" = cumulative soft-Bollinger area (BBZ excess beyond 1.7σ summed
+-- over 6 days), "MA" = move since the last SMA20 contact normalised by ATR20. The
+-- top 10 of each list are merged (a ticker kept once, in its better-ranked list);
+-- display_score interleaves the lists 1-for-1 by rank for the screener ordering.
+CREATE TABLE IF NOT EXISTS panic_watchlist (
+    symbol        TEXT PRIMARY KEY NOT NULL,
+    list_kind     TEXT NOT NULL DEFAULT 'BB',   -- 'BB' | 'MA'
+    value         REAL NOT NULL DEFAULT 0,       -- BB area sum, or |move|/ATR20
+    direction     INTEGER NOT NULL DEFAULT 0,    -- +1 up / −1 down / 0
+    rank          INTEGER NOT NULL DEFAULT 0,    -- 1-based rank within its list
+    display_score REAL NOT NULL DEFAULT 0,       -- global interleaved ordering key
+    prev_volume   INTEGER,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_mr_scores_display ON mean_reversion_scores(display_score DESC);
+CREATE INDEX IF NOT EXISTS idx_panic_watchlist_display ON panic_watchlist(display_score DESC);
 
 -- Persisted LLM analysis RESULTS per ticker (panic mean-reversion button read).
 -- Only the model's outputs are stored (context summary + reversion verdict), not
@@ -254,6 +245,15 @@ CREATE TABLE IF NOT EXISTS chart_drawings (
     t2         REAL,
     p2         REAL,
     text       TEXT,
+    -- 'intraday' drawings show only on intraday panes, 'daily' only on the daily
+    -- pane — a drawing belongs to the timeframe class it was placed on.
+    scope      TEXT NOT NULL DEFAULT 'intraday',
+    -- Style (TradingView-like editing). NULL = use the rendering defaults.
+    color      TEXT,
+    opacity    REAL,
+    width      REAL,
+    line_style TEXT,
+    font_size  REAL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_chart_drawings_symbol ON chart_drawings(symbol);
@@ -274,18 +274,23 @@ CREATE TABLE IF NOT EXISTS screener_dismissals (
 /// error is swallowed — the column simply already exists.
 const ALTERS: &[&str] = &[
     "ALTER TABLE price_alarms ADD COLUMN triggered_at TEXT",
-    "ALTER TABLE mean_reversion_scores ADD COLUMN prev_volume INTEGER",
-    "ALTER TABLE mean_reversion_scores ADD COLUMN parabolic_score REAL NOT NULL DEFAULT 0",
-    "ALTER TABLE mean_reversion_scores ADD COLUMN volume_score REAL NOT NULL DEFAULT 0",
-    "ALTER TABLE mean_reversion_scores ADD COLUMN run_score REAL NOT NULL DEFAULT 0",
-    "ALTER TABLE mean_reversion_scores ADD COLUMN run_len INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE mean_reversion_scores ADD COLUMN run_dir INTEGER NOT NULL DEFAULT 0",
+    // Panic Mean Reversion was reworked into a two-list watchlist (`panic_watchlist`);
+    // the old composite-scoring table is obsolete. Dropped so a stale schema can't
+    // linger. (Not strictly an ALTER, but the same idempotent-migration channel.)
+    "DROP TABLE IF EXISTS mean_reversion_scores",
     // Multi-day close-to-close % change (1d/2d/4d/6d; 3d/5d predate this and are
     // already in the CREATE for older DBs).
     "ALTER TABLE fundamentals_cache ADD COLUMN change_1d_pct REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN change_2d_pct REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN change_4d_pct REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN change_6d_pct REAL",
+    // Editable drawings: per-timeframe scope + style columns (TradingView-like).
+    "ALTER TABLE chart_drawings ADD COLUMN scope TEXT NOT NULL DEFAULT 'intraday'",
+    "ALTER TABLE chart_drawings ADD COLUMN color TEXT",
+    "ALTER TABLE chart_drawings ADD COLUMN opacity REAL",
+    "ALTER TABLE chart_drawings ADD COLUMN width REAL",
+    "ALTER TABLE chart_drawings ADD COLUMN line_style TEXT",
+    "ALTER TABLE chart_drawings ADD COLUMN font_size REAL",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

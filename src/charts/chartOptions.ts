@@ -23,12 +23,16 @@ export const BACKFILL_BATCH = 500;
 // SL/TP lines render solid while they are just planned levels, and switch to a
 // dotted, lower-opacity "order" style once a position is open (the levels have
 // become live bracket orders that will trigger fills when touched).
+//
+// `axisLabelVisible` is false on purpose: the right-edge "price + ✕" label pill
+// (rendered in the component, tracked to the line) replaces the native axis tag,
+// so the delete button is part of the label instead of a separate overlay.
 export function slOpts(order: boolean, title = "SL") {
   return {
     color:            order ? "rgba(239,68,68,0.55)" : "#ef4444",
     lineWidth:        1 as const,
     lineStyle:        order ? LineStyle.Dotted : LineStyle.Solid,
-    axisLabelVisible: true,
+    axisLabelVisible: false,
     title:            order ? `${title} ◦` : title,
   };
 }
@@ -37,7 +41,7 @@ export function tpOpts(order: boolean, title = "TP") {
     color:            order ? "rgba(34,197,94,0.55)" : "#22c55e",
     lineWidth:        1 as const,
     lineStyle:        order ? LineStyle.Dotted : LineStyle.Solid,
-    axisLabelVisible: true,
+    axisLabelVisible: false,
     title:            order ? `${title} ◦` : title,
   };
 }
@@ -61,7 +65,8 @@ export const ALARM_OPTIONS = {
   color:            "#f59e0b", // amber
   lineWidth:        1 as const,
   lineStyle:        LineStyle.Dashed,
-  axisLabelVisible: true,
+  // Native axis tag off — the right-edge "price + ✕" label pill stands in for it.
+  axisLabelVisible: false,
   title:            "⏰",
 };
 

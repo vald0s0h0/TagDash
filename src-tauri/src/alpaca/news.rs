@@ -47,22 +47,25 @@ pub async fn fetch_recent_news(
     days: i64,
     limit: u32,
 ) -> Result<Vec<NewsArticle>, String> {
-    let start = (Utc::now() - Duration::days(days.max(1)))
+    // App clock: during a Market Replay the window is relative to the simulated
+    // day AND capped at the simulated instant, so an article published later in
+    // the replayed day (or after it) can never leak into the LLM grounding.
+    let now = crate::time::now();
+    let start = (now - Duration::days(days.max(1)))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-
-    let url = reqwest::Url::parse_with_params(
-        NEWS_URL,
-        &[
-            ("symbols", symbol),
-            ("start", start.as_str()),
-            ("limit", &limit.to_string()),
-            ("sort", "desc"),
-            ("include_content", "true"),
-            ("exclude_contentless", "false"),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+    let mut params: Vec<(&str, String)> = vec![
+        ("symbols", symbol.to_string()),
+        ("start", start),
+        ("limit", limit.to_string()),
+        ("sort", "desc".into()),
+        ("include_content", "true".into()),
+        ("exclude_contentless", "false".into()),
+    ];
+    if crate::replay::clock::is_active() {
+        params.push(("end", now.format("%Y-%m-%dT%H:%M:%SZ").to_string()));
+    }
+    let url = reqwest::Url::parse_with_params(NEWS_URL, &params).map_err(|e| e.to_string())?;
 
     let client = reqwest::Client::new();
     let resp = client

@@ -13,6 +13,20 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::types::Session;
 
+/// The app clock: real `Utc::now()` in live mode, the simulated instant while a
+/// Market Replay is active. Every engine / command that needs "now" for market
+/// logic (session gates, alert timestamps, fills, trade IDs, "today") must call
+/// this instead of `Utc::now()`, so the whole app follows the replayed day.
+/// Infrastructure timestamps (feed diagnostics, sync-queue bookkeeping…) keep
+/// using `Utc::now()` on purpose.
+pub fn now() -> DateTime<Utc> {
+    if crate::replay::clock::is_active() {
+        crate::replay::clock::sim_now()
+    } else {
+        Utc::now()
+    }
+}
+
 /// US Eastern UTC offset in hours for `instant`: 4 during EDT, 5 during EST.
 ///
 /// US daylight-saving transitions (current rules, since 2007):
@@ -56,15 +70,23 @@ pub fn et_date(instant: DateTime<Utc>) -> String {
     to_et(instant).format("%Y-%m-%d").to_string()
 }
 
+/// UTC instant of `hour:min` ET wall-clock on `instant`'s ET calendar day
+/// (DST-aware). The generic primitive behind `et_session_open_utc`: lets callers
+/// pin Alpaca REST windows to any ET wall time regardless of EST/EDT — e.g. the
+/// 04:00 ET premarket open or the 09:30 cash open.
+pub fn et_clock_utc(instant: DateTime<Utc>, hour: u32, min: u32) -> DateTime<Utc> {
+    let offset = et_offset_hours(instant);
+    let et_day = (instant - Duration::hours(offset)).date_naive();
+    // hh:mm ET = (hh:mm + offset) UTC on the same ET calendar day.
+    let naive = et_day.and_hms_opt(hour, min, 0).expect("valid wall time");
+    Utc.from_utc_datetime(&naive) + Duration::hours(offset)
+}
+
 /// UTC instant of the 09:30 ET regular-session open on `instant`'s ET day
 /// (DST-aware). Lets callers pin Alpaca REST windows to the cash open regardless
 /// of EST/EDT — e.g. 13:30Z in summer, 14:30Z in winter.
 pub fn et_session_open_utc(instant: DateTime<Utc>) -> DateTime<Utc> {
-    let offset = et_offset_hours(instant);
-    let et_day = (instant - Duration::hours(offset)).date_naive();
-    // 09:30 ET = (09:30 + offset) UTC on the same ET calendar day.
-    let naive_open = et_day.and_hms_opt(9, 30, 0).expect("09:30 is a valid time");
-    Utc.from_utc_datetime(&naive_open) + Duration::hours(offset)
+    et_clock_utc(instant, 9, 30)
 }
 
 /// Market session at `instant`, from ET wall time. Boundaries are unchanged from

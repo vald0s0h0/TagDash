@@ -11,19 +11,27 @@ import {
   MoreHorizontal,
   NotebookPen,
   Slash,
+  Smile,
   Type,
 } from "lucide-react";
 import { JournalModal } from "./JournalModal";
+import { DrawingContextMenu } from "./DrawingContextMenu";
 import { useQuery } from "@tanstack/react-query";
-import type { AlertSignal, PaneSpec, Timeframe, ZoneAssignment } from "@/types";
-import { useLayoutStore } from "@/stores/layoutStore";
-import { useChartStore, type DrawMode } from "@/stores/chartStore";
+import type { AlertSignal, PaneSpec, StrategyCard, Timeframe, ZoneAssignment } from "@/types";
+import { useLayoutStore, MANUAL_STRATEGY_ID } from "@/stores/layoutStore";
+import {
+  useChartStore, type DrawMode, type DrawScope, type ChartLine,
+  type ChartAnnotation, type CtxTarget, type LineStyleName,
+} from "@/stores/chartStore";
+import { useDrawingPrefs } from "@/stores/drawingPrefsStore";
+import {
+  registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
+} from "@/stores/hotkeyStore";
 import { useStrategyCards } from "@/queries/useScanner";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
 import { nyFilenameStamp } from "@/lib/nyTime";
 import { LightweightChart } from "./LightweightChart";
-import { EnrichmentBand } from "./EnrichmentBand";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -33,9 +41,41 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  PRIORITY_STYLES, TIMEFRAMES, resolveFieldValue,
-  FieldChip, TBtn, Sep, TextInput, EmptyZone,
+  PRIORITY_STYLES, TIMEFRAMES,
+  ChartInfoBar, StrategyInfoOverlay, TBtn, Sep, EmptyZone,
 } from "./chartZoneParts";
+
+// Mood emojis offered by the toolbar (euphoric / angry / panicked / in the clouds).
+const EMOJIS: { glyph: string; title: string }[] = [
+  { glyph: "🤑", title: "Euphorique" },
+  { glyph: "😡", title: "En colère" },
+  { glyph: "😱", title: "Paniqué" },
+  { glyph: "😶‍🌫️", title: "Dans les nuages (oubli des règles)" },
+];
+
+// Default chart for a manually-searched ticker: one 5-minute pane with VWAP +
+// Bollinger, info band = float / industry / country.
+const MANUAL_CARD: StrategyCard = {
+  universe: "us_stocks",
+  panes: [{
+    timeframe: "5m",
+    symbol: null,
+    interactive: true,
+    indicators: [
+      { kind: "vwap", period: null },
+      { kind: "bollinger_bands", period: 20 },
+    ],
+  }],
+  info_fields: [
+    { key: "float_shares", label: "Float",     source: "enrichment" },
+    { key: "industry",     label: "Industrie", source: "enrichment" },
+    { key: "country",      label: "Pays",      source: "enrichment" },
+    { key: "price",        label: "Px",        source: "alert" },
+    { key: "change_day_pct", label: "Chg",     source: "alert" },
+  ],
+  llm: null,
+  enrichments: [],
+};
 
 // ─── Main ChartZone ───────────────────────────────────────────────────────────
 
@@ -53,11 +93,6 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const crosshairSyncRef = useRef(createCrosshairSync());
   const [narrowToolbar, setNarrowToolbar] = useState(false);
 
-  // Text annotation pending state
-  const [pendingText, setPendingText] = useState<{
-    time: number; price: number; pixelX: number; pixelY: number;
-  } | null>(null);
-
   // Journal modal
   const [journalOpen, setJournalOpen] = useState(false);
 
@@ -69,7 +104,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   const chartStore   = useChartStore();
   const zoneState    = useChartStore((s) => s.getZone(zone.zone_id));
-  const { timeframe, drawMode, orderMode, lines, annotations, alarms, linePoint1, context } = zoneState;
+  const { timeframe, drawMode, orderMode, lines, annotations, alarms, linePoint1, pendingEmoji, context } = zoneState;
+
+  // Right-click context menu (one per zone).
+  const [ctxMenu, setCtxMenu] = useState<{ target: CtxTarget; x: number; y: number } | null>(null);
 
   const hasSl      = context?.stop_loss  != null;
   const hasTp      = context?.take_profit != null;
@@ -77,7 +115,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   // ── Strategy identity card → panes + info-band fields ──────────────────────
   const { data: cards } = useStrategyCards();
-  const card  = zone.strategy_id ? cards?.[zone.strategy_id] ?? null : null;
+  const isManual = zone.strategy_id === MANUAL_STRATEGY_ID;
+  const card  = isManual
+    ? MANUAL_CARD
+    : zone.strategy_id ? cards?.[zone.strategy_id] ?? null : null;
   // Panes to render (fallback = a single interactive pane at the toolbar tf).
   const panes: PaneSpec[] = card?.panes?.length
     ? card.panes
@@ -120,20 +161,34 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const openPosition = positions?.find((p) => p.symbol === zone.symbol) ?? null;
   const hasPosition  = openPosition != null;
 
-  // ── Per-symbol info-band extras (score / market cap / float) ───────────────
-  // Not in the live snapshot — fetched from the DB (mean_reversion_scores +
-  // universe_assets). Static within a day, so a long stale time is fine.
+  // ── Per-symbol info-band extras (score / cap / float / BBZ / PM vol / news) ─
+  // Mixes static DB data (score, cap, float, meta) with live-derived fields
+  // (Bollinger Z off the live price, premarket volume, news presence), so it's
+  // polled rather than cached — the common info bar's metrics stay current.
   const { data: cardInfo } = useQuery({
     queryKey: ["card_info", zone.symbol],
     queryFn:  () => api.getCardInfo(zone.symbol!),
     enabled:  !!zone.symbol,
-    staleTime: 5 * 60 * 1000,
+    refetchInterval: 3000,
   });
+
+  // ── Current (forming) bar volume on the displayed timeframe ────────────────
+  // Polls the live ring buffer (forming bar included) so the common info bar's
+  // "Vol barre" updates as the candle fills.
+  const { data: tfBars } = useQuery({
+    queryKey: ["tf_bars_vol", zone.symbol, timeframe],
+    queryFn:  () => api.getTickerBars(zone.symbol!, timeframe),
+    enabled:  !!zone.symbol,
+    refetchInterval: 1500,
+  });
+  const currentBarVolume = tfBars && tfBars.length > 0
+    ? tfBars[tfBars.length - 1].volume
+    : null;
 
   // ── Load existing context when zone symbol changes ─────────────────────────
   useEffect(() => {
     if (!zone.symbol) return;
-    api.getZoneTradeContext(zone.zone_id).then((ctx) => {
+    api.getZoneTradeContext(zone.zone_id, zone.symbol!).then((ctx) => {
       chartStore.setContext(zone.zone_id, ctx ?? null);
     });
   }, [zone.zone_id, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -168,16 +223,30 @@ export function ChartZone({ zone }: ChartZoneProps) {
       return;
     }
     api.getDrawingsForSymbol(zone.symbol).then((rows) => {
-      const lines = rows
+      const lines: ChartLine[] = rows
         .filter((d) => d.kind === "line" && d.t2 != null && d.p2 != null)
         .map((d) => ({
           id: d.id,
           point1: { time: d.t1, price: d.p1 },
           point2: { time: d.t2!, price: d.p2! },
+          scope: (d.scope ?? "intraday") as DrawScope,
+          color: d.color ?? "#f59e0b",
+          opacity: d.opacity ?? 1,
+          width: d.width ?? 2,
+          lineStyle: (d.line_style ?? "solid") as LineStyleName,
         }));
-      const anns = rows
-        .filter((d) => d.kind === "text")
-        .map((d) => ({ id: d.id, time: d.t1, price: d.p1, text: d.text ?? "", pixelX: 0, pixelY: 0 }));
+      const anns: ChartAnnotation[] = rows
+        .filter((d) => d.kind === "text" || d.kind === "emoji")
+        .map((d) => ({
+          id: d.id,
+          kind: d.kind === "emoji" ? "emoji" : "text",
+          time: d.t1, price: d.p1, text: d.text ?? "",
+          scope: (d.scope ?? "intraday") as DrawScope,
+          color: d.color ?? (d.kind === "emoji" ? "#ffffff" : "#fcd34d"),
+          opacity: d.opacity ?? 1,
+          fontSize: d.font_size ?? (d.kind === "emoji" ? 24 : 12),
+          pixelX: 0, pixelY: 0,
+        }));
       chartStore.setLines(zone.zone_id, lines);
       chartStore.setAnnotations(zone.zone_id, anns);
     }).catch(() => {});
@@ -204,7 +273,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const prevHasPosition = useRef(false);
   useEffect(() => {
     if (prevHasPosition.current && !hasPosition && zone.symbol) {
-      api.getZoneTradeContext(zone.zone_id).then((ctx) => {
+      api.getZoneTradeContext(zone.zone_id, zone.symbol!).then((ctx) => {
         chartStore.setContext(zone.zone_id, ctx ?? null);
       });
     }
@@ -250,8 +319,9 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const handlePriceClick = useCallback(async (
     price: number,
     time:  number,
-    pixelX: number,
-    pixelY: number,
+    _pixelX: number,
+    _pixelY: number,
+    scope: DrawScope,
   ) => {
     // Read drawMode and linePoint1 from the store at call time — avoids any
     // stale-closure issue where the captured value lags behind the click.
@@ -289,7 +359,11 @@ export function ChartZone({ zone }: ChartZoneProps) {
       if (!lp1) {
         chartStore.setLinePoint1(zone.zone_id, { time, price });
       } else {
-        const line = { id: `line-${Date.now()}`, point1: lp1, point2: { time, price } };
+        const sty = useDrawingPrefs.getState().line;
+        const line: ChartLine = {
+          id: `line-${Date.now()}`, point1: lp1, point2: { time, price },
+          scope, color: sty.color, opacity: sty.opacity, width: sty.width, lineStyle: sty.lineStyle,
+        };
         chartStore.addLine(zone.zone_id, line);
         chartStore.setLinePoint1(zone.zone_id, null);
         chartStore.setDrawMode(zone.zone_id, "none");
@@ -298,11 +372,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
           api.createDrawing({
             id: line.id, symbol: sym, kind: "line",
             t1: lp1.time, p1: lp1.price, t2: time, p2: price, text: null,
+            scope, color: line.color, opacity: line.opacity, width: line.width, line_style: line.lineStyle,
           }).catch(() => {});
         }
       }
-    } else if (mode === "text") {
-      setPendingText({ time, price, pixelX, pixelY });
     }
   }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
 
@@ -356,28 +429,123 @@ export function ChartZone({ zone }: ChartZoneProps) {
     try { await api.deleteAlarm(id); } catch (e) { console.error("delete alarm failed:", e); }
   }, [zone.zone_id, chartStore]);
 
-  // ── Text annotation confirm ────────────────────────────────────────────────
-  const handleTextConfirm = useCallback((text: string) => {
-    if (!pendingText) return;
-    const ann = {
-      id:    `ann-${Date.now()}`,
-      time:  pendingText.time,
-      price: pendingText.price,
-      text,
-      pixelX: pendingText.pixelX,
-      pixelY: pendingText.pixelY,
+  // ── Create a text / emoji annotation (scope = the pane it was placed on) ───
+  const handleCreateAnnotation = useCallback((
+    kind: "text" | "emoji", time: number, price: number, text: string, scope: DrawScope,
+  ) => {
+    const prefs = useDrawingPrefs.getState();
+    const ann: ChartAnnotation = {
+      id: `ann-${Date.now()}`, kind, time, price, text, scope,
+      color:    kind === "emoji" ? "#ffffff" : prefs.text.color,
+      opacity:  kind === "emoji" ? 1 : prefs.text.opacity,
+      fontSize: kind === "emoji" ? prefs.emoji.fontSize : prefs.text.fontSize,
+      pixelX: 0, pixelY: 0,
     };
     chartStore.addAnnotation(zone.zone_id, ann);
     chartStore.setDrawMode(zone.zone_id, "none");
-    setPendingText(null);
-    // Memorise on the ticker (persisted, shown on every chart of this symbol).
     if (zone.symbol) {
       api.createDrawing({
-        id: ann.id, symbol: zone.symbol, kind: "text",
-        t1: ann.time, p1: ann.price, t2: null, p2: null, text,
+        id: ann.id, symbol: zone.symbol, kind,
+        t1: time, p1: price, t2: null, p2: null, text,
+        scope, color: ann.color, opacity: ann.opacity, font_size: ann.fontSize,
       }).catch(() => {});
     }
-  }, [pendingText, zone.zone_id, zone.symbol, chartStore]);
+  }, [zone.zone_id, zone.symbol, chartStore]);
+
+  // Persist a drawing change to the DB (style/position). Builds the row from the
+  // current store state of `id` (line or annotation).
+  const persistDrawing = useCallback((id: string) => {
+    const sym = zone.symbol;
+    if (!sym) return;
+    const z = useChartStore.getState().getZone(zone.zone_id);
+    const l = z.lines.find((x) => x.id === id);
+    if (l) {
+      api.updateDrawing({
+        id, symbol: sym, kind: "line",
+        t1: l.point1.time, p1: l.point1.price, t2: l.point2.time, p2: l.point2.price, text: null,
+        scope: l.scope, color: l.color, opacity: l.opacity, width: l.width, line_style: l.lineStyle,
+      }).catch(() => {});
+      return;
+    }
+    const a = z.annotations.find((x) => x.id === id);
+    if (a) {
+      api.updateDrawing({
+        id, symbol: sym, kind: a.kind,
+        t1: a.time, p1: a.price, t2: null, p2: null, text: a.text,
+        scope: a.scope, color: a.color, opacity: a.opacity, font_size: a.fontSize,
+      }).catch(() => {});
+    }
+  }, [zone.zone_id, zone.symbol]);
+
+  const handleLineChange = useCallback((id: string, point1: { time: number; price: number }, point2: { time: number; price: number }) => {
+    chartStore.updateLine(zone.zone_id, id, { point1, point2 });
+    persistDrawing(id);
+  }, [zone.zone_id, chartStore, persistDrawing]);
+
+  const handleAnnotationMove = useCallback((id: string, time: number, price: number) => {
+    chartStore.updateAnnotation(zone.zone_id, id, { time, price });
+    persistDrawing(id);
+  }, [zone.zone_id, chartStore, persistDrawing]);
+
+  const handleEditAnnotation = useCallback((id: string, text: string) => {
+    chartStore.updateAnnotation(zone.zone_id, id, { text });
+    persistDrawing(id);
+  }, [zone.zone_id, chartStore, persistDrawing]);
+
+  const handleStyleLine = useCallback((id: string, patch: Partial<ChartLine>) => {
+    chartStore.updateLine(zone.zone_id, id, patch);
+    // Last-used style becomes the default for the next line.
+    useDrawingPrefs.getState().setLine(patch as Partial<ReturnType<typeof useDrawingPrefs.getState>["line"]>);
+    persistDrawing(id);
+  }, [zone.zone_id, chartStore, persistDrawing]);
+
+  const handleStyleAnnotation = useCallback((id: string, patch: Partial<ChartAnnotation>) => {
+    chartStore.updateAnnotation(zone.zone_id, id, patch);
+    const z = useChartStore.getState().getZone(zone.zone_id);
+    const a = z.annotations.find((x) => x.id === id);
+    if (a?.kind === "emoji") { if (patch.fontSize != null) useDrawingPrefs.getState().setEmoji({ fontSize: patch.fontSize }); }
+    else useDrawingPrefs.getState().setText(patch as Partial<ReturnType<typeof useDrawingPrefs.getState>["text"]>);
+    persistDrawing(id);
+  }, [zone.zone_id, chartStore, persistDrawing]);
+
+  const handleDeleteLine = useCallback((id: string) => {
+    chartStore.removeLine(zone.zone_id, id);
+    api.deleteDrawing(id).catch(() => {});
+  }, [zone.zone_id, chartStore]);
+
+  const handleDeleteAnnotation = useCallback((id: string) => {
+    chartStore.removeAnnotation(zone.zone_id, id);
+    api.deleteDrawing(id).catch(() => {});
+  }, [zone.zone_id, chartStore]);
+
+  const handleDuplicateLine = useCallback((id: string) => {
+    const z = useChartStore.getState().getZone(zone.zone_id);
+    const l = z.lines.find((x) => x.id === id);
+    if (!l || !zone.symbol) return;
+    // Offset the copy slightly in price so it's visible.
+    const dp = (l.point1.price + l.point2.price) * 0.01;
+    const copy: ChartLine = {
+      ...l, id: `line-${Date.now()}`,
+      point1: { ...l.point1, price: l.point1.price + dp },
+      point2: { ...l.point2, price: l.point2.price + dp },
+    };
+    chartStore.addLine(zone.zone_id, copy);
+    api.createDrawing({
+      id: copy.id, symbol: zone.symbol, kind: "line",
+      t1: copy.point1.time, p1: copy.point1.price, t2: copy.point2.time, p2: copy.point2.price, text: null,
+      scope: copy.scope, color: copy.color, opacity: copy.opacity, width: copy.width, line_style: copy.lineStyle,
+    }).catch(() => {});
+  }, [zone.zone_id, zone.symbol, chartStore]);
+
+  const handleAlarmDragEnd = useCallback((id: string, price: number) => {
+    const z = useChartStore.getState().getZone(zone.zone_id);
+    chartStore.setAlarms(zone.zone_id, z.alarms.map((a) => a.id === id ? { ...a, price } : a));
+    api.updateAlarmPrice(id, price).catch(() => {});
+  }, [zone.zone_id, chartStore]);
+
+  const handleContextMenu = useCallback((target: CtxTarget, clientX: number, clientY: number) => {
+    setCtxMenu({ target, x: clientX, y: clientY });
+  }, []);
 
   // ── Toggle draw mode (click same button to deactivate) ────────────────────
   const toggleMode = useCallback((mode: DrawMode) => {
@@ -486,6 +654,36 @@ export function ChartZone({ zone }: ChartZoneProps) {
         ctx.drawImage(src, sr.left - rect.left, sr.top - rect.top + headerH);
       });
 
+      // The on-chart strategy overlay is a DOM layer (not a canvas), so rasterise
+      // its cells onto the composite by hand — at their on-chart position, below
+      // the info header — so screenshots show the strategy-specific fields too.
+      const overlayCells = container.querySelectorAll<HTMLElement>("[data-capture-cell]");
+      overlayCells.forEach((cell) => {
+        const cr = cell.getBoundingClientRect();
+        const x = cr.left - rect.left;
+        const y = cr.top - rect.top + headerH;
+        const w = cr.width;
+        const h = cr.height;
+        const padX = 6;
+        // Opaque box (the live backdrop-blur can't be reproduced on canvas).
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(x, y, w, h);
+        const label = cell.children[0]?.textContent?.trim() ?? "";
+        const value = cell.children[1]?.textContent?.trim() ?? "";
+        if (label) {
+          ctx.font = "9px ui-monospace, monospace";
+          ctx.textBaseline = "top";
+          ctx.fillStyle = "#9a9a9a";
+          ctx.fillText(label, x + padX, y + 3);
+        }
+        if (value) {
+          ctx.font = "bold 14px ui-monospace, monospace";
+          ctx.textBaseline = "bottom";
+          ctx.fillStyle = "#e5e5e5";
+          ctx.fillText(value, x + padX, y + h - 3);
+        }
+      });
+
       const dataUrl = canvas.toDataURL("image/png");
 
       const ts  = nyFilenameStamp(); // New York time
@@ -517,6 +715,42 @@ export function ChartZone({ zone }: ChartZoneProps) {
       setTimeout(() => setCaptureStatus("idle"), 3000);
     }
   }, [zone.zone_id, hasTradeId, context]);
+
+  // ── Hotkeys: run a bindable action on this zone ────────────────────────────
+  // Mirrors the toolbar buttons / timeframe dropdown / IA button. The global
+  // listener (useHotkeys) routes a chord to the hovered zone's runner; timeframe
+  // actions drive the interactive (left) pane via the same setTimeframe the
+  // dropdown uses.
+  const runAction = useCallback((id: HotkeyActionId) => {
+    switch (id) {
+      case "release":    handleRelease(); break;
+      case "sl":         toggleMode("sl"); break;
+      case "tp":         toggleMode("tp"); break;
+      case "alarm":      toggleMode("alarm"); break;
+      case "line":       toggleMode("line"); break;
+      case "text":       toggleMode("text"); break;
+      case "capture":    if (captureStatus === "idle") handleCapture(); break;
+      case "journal":    if (hasTradeId) setJournalOpen(true); break;
+      case "order_mode": chartStore.setOrderMode(zone.zone_id, orderMode === "market" ? "limit" : "market"); break;
+      case "order_25":   handleOrder(25); break;
+      case "order_50":   handleOrder(50); break;
+      case "order_100":  handleOrder(100); break;
+      case "close":      handleClose(); break;
+      case "run_llm":
+        if (card?.llm && zone.symbol && zone.strategy_id) {
+          api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
+        }
+        break;
+      default: {
+        const tf = TF_FOR_ACTION[id];
+        if (tf) chartStore.setTimeframe(zone.zone_id, tf);
+      }
+    }
+  }, [handleRelease, toggleMode, captureStatus, handleCapture, hasTradeId,
+      chartStore, zone.zone_id, zone.symbol, zone.strategy_id, orderMode,
+      handleOrder, handleClose, card]);
+
+  useEffect(() => registerZoneHotkeys(zone.zone_id, runAction), [zone.zone_id, runAction]);
 
   // ── Drag-and-drop handlers (alert → zone only; zone-to-zone removed) ────────
   function handleDragOver(e: React.DragEvent) {
@@ -569,6 +803,42 @@ export function ChartZone({ zone }: ChartZoneProps) {
       onClick={() => toggleMode("text")}>
       <Type className="h-3 w-3" />
     </TBtn>
+  );
+
+  const tbEmoji = (
+    <DropdownMenu key="emoji">
+      <DropdownMenuTrigger asChild>
+        <button
+          title="Ajouter un emoji d'humeur"
+          className={cn(
+            "flex h-5 shrink-0 items-center gap-0.5 rounded px-1.5 text-[10px] font-medium transition-colors",
+            drawMode === "emoji" ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground",
+          )}
+        >
+          <Smile className="h-3 w-3" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-0">
+        <div className="flex gap-0.5 p-1">
+          {EMOJIS.map((e) => (
+            <button
+              key={e.glyph}
+              title={e.title}
+              onClick={() => {
+                chartStore.setDrawMode(zone.zone_id, "emoji");
+                chartStore.setPendingEmoji(zone.zone_id, e.glyph);
+              }}
+              className={cn(
+                "rounded px-1.5 py-1 text-lg leading-none hover:bg-accent",
+                pendingEmoji === e.glyph && drawMode === "emoji" && "bg-accent",
+              )}
+            >
+              {e.glyph}
+            </button>
+          ))}
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 
   const tbClock = (
@@ -710,17 +980,19 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   // Primary = always visible; secondary = in overflow when narrow
   const primaryButtons  = [tbRelease, tbSl, tbTp, tbAlarm, tbClock];
-  const secondaryButtons = [tbLine, tbText, tbSize25, tbSize50, tbSize100, tbOrderMode, tbClose, tbCapture, tbJournal];
+  const secondaryButtons = [tbLine, tbText, tbEmoji, tbSize25, tbSize50, tbSize100, tbOrderMode, tbClose, tbCapture, tbJournal];
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div
+      data-zone-id={zone.zone_id}
       className={cn(
         "relative flex h-full w-full flex-col overflow-hidden rounded-md border border-border bg-card transition-colors",
         styles?.accent,
         isDragOver && "border-blue-500/70 bg-blue-900/5"
       )}
+      onMouseEnter={() => setHoveredZone(zone.zone_id)}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -867,38 +1139,24 @@ export function ChartZone({ zone }: ChartZoneProps) {
         </div>
       </div>
 
-      {/* ── Info band: strategy name (common) + strategy-specific fields ───── */}
-      {/* Common info (name + priority badge) lives in the header above. When the
-          strategy declares enrichment, an async-filled EnrichmentBand is shown;
-          otherwise a generic chip row resolved from the live snapshot.
-          Wrapped in infoBandRef so the screenshot capture can include it. */}
+      {/* ── Common info bar — identical for every strategy ─────────────────── */}
+      {/* Strategy badge · Bollinger Z · premarket vol · current-bar vol · news ·
+          IA analysis (context/verdict). Strategy-specific fields are drawn on the
+          chart itself (StrategyInfoOverlay), not here. Wrapped in infoBandRef so
+          the screenshot capture can include it. */}
       <div ref={infoBandRef}>
-        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 px-2 pt-1">
-          {zone.strategy_name && (
-            <span className="shrink-0 text-[10px] text-muted-foreground truncate">
-              {zone.strategy_name}
-            </span>
-          )}
-          {!enrichment &&
-            card?.info_fields.map((f) => (
-              <FieldChip key={f.key} field={f} value={resolveFieldValue(f.key, liveState, cardInfo ?? null)} />
-            ))}
-          {zone.price != null && (
-            <span className="text-xs font-medium tabular-nums ml-auto shrink-0">
-              ${zone.price.toFixed(2)}
-            </span>
-          )}
-        </div>
-        {enrichment && (
-          <EnrichmentBand
-            e={enrichment}
-            onRunLlm={() => {
-              if (zone.symbol && zone.strategy_id) {
-                api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
-              }
-            }}
-          />
-        )}
+        <ChartInfoBar
+          zone={zone}
+          card={card}
+          cardInfo={cardInfo ?? null}
+          enrichment={enrichment ?? null}
+          currentBarVolume={currentBarVolume}
+          onRunLlm={() => {
+            if (zone.symbol && zone.strategy_id) {
+              api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
+            }
+          }}
+        />
 
         {/* Reason + LLM summary */}
         {zone.reason && (
@@ -925,7 +1183,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
         {panes.map((pane, i) => {
           const isInteractive = i === interactiveIdx;
           const paneSymbol    = pane.symbol ?? zone.symbol!;
-          const isDaily       = pane.timeframe === "daily";
+          const paneTf        = isInteractive ? timeframe : pane.timeframe;
+          const isDaily       = paneTf === "daily";
+          // Drawings belong to a timeframe class: an intraday pane only shows
+          // intraday drawings, the daily pane only shows daily ones.
+          const paneScope: DrawScope = isDaily ? "daily" : "intraday";
+          const paneLines       = lines.filter((l) => l.scope === paneScope);
+          const paneAnnotations = annotations.filter((a) => a.scope === paneScope);
           // The daily pane loads its bars through the unified path (Alpaca-fresh,
           // today's session included) like every other pane; only the split-day
           // markers come from the enrichment payload.
@@ -939,22 +1203,37 @@ export function ChartZone({ zone }: ChartZoneProps) {
               className={cn("relative min-w-0 flex-1", i > 0 && "border-l border-border/40")}
             >
               {!isInteractive && (
-                <span className="pointer-events-none absolute left-1 top-1 z-10 rounded bg-black/40 px-1 text-[8px] tabular-nums text-muted-foreground/70">
+                <span className={cn(
+                  "pointer-events-none absolute top-1 z-10 rounded bg-black/40 px-1 text-[8px] tabular-nums text-muted-foreground/70",
+                  // Left pane carries the strategy overlay top-left → label goes right.
+                  i === 0 ? "right-1" : "left-1",
+                )}>
                   {paneSymbol} · {pane.timeframe}
                 </span>
               )}
+              {/* Strategy-specific info, drawn on the left pane only. */}
+              {i === 0 && (
+                <StrategyInfoOverlay
+                  card={card}
+                  live={liveState}
+                  cardInfo={cardInfo ?? null}
+                  enrichment={enrichment ?? null}
+                />
+              )}
               <LightweightChart
                 symbol={paneSymbol}
-                timeframe={isInteractive ? timeframe : pane.timeframe}
+                timeframe={paneTf}
                 drawMode={drawMode}
+                paneScope={paneScope}
+                pendingEmoji={pendingEmoji}
                 slPrice={context?.stop_loss ?? null}
                 tpPrice={context?.take_profit ?? null}
                 entryPrice={openPosition?.avg_entry_price ?? null}
                 bid={liveState?.bid ?? null}
                 ask={liveState?.ask ?? null}
                 ordersActive={hasPosition}
-                lines={lines}
-                annotations={annotations}
+                lines={paneLines}
+                annotations={paneAnnotations}
                 alarms={alarms}
                 linePoint1={linePoint1}
                 indicators={pane.indicators}
@@ -968,20 +1247,14 @@ export function ChartZone({ zone }: ChartZoneProps) {
                 onDeleteSl={handleDeleteSl}
                 onDeleteTp={handleDeleteTp}
                 onDeleteAlarm={handleDeleteAlarm}
+                onAlarmDragEnd={handleAlarmDragEnd}
+                onLineChange={handleLineChange}
+                onAnnotationMove={handleAnnotationMove}
+                onCreateAnnotation={(kind, time, price, text) => handleCreateAnnotation(kind, time, price, text, paneScope)}
+                onEditAnnotation={handleEditAnnotation}
+                onContextMenu={handleContextMenu}
+                onCancelTool={() => chartStore.setDrawMode(zone.zone_id, "none")}
               />
-
-              {/* Text annotation input overlay — lives in the interactive pane */}
-              {isInteractive && pendingText && (
-                <div
-                  className="absolute z-10"
-                  style={{ left: pendingText.pixelX, top: pendingText.pixelY, transform: "translate(-50%, -110%)" }}
-                >
-                  <TextInput
-                    onConfirm={handleTextConfirm}
-                    onCancel={() => { setPendingText(null); chartStore.setDrawMode(zone.zone_id, "none"); }}
-                  />
-                </div>
-              )}
             </div>
           );
         })}
@@ -996,6 +1269,33 @@ export function ChartZone({ zone }: ChartZoneProps) {
           symbol={zone.symbol!}
         />
       )}
+
+      {/* Right-click context menu for a drawing / price line */}
+      {ctxMenu && (() => {
+        const t = ctxMenu.target;
+        const lineId = t.type === "line" ? t.id : null;
+        const annId  = t.type === "annotation" ? t.id : null;
+        return (
+          <DrawingContextMenu
+            target={t}
+            x={ctxMenu.x}
+            y={ctxMenu.y}
+            line={lineId ? lines.find((l) => l.id === lineId) : undefined}
+            annotation={annId ? annotations.find((a) => a.id === annId) : undefined}
+            onClose={() => setCtxMenu(null)}
+            onDelete={() => {
+              if (t.type === "line") handleDeleteLine(t.id);
+              else if (t.type === "annotation") handleDeleteAnnotation(t.id);
+              else if (t.type === "sl") handleDeleteSl();
+              else if (t.type === "tp") handleDeleteTp();
+              else if (t.type === "alarm") handleDeleteAlarm(t.id);
+            }}
+            onDuplicate={lineId ? () => handleDuplicateLine(lineId) : undefined}
+            onStyleLine={lineId ? (patch) => handleStyleLine(lineId, patch) : undefined}
+            onStyleAnnotation={annId ? (patch) => handleStyleAnnotation(annId, patch) : undefined}
+          />
+        );
+      })()}
     </div>
   );
 }

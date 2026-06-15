@@ -40,6 +40,37 @@ struct RawBar {
     vw: Option<f64>,
 }
 
+/// Market-Replay leak guard: the effective `end` query parameter for a bars
+/// request of `tf_secs` granularity. In live mode this is just the caller's
+/// requested end (or none). While a replay is active the end is clamped to the
+/// simulated instant minus one bucket, so a bar overlapping the simulated
+/// "future" — including the replay day's own daily bar, whose close would leak —
+/// can never be returned. The earlier of (requested, clamp) wins.
+fn effective_end(tf_secs: i64, requested: Option<&str>) -> Option<String> {
+    let clamp = crate::replay::clock::rest_end_clamp(tf_secs);
+    match (requested, clamp) {
+        (None, c) => c,
+        (Some(r), None) => Some(r.to_string()),
+        (Some(r), Some(c)) => {
+            let rp = chrono::DateTime::parse_from_rfc3339(r)
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let cp = chrono::DateTime::parse_from_rfc3339(&c)
+                .map(|d| d.with_timezone(&chrono::Utc));
+            match (rp, cp) {
+                (Ok(r0), Ok(c0)) if r0 <= c0 => Some(r.to_string()),
+                _ => Some(c),
+            }
+        }
+    }
+}
+
+/// Append `&end=…` to a bars URL when an effective end applies.
+fn push_end(url: &mut String, tf_secs: i64, requested: Option<&str>) {
+    if let Some(end) = effective_end(tf_secs, requested) {
+        url.push_str(&format!("&end={end}"));
+    }
+}
+
 /// Fetch the last `limit_days` daily bars per symbol.
 /// Alpaca caps requests at 1 000 symbols and paginates the response with
 /// `next_page_token`, so we chunk the symbol list and follow pagination.
@@ -49,11 +80,13 @@ pub async fn fetch_daily_bars(
     symbols: &[String],
     limit_days: u32,
 ) -> Result<HashMap<String, Vec<BarData>>, String> {
-    use chrono::{Duration, Utc};
+    use chrono::Duration;
 
     // Go back enough calendar days to cover `limit_days` trading days
     // (weekends + holidays), then truncate to the most recent ones below.
-    let start = (Utc::now() - Duration::days((limit_days as i64).max(1) * 2 + 10))
+    // App clock (`time::now`): in replay the window is relative to the simulated
+    // day, in live mode it is identical to Utc::now().
+    let start = (crate::time::now() - Duration::days((limit_days as i64).max(1) * 2 + 10))
         .format("%Y-%m-%d")
         .to_string();
     let mut result = fetch_daily_bars_since(key, secret, symbols, &start).await?;
@@ -95,8 +128,9 @@ pub async fn fetch_daily_bars_since(
         loop {
             let mut url = format!(
                 "https://data.alpaca.markets/v2/stocks/bars?symbols={sym_str}\
-                 &timeframe=1Day&start={start}&limit=10000&adjustment=raw"
+                 &timeframe=1Day&start={start}&limit=10000&adjustment=split"
             );
+            push_end(&mut url, 86_400, None); // replay guard: no future daily bar
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
@@ -150,18 +184,34 @@ pub async fn fetch_intraday_bars_today(
     secret: &str,
     symbols: &[String],
 ) -> Result<HashMap<String, Vec<crate::market_state::aggregators::Bar>>, String> {
+    // Session start = today's 09:30 ET regular-session open (DST-aware), so Alpaca
+    // returns bars from the cash open regardless of EST/EDT. App clock: in replay
+    // "today" is the simulated day (and the end is clamped to the sim instant).
+    let start = crate::time::et_session_open_utc(crate::time::now())
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fetch_minute_bars_since(key, secret, symbols, &start).await
+}
+
+/// Fetch 1-minute bars for each symbol from `start` (RFC3339, inclusive) to now,
+/// as engine `Bar`s (time-ascending, with trade_count + vwap populated from
+/// Alpaca's `n`/`vw`). The general primitive behind `fetch_intraday_bars_today`;
+/// also used by the Micro Pullback engine to backfill a premarket dormancy
+/// baseline at a late start (the live 10s ring is empty until the feed warms up,
+/// but the last few minutes of 1-minute bars reconstruct the sleep baseline so the
+/// engine can arm immediately instead of waiting ~5 minutes).
+pub async fn fetch_minute_bars_since(
+    key: &str,
+    secret: &str,
+    symbols: &[String],
+    start: &str,
+) -> Result<HashMap<String, Vec<crate::market_state::aggregators::Bar>>, String> {
     use chrono::{DateTime, Utc};
     use crate::market_state::aggregators::Bar;
 
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
-    // Session start = today's 09:30 ET regular-session open (DST-aware), so Alpaca
-    // returns bars from the cash open regardless of EST/EDT.
-    let start = crate::time::et_session_open_utc(Utc::now())
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
-
     let client = reqwest::Client::new();
     let mut out: HashMap<String, Vec<Bar>> = HashMap::new();
 
@@ -171,8 +221,9 @@ pub async fn fetch_intraday_bars_today(
         loop {
             let mut url = format!(
                 "https://data.alpaca.markets/v2/stocks/bars?symbols={sym_str}\
-                 &timeframe=1Min&start={start}&limit=10000&adjustment=raw"
+                 &timeframe=1Min&start={start}&limit=10000&adjustment=split"
             );
+            push_end(&mut url, 60, None); // replay guard: nothing past the sim clock
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
@@ -255,16 +306,18 @@ pub async fn fetch_recent_bars(
 
     // Cover `limit` bars of trading time, inflated ×3 for overnight/weekend gaps
     // and padded by 5 days so even a pre-open call still reaches prior sessions.
+    // App clock: relative to the simulated day during a replay.
     let lookback_secs = tf.seconds() * (limit.max(1) as i64) * 3 + 5 * 86_400;
-    let start = (Utc::now() - Duration::seconds(lookback_secs))
+    let start = (crate::time::now() - Duration::seconds(lookback_secs))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
 
     let client = reqwest::Client::new();
-    let url = format!(
+    let mut url = format!(
         "https://data.alpaca.markets/v2/stocks/bars?symbols={symbol}\
-         &timeframe={timeframe}&start={start}&limit={limit}&sort=desc&adjustment=raw"
+         &timeframe={timeframe}&start={start}&limit={limit}&sort=desc&adjustment=split"
     );
+    push_end(&mut url, tf.seconds(), None); // replay guard: charts never see the future
     let resp = client
         .get(&url)
         .header("APCA-API-KEY-ID", key)
@@ -327,9 +380,11 @@ pub async fn fetch_bars_before(
     };
 
     let client = reqwest::Client::new();
+    // Replay guard: keep the caller's `end` unless the simulated clock is earlier.
+    let end = effective_end(tf.seconds(), Some(end)).unwrap_or_else(|| end.to_string());
     let url = format!(
         "https://data.alpaca.markets/v2/stocks/bars?symbols={symbol}\
-         &timeframe={timeframe}&end={end}&limit={limit}&sort=desc&adjustment=raw"
+         &timeframe={timeframe}&end={end}&limit={limit}&sort=desc&adjustment=split"
     );
     let resp = client
         .get(&url)

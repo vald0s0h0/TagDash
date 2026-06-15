@@ -1,12 +1,15 @@
-// Per-zone trade context stored in RAM only (no persistence in V1).
-// Each zone tracks its SL, TP, and tradeID independently.
+// Trade context (SL / TP / tradeID) stored in RAM, keyed by TICKER (symbol) so it
+// belongs to the ticker, not the chart slot: it persists as a zone swaps between
+// tickers and follows the ticker (incl. coming back to it later). A lightweight
+// zone→symbol map lets the zone_id-based commands (orders, screenshots, close)
+// resolve the zone's current ticker without changing their signatures.
 
 use std::collections::HashMap;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneTradeContext {
+    /// Kept for the frontend type; now mirrors `symbol` (context is per-ticker).
     pub zone_id:     String,
     pub symbol:      String,
     pub strategy_id: String,
@@ -20,19 +23,23 @@ pub struct ZoneTradeContext {
 }
 
 pub struct ChartState {
-    zones: HashMap<String, ZoneTradeContext>,
+    /// Trade context per ticker (symbol).
+    contexts: HashMap<String, ZoneTradeContext>,
+    /// Which ticker each zone currently shows, so zone_id-based commands resolve
+    /// the symbol. Updated whenever the frontend loads or mutates a zone.
+    zone_symbol: HashMap<String, String>,
 }
 
 impl ChartState {
     pub fn new() -> Self {
-        Self { zones: HashMap::new() }
+        Self { contexts: HashMap::new(), zone_symbol: HashMap::new() }
     }
 
-    fn entry(&mut self, zone_id: &str, symbol: &str, strategy_id: &str) -> &mut ZoneTradeContext {
-        self.zones
-            .entry(zone_id.to_string())
+    fn entry(&mut self, symbol: &str, strategy_id: &str) -> &mut ZoneTradeContext {
+        self.contexts
+            .entry(symbol.to_string())
             .or_insert_with(|| ZoneTradeContext {
-                zone_id:     zone_id.to_string(),
+                zone_id:     symbol.to_string(),
                 symbol:      symbol.to_string(),
                 strategy_id: strategy_id.to_string(),
                 trade_id:    None,
@@ -43,23 +50,62 @@ impl ChartState {
     }
 
     fn gen_trade_id(symbol: &str, strategy_id: &str) -> String {
-        let ts    = Utc::now().format("%y%m%d%H%M%S").to_string();
+        let ts    = crate::time::now().format("%y%m%d%H%M%S").to_string();
         let strat = strategy_id.to_uppercase().replace('-', "_");
         format!("{}-{}-{}", ts, symbol.to_uppercase(), strat)
     }
 
-    pub fn get_context(&self, zone_id: &str) -> Option<ZoneTradeContext> {
-        self.zones.get(zone_id).cloned()
+    /// Record which ticker a zone currently shows (so zone_id lookups resolve it).
+    fn track_zone(&mut self, zone_id: &str, symbol: &str) {
+        self.zone_symbol.insert(zone_id.to_string(), symbol.to_string());
     }
 
-    /// Returns existing tradeID or generates a new one.
+    /// Context for a ticker (by symbol).
+    pub fn get_context(&self, symbol: &str) -> Option<ZoneTradeContext> {
+        self.contexts.get(symbol).cloned()
+    }
+
+    /// Snapshot of all per-ticker trade contexts, for persistence. The
+    /// `zone_symbol` map is intentionally excluded: it's per-session layout state
+    /// the frontend re-establishes via `load_zone_context` on load.
+    pub fn export_contexts(&self) -> Vec<ZoneTradeContext> {
+        self.contexts.values().cloned().collect()
+    }
+
+    /// Restore per-ticker trade contexts from a persisted snapshot (called once at
+    /// startup). Keyed by symbol so SL/TP/tradeID lines reappear on the chart for
+    /// an open multi-day trade after a restart.
+    pub fn import_contexts(&mut self, ctxs: Vec<ZoneTradeContext>) {
+        for c in ctxs {
+            self.contexts.insert(c.symbol.clone(), c);
+        }
+    }
+
+    /// Context of the ticker a zone currently shows (zone_id → symbol → context).
+    /// Used by the in-zone order / screenshot / close commands, which only carry a
+    /// zone_id. Returns None when the zone holds no (known) ticker yet.
+    pub fn get_context_for_zone(&self, zone_id: &str) -> Option<ZoneTradeContext> {
+        let symbol = self.zone_symbol.get(zone_id)?;
+        self.contexts.get(symbol).cloned()
+    }
+
+    /// Frontend load path: record the zone's current ticker, then return that
+    /// ticker's context. The context follows the ticker, so swapping a zone's
+    /// ticker shows the new ticker's own SL/TP (and coming back restores it).
+    pub fn load_zone_context(&mut self, zone_id: &str, symbol: &str) -> Option<ZoneTradeContext> {
+        self.track_zone(zone_id, symbol);
+        self.get_context(symbol)
+    }
+
+    /// Returns existing tradeID or generates a new one (per ticker).
     pub fn create_or_get_trade_id(
         &mut self,
         zone_id:     &str,
         symbol:      &str,
         strategy_id: &str,
     ) -> String {
-        let z = self.entry(zone_id, symbol, strategy_id);
+        self.track_zone(zone_id, symbol);
+        let z = self.entry(symbol, strategy_id);
         if z.trade_id.is_none() {
             z.trade_id = Some(Self::gen_trade_id(symbol, strategy_id));
         }
@@ -74,7 +120,8 @@ impl ChartState {
         strategy_id: &str,
         price:       Option<f64>,
     ) -> ZoneTradeContext {
-        let z = self.entry(zone_id, symbol, strategy_id);
+        self.track_zone(zone_id, symbol);
+        let z = self.entry(symbol, strategy_id);
         // A previously-closed trade: placing a fresh SL starts a NEW trade.
         if price.is_some() && z.closed {
             z.trade_id = None;
@@ -95,7 +142,8 @@ impl ChartState {
         strategy_id: &str,
         price:       Option<f64>,
     ) -> ZoneTradeContext {
-        let z = self.entry(zone_id, symbol, strategy_id);
+        self.track_zone(zone_id, symbol);
+        let z = self.entry(symbol, strategy_id);
         // A previously-closed trade: placing a fresh TP starts a NEW trade.
         if price.is_some() && z.closed {
             z.trade_id = None;
@@ -108,27 +156,28 @@ impl ChartState {
         z.clone()
     }
 
-    /// Called when a zone is released; removes its context.
+    /// Called when a zone is released: forget which ticker it showed. The ticker's
+    /// trade context is KEPT (it belongs to the ticker, not the zone).
     pub fn clear_zone(&mut self, zone_id: &str) {
-        self.zones.remove(zone_id);
+        self.zone_symbol.remove(zone_id);
     }
 
-    /// Called when a trade closes (position flat). Clears the owning zone's
-    /// SL/TP so the chart bracket lines disappear, but KEEPS the tradeID and
-    /// flags the zone as `closed` — the journal/screenshots can still be filled
-    /// in for the closed trade until a new SL or TP is placed (which then starts
-    /// a fresh trade). The zone keeps its symbol/strategy. Returns the zone_id.
+    /// Called when a trade closes (position flat). Clears the owning TICKER's
+    /// SL/TP so the chart bracket lines disappear, but KEEPS the tradeID and flags
+    /// the context `closed` — the journal/screenshots can still be filled in for
+    /// the closed trade until a new SL or TP is placed (which starts a fresh
+    /// trade). Returns the symbol whose trade was reset.
     pub fn reset_closed_trade(&mut self, trade_id: &str) -> Option<String> {
-        let zone_id = self
-            .zones
+        let symbol = self
+            .contexts
             .iter()
             .find(|(_, c)| c.trade_id.as_deref() == Some(trade_id))
-            .map(|(z, _)| z.clone())?;
-        if let Some(c) = self.zones.get_mut(&zone_id) {
+            .map(|(s, _)| s.clone())?;
+        if let Some(c) = self.contexts.get_mut(&symbol) {
             c.stop_loss   = None;
             c.take_profit = None;
             c.closed      = true;
         }
-        Some(zone_id)
+        Some(symbol)
     }
 }

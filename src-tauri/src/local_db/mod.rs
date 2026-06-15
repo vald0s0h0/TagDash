@@ -3,6 +3,7 @@
 // All writes on the live path are fire-and-forget via a tokio channel.
 
 pub mod alarm_repository;
+pub mod book_repository;
 pub mod bug_repository;
 pub mod cache_repository;
 pub mod company_meta_repository;

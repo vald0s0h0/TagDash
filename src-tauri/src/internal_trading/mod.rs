@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{
     Fill, InternalOrder, OrderStatus, OrderType, Position, RiskSizingResult,
@@ -35,7 +36,7 @@ fn excursions(side: Side, entry: f64, qty: f64, high: f64, low: f64) -> (f64, f6
 
 // ─── InternalBook ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct InternalBook {
     pub trades:    HashMap<String, Trade>,
     pub orders:    HashMap<String, InternalOrder>,
@@ -46,6 +47,54 @@ pub struct InternalBook {
 impl InternalBook {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A copy of the book bounded to the live working set, for persistence so an
+    /// open multi-day position and its resting orders reload identically after a
+    /// restart. What's kept:
+    ///   • all open positions;
+    ///   • trades that are still open (`closed_at` is None) — the engine's live
+    ///     trades plus any not-yet-filled entry;
+    ///   • fills and orders belonging to those open trades;
+    ///   • all `Pending` orders (live exits / resting entries).
+    /// What's dropped (and why it's safe):
+    ///   • cancelled orders — terminal, never acted on again, and the bracket
+    ///     churn from moving SL/TP lines would otherwise grow without bound;
+    ///   • closed trades and their fills/filled orders — once flat they serve no
+    ///     purpose for the live engine, and their executions, original SL and
+    ///     journal notes are already persisted in dedicated tables (`executions`,
+    ///     `trade_levels`, `journal_entries`). This bounds the snapshot to ~one
+    ///     working day of activity plus whatever stays open.
+    /// In-RAM state is untouched — pruning only shapes the persisted copy, so a
+    /// just-closed trade is still queryable until the next restart.
+    pub fn persistable_snapshot(&self) -> InternalBook {
+        use std::collections::HashSet;
+        let open_trades: HashSet<&str> = self.trades.values()
+            .filter(|t| t.closed_at.is_none())
+            .map(|t| t.trade_id.as_str())
+            .collect();
+
+        InternalBook {
+            positions: self.positions.clone(),
+            trades: self.trades.values()
+                .filter(|t| t.closed_at.is_none())
+                .map(|t| (t.trade_id.clone(), t.clone()))
+                .collect(),
+            fills: self.fills.iter()
+                .filter(|f| open_trades.contains(f.trade_id.as_str()))
+                .cloned()
+                .collect(),
+            orders: self.orders.iter()
+                .filter(|(_, o)| o.status != OrderStatus::Cancelled)
+                .filter(|(_, o)| {
+                    o.status == OrderStatus::Pending
+                        || o.trade_id.as_deref()
+                            .map(|t| open_trades.contains(t))
+                            .unwrap_or(false)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
     }
 
     // ── Risk sizing ───────────────────────────────────────────────────────────
@@ -75,7 +124,7 @@ impl InternalBook {
         take_profit: Option<f64>,
     ) -> InternalOrder {
         let order_id = gen_id();
-        let now      = Utc::now();
+        let now      = crate::time::now();
 
         // OCO indicator: both SL and TP configured
         let oco_group = if stop_loss.is_some() && take_profit.is_some() {
@@ -143,7 +192,7 @@ impl InternalBook {
     ) -> Fill {
         let order_id = gen_id();
         let fill_id  = gen_id();
-        let now      = Utc::now();
+        let now      = crate::time::now();
 
         let effective_tid = trade_id.clone().unwrap_or_else(|| {
             format!(
@@ -302,7 +351,7 @@ impl InternalBook {
         &mut self,
         prices: &HashMap<String, (f64, f64)>, // symbol -> (bid, ask)
     ) -> Vec<Fill> {
-        let now = Utc::now();
+        let now = crate::time::now();
         let mut to_fill: Vec<(String, InternalOrder, f64)> = vec![];
 
         for (oid, order) in &self.orders {
@@ -432,7 +481,7 @@ impl InternalBook {
             Side::Short => Side::Long,
         };
         let oco = format!("bracket-{}", pos.trade_id);
-        let now = Utc::now();
+        let now = crate::time::now();
         let trade_id = Some(pos.trade_id.clone());
 
         // SL → protective stop (market exit on trigger).
@@ -680,6 +729,48 @@ mod tests {
             .collect();
         assert_eq!(tp_orders.len(), 1, "expected resting TP after entry fill");
         assert_eq!(tp_orders[0].limit_price, Some(11.00), "TP must reflect dragged level");
+    }
+
+    // An open position + its resting bracket must survive a JSON round-trip (the
+    // persistence path) identically, while a fully-closed trade is pruned out.
+    #[test]
+    fn persistable_snapshot_round_trips_open_drops_closed() {
+        let mut book = InternalBook::new();
+
+        // Closed trade: enter then exit AAA → goes flat.
+        book.execute_market_fill(
+            Some("CLOSED".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, None, None,
+        );
+        book.close_position("AAA", 10.50, 10.52, "strat".into(), "z1".into());
+        assert!(book.positions.get("AAA").is_none());
+
+        // Open trade: enter BBB with SL/TP → live position + bracket orders.
+        book.execute_market_fill(
+            Some("OPEN".into()), "z2".into(), "BBB".into(), "strat".into(),
+            Side::Long, 50, 20.00, Some(19.00), Some(22.00),
+        );
+        book.sync_bracket_orders("BBB");
+
+        // Snapshot → JSON → back (what persistence does across a restart).
+        let snap = book.persistable_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: InternalBook = serde_json::from_str(&json).unwrap();
+
+        // Open position preserved identically.
+        let pos = restored.positions.get("BBB").expect("open position restored");
+        assert_eq!(pos.quantity, 50);
+        assert_eq!(pos.stop_loss, Some(19.00));
+        assert_eq!(pos.take_profit, Some(22.00));
+
+        // Open trade kept, closed trade pruned.
+        assert!(restored.trades.contains_key("OPEN"));
+        assert!(!restored.trades.contains_key("CLOSED"));
+
+        // Resting bracket exits (pending, reduce-only) restored; no cancelled churn.
+        let pending: Vec<_> = restored.get_pending_orders();
+        assert_eq!(pending.iter().filter(|o| o.reduce_only).count(), 2);
+        assert!(restored.orders.values().all(|o| o.status != OrderStatus::Cancelled));
     }
 
     // A long that runs up then comes back to be stopped should record both the

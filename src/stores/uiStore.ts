@@ -12,6 +12,10 @@ interface UiState {
   /** Symbols the user dismissed from the pre-open screener. Persisted per trading
    *  day (DB) so dismissals survive a restart and reset the next day. */
   dismissedScreener: string[];
+  /** Market Replay toolbar visibility (toggled from the LeftRail menu; the
+   *  toolbar only renders when this is on). */
+  replayOpen:        boolean;
+  toggleReplay:      () => void;
   setActiveSession:  (s: Session) => void;
   toggleLogs:        () => void;
   showModal:         (m: Modal) => void;
@@ -30,7 +34,9 @@ export const useUiStore = create<UiState>((set) => ({
   openModal:         "startup",
   selectedTicker:    null,
   dismissedScreener: [],
+  replayOpen:        false,
 
+  toggleReplay:      () => set((state) => ({ replayOpen: !state.replayOpen })),
   setActiveSession:  (s) => set({ activeSession: s }),
   toggleLogs:        () => set((state) => ({ logsOpen: !state.logsOpen })),
   showModal:         (m) => set({ openModal: m }),

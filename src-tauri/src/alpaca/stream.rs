@@ -328,6 +328,10 @@ async fn session(
                                     if let (Some(sym), Some(price)) = (m.symbol.as_deref(), m.price) {
                                         let event_time = parse_ts(m.timestamp.as_deref());
                                         ms.on_trade(sym, price, m.size.unwrap_or(0), event_time, now, warn_ms, critical_ms);
+                                        // Trade tape: fine-granularity record of the day so
+                                        // it can be replayed tick-by-tick later (fire-and-
+                                        // forget channel send — see replay::tape).
+                                        crate::replay::tape::record_trade(sym, price, m.size.unwrap_or(0), event_time);
                                         if focus.contains(sym) {
                                             ticks.insert(sym.to_string(), TickEvent {
                                                 symbol: sym.to_string(),
@@ -342,6 +346,8 @@ async fn session(
                                         (m.symbol.as_deref(), m.bid_price, m.ask_price)
                                     {
                                         ms.on_quote(sym, bid, ask, now);
+                                        let event_time = parse_ts(m.timestamp.as_deref());
+                                        crate::replay::tape::record_quote(sym, bid, ask, event_time);
                                     }
                                 }
                                 "b" => {

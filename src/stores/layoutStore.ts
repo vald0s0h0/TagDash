@@ -1,6 +1,9 @@
 import { create } from "zustand";
 import type { Session, AlertSignal, ZoneAssignment, LayoutTab } from "@/types";
 
+// Sentinel strategy_id for tickers opened manually via the spotlight search.
+export const MANUAL_STRATEGY_ID = "__manual__";
+
 const ZONES_PER_TAB: Record<Session, number> = {
   premarket:  1,
   pre_open:   1,
@@ -110,6 +113,10 @@ interface LayoutState {
   // pre-open chart panel rather than spawning new tabs.
   openInActiveZone: (alert: AlertSignal) => void;
 
+  // Manual ticker search (spotlight): open a symbol in the first empty zone of
+  // the session's active tab, else replace the active tab's first zone.
+  openTickerInZone: (symbol: string, session: Session) => void;
+
   // Release (Libérer button): clears the zone, auto-removes empty non-first tabs.
   releaseZone: (zone_id: string) => void;
 
@@ -190,6 +197,34 @@ export const useLayoutStore = create<LayoutState>((set) => ({
         tabs,
         activeTabId: { ...state.activeTabId, [session]: tab.tab_id },
       };
+    });
+  },
+
+  // ── openTickerInZone ──────────────────────────────────────────────────────
+  openTickerInZone(symbol, session) {
+    set((state) => {
+      const tabs    = deepCloneTabs(state.tabs);
+      const activeId = state.activeTabId[session];
+      const tab = tabs[session].find((t) => t.tab_id === activeId) ?? tabs[session][0];
+      if (!tab || tab.zones.length === 0) return {};
+      const content: ZoneContent = {
+        symbol,
+        alert_id:      `manual-${Date.now()}`,
+        strategy_id:   MANUAL_STRATEGY_ID,
+        strategy_name: "Recherche",
+        priority:      null,
+        reason:        null,
+        price:         null,
+        placed_at:     new Date().toISOString(),
+        llm_status:    null,
+        llm_summary:   null,
+        display_timeframe: "5m",
+        side:          null,
+      };
+      // First empty zone of the active tab, else its first zone.
+      const target = tab.zones.find((z) => z.symbol === null) ?? tab.zones[0];
+      applyContent(target, content);
+      return { tabs, activeTabId: { ...state.activeTabId, [session]: tab.tab_id } };
     });
   },
 

@@ -20,8 +20,10 @@ import type {
   Position,
   PrevDayLevels,
   PriceAlarm,
+  ReplayStatus,
   ScreenerMatch,
   SecretsStatus,
+  SplitMarker,
   StartupState,
   Strategy,
   StrategyCard,
@@ -109,6 +111,10 @@ export const api = {
   // Lazily back-fill older history (batch) as the user scrolls into the past.
   loadOlderBars: (symbol: string, timeframe: Timeframe, before: string, limit: number) =>
     invoke<Bar[]>("load_older_bars", { symbol, timeframe, before, limit }),
+  // Historical split-day markers (Alpaca corporate-actions, last 2y) for any
+  // daily chart — red dots on the split ex-dates.
+  getSplitMarkers: (symbol: string) =>
+    invoke<SplitMarker[]>("get_split_markers", { symbol }),
   // Previous trading day's reference levels (PDC/PDH/PDL) relative to today.
   getPreviousDayLevels: (symbol: string) =>
     invoke<PrevDayLevels | null>("get_previous_day_levels", { symbol }),
@@ -141,8 +147,8 @@ export const api = {
   stopScanner:     () => invoke<void>("stop_scanner"),
 
   // Chart / zone trade context
-  getZoneTradeContext: (zone_id: string) =>
-    invoke<ZoneTradeContext | null>("get_zone_trade_context", { zone_id }),
+  getZoneTradeContext: (zone_id: string, symbol: string) =>
+    invoke<ZoneTradeContext | null>("get_zone_trade_context", { zone_id, symbol }),
   createOrGetTradeIdForZone: (zone_id: string, symbol: string, strategy_id: string) =>
     invoke<string>("create_or_get_trade_id_for_zone", { zone_id, symbol, strategy_id }),
   updateZoneSl: (zone_id: string, symbol: string, strategy_id: string, price: number | null) =>
@@ -177,6 +183,26 @@ export const api = {
     invoke<void>("create_drawing", { drawing }),
   getDrawingsForSymbol: (symbol: string) =>
     invoke<ChartDrawing[]>("get_drawings_for_symbol", { symbol }),
+  updateDrawing: (drawing: ChartDrawing) =>
+    invoke<void>("update_drawing", { drawing }),
   deleteDrawing: (id: string) =>
     invoke<void>("delete_drawing", { id }),
+  updateAlarmPrice: (id: string, price: number) =>
+    invoke<void>("update_alarm_price", { id, price }),
+
+  // Market Replay
+  replayStart: (day: string, start_hm: string) =>
+    invoke<void>("replay_start", { day, start_hm }),
+  replayStop:       () => invoke<void>("replay_stop"),
+  replaySetPlaying: (playing: boolean) =>
+    invoke<void>("replay_set_playing", { playing }),
+  replaySetSpeed:   (speed: number) =>
+    invoke<void>("replay_set_speed", { speed }),
+  replaySeekRelative: (delta_secs: number) =>
+    invoke<void>("replay_seek_relative", { delta_secs }),
+  replaySeekClock: (hm: string) =>
+    invoke<void>("replay_seek_clock", { hm }),
+  replayNextAlert: () => invoke<void>("replay_next_alert"),
+  replayNextDay:   () => invoke<void>("replay_next_day"),
+  getReplayStatus: () => invoke<ReplayStatus>("get_replay_status"),
 };

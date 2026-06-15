@@ -83,6 +83,16 @@ pub fn mark_triggered(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move an existing alarm to a new price (chart-drag). Re-arms it (clears any
+/// previous trigger) since the level changed.
+pub fn update_price(conn: &Connection, id: &str, price: f64) -> Result<()> {
+    conn.execute(
+        "UPDATE price_alarms SET price=?2, triggered_at=NULL WHERE id=?1",
+        params![id, price],
+    )?;
+    Ok(())
+}
+
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM price_alarms WHERE id=?1", params![id])?;
     Ok(())
