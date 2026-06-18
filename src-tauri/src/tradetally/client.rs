@@ -128,27 +128,91 @@ impl TtClient {
         self.handle_resp(resp).await
     }
 
-    /// Upload a screenshot to a trade's image gallery.
-    /// The TradeTally /images route needs a logged-in session (the API token is
-    /// rejected there), so this logs in with email/password to obtain a JWT,
-    /// then POSTs the PNG as multipart field `images` (matches the server's
-    /// `upload.array('images', 10)`). `image_endpoint` is already {TT_ID}-resolved.
-    pub async fn upload_images_session(&self, image_endpoint: &str, file_path: &str) -> Result<(), String> {
+    /// GET a JSON resource (Bearer token). Used by the dashboard to page through
+    /// `/api/v1/trades`. In mock mode returns an empty payload so the sync is a no-op.
+    pub async fn get_json(&self, endpoint: &str) -> Result<Value, String> {
         if self.mock_mode {
-            if self.mock_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(self.mock_delay_ms)).await;
-            }
-            return if self.mock_fail { Err("mock: forced failure".into()) } else { Ok(()) };
+            return Ok(json!({ "trades": [] }));
+        }
+        let resp = self.inner
+            .get(self.url(endpoint))
+            .header("Authorization", self.auth_header())
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        self.handle_resp(resp).await
+    }
+
+    /// Create or update today's diary entry (`POST /api/diary`). That route sits
+    /// behind the session `authenticate` middleware (not the flexible API-key auth
+    /// the v1 trade routes use), so the API token may be rejected: try it first,
+    /// then fall back to a session-login JWT (email/password) on 401/403.
+    pub async fn create_diary_entry(
+        &self,
+        entry_date: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        if self.mock_mode {
+            return self.mock_response().await.map(|_| ());
+        }
+        let endpoint = "/api/diary";
+        let body = json!({
+            "entryDate": entry_date,
+            "title":     title,
+            "content":   content,
+            "entryType": "diary",
+        });
+
+        // 1) Try the API token.
+        let resp = self.inner
+            .post(self.url(endpoint))
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status.as_u16() != 401 && status.as_u16() != 403 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("diary HTTP {status}: {}", &text[..text.len().min(200)]));
         }
 
+        // 2) Token refused → session login, retry with the JWT.
+        let jwt = self.login_jwt().await?;
+        let resp = self.inner
+            .post(self.url(endpoint))
+            .header("Authorization", format!("Bearer {jwt}"))
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("diary (session) HTTP {status}: {}", &text[..text.len().min(200)]));
+        }
+        Ok(())
+    }
+
+    /// Log in with the stored email/password and return a JWT. Shared by the
+    /// diary POST and the screenshot upload (both behind session auth).
+    async fn login_jwt(&self) -> Result<String, String> {
         let (email, password) = match (self.email.as_deref(), self.password.as_deref()) {
             (Some(e), Some(p)) if !e.is_empty() && !p.is_empty() => (e, p),
             _ => return Err(
                 "TradeTally session credentials not set (tradetally_email / tradetally_password)".into()
             ),
         };
-
-        // 1) Log in to obtain a JWT (top-level `token` field).
         let login = self.inner
             .post(format!("{}/api/auth/login", self.base_url))
             .header("Content-Type", "application/json")
@@ -163,13 +227,30 @@ impl TtClient {
             return Err(format!("login HTTP {login_status}: {}", &login_text[..login_text.len().min(160)]));
         }
         let lj: Value = serde_json::from_str(&login_text).map_err(|e| format!("login JSON: {e}"))?;
-        let jwt = lj.get("token").and_then(|v| v.as_str()).ok_or_else(|| {
+        lj.get("token").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| {
             if lj.get("requires2FA").and_then(|v| v.as_bool()).unwrap_or(false) {
-                "TradeTally login requires 2FA — screenshot upload not supported".to_string()
+                "TradeTally login requires 2FA — session actions not supported".to_string()
             } else {
                 "TradeTally login returned no token".to_string()
             }
-        })?;
+        })
+    }
+
+    /// Upload a screenshot to a trade's image gallery.
+    /// The TradeTally /images route needs a logged-in session (the API token is
+    /// rejected there), so this logs in with email/password to obtain a JWT,
+    /// then POSTs the PNG as multipart field `images` (matches the server's
+    /// `upload.array('images', 10)`). `image_endpoint` is already {TT_ID}-resolved.
+    pub async fn upload_images_session(&self, image_endpoint: &str, file_path: &str) -> Result<(), String> {
+        if self.mock_mode {
+            if self.mock_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.mock_delay_ms)).await;
+            }
+            return if self.mock_fail { Err("mock: forced failure".into()) } else { Ok(()) };
+        }
+
+        // 1) Log in to obtain a JWT (top-level `token` field).
+        let jwt = self.login_jwt().await?;
 
         // 2) Upload the PNG (multipart field `images`).
         let bytes = std::fs::read(file_path).map_err(|e| format!("read screenshot: {e}"))?;

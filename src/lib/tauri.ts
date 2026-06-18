@@ -10,6 +10,8 @@ import type {
   CardInfo,
   CardNews,
   ChartDrawing,
+  DailyBackground,
+  DashboardTrade,
   FeedDiagnostics,
   Fill,
   InternalOrder,
@@ -40,6 +42,14 @@ import type {
 export const api = {
   // Status
   getAppStatus: () => invoke<AppStatus>("get_app_status"),
+
+  // Dashboard (moodboard)
+  syncTradetallyTrades:  () => invoke<number>("sync_tradetally_trades"),
+  getDashboardTrades:    () => invoke<DashboardTrade[]>("get_dashboard_trades"),
+  saveDiaryEntry:        (title: string, content: string) =>
+    invoke<void>("save_diary_entry", { title, content }),
+  getDailyBackground:    () => invoke<DailyBackground>("get_daily_background"),
+  openBackgroundsFolder: () => invoke<void>("open_backgrounds_folder"),
 
   // Config
   getLocalConfig:    () => invoke<AppConfig>("get_local_config"),

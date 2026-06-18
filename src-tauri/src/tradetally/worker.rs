@@ -141,6 +141,15 @@ async fn dispatch(
             client.put_json(endpoint, &payload).await?;
             Ok(None)
         }
+        // Diary card: create-or-update today's TradeTally diary entry. Token-first
+        // with a session-login fallback (the /api/diary route uses session auth).
+        "diary_entry" => {
+            let entry_date = payload.get("entryDate").and_then(|v| v.as_str()).unwrap_or_default();
+            let title      = payload.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+            let content    = payload.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            client.create_diary_entry(entry_date, title, content).await?;
+            Ok(None)
+        }
         // Screenshot: read the local PNG and upload it via a session login
         // (multipart) to /api/trades/{id}/images.
         "chart_updated" => {

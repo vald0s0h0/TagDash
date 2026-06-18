@@ -4,7 +4,15 @@ import { api } from "@/lib/tauri";
 
 type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | null;
 
+/** Top-level view: the trading workspace (sessions + charts + sidebar) vs the
+ *  standalone KPI dashboard (moodboard, no sidebar). */
+export type View = "trading" | "dashboard";
+
 interface UiState {
+  /** Which top-level view is shown. The dashboard (Moon, first in the rail) hides
+   *  the sidebar; the session tabs switch back to the trading workspace. */
+  activeView:        View;
+  setActiveView:     (v: View) => void;
   activeSession:     Session;
   logsOpen:          boolean;
   openModal:         Modal;
@@ -27,6 +35,10 @@ interface UiState {
 }
 
 export const useUiStore = create<UiState>((set) => ({
+  // Default to the trading workspace so the startup pipeline / scanner flow is
+  // unchanged; the Moon dashboard is opt-in (first button in the rail).
+  activeView:        "trading",
+  setActiveView:     (v) => set({ activeView: v }),
   // Start on the premarket tab (where the trading session begins) and surface the
   // startup pipeline modal so launch progress is visible right away.
   activeSession:     "premarket",

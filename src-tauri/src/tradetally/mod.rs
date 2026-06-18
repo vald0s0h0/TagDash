@@ -276,6 +276,23 @@ pub fn enqueue_note_updated(
     enqueue_event(conn, "note_updated", trade_id, symbol, V1_UPDATE, payload);
 }
 
+/// Journal/diary card → create-or-update today's TradeTally diary entry. Not tied
+/// to a trade (uses the `/api/diary` route, `createOrUpdateEntry`). Routed through
+/// the same resilient queue as trade events so a transient failure just retries.
+pub fn enqueue_diary_entry(
+    conn:       &Connection,
+    entry_date: &str,
+    title:      &str,
+    content:    &str,
+) {
+    let payload = json!({
+        "entryDate": entry_date,
+        "title":     title,
+        "content":   content,
+    });
+    enqueue_event(conn, "diary_entry", "diary", "diary", "/api/diary", payload);
+}
+
 /// Screenshot captured → upload it to the trade's image gallery. Only the local
 /// file path is queued; the worker logs in (session) and POSTs the PNG at send
 /// time. Uses the non-v1 /images route (the only image-upload endpoint).

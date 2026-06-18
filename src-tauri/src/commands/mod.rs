@@ -15,9 +15,9 @@ use crate::config::secrets::{Secrets, SecretsStatus};
 use crate::internal_trading::InternalBook;
 use crate::local_db::{
     alarm_repository, book_repository, bug_repository, cache_repository, company_meta_repository,
-    drawing_repository, execution_repository, get_recent_logs, journal_repository,
-    universe_repository, BugReport, JournalEntry, LocalLogEntry, PriceAlarm, SyncQueueStatus,
-    tradetally_queue_repository,
+    dashboard_repository, drawing_repository, execution_repository, get_recent_logs,
+    journal_repository, universe_repository, BugReport, JournalEntry, LocalLogEntry, PriceAlarm,
+    SyncQueueStatus, tradetally_queue_repository,
 };
 use crate::local_db::drawing_repository::Drawing;
 use crate::market_state::{
@@ -2021,4 +2021,85 @@ pub fn get_tickers_table(
     let query = query.unwrap_or_default();
     let limit = limit.unwrap_or(200);
     crate::company_intel::tickers_table(&state.db, &state.market, &query, limit)
+}
+
+// ─── Dashboard (moodboard) ────────────────────────────────────────────────────
+
+/// Re-sync the user's trades from TradeTally (source of truth) into the local
+/// `tt_trades` cache. Called every time the dashboard tab opens, and on demand via
+/// the Refresh button. Returns the number of trades upserted.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn sync_tradetally_trades(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    // Build the TradeTally client the same way the background worker does.
+    let (base_url, token, mock_mode, mock_fail, mock_delay, tt_email, tt_password) = {
+        let cfg = state.config.read().unwrap();
+        let sec = state.secrets.read().unwrap();
+        (
+            cfg.tradetally.api_base_url.clone(),
+            sec.tradetally_token.clone().unwrap_or_default(),
+            cfg.tradetally.mock_mode,
+            cfg.tradetally.mock_fail,
+            cfg.tradetally.mock_delay_ms,
+            sec.tradetally_email.clone(),
+            sec.tradetally_password.clone(),
+        )
+    };
+    if token.is_empty() && !mock_mode {
+        return Err("TradeTally token not set".into());
+    }
+
+    let client = tradetally::TtClient::new(base_url, token, mock_mode)
+        .with_mock_options(mock_fail, mock_delay)
+        .with_session_creds(tt_email, tt_password);
+
+    // Network fetch happens with no DB lock held.
+    let trades = crate::dashboard::sync_trades(&client).await?;
+
+    let count = {
+        let mut guard = state.db.lock().unwrap();
+        let n = dashboard_repository::upsert_trades_bulk(&mut guard, &trades)
+            .map_err(|e| e.to_string())?;
+        let _ = cache_repository::set_app_meta(&guard, "tt_trades_synced_at", &Utc::now().to_rfc3339());
+        n
+    };
+    Ok(count)
+}
+
+/// Cached trades for the dashboard KPI cards (oldest first). The frontend derives
+/// profit factor, PnL curve, etc. from these.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_dashboard_trades(state: tauri::State<'_, AppState>) -> Vec<crate::dashboard::DashboardTrade> {
+    let conn = state.db.lock().unwrap();
+    dashboard_repository::get_all_trades(&conn).unwrap_or_default()
+}
+
+/// Journal/diary card → create-or-update today's TradeTally diary entry. Enqueued
+/// on the resilient sync queue (drained by the background worker) and mirrored
+/// locally. `entry_date` is today's ET calendar day.
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_diary_entry(
+    title:   String,
+    content: String,
+    state:   tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let entry_date = crate::time::et_date(crate::time::now());
+    let id = format!("{}-{}", entry_date, Utc::now().timestamp_millis());
+    let conn = state.db.lock().unwrap();
+    tradetally::enqueue_diary_entry(&conn, &entry_date, &title, &content);
+    dashboard_repository::insert_diary_local(&conn, &id, &entry_date, &title, &content)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Today's background image (deterministic per ET day) from the user's photo
+/// folder, plus the folder path so the UI can show / open it.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_daily_background(state: tauri::State<'_, AppState>) -> crate::dashboard::DailyBackground {
+    crate::dashboard::pick_daily_background(&state.app_dir)
+}
+
+/// Open the backgrounds folder in the OS file manager.
+#[tauri::command(rename_all = "snake_case")]
+pub fn open_backgrounds_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::dashboard::open_folder(&state.app_dir.join("backgrounds"))
 }

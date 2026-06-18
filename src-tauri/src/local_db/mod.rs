@@ -8,6 +8,7 @@ pub mod bug_repository;
 pub mod cache_repository;
 pub mod company_intel_repository;
 pub mod company_meta_repository;
+pub mod dashboard_repository;
 pub mod drawing_repository;
 pub mod execution_repository;
 pub mod journal_repository;

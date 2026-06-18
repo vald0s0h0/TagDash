@@ -24,6 +24,11 @@
     --input: 240 6% 90%;
     --ring: 240 5% 65%;
     --radius: 0.5rem;
+    --chart-1: 12 76% 61%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
   }
 
   .dark {
@@ -46,6 +51,11 @@
     --border: 240 4% 16%;
     --input: 240 4% 16%;
     --ring: 240 5% 65%;
+    --chart-1: 220 70% 50%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
   }
 
   * {
@@ -92,4 +102,17 @@
   *::-webkit-scrollbar-button {
     display: none;
   }
+}
+
+/* ─── Dashboard (moodboard) glass cards ──────────────────────────────────────
+   Frosted-glass effect for the KPI dashboard cards ONLY (over the daily photo
+   background). Adapted from css.glass to the shadcn dark theme: a low-alpha white
+   tint + 1px hairline + blur. Not used anywhere else in the app. */
+.glass-card {
+  background: hsl(0 0% 100% / 0.05);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid hsl(0 0% 100% / 0.11);
 }

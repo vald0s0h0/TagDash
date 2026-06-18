@@ -177,6 +177,39 @@ export interface StrategyCard {
   enrichments: EnrichmentSpec[];
 }
 
+// ─── Dashboard (moodboard) ────────────────────────────────────────────────────
+
+/** One trade mirrored from TradeTally (mirrors DashboardTrade in dashboard/mod.rs).
+ *  `raw` is the full upstream object so future cards can read un-mapped fields. */
+export interface DashboardTrade {
+  tt_id:       string;
+  symbol:      string | null;
+  side:        string | null;
+  quantity:    number | null;
+  entry_price: number | null;
+  exit_price:  number | null;
+  pnl:         number | null;
+  pnl_percent: number | null;
+  entry_date:  string | null;
+  exit_date:   string | null;
+  commission:  number | null;
+  fees:        number | null;
+  status:      string | null;
+  setup:       string | null;
+  strategy:    string | null;
+  broker:      string | null;
+  tags:        string[];
+  raw:         unknown;
+}
+
+/** The daily background photo + its folder (mirrors DailyBackground in
+ *  dashboard/mod.rs). `data_url` is null when the folder has no images. */
+export interface DailyBackground {
+  dir:       string;
+  file_name: string | null;
+  data_url:  string | null;
+}
+
 export interface Trade {
   trade_id: string;
   symbol: string;

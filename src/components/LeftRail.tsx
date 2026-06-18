@@ -3,6 +3,7 @@ import {
   Bug,
   CircleDot,
   History,
+  Moon,
   MoreVertical,
   Newspaper,
   Play,
@@ -42,6 +43,8 @@ const TABS: { id: Session; label: string; icon: typeof Sun }[] = [
 export function LeftRail() {
   const active     = useUiStore((s) => s.activeSession);
   const setActive  = useUiStore((s) => s.setActiveSession);
+  const activeView    = useUiStore((s) => s.activeView);
+  const setActiveView = useUiStore((s) => s.setActiveView);
   const toggleLogs = useUiStore((s) => s.toggleLogs);
   const toggleReplay = useUiStore((s) => s.toggleReplay);
   const showModal  = useUiStore((s) => s.showModal);
@@ -59,15 +62,30 @@ export function LeftRail() {
   return (
     <>
       <aside className="flex h-full w-14 flex-col items-center justify-between border-r border-border bg-card py-3">
-        {/* Session tabs */}
+        {/* Tabs: Dashboard (Moon, first) + trading sessions */}
         <div className="flex flex-col items-center gap-2">
+          {/* Dashboard — standalone KPI moodboard (no sidebar). */}
+          <button
+            onClick={() => setActiveView("dashboard")}
+            title="Dashboard"
+            className={cn(
+              "flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
+              activeView === "dashboard" && "bg-accent text-foreground"
+            )}
+          >
+            <Moon className="h-5 w-5" />
+          </button>
+
           {TABS.map((tab) => {
             const Icon     = tab.icon;
-            const isActive = active === tab.id;
+            const isActive = activeView === "trading" && active === tab.id;
             return (
               <button
                 key={tab.id}
-                onClick={() => setActive(tab.id)}
+                onClick={() => {
+                  setActive(tab.id);
+                  setActiveView("trading");
+                }}
                 title={tab.label}
                 className={cn(
                   "flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",

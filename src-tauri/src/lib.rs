@@ -4,6 +4,7 @@ pub mod chart_payloads;
 pub mod commands;
 pub mod company_intel;
 pub mod config;
+pub mod dashboard;
 pub mod enrichment;
 pub mod fmp;
 pub mod internal_trading;
@@ -397,6 +398,12 @@ pub fn run() {
             commands::get_company_intel,
             commands::refresh_company_intel,
             commands::get_tickers_table,
+            // Dashboard (moodboard)
+            commands::sync_tradetally_trades,
+            commands::get_dashboard_trades,
+            commands::save_diary_entry,
+            commands::get_daily_background,
+            commands::open_backgrounds_folder,
             // Chart / trade context
             commands::get_zone_trade_context,
             commands::create_or_get_trade_id_for_zone,

@@ -395,6 +395,45 @@ CREATE TABLE IF NOT EXISTS company_filings (
 );
 CREATE INDEX IF NOT EXISTS idx_company_filings_symbol ON company_filings(symbol, filing_date DESC);
 CREATE INDEX IF NOT EXISTS idx_company_filings_category ON company_filings(symbol, category);
+
+-- ─── Dashboard (moodboard) ───────────────────────────────────────────────────
+-- Local mirror of the user's TradeTally trades, refreshed from the API every time
+-- the dashboard tab opens. TradeTally is the source of truth — this table is only
+-- a cache that feeds the KPI cards (profit factor, PnL curve, …). `raw_json` keeps
+-- the full upstream object so new cards can read fields we don't column-map yet.
+CREATE TABLE IF NOT EXISTS tt_trades (
+    tt_id       TEXT PRIMARY KEY NOT NULL,
+    symbol      TEXT,
+    side        TEXT,
+    quantity    REAL,
+    entry_price REAL,
+    exit_price  REAL,
+    pnl         REAL,
+    pnl_percent REAL,
+    entry_date  TEXT,
+    exit_date   TEXT,
+    commission  REAL,
+    fees        REAL,
+    status      TEXT,
+    setup       TEXT,
+    strategy    TEXT,
+    broker      TEXT,
+    tags_json   TEXT NOT NULL DEFAULT '[]',
+    raw_json    TEXT NOT NULL DEFAULT '{}',
+    synced_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tt_trades_exit ON tt_trades(exit_date);
+
+-- Local copy of diary (journal) entries sent to TradeTally from the dashboard's
+-- Journal card. Mirror only — the authoritative entry lives in TradeTally
+-- (POST /api/diary, create-or-update per ET day). Kept for a future history view.
+CREATE TABLE IF NOT EXISTS diary_entries_local (
+    id         TEXT PRIMARY KEY NOT NULL,
+    entry_date TEXT NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    content    TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;
 
 /// Idempotent column additions for DBs created before the column existed.

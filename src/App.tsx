@@ -6,6 +6,7 @@ import { MainWindow } from "@/components/MainWindow";
 import { LogsPanel } from "@/components/LogsPanel";
 import { ReplayToolbar } from "@/components/ReplayToolbar";
 import { TickerSpotlight } from "@/components/TickerSpotlight";
+import { Dashboard } from "@/components/dashboard/Dashboard";
 import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertNotifications } from "@/queries/useAlertNotifications";
@@ -14,6 +15,7 @@ import { api } from "@/lib/tauri";
 
 export default function App() {
   const logsOpen = useUiStore((s) => s.logsOpen);
+  const activeView = useUiStore((s) => s.activeView);
   const setDismissedScreener = useUiStore((s) => s.setDismissedScreener);
 
   // App-level OS notifications on every new scanner alert (opt-in in Settings).
@@ -61,13 +63,20 @@ export default function App() {
       <TitleBar />
       <div className="flex flex-1 overflow-hidden">
         <LeftRail />
-        <Sidebar />
-        <div className="flex flex-1 flex-col overflow-hidden">
-          {/* Market Replay transport bar — rendered only when activated (menu). */}
-          <ReplayToolbar />
-          <MainWindow />
-          {logsOpen && <LogsPanel />}
-        </div>
+        {activeView === "dashboard" ? (
+          // KPI moodboard — full-bleed, no sidebar.
+          <Dashboard />
+        ) : (
+          <>
+            <Sidebar />
+            <div className="flex flex-1 flex-col overflow-hidden">
+              {/* Market Replay transport bar — rendered only when activated (menu). */}
+              <ReplayToolbar />
+              <MainWindow />
+              {logsOpen && <LogsPanel />}
+            </div>
+          </>
+        )}
         <TickerSpotlight />
       </div>
     </div>
