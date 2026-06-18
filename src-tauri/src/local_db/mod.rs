@@ -6,6 +6,7 @@ pub mod alarm_repository;
 pub mod book_repository;
 pub mod bug_repository;
 pub mod cache_repository;
+pub mod company_intel_repository;
 pub mod company_meta_repository;
 pub mod drawing_repository;
 pub mod execution_repository;

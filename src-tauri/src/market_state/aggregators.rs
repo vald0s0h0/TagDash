@@ -117,8 +117,15 @@ impl CandleAggregator {
         prints: u64,
         trade_time: DateTime<Utc>,
     ) -> Option<Bar> {
-        let bar_secs  = self.timeframe.seconds();
-        let bar_start = bucket_start(trade_time, bar_secs);
+        // Intraday frames bucket on fixed UTC-second boundaries; the daily frame
+        // buckets on the NY TRADING DAY (00:00 ET in UTC) so each candle lands on
+        // the correct Eastern date — UTC-midnight bucketing would stamp a session
+        // one calendar day early (the "Sunday bar for Monday" bug).
+        let bar_start = if self.timeframe == Timeframe::Daily {
+            crate::time::et_midnight_utc(trade_time)
+        } else {
+            bucket_start(trade_time, self.timeframe.seconds())
+        };
 
         match self.bar_open_time {
             None => {

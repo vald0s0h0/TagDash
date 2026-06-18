@@ -4,13 +4,14 @@ import { useQuery } from "@tanstack/react-query";
 import { useUiStore } from "@/stores/uiStore";
 import { useActiveAlerts, useScreenerMatches, useStartScanner } from "@/queries/useScanner";
 import { useLayoutStore } from "@/stores/layoutStore";
+import { useAlertStatusStore } from "@/stores/alertStatusStore";
 import { ScannerAlerts } from "@/components/ScannerAlerts";
 import { ScreenerPanel } from "@/components/ScreenerPanel";
 import { PositionsPanel } from "@/components/PositionsPanel";
 import { OrdersPanel } from "@/components/OrdersPanel";
 import { AlarmsPanel } from "@/components/AlarmsPanel";
 import { api } from "@/lib/tauri";
-import type { AlertSignal } from "@/types";
+import type { AlertSignal, Session } from "@/types";
 
 function SectionHeader({
   icon: Icon,
@@ -42,6 +43,12 @@ export function Sidebar() {
   const alertsQuery  = useActiveAlerts();
   const alerts       = alertsQuery.data ?? [];
   const placeAlert   = useLayoutStore((s) => s.placeAlert);
+  const setSelectedTicker = useUiStore((s) => s.setSelectedTicker);
+  // Symbol shown in the active session's (single) chart — drives the release →
+  // open-next behaviour below.
+  const activeZoneSymbol = useLayoutStore(
+    (s) => s.tabs[active][0]?.zones[0]?.symbol ?? null,
+  );
 
   const isPreOpen     = active === "pre_open";
   const screenerQuery = useScreenerMatches();
@@ -86,6 +93,28 @@ export function Sidebar() {
       }
     }
   }, [alerts, placeAlert]);
+
+  // On release: when the active session's chart goes from a ticker to empty (a
+  // non-null → null transition of the SAME session's zone = a Libérer), land on
+  // the most recent still-pending (not released) alert of that session — so the
+  // chart never sits empty while other tickers wait.
+  const prevZoneRef = useRef<{ session: Session; symbol: string | null }>({
+    session: active,
+    symbol:  activeZoneSymbol,
+  });
+  useEffect(() => {
+    const prev = prevZoneRef.current;
+    prevZoneRef.current = { session: active, symbol: activeZoneSymbol };
+    if (prev.session !== active || prev.symbol == null || activeZoneSymbol != null) return;
+    const released = useAlertStatusStore.getState().released;
+    const next = alerts
+      .filter((a) => a.session === active && !released.has(a.symbol))
+      .sort((x, y) => new Date(y.timestamp).getTime() - new Date(x.timestamp).getTime())[0];
+    if (next) {
+      setSelectedTicker(next.symbol);
+      placeAlert(next);
+    }
+  }, [activeZoneSymbol, active, alerts, placeAlert, setSelectedTicker]);
 
   // Filter displayed alerts by currently active session tab
   const sessionAlerts = alerts.filter((a) => a.session === active);

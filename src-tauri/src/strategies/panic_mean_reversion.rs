@@ -93,6 +93,7 @@ impl ScanStrategy for PanicMeanReversion {
                         period: Some(20),
                     }],
                     interactive: false,
+                    column:      None,
                 },
                 // Right — 5-minute execution view; this is the tradeable pane.
                 PaneSpec {
@@ -105,6 +106,7 @@ impl ScanStrategy for PanicMeanReversion {
                         PaneIndicator { kind: IndicatorKind::PreviousLow,   period: None },
                     ],
                     interactive: true,
+                    column:      None,
                 },
             ],
             // Strategy-specific overlay fields (top-left on the left pane): best

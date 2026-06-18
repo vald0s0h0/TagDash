@@ -87,6 +87,7 @@ impl ScanStrategy for PerfectPullback {
                         PaneIndicator { kind: IndicatorKind::Volume, period: None },
                     ],
                     interactive: false,
+                    column:      None,
                 },
                 PaneSpec {
                     timeframe:   "1m".into(),
@@ -97,6 +98,7 @@ impl ScanStrategy for PerfectPullback {
                         PaneIndicator { kind: IndicatorKind::Volume, period: None },
                     ],
                     interactive: true,
+                    column:      None,
                 },
             ],
             // Live-sourced info band (no enrichment/LLM for this strategy).

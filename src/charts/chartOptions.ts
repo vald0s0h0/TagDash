@@ -17,8 +17,10 @@ export const TF_SECONDS: Record<Timeframe, number> = {
 // the first loaded bar (logical index). Generous so older history is fetched a bit
 // BEFORE the user actually scrolls onto the blank, avoiding a visible gap.
 export const BACKFILL_THRESHOLD = 100;
-// Bars to fetch per Alpaca call when back-filling (its practical per-request cap).
-export const BACKFILL_BATCH = 500;
+// Older bars pulled per back-fill step (one Alpaca call per trigger). The chart's
+// visible-range handler re-fires as the user keeps scrolling left, so history grows
+// in steps of this size — the official lightweight-charts "infinite history" pattern.
+export const BACKFILL_BATCH = 300;
 
 // SL/TP lines render solid while they are just planned levels, and switch to a
 // dotted, lower-opacity "order" style once a position is open (the levels have

@@ -45,6 +45,23 @@ CREATE TABLE IF NOT EXISTS fundamentals_cache (
     change_4d_pct    REAL,
     change_5d_pct    REAL,
     change_6d_pct    REAL,
+    -- Behavioural scores computed once at startup over the daily cache, stored as a
+    -- raw metric + a DB-wide percentile rank (0..100, 100 = worst). See
+    -- `cache_repository::recompute_pump_dump_scores` / `recompute_dilution_scores`.
+    pump_dump_raw    REAL,   -- mean(wick/ATR) × (1 + big-wick frequency)
+    pump_dump_score  REAL,   -- percentile rank of pump_dump_raw (100 = most pump&dump)
+    dilution_pct_12m REAL,   -- split-adjusted shares-outstanding change over ~12 months
+    dilution_score   REAL,   -- percentile rank of dilution_pct_12m (100 = most dilutive)
+    shares_outstanding_12m REAL,  -- split-adjusted shares ~12 months ago (transparency)
+    -- Absolute per-ticker risk scores (0..100, computed from already-collected
+    -- SEC filings / financials / short interest; NULL = inputs not collected).
+    dilution_capacity_score REAL,  -- legal/filing readiness to dilute fast (SEC shelf/forms/flags)
+    dilution_need_score     REAL,  -- apparent need for cash (losses, burn, runway)
+    short_interest_score    REAL,  -- short crowding / squeeze fuel (short%float + days-to-cover)
+    -- Most recent split (rolled up from `ticker_splits`) + count over the last year.
+    last_split_date  TEXT,
+    last_split_label TEXT,
+    split_count_1y   INTEGER,
     updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -267,6 +284,117 @@ CREATE TABLE IF NOT EXISTS screener_dismissals (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (symbol, day)
 );
+
+-- Historical shares-outstanding snapshots per ticker (SEC XBRL frames, bulk:
+-- dei:EntityCommonStockSharesOutstanding). Decoupled evidence feeding the rolled-up
+-- dilution metrics in `fundamentals_cache`. One row per (symbol, period_end).
+CREATE TABLE IF NOT EXISTS dilution_snapshots (
+    symbol             TEXT NOT NULL,
+    period_end         TEXT NOT NULL,    -- YYYY-MM-DD of the XBRL instant frame
+    shares_outstanding REAL NOT NULL,    -- as-reported (NOT split-adjusted)
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, period_end)
+);
+CREATE INDEX IF NOT EXISTS idx_dilution_snapshots_symbol ON dilution_snapshots(symbol, period_end DESC);
+
+-- Stock split events per ticker (Alpaca corporate-actions, bulk). Feeds the
+-- rolled-up split columns in `fundamentals_cache` and the split-neutralisation of
+-- the dilution score. One row per (symbol, ex_date).
+CREATE TABLE IF NOT EXISTS ticker_splits (
+    symbol      TEXT NOT NULL,
+    ex_date     TEXT NOT NULL,           -- YYYY-MM-DD
+    label       TEXT,                    -- "x4" forward, "1:10" reverse
+    from_factor REAL,                    -- old_rate
+    to_factor   REAL,                    -- new_rate (split factor = to/from)
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, ex_date)
+);
+CREATE INDEX IF NOT EXISTS idx_ticker_splits_symbol ON ticker_splits(symbol, ex_date DESC);
+
+-- ─── Company intelligence ────────────────────────────────────────────────────
+-- Normalized "company intelligence" per ticker, collected by the isolated
+-- `crate::company_intel` job (SEC EDGAR / Massive / FMP). This is PURELY ADDITIVE
+-- data — it never touches float / fundamentals (those live in fundamentals_cache
+-- and universe_assets and are owned by the startup pipeline).
+--
+-- Each logical section (short interest, financial health, dilution, ownership)
+-- carries its OWN source label + updated_at marker, so a partial collection (one
+-- provider down) only refreshes the sections it could reach and the rest keeps the
+-- last good value. `last_updated_at` is the overall cache marker used for TTL.
+CREATE TABLE IF NOT EXISTS company_intel (
+    symbol                       TEXT PRIMARY KEY NOT NULL,
+    -- Resolved SEC CIK (10-digit, zero-padded), cached so later runs skip the
+    -- ticker→CIK lookup.
+    cik                          TEXT,
+
+    -- Short interest (source: Massive).
+    short_interest               INTEGER,
+    days_to_cover                REAL,
+    short_interest_settlement    TEXT,
+    short_interest_source        TEXT,
+    short_interest_updated_at    TEXT,
+
+    -- Financial health (source: SEC Company Facts XBRL, FMP fallback).
+    net_income_last_q            REAL,
+    net_income_ttm               REAL,
+    negative_quarters_last4      INTEGER,
+    operating_cash_flow_ttm      REAL,
+    cash_and_equivalents         REAL,
+    financials_period_end        TEXT,
+    financials_source            TEXT,
+    financials_updated_at        TEXT,
+
+    -- Registered S-3 / dilution filings (source: SEC EDGAR submissions). The raw
+    -- filings live in `company_filings`; these are the rolled-up summary fields.
+    has_recent_shelf             INTEGER,   -- 0/1: an S-3 family filing seen recently
+    latest_dilution_form         TEXT,
+    latest_dilution_date         TEXT,
+    -- JSON: { "atm": bool, "resale": bool, "warrants": bool, "offering_amount": f64|null }
+    dilution_flags               TEXT,
+    dilution_source              TEXT,
+    dilution_updated_at          TEXT,
+
+    -- Ownership / locked shares (source: SEC 13D/13G; FMP/Massive fallback).
+    institutional_ownership_pct  REAL,
+    insider_ownership_pct        REAL,
+    holders_5pct_count           INTEGER,
+    -- JSON array: [{ "name": str, "pct": f64|null, "form": str, "date": str }]
+    holders_5pct                 TEXT,
+    restricted_shares            INTEGER,
+    ownership_source             TEXT,
+    ownership_updated_at         TEXT,
+
+    -- Overall cache markers.
+    last_updated_at              TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Last collection error per section, JSON: { "short_interest": "…", … }.
+    last_errors                  TEXT
+);
+
+-- Raw recent SEC filings fetched for a ticker (the dilution / ownership feed).
+-- One row per (symbol, accession_number). Kept separate from the normalized
+-- `company_intel` table so the rolled-up summary and the underlying evidence are
+-- decoupled — the UI can drill from a dilution flag down to the actual filing.
+CREATE TABLE IF NOT EXISTS company_filings (
+    accession_number  TEXT NOT NULL,
+    symbol            TEXT NOT NULL,
+    cik               TEXT,
+    form_type         TEXT NOT NULL,
+    filing_date       TEXT,
+    report_date       TEXT,
+    primary_document  TEXT,
+    document_url      TEXT,
+    description       TEXT,
+    -- Classification computed at fetch time.
+    category          TEXT,      -- 'dilution' | 'ownership' | 'other'
+    detected_atm      INTEGER NOT NULL DEFAULT 0,
+    detected_resale   INTEGER NOT NULL DEFAULT 0,
+    detected_warrants INTEGER NOT NULL DEFAULT 0,
+    offering_amount   REAL,
+    fetched_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, accession_number)
+);
+CREATE INDEX IF NOT EXISTS idx_company_filings_symbol ON company_filings(symbol, filing_date DESC);
+CREATE INDEX IF NOT EXISTS idx_company_filings_category ON company_filings(symbol, category);
 "#;
 
 /// Idempotent column additions for DBs created before the column existed.
@@ -284,6 +412,19 @@ const ALTERS: &[&str] = &[
     "ALTER TABLE fundamentals_cache ADD COLUMN change_2d_pct REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN change_4d_pct REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN change_6d_pct REAL",
+    // Behavioural scores + rolled-up splits (added after the fundamentals_cache
+    // CREATE above; ALTERs let pre-existing DBs gain the columns idempotently).
+    "ALTER TABLE fundamentals_cache ADD COLUMN pump_dump_raw REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN pump_dump_score REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN dilution_pct_12m REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN dilution_score REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN shares_outstanding_12m REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN last_split_date TEXT",
+    "ALTER TABLE fundamentals_cache ADD COLUMN last_split_label TEXT",
+    "ALTER TABLE fundamentals_cache ADD COLUMN split_count_1y INTEGER",
+    "ALTER TABLE fundamentals_cache ADD COLUMN dilution_capacity_score REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN dilution_need_score REAL",
+    "ALTER TABLE fundamentals_cache ADD COLUMN short_interest_score REAL",
     // Editable drawings: per-timeframe scope + style columns (TradingView-like).
     "ALTER TABLE chart_drawings ADD COLUMN scope TEXT NOT NULL DEFAULT 'intraday'",
     "ALTER TABLE chart_drawings ADD COLUMN color TEXT",

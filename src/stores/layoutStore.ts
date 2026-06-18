@@ -1,13 +1,16 @@
 import { create } from "zustand";
 import type { Session, AlertSignal, ZoneAssignment, LayoutTab } from "@/types";
+import { useAlertStatusStore } from "@/stores/alertStatusStore";
 
 // Sentinel strategy_id for tickers opened manually via the spotlight search.
 export const MANUAL_STRATEGY_ID = "__manual__";
 
+// One chart per session: the alert sidebar is how the user switches ticker, so
+// every session holds a single zone (no 2×2 grid, no overflow tabs).
 const ZONES_PER_TAB: Record<Session, number> = {
   premarket:  1,
   pre_open:   1,
-  open:       4,
+  open:       1,
   afterhours: 1,
 };
 
@@ -133,38 +136,24 @@ export const useLayoutStore = create<LayoutState>((set) => ({
   ) as Record<Session, string>,
 
   // ── placeAlert ──────────────────────────────────────────────────────────────
+  // Single chart per session: a new alert auto-opens by replacing the session's
+  // sole zone (no overflow tabs). The ticker it displaces stays "observed, not
+  // released" (pale-yellow card) until libéré.
   placeAlert(alert) {
     set((state) => {
-      const session     = alert.session;
-      const tabs        = deepCloneTabs(state.tabs);
-      const sessionTabs = tabs[session];
-
-      // Anti-spam: symbol already displayed in this session → skip
-      for (const tab of sessionTabs) {
-        if (tab.zones.some((z) => z.symbol === alert.symbol)) return {};
-      }
-
-      // Find first empty zone across existing tabs
-      for (const tab of sessionTabs) {
-        const empty = tab.zones.find((z) => z.symbol === null);
-        if (empty) {
-          applyContent(empty, alertToContent(alert));
-          return {
-            tabs,
-            activeTabId: { ...state.activeTabId, [session]: tab.tab_id },
-          };
-        }
-      }
-
-      // All zones full → create a new tab
-      const newTab = makeTab(session, sessionTabs.length);
-      applyContent(newTab.zones[0], alertToContent(alert));
-      sessionTabs.push(newTab);
+      const session = alert.session;
+      const zone0   = state.tabs[session][0]?.zones[0];
+      // Already on screen → leave it (no needless re-render / re-seed).
+      if (!zone0 || zone0.symbol === alert.symbol) return {};
+      const tabs = deepCloneTabs(state.tabs);
+      const tab  = tabs[session][0];
+      applyContent(tab.zones[0], alertToContent(alert));
       return {
         tabs,
-        activeTabId: { ...state.activeTabId, [session]: newTab.tab_id },
+        activeTabId: { ...state.activeTabId, [session]: tab.tab_id },
       };
     });
+    useAlertStatusStore.getState().markObserved(alert.symbol);
   },
 
   // ── placeAlertInZone ────────────────────────────────────────────────────────
@@ -198,6 +187,7 @@ export const useLayoutStore = create<LayoutState>((set) => ({
         activeTabId: { ...state.activeTabId, [session]: tab.tab_id },
       };
     });
+    useAlertStatusStore.getState().markObserved(alert.symbol);
   },
 
   // ── openTickerInZone ──────────────────────────────────────────────────────
@@ -226,16 +216,19 @@ export const useLayoutStore = create<LayoutState>((set) => ({
       applyContent(target, content);
       return { tabs, activeTabId: { ...state.activeTabId, [session]: tab.tab_id } };
     });
+    useAlertStatusStore.getState().markObserved(symbol);
   },
 
   // ── releaseZone ─────────────────────────────────────────────────────────────
   releaseZone(zone_id) {
+    let releasedSymbol: string | null = null;
     set((state) => {
       const tabs = deepCloneTabs(state.tabs);
       for (const session of SESSIONS) {
         for (const tab of tabs[session]) {
           const zone = tab.zones.find((z) => z.zone_id === zone_id);
           if (zone) {
+            releasedSymbol = zone.symbol;
             clearContent(zone);
             // Remove empty non-first tabs
             tabs[session] = tabs[session].filter(
@@ -243,7 +236,13 @@ export const useLayoutStore = create<LayoutState>((set) => ({
             );
             const active      = state.activeTabId[session];
             const stillExists = tabs[session].some((t) => t.tab_id === active);
-            const newActive   = stillExists ? active : tabs[session][0].tab_id;
+            // When the active tab was removed (emptied + closed), land on a tab that
+            // still holds a chart rather than a blank one; fall back to the first tab
+            // only if nothing has content.
+            const withContent = tabs[session].find((t) => t.zones.some((z) => z.symbol !== null));
+            const newActive   = stillExists
+              ? active
+              : (withContent ?? tabs[session][0]).tab_id;
             return {
               tabs,
               activeTabId: { ...state.activeTabId, [session]: newActive },
@@ -253,6 +252,7 @@ export const useLayoutStore = create<LayoutState>((set) => ({
       }
       return {};
     });
+    if (releasedSymbol) useAlertStatusStore.getState().markReleased(releasedSymbol);
   },
 
   // ── setActiveTab ─────────────────────────────────────────────────────────────

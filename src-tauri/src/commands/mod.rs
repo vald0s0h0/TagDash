@@ -694,9 +694,22 @@ pub async fn load_chart_bars(
 
     match crate::alpaca::bars::fetch_recent_bars(&key, &secret, &symbol, tf, limit).await {
         Ok(history) => {
-            let mut market = state.market.write().unwrap();
-            market.merge_history_bars(&symbol, tf, history);
-            Ok(market.get_bars(&symbol, tf))
+            {
+                let mut market = state.market.write().unwrap();
+                market.merge_history_bars(&symbol, tf, history);
+            }
+            // Daily chart during premarket: seed the provisional premarket candle from
+            // Alpaca 04:00→now minute bars so it shows the full premarket range (not
+            // just the slice since the feed warmed up). Dropped at the 09:30 open by
+            // the regular-session path. Awaited with no lock held.
+            if tf == Timeframe::Daily && crate::time::is_premarket(crate::time::now()) {
+                match crate::alpaca::bars::fetch_premarket_daily_bar(&key, &secret, &symbol).await {
+                    Ok(Some(bar)) => state.market.write().unwrap().seed_premarket_daily(&symbol, bar),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[tagdash] premarket daily bar {symbol} failed: {e}"),
+                }
+            }
+            Ok(state.market.read().unwrap().get_bars(&symbol, tf))
         }
         Err(e) => {
             eprintln!("[tagdash] load_chart_bars {symbol} {timeframe} failed: {e}");
@@ -1105,6 +1118,27 @@ pub struct CardInfo {
     pub has_news:          bool,
     /// The most recent live headline text, if any (for the common "News" chip).
     pub news_title:        Option<String>,
+    // ── Micro Pullback overlay: behavioural / risk scores (0..100, 100 = worst;
+    //    None = inputs not collected). ──────────────────────────────────────────
+    pub short_interest_score:    Option<f64>,
+    pub dilution_capacity_score: Option<f64>,
+    pub dilution_need_score:     Option<f64>,
+    pub dilution_score:          Option<f64>,
+    pub pump_dump_score:         Option<f64>,
+    /// Real-time liquidity gauge: total share volume traded in the last 60 seconds
+    /// (live 10s ring, forming bar included). None when no intraday bars yet. This
+    /// is "right now", not the cumulative session — drives the overlay's Vol bar.
+    pub live_volume:             Option<i64>,
+}
+
+/// One headline for the Micro Pullback overlay's news list (Alpaca REST, fetched
+/// per displayed ticker). `created_at` is the publish time (RFC 3339) the frontend
+/// turns into a freshness badge.
+#[derive(Debug, Serialize)]
+pub struct CardNews {
+    pub headline:   String,
+    pub created_at: String,
+    pub source:     Option<String>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1113,6 +1147,7 @@ pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardI
     let asset = universe_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
     let score = crate::local_db::scoring_repository::get_one(&db, &symbol).unwrap_or(None);
     let meta  = company_meta_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
+    let risk  = cache_repository::get_risk_scores(&db, &symbol).unwrap_or_default();
     let (mr_score, mr_score_kind, mr_direction) = match score {
         Some(s) => (Some(s.value), Some(s.list_kind), Some(s.direction)),
         None => (None, None, None),
@@ -1123,7 +1158,7 @@ pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardI
     let closes_asc: Vec<f64> = daily.iter().rev().filter_map(|b| b.close).collect();
 
     // One market lock for the live price (BBZ), premarket volume and news.
-    let (bbz, premarket_volume, news_title) = {
+    let (bbz, premarket_volume, news_title, live_volume) = {
         let market = state.market.read().unwrap();
         // Live price drives the BBZ; fall back to the last cached daily close.
         let price = market.last_price(&symbol).or_else(|| closes_asc.last().copied());
@@ -1148,7 +1183,9 @@ pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardI
         let premarket_volume = if pm_any { Some(pm_sum) } else { None };
 
         let news_title = market.latest_news(&symbol).map(|h| h.headline);
-        (bbz, premarket_volume, news_title)
+        // Real-time liquidity: shares traded in the last 60 seconds (rolling).
+        let live_volume = market.volume_in_last(&symbol, 60, now);
+        (bbz, premarket_volume, news_title, live_volume)
     };
 
     CardInfo {
@@ -1163,7 +1200,52 @@ pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardI
         premarket_volume,
         has_news:      news_title.is_some(),
         news_title,
+        short_interest_score:    risk.short_interest_score,
+        dilution_capacity_score: risk.dilution_capacity_score,
+        dilution_need_score:     risk.dilution_need_score,
+        dilution_score:          risk.dilution_score,
+        pump_dump_score:         risk.pump_dump_score,
+        live_volume,
     }
+}
+
+/// The most recent single-ticker headlines for `symbol` (Alpaca news REST), for the
+/// Micro Pullback overlay's news list. Fetched per displayed ticker, headlines only
+/// (no article body). Headlines that reference several tickers are dropped — we only
+/// want news genuinely about this one. Returns up to 4, newest first. Empty on
+/// missing credentials / fetch error so the overlay degrades gracefully.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_ticker_news(
+    symbol: String,
+    state:  tauri::State<'_, AppState>,
+) -> Result<Vec<CardNews>, String> {
+    let (key, secret) = {
+        let s = state.secrets.read().unwrap();
+        (s.alpaca_key.clone(), s.alpaca_secret.clone())
+    };
+    let (Some(key), Some(secret)) = (key, secret) else {
+        return Ok(vec![]); // no credentials (e.g. mock mode)
+    };
+    if key.is_empty() || secret.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Fetch a generous window/limit so enough single-ticker candidates survive the
+    // multi-ticker filter; then keep the 4 newest (the API already sorts desc).
+    let raw = crate::alpaca::news::fetch_recent_headlines(&key, &secret, &symbol, 30, 50)
+        .await
+        .unwrap_or_default();
+    let out: Vec<CardNews> = raw
+        .into_iter()
+        .filter(|n| n.symbols.len() <= 1) // drop headlines lumping several tickers
+        .map(|n| CardNews {
+            headline:   n.headline,
+            created_at: n.created_at.to_rfc3339(),
+            source:     Some(n.source).filter(|s| !s.is_empty()),
+        })
+        .take(4)
+        .collect();
+    Ok(out)
 }
 
 /// Force an immediate rebuild of the Panic Mean Reversion watchlist (ignores the
@@ -1319,19 +1401,21 @@ fn market_prices(state: &tauri::State<'_, AppState>, symbol: &str) -> (f64, f64)
 }
 
 /// Per-symbol (bid, ask) over the whole live snapshot, synthesising a bid/ask from
-/// the last price when a real quote is missing. Shared by the position/order
-/// getters and the backend trading loop.
+/// the last price when a real quote is missing. Symbols without a real (positive)
+/// last price are omitted — a (0, 0) entry would otherwise poison live PnL and,
+/// historically, trip resting stops at $0. Used for the PnL refresh only; order
+/// fills run off `drain_fill_windows` (the true price path), not this snapshot.
 fn all_market_prices(market: &RwLock<MarketState>) -> HashMap<String, (f64, f64)> {
     market
         .read()
         .unwrap()
         .tickers
         .iter()
-        .map(|(sym, t)| {
-            let last = t.last_price.unwrap_or(0.0);
+        .filter_map(|(sym, t)| {
+            let last = t.last_price.filter(|p| *p > 0.0)?;
             let bid  = t.bid.unwrap_or_else(|| (last * 0.999).max(0.0));
             let ask  = t.ask.unwrap_or_else(|| last * 1.001);
-            (sym.clone(), (bid, ask))
+            Some((sym.clone(), (bid, ask)))
         })
         .collect()
 }
@@ -1518,11 +1602,14 @@ fn sync_fill(
 }
 
 /// Backend trading loop: drives the internal order book off market data instead
-/// of as a side effect of UI position/order polls. Every tick it (1) fills any
-/// pending limit/stop orders that price has crossed, (2) re-arms the bracket
-/// orders for symbols that just filled, (3) refreshes live PnL + MAE/MFE
-/// watermarks, then (4) mirrors each new fill to TradeTally. So fills happen at a
-/// steady cadence whether or not any panel is open, and the getters are pure reads.
+/// of as a side effect of UI position/order polls. Every tick it (1) drains the
+/// per-symbol price path since the last tick and fills any pending limit/stop
+/// orders that path crossed (range-based, so a level spiked through and retraced
+/// still fills, and SL/TP inside one window resolve by which the price reached
+/// first), (2) re-arms the bracket orders for symbols that just filled,
+/// (3) refreshes live PnL + MAE/MFE watermarks, then (4) mirrors each new fill to
+/// TradeTally. So fills happen at a steady cadence whether or not any panel is
+/// open, and the getters are pure reads.
 pub fn spawn_trading_loop(
     running:       Arc<std::sync::atomic::AtomicBool>,
     market:        Arc<RwLock<MarketState>>,
@@ -1537,10 +1624,14 @@ pub fn spawn_trading_loop(
     running.store(true, Ordering::Relaxed);
     tauri::async_runtime::spawn(async move {
         while running.load(Ordering::Relaxed) {
-            let prices = all_market_prices(&market);
+            // Price path since the last tick (drives fills) + a guarded snapshot
+            // (drives PnL). Each market lock is released before the book is taken,
+            // so there's no lock nesting.
+            let windows = market.write().unwrap().drain_fill_windows();
+            let prices  = all_market_prices(&market);
             let new_fills = {
                 let mut book = internal_book.write().unwrap();
-                let nf = book.try_fill_pending(&prices);
+                let nf = book.try_fill_pending(&windows);
                 // Reconcile bracket orders for any symbol that just filled (entry →
                 // arm SL/TP; exit → clear leftovers).
                 for f in &nf {
@@ -1877,4 +1968,57 @@ pub fn replay_next_day(state: tauri::State<'_, AppState>) -> Result<(), String> 
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_replay_status(state: tauri::State<'_, AppState>) -> crate::replay::ReplayStatus {
     state.replay.status.read().unwrap().clone()
+}
+
+// ─── Company intelligence (read-only; collection happens in the background) ────
+// These commands NEVER make network calls themselves — they only read the local
+// SQLite cache the `crate::company_intel` job populates in the background. The one
+// refresh command spawns a background task and returns immediately, so the UI
+// never blocks and never drives a network request directly.
+
+/// The self-describing `company_intel` catalog: every captured datum, its label,
+/// section, source and type. Lets the UI render the data without hard-coding
+/// field names.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_company_intel_catalog() -> Vec<crate::company_intel::IntelField> {
+    crate::company_intel::catalog().to_vec()
+}
+
+/// The cached company-intel record for one ticker (None until collected).
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_company_intel(
+    symbol: String,
+    state: tauri::State<'_, AppState>,
+) -> Option<crate::company_intel::CompanyIntel> {
+    crate::company_intel::get_company_intel(&state.db, &symbol)
+}
+
+/// Request a background refresh of one ticker's company intel. Spawns the
+/// collection job on the async runtime and returns immediately — the network work
+/// runs in the backend, never on the UI path.
+#[tauri::command(rename_all = "snake_case")]
+pub fn refresh_company_intel(symbol: String, state: tauri::State<'_, AppState>) {
+    let db = state.db.clone();
+    let config = state.config.clone();
+    let secrets = state.secrets.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::company_intel::refresh_company_intel(db, config, secrets, symbol).await;
+    });
+}
+
+/// A bounded EXTRACT of the tickers data table: the universe DB joined with every
+/// enrichment source (fundamentals, company meta, company intel) plus news /
+/// filings counts. Empty `query` → the most recently collected rows; otherwise →
+/// tickers matching the query (symbol prefix or name contains). Read-only — a
+/// snapshot of the local DB for the data-table view, no network. Bounded so the UI
+/// never loads the whole universe at once.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_tickers_table(
+    query: Option<String>,
+    limit: Option<u32>,
+    state: tauri::State<'_, AppState>,
+) -> Vec<crate::company_intel::TickerTableRow> {
+    let query = query.unwrap_or_default();
+    let limit = limit.unwrap_or(200);
+    crate::company_intel::tickers_table(&state.db, &state.market, &query, limit)
 }

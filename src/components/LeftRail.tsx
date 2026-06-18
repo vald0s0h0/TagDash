@@ -12,6 +12,7 @@ import {
   Settings,
   Sun,
   Sunrise,
+  Table2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/stores/uiStore";
@@ -29,6 +30,7 @@ import { StartupModal } from "@/components/StartupModal";
 import { FeedDiagnosticsModal } from "@/components/FeedDiagnosticsModal";
 import { NewsDebugModal } from "@/components/NewsDebugModal";
 import { BugReportModal } from "@/components/BugReportModal";
+import { TickersTableModal } from "@/components/TickersTableModal";
 import type { Session } from "@/types";
 
 const TABS: { id: Session; label: string; icon: typeof Sun }[] = [
@@ -78,8 +80,34 @@ export function LeftRail() {
           })}
         </div>
 
-        {/* Bottom: latency + menu */}
+        {/* Bottom: quick actions + latency + menu */}
         <div className="flex flex-col items-center gap-3">
+          {/* Quick actions — Market Replay, Settings, Bug report (same order &
+              icons as the old ⋮ menu), stacked above the latency readout. */}
+          <div className="flex flex-col items-center gap-2">
+            <button
+              onClick={toggleReplay}
+              title="Market Replay"
+              className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <History className="h-5 w-5" />
+            </button>
+            <button
+              onClick={() => showModal("settings")}
+              title="Settings"
+              className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <Settings className="h-5 w-5" />
+            </button>
+            <button
+              onClick={() => showModal("bug-report")}
+              title="Signaler un bug"
+              className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <Bug className="h-5 w-5" />
+            </button>
+          </div>
+
           <div
             className={cn("flex flex-col items-center text-[10px]", latencyColor)}
             title="websocket_to_ui_latency_ms"
@@ -113,15 +141,11 @@ export function LeftRail() {
                 Debug news premarket
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={toggleReplay}>
-                <History className="mr-2 h-4 w-4" />
-                Market Replay
+              <DropdownMenuItem onClick={() => showModal("tickers-table")}>
+                <Table2 className="mr-2 h-4 w-4" />
+                Données tickers (DB)
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => showModal("settings")}>
-                <Settings className="mr-2 h-4 w-4" />
-                Settings
-              </DropdownMenuItem>
               <DropdownMenuItem onClick={toggleLogs}>
                 <ScrollText className="mr-2 h-4 w-4" />
                 Logs
@@ -130,11 +154,6 @@ export function LeftRail() {
               <DropdownMenuItem onClick={() => showModal("sync-status")}>
                 <RefreshCw className="mr-2 h-4 w-4" />
                 Sync TradeTally Status
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => showModal("bug-report")}>
-                <Bug className="mr-2 h-4 w-4" />
-                Signaler un bug
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -164,6 +183,10 @@ export function LeftRail() {
       />
       <BugReportModal
         open={openModal === "bug-report"}
+        onClose={closeModal}
+      />
+      <TickersTableModal
+        open={openModal === "tickers-table"}
         onClose={closeModal}
       />
     </>

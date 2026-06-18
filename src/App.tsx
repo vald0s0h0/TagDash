@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from "react";
+import { TitleBar } from "@/components/TitleBar";
 import { LeftRail } from "@/components/LeftRail";
 import { Sidebar } from "@/components/Sidebar";
 import { MainWindow } from "@/components/MainWindow";
@@ -54,16 +55,21 @@ export default function App() {
   }, [focusKey]);
 
   return (
-    <div className="flex h-full w-full overflow-hidden">
-      <LeftRail />
-      <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        {/* Market Replay transport bar — rendered only when activated (menu). */}
-        <ReplayToolbar />
-        <MainWindow />
-        {logsOpen && <LogsPanel />}
+    <div className="flex h-full w-full flex-col overflow-hidden">
+      {/* Custom OS title bar (native decorations disabled): logo · strategy
+          toggles · NY clock · window controls. */}
+      <TitleBar />
+      <div className="flex flex-1 overflow-hidden">
+        <LeftRail />
+        <Sidebar />
+        <div className="flex flex-1 flex-col overflow-hidden">
+          {/* Market Replay transport bar — rendered only when activated (menu). */}
+          <ReplayToolbar />
+          <MainWindow />
+          {logsOpen && <LogsPanel />}
+        </div>
+        <TickerSpotlight />
       </div>
-      <TickerSpotlight />
     </div>
   );
 }

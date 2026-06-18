@@ -136,7 +136,7 @@ impl Config {
         watch_fast_window_secs:  1,
         watch_fast_rate_per_sec: 5.0,
         watch_slow_window_secs:  5,
-        watch_slow_rate_per_sec: 2.0,
+        watch_slow_rate_per_sec: 3.0,
 
         tempos: [
             Tempo {

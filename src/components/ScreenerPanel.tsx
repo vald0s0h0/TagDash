@@ -72,11 +72,6 @@ function ScreenerCard({ match: m, selected, onOpen, onDismiss }: CardProps) {
         selected && "border-blue-600 bg-accent/40",
       )}
       onClick={() => onOpen(m)}
-      draggable
-      onDragStart={(e) => {
-        e.dataTransfer.setData("application/tagdash-alert", JSON.stringify(matchToAlert(m)));
-        e.dataTransfer.effectAllowed = "copy";
-      }}
     >
       {/* Dismiss button */}
       <button

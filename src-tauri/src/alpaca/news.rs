@@ -35,6 +35,86 @@ struct RawArticle {
     content:    Option<String>,
     source:     Option<String>,
     created_at: Option<String>,
+    #[serde(default)]
+    symbols:    Vec<String>,
+}
+
+/// One headline (no article body) with the tickers it references — for the
+/// at-a-glance overlay news list. `symbols` lets the caller drop headlines that
+/// lump several tickers together (we only want news genuinely about one ticker).
+#[derive(Debug, Clone)]
+pub struct NewsHeadlineLite {
+    pub created_at: DateTime<Utc>,
+    pub headline:   String,
+    pub source:     String,
+    pub symbols:    Vec<String>,
+}
+
+/// Fetch up to `limit` of the most recent HEADLINES for `symbol` published within
+/// the last `days` days (newest first), WITHOUT article content. Each item keeps
+/// the tickers it references so the caller can keep only single-ticker news.
+/// Returns an empty Vec when keys are missing or the request fails.
+pub async fn fetch_recent_headlines(
+    key: &str,
+    secret: &str,
+    symbol: &str,
+    days: i64,
+    limit: u32,
+) -> Result<Vec<NewsHeadlineLite>, String> {
+    let now = crate::time::now();
+    let start = (now - Duration::days(days.max(1)))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let mut params: Vec<(&str, String)> = vec![
+        ("symbols", symbol.to_string()),
+        ("start", start),
+        ("limit", limit.to_string()),
+        ("sort", "desc".into()),
+        ("include_content", "false".into()),
+        ("exclude_contentless", "false".into()),
+    ];
+    if crate::replay::clock::is_active() {
+        params.push(("end", now.format("%Y-%m-%dT%H:%M:%SZ").to_string()));
+    }
+    let url = reqwest::Url::parse_with_params(NEWS_URL, &params).map_err(|e| e.to_string())?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("APCA-API-KEY-ID", key)
+        .header("APCA-API-SECRET-KEY", secret)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet = &body[..body.len().min(200)];
+        return Err(format!("Alpaca news HTTP {status}: {snippet}"));
+    }
+
+    let raw: NewsResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let out = raw
+        .news
+        .into_iter()
+        .filter_map(|a| {
+            let headline = a.headline.filter(|h| !h.trim().is_empty())?;
+            let created_at = a
+                .created_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            Some(NewsHeadlineLite {
+                created_at,
+                headline,
+                source:  a.source.unwrap_or_default(),
+                symbols: a.symbols.into_iter().map(|s| s.to_uppercase()).collect(),
+            })
+        })
+        .collect();
+    Ok(out)
 }
 
 /// Fetch up to `limit` of the most recent articles for `symbol` published within

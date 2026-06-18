@@ -8,7 +8,7 @@ pub mod ring_buffer;
 
 use std::collections::{HashMap, VecDeque};
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{LatencyLevel, LatencyStatus, NewsHeadline, NewsRef};
@@ -222,6 +222,45 @@ impl TradeCounter {
     }
 }
 
+/// Accumulates the price path of one symbol since the internal book last drained
+/// it, so fills are detected against the whole micro-bar (range + extreme order)
+/// rather than a sampled snapshot. `seq` is a per-window print counter; the
+/// extremes remember the print index at which they were last set, which yields
+/// the order they were reached in (used for the SL/TP tie-break in `FillWindow`).
+#[derive(Debug, Clone, Copy)]
+struct FillAccum {
+    first:    f64,
+    high:     f64,
+    low:      f64,
+    last:     f64,
+    seq:      u64,
+    low_seq:  u64,
+    high_seq: u64,
+}
+
+impl FillAccum {
+    fn new(price: f64) -> Self {
+        Self { first: price, high: price, low: price, last: price, seq: 0, low_seq: 0, high_seq: 0 }
+    }
+    fn record(&mut self, price: f64) {
+        self.seq += 1;
+        self.last = price;
+        if price < self.low  { self.low  = price; self.low_seq  = self.seq; }
+        if price > self.high { self.high = price; self.high_seq = self.seq; }
+    }
+    fn finish(self) -> crate::types::FillWindow {
+        crate::types::FillWindow {
+            first: self.first,
+            high:  self.high,
+            low:   self.low,
+            last:  self.last,
+            // `<=` so a flat window (low_seq == high_seq == 0) resolves to the
+            // adverse/low side — the conservative worst-case fill assumption.
+            low_first: self.low_seq <= self.high_seq,
+        }
+    }
+}
+
 /// Full in-process market state (not serialized — internal use only).
 pub struct MarketState {
     pub tickers:      HashMap<String, TickerLiveState>,
@@ -239,6 +278,15 @@ pub struct MarketState {
     vwap_acc:         HashMap<String, (f64, f64)>,
     /// Per-symbol rolling trade-print counters (trade acceleration measure).
     trade_counts:     HashMap<String, TradeCounter>,
+    /// Per-symbol price path since the internal book last drained it, consumed by
+    /// the trading loop to fill resting orders against the full micro-bar.
+    fill_windows:     HashMap<String, FillAccum>,
+    /// Provisional premarket DAILY candle per symbol (04:00–09:30 ET, today). Built
+    /// from premarket prints + an Alpaca premarket seed; `get_bars` surfaces it as
+    /// today's daily candle during premarket and it is dropped at the 09:30 open so
+    /// the regular-session daily aggregator takes over (the regular daily candle
+    /// never mixes premarket prints, matching Alpaca's own daily bars).
+    premarket_daily:  HashMap<String, Bar>,
     /// Live news headlines keyed by upper-cased symbol (correlation engine).
     news_by_symbol:   HashMap<String, Vec<NewsHeadline>>,
     /// Flat newest-first log of recent headlines (debug panel).
@@ -263,6 +311,8 @@ impl MarketState {
             feed:         FeedDiagnostics::default(),
             vwap_acc:     HashMap::new(),
             trade_counts:   HashMap::new(),
+            fill_windows:   HashMap::new(),
+            premarket_daily: HashMap::new(),
             news_by_symbol: HashMap::new(),
             news_log:       VecDeque::new(),
             news_feed:      NewsDiagnostics::default(),
@@ -426,13 +476,50 @@ impl MarketState {
         // Update global latency
         self.latency = latency::compute(event_time, now, warn_ms, critical_ms);
 
-        // Feed per-timeframe candle aggregators
+        // Feed per-timeframe candle aggregators. Intraday frames take every print
+        // (pre / regular / post-market); the daily frame takes ONLY regular-session
+        // prints, so a daily candle reflects the cash session alone (matching
+        // Alpaca's daily bars) — extended-hours ticks stay on the intraday charts.
+        let regular = crate::time::is_regular_session(event_time);
         let agg_map = self.aggregators.get_mut(symbol).unwrap();
         let bar_map = self.bars.get_mut(symbol).unwrap();
         for (&tf, agg) in agg_map.iter_mut() {
+            if tf == Timeframe::Daily && !regular {
+                continue;
+            }
             if let Some(closed) = agg.on_trade_n(price, size, prints, event_time) {
                 bar_map.get_mut(&tf).unwrap().push(closed);
             }
+        }
+
+        // Provisional premarket DAILY candle — the daily chart's "current premarket
+        // bar". Built from premarket prints only (the regular daily aggregator above
+        // skips them); `get_bars` shows it as today's daily candle during premarket.
+        // At the 09:30 open (the first non-premarket print) it is dropped, so the
+        // regular-session candle becomes the current daily bar. Stamped at NY
+        // midnight so it lands on today's daily slot.
+        if crate::time::is_premarket(event_time) {
+            let stamp = crate::time::et_midnight_utc(event_time);
+            let bar = self.premarket_daily.entry(symbol.to_string()).or_insert_with(|| Bar {
+                time: stamp, open: price, high: price, low: price, close: price,
+                volume: 0, vwap: None, trade_count: Some(0),
+            });
+            // A bar left over from a previous day → restart it for today.
+            if ny_date(bar.time) != ny_date(event_time) {
+                *bar = Bar {
+                    time: stamp, open: price, high: price, low: price, close: price,
+                    volume: 0, vwap: None, trade_count: Some(0),
+                };
+            }
+            bar.high   = bar.high.max(price);
+            bar.low    = bar.low.min(price);
+            bar.close  = price;
+            bar.volume += size;
+            bar.trade_count = Some(bar.trade_count.unwrap_or(0) + prints);
+        } else {
+            // Outside premarket (the 09:30 open onward) the premarket bar has served
+            // its purpose — drop it so the regular daily candle takes over.
+            self.premarket_daily.remove(symbol);
         }
 
         // Record the print(s) in the rolling trade-rate counter (acceleration).
@@ -440,6 +527,51 @@ impl MarketState {
             .entry(symbol.to_string())
             .or_default()
             .record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+
+        // Extend the fill window (price path since the book last drained it) so
+        // resting SL/TP/entry orders fill against the whole micro-bar.
+        self.fill_windows
+            .entry(symbol.to_string())
+            .and_modify(|w| w.record(price))
+            .or_insert_with(|| FillAccum::new(price));
+    }
+
+    /// Take and clear the per-symbol fill windows accumulated since the last call.
+    /// The trading loop calls this each tick: every symbol that printed at least
+    /// one trade in the interval yields a `FillWindow`; symbols that didn't print
+    /// are absent, so no order is ever filled against a fabricated price.
+    pub fn drain_fill_windows(&mut self) -> HashMap<String, crate::types::FillWindow> {
+        self.fill_windows
+            .drain()
+            .map(|(sym, acc)| (sym, acc.finish()))
+            .collect()
+    }
+
+    /// Seed/refresh the provisional premarket daily candle for `symbol` from an
+    /// externally-aggregated premarket bar (Alpaca 04:00→now minute bars). Lets a
+    /// daily chart opened mid-premarket show the FULL premarket range, not only the
+    /// slice since the live feed warmed up. Merges with any live-built bar: Alpaca's
+    /// open (the true 04:00 open) and the extreme high/low/volume win, while the live
+    /// close (freshest tick) is kept when one exists. A bar from a previous day is
+    /// replaced wholesale.
+    pub fn seed_premarket_daily(&mut self, symbol: &str, seed: Bar) {
+        use std::collections::hash_map::Entry;
+        match self.premarket_daily.entry(symbol.to_string()) {
+            Entry::Occupied(mut o) => {
+                let b = o.get_mut();
+                if ny_date(b.time) != ny_date(seed.time) {
+                    *b = seed;
+                    return;
+                }
+                b.open   = seed.open;
+                b.high   = b.high.max(seed.high);
+                b.low    = b.low.min(seed.low);
+                b.volume = b.volume.max(seed.volume);
+                b.vwap   = seed.vwap.or(b.vwap);
+                // b.close kept: a live tick is fresher than Alpaca's last minute bar.
+            }
+            Entry::Vacant(v) => { v.insert(seed); }
+        }
     }
 
     /// Wipe every piece of market DATA (tickers, candles, VWAP/trade counters,
@@ -452,6 +584,8 @@ impl MarketState {
         self.bars.clear();
         self.vwap_acc.clear();
         self.trade_counts.clear();
+        self.fill_windows.clear();
+        self.premarket_daily.clear();
         self.news_by_symbol.clear();
         self.news_log.clear();
     }
@@ -463,6 +597,19 @@ impl MarketState {
         self.trade_counts
             .get(symbol)
             .map(|tc| tc.count_last(now.timestamp(), secs))
+    }
+
+    /// Total share volume for `symbol` over the last `secs` seconds, summed from
+    /// the live 10-second ring (forming bar included). A real-time "liquidity right
+    /// now" gauge for the info overlay — deliberately a short rolling window, not
+    /// the cumulative session volume. None when the symbol has no intraday bars.
+    pub fn volume_in_last(&self, symbol: &str, secs: i64, now: DateTime<Utc>) -> Option<i64> {
+        let bars = self.get_bars(symbol, Timeframe::S10);
+        if bars.is_empty() {
+            return None;
+        }
+        let cutoff = now - chrono::Duration::seconds(secs);
+        Some(bars.iter().filter(|b| b.time >= cutoff).map(|b| b.volume as i64).sum())
     }
 
     // ── News investor (Alpaca news WebSocket, premarket) ───────────────────────
@@ -539,6 +686,16 @@ impl MarketState {
             .and_then(|list| list.iter().max_by_key(|n| n.received_at).cloned())
     }
 
+    /// Count of recent live headlines currently retained per symbol (RAM), for the
+    /// tickers data table. Reflects the in-memory retention window, not a DB store
+    /// (live news isn't persisted) — enough to confirm news data exists per ticker.
+    pub fn all_news_counts(&self) -> std::collections::HashMap<String, usize> {
+        self.news_by_symbol
+            .iter()
+            .map(|(sym, list)| (sym.clone(), list.len()))
+            .collect()
+    }
+
     /// Snapshot of the news diagnostics with the recent log attached, for the
     /// debug panel. (`recent` is filled here rather than kept duplicated in RAM.)
     pub fn news_diagnostics(&self) -> NewsDiagnostics {
@@ -605,51 +762,49 @@ impl MarketState {
             .and_then(|a| a.current_bar());
 
         if tf == Timeframe::Daily {
-            // EXACTLY one candle per NY trading day. The ring can transiently hold
-            // a day at two slightly different UTC stamps — Alpaca daily bars carry
-            // a DST-varying time-of-day (04:00Z in summer / 05:00Z in winter), and
-            // a re-stamped forming bar may not match — which a timestamp-keyed
-            // dedup would render as two bars for the same day (the premarket "day
-            // shown twice" bug). Keying by NY date collapses them to one.
+            let now = crate::time::now();
+            // The current daily candle source flips at the 09:30 cash open:
+            //   • premarket (04:00–09:30) → the provisional premarket bar (premarket
+            //     prints + Alpaca premarket seed) — the daily chart's "current
+            //     premarket bar".
+            //   • from the open onward → the live regular-session aggregator's forming
+            //     bar; the premarket bar has been dropped, so the candle "se retire"
+            //     and becomes the normal current daily bar.
+            let daily_forming = if crate::time::is_premarket(now) {
+                self.premarket_daily.get(symbol).cloned()
+            } else {
+                forming
+            };
+
+            // EXACTLY one candle per NY trading day. The ring can transiently hold a
+            // day at two slightly different UTC stamps — Alpaca daily bars carry a
+            // DST-varying time-of-day (04:00Z in summer / 05:00Z in winter) — which a
+            // timestamp-keyed dedup would render as two bars for the same day (the
+            // premarket "day shown twice" bug). Keying by NY date collapses them.
             let mut by_day: std::collections::BTreeMap<NaiveDate, Bar> =
                 std::collections::BTreeMap::new();
             for b in raw { by_day.insert(ny_date(b.time), b); }
 
-            if let Some(forming) = forming {
-                // The forming daily candle is bucketed to UTC MIDNIGHT (≠ a NY
-                // date), so its day is taken from the app clock, not its own stamp.
-                // Only fold it when it actually covers today's UTC day (a fresh
-                // trade today): during NY trading hours the bucket's UTC date equals
-                // today's, while a stale older bucket (no trade yet today) is
-                // ignored so it can't paint a bogus current candle.
-                let now = crate::time::now();
-                if forming.time.date_naive() == now.date_naive() {
-                    let fday = ny_date(now);
-                    if let Some(existing) = by_day.get_mut(&fday) {
+            if let Some(forming) = daily_forming {
+                // The forming daily candle is bucketed on the NY trading day, so
+                // `ny_date` of its stamp IS the trading day. Fold it only into the
+                // CURRENT day's bar — a stale forming bar left from a previous session
+                // (no trade yet today) must never mutate an already-closed day.
+                let today = ny_date(now);
+                if ny_date(forming.time) == today {
+                    match by_day.get_mut(&today) {
                         // (a) Today's authoritative bar is already here → fold the
-                        // live values in so the current candle moves with each trade
-                        // (latest close + any new high/low). Alpaca's open + volume
-                        // are kept.
-                        existing.high  = existing.high.max(forming.high);
-                        existing.low   = existing.low.min(forming.low);
-                        existing.close = forming.close;
-                    } else {
-                        // (b) No bar for today yet (premarket / Alpaca lag) → append
-                        // the live candle AS today's bar so the chart shows the
-                        // current day instead of a gap. Stamp it by shifting the last
-                        // bar's timestamp forward by the whole-day gap, so it
-                        // inherits the series' own time-of-day (and DST quirk) and
-                        // lands on the right NY-day axis label; Alpaca's later
-                        // authoritative bar — at the same stamp — replaces it cleanly.
-                        let last = by_day.iter().next_back().map(|(d, b)| (*d, b.time));
-                        if last.map_or(true, |(d, _)| fday > d) {
-                            let mut today = forming;
-                            if let Some((last_day, last_time)) = last {
-                                today.time = last_time + Duration::days((fday - last_day).num_days());
-                            }
-                            by_day.insert(fday, today);
+                        // live values so the current candle moves with each trade
+                        // (latest close + any new high/low); Alpaca's open is kept.
+                        Some(existing) => {
+                            existing.high  = existing.high.max(forming.high);
+                            existing.low   = existing.low.min(forming.low);
+                            existing.close = forming.close;
                         }
-                        // else: a stale forming bar older than the series → ignore.
+                        // (b) No bar for today yet (Alpaca lag early in the session) →
+                        // append the live candle AS today's bar (already correctly
+                        // stamped); Alpaca's later bar, at the same stamp, replaces it.
+                        None => { by_day.insert(today, forming); }
                     }
                 }
             }
@@ -719,6 +874,22 @@ impl MarketState {
         if let Some(rb) = self.bars.get_mut(symbol).and_then(|m| m.get_mut(&Timeframe::M1)) {
             rb.push(Bar { time: bar_time, open, high, low, close, volume, vwap: Some(vw), trade_count: n });
         }
+
+        // Feed the fill window so resting orders are still serviced for symbols the
+        // live broad tier only streams as minute bars (no trade ticks) during the
+        // regular session. Walk the bar along a plausible intrabar path so the
+        // SL/TP extreme order (`low_first`) is set: green O→L→H→C, red O→H→L→C.
+        let acc = self.fill_windows
+            .entry(symbol.to_string())
+            .or_insert_with(|| FillAccum::new(open));
+        if close >= open {
+            acc.record(low);
+            acc.record(high);
+        } else {
+            acc.record(high);
+            acc.record(low);
+        }
+        acc.record(close);
     }
 
     /// Number of closed bars currently held in RAM for (symbol, tf).
@@ -794,5 +965,108 @@ impl MarketState {
 impl Default for MarketState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(s: i64) -> DateTime<Utc> {
+        chrono::TimeZone::timestamp_opt(&Utc, 1_700_000_000 + s, 0).single().unwrap()
+    }
+
+    // Trades accumulate into a per-symbol window (range + extreme order) that the
+    // trading loop drains; draining clears it so the next poll starts fresh.
+    #[test]
+    fn fill_window_tracks_range_and_low_first() {
+        let mut ms = MarketState::new();
+        // Up then down: high reached before low → low_first = false.
+        ms.on_replay_trade("AAA", 10.0, 100, 1, t(0));
+        ms.on_replay_trade("AAA", 11.0, 100, 1, t(1));
+        ms.on_replay_trade("AAA", 9.5, 100, 1, t(2));
+
+        let w = ms.drain_fill_windows();
+        let aaa = w.get("AAA").expect("window for AAA");
+        assert_eq!(aaa.first, 10.0);
+        assert_eq!(aaa.high, 11.0);
+        assert_eq!(aaa.low, 9.5);
+        assert_eq!(aaa.last, 9.5);
+        assert!(!aaa.low_first, "high (11) came before low (9.5)");
+
+        // Drained → empty until the next print.
+        assert!(ms.drain_fill_windows().is_empty());
+    }
+
+    // A symbol that didn't print yields no window — the trading loop then never
+    // fills its resting orders against a fabricated price.
+    #[test]
+    fn untraded_symbol_has_no_window() {
+        let mut ms = MarketState::new();
+        ms.set_previous_close("QUIET", 12.0, t(0)); // seeded, but never traded
+        assert!(ms.drain_fill_windows().get("QUIET").is_none());
+    }
+
+    // The daily chart shows a provisional premarket candle during 04:00–09:30 ET
+    // (premarket prints only), then drops it at the 09:30 open so the regular
+    // session starts a fresh candle from the open price.
+    #[test]
+    fn daily_premarket_bar_then_resets_at_open() {
+        use crate::market_state::aggregators::Timeframe;
+        use crate::replay::clock;
+
+        // Restore the real clock even if an assertion below panics, so this
+        // global-clock test can never leak its simulated time into other tests.
+        struct ClockGuard;
+        impl Drop for ClockGuard {
+            fn drop(&mut self) { clock::deactivate(); }
+        }
+
+        let parse = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        // Monday 2026-06-15, EDT (UTC−4): 07:00 / 08:00 ET premarket, 10:00 ET open.
+        let pm1  = parse("2026-06-15T11:00:00Z"); // 07:00 ET
+        let pm2  = parse("2026-06-15T12:00:00Z"); // 08:00 ET
+        let reg  = parse("2026-06-15T14:00:00Z"); // 10:00 ET (regular session)
+
+        clock::activate(pm2); // app clock sits inside premarket
+        let _guard = ClockGuard;
+
+        let mut ms = MarketState::new();
+        ms.on_replay_trade("AAA", 10.0, 100, 1, pm1);
+        ms.on_replay_trade("AAA", 11.0, 100, 1, pm2);
+
+        // During premarket: one daily candle = the premarket bar.
+        let daily = ms.get_bars("AAA", Timeframe::Daily);
+        assert_eq!(daily.len(), 1, "premarket: exactly one daily candle");
+        assert_eq!(daily[0].open, 10.0);
+        assert_eq!(daily[0].high, 11.0);
+        assert_eq!(daily[0].low, 10.0);
+        assert_eq!(daily[0].close, 11.0);
+        assert_eq!(daily[0].volume, 200, "premarket prints accumulate volume");
+
+        // At the open the premarket bar is dropped; the regular candle opens fresh.
+        clock::set_sim(reg);
+        ms.on_replay_trade("AAA", 9.5, 50, 1, reg);
+        let daily = ms.get_bars("AAA", Timeframe::Daily);
+        assert_eq!(daily.len(), 1, "open: still one daily candle");
+        assert_eq!(daily[0].open, 9.5, "regular open replaces premarket open");
+        assert_eq!(daily[0].high, 9.5, "premarket high discarded");
+        assert_eq!(daily[0].volume, 50, "premarket volume discarded");
+    }
+
+    // A live minute bar (no trade ticks) also feeds the window, with the extreme
+    // order following the green/red path so SL/TP still resolve correctly.
+    #[test]
+    fn minute_bar_feeds_window_with_path_order() {
+        let mut ms = MarketState::new();
+        // Red bar O=10 H=10.5 L=9.0 C=9.2 → path O→H→L→C, low after high.
+        ms.on_bar("BBB", t(0), 10.0, 10.5, 9.0, 9.2, 1_000, 9.7, Some(10), t(0));
+        let w = ms.drain_fill_windows();
+        let bbb = w.get("BBB").expect("window for BBB");
+        assert_eq!(bbb.first, 10.0);
+        assert_eq!(bbb.high, 10.5);
+        assert_eq!(bbb.low, 9.0);
+        assert_eq!(bbb.last, 9.2);
+        assert!(!bbb.low_first, "red bar: high before low");
     }
 }

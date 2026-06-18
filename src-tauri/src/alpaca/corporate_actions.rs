@@ -43,8 +43,14 @@ struct CorporateActions {
 struct RawSplit {
     #[serde(default)]
     symbol:   Option<String>,
-    #[serde(default, alias = "ex_date", alias = "process_date")]
+    // Alpaca's split payload carries BOTH `ex_date` and `process_date`; we read the
+    // ex-date by its own name. (A `process_date` alias here makes serde see two keys
+    // mapping to this field → "duplicate field ex_date".) `process_date` is a fallback
+    // ONLY when ex_date is absent — handled in `into_split`, not via a serde alias.
+    #[serde(default)]
     ex_date:  Option<String>,
+    #[serde(default)]
+    process_date: Option<String>,
     #[serde(default)]
     new_rate: Option<f64>,
     #[serde(default)]
@@ -53,7 +59,7 @@ struct RawSplit {
 
 impl RawSplit {
     fn into_split(self) -> Option<Split> {
-        let date = self.ex_date?;
+        let date = self.ex_date.or(self.process_date)?;
         let date = date.get(..10).unwrap_or(&date).to_string();
         let label = split_label(self.new_rate, self.old_rate);
         Some(Split { date, label })
@@ -210,4 +216,125 @@ pub async fn fetch_recent_split_symbols(
     }
 
     Ok(hit.into_iter().collect())
+}
+
+/// One full split event with its issuer + rates (for persistence in the DB, not
+/// just chart markers): the dilution score neutralises splits via `to/from`.
+#[derive(Debug, Clone)]
+pub struct SplitEvent {
+    pub symbol: String,
+    pub date: String,   // ex-date YYYY-MM-DD
+    pub from: f64,      // old_rate
+    pub to: f64,        // new_rate
+    pub label: String,  // "x4" / "1:10"
+}
+
+/// Fetch EVERY forward/reverse split for `symbols` with an ex-date on/after `start`
+/// (YYYY-MM-DD), as full events (issuer + rates). Same chunked/paginated bulk shape
+/// as `fetch_recent_split_symbols`, but returns the events instead of just the
+/// affected symbols — used at startup to persist `ticker_splits` (display + dilution
+/// split-neutralisation).
+pub async fn fetch_all_splits(
+    key: &str,
+    secret: &str,
+    symbols: &[String],
+    start: &str,
+) -> Result<Vec<SplitEvent>, String> {
+    if symbols.is_empty() {
+        return Ok(vec![]);
+    }
+    let start = start.get(..10).unwrap_or(start).to_string();
+    let end = crate::time::now().format("%Y-%m-%d").to_string();
+    let client = reqwest::Client::new();
+    let mut out: Vec<SplitEvent> = Vec::new();
+
+    for chunk in symbols.chunks(100) {
+        let sym_str = chunk.join(",");
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "https://data.alpaca.markets/v1/corporate-actions?symbols={sym_str}\
+                 &types=forward_split,reverse_split&start={start}&end={end}&limit=1000&sort=desc"
+            );
+            if let Some(tok) = &page_token {
+                url.push_str(&format!("&page_token={tok}"));
+            }
+            let resp = client
+                .get(&url)
+                .header("APCA-API-KEY-ID", key)
+                .header("APCA-API-SECRET-KEY", secret)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Alpaca corporate-actions HTTP {status}: {body}"));
+            }
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            let parsed: CorporateActionsResponse = serde_json::from_str(&body)
+                .map_err(|e| format!("corporate-actions parse error: {e} — body: {}", &body[..body.len().min(400)]))?;
+            if let Some(ca) = parsed.corporate_actions {
+                for s in ca.forward_splits.into_iter().chain(ca.reverse_splits) {
+                    let date = s.ex_date.clone().or_else(|| s.process_date.clone());
+                    let (Some(symbol), Some(date)) = (s.symbol.clone(), date) else {
+                        continue;
+                    };
+                    let from = s.old_rate.unwrap_or(1.0);
+                    let to = s.new_rate.unwrap_or(1.0);
+                    let date = date.get(..10).unwrap_or(&date).to_string();
+                    out.push(SplitEvent {
+                        symbol,
+                        date,
+                        from,
+                        to,
+                        label: split_label(s.new_rate, s.old_rate),
+                    });
+                }
+            }
+            match parsed.next_page_token {
+                Some(tok) if !tok.is_empty() => page_token = Some(tok),
+                _ => break,
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: Alpaca's split payload carries BOTH `ex_date` and `process_date`.
+    // A serde alias mapping `process_date` onto the `ex_date` field made serde see two
+    // keys for one field → "duplicate field ex_date". This must parse cleanly now.
+    #[test]
+    fn parses_split_with_ex_date_and_process_date() {
+        let body = r#"{"corporate_actions":{"reverse_splits":[
+            {"ex_date":"2026-06-18","id":"x","new_cusip":"G9767H133","new_rate":1,
+             "old_cusip":"G9767H125","old_rate":100,"payable_date":"2026-06-18",
+             "process_date":"2026-06-18","record_date":"2026-06-18","symbol":"WOK"}
+        ]},"next_page_token":null}"#;
+        let parsed: CorporateActionsResponse = serde_json::from_str(body).unwrap();
+        let ca = parsed.corporate_actions.unwrap();
+        assert_eq!(ca.reverse_splits.len(), 1);
+        let split = ca.reverse_splits.into_iter().next().unwrap().into_split().unwrap();
+        assert_eq!(split.date, "2026-06-18");
+        assert_eq!(split.label, "1:100"); // 100→1 reverse
+    }
+
+    // When ex_date is absent, fall back to process_date.
+    #[test]
+    fn falls_back_to_process_date() {
+        let raw = RawSplit {
+            symbol: Some("ZZZ".into()),
+            ex_date: None,
+            process_date: Some("2026-04-01".into()),
+            new_rate: Some(1.0),
+            old_rate: Some(10.0),
+        };
+        let s = raw.into_split().unwrap();
+        assert_eq!(s.date, "2026-04-01");
+        assert_eq!(s.label, "1:10");
+    }
 }

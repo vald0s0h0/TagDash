@@ -90,6 +90,25 @@ export interface CardInfo {
   has_news:          boolean;
   /** Most recent live headline text, if any. */
   news_title:        string | null;
+  // ── Micro Pullback overlay: behavioural / risk scores (0..100, 100 = worst;
+  //    null = inputs not collected). ──────────────────────────────────────────
+  short_interest_score:    number | null;
+  dilution_capacity_score: number | null;
+  dilution_need_score:     number | null;
+  dilution_score:          number | null;
+  pump_dump_score:         number | null;
+  /** Real-time liquidity: shares traded in the last 60s (rolling). null = no
+   *  intraday bars yet. Drives the overlay's Vol bar (not the cumulative session). */
+  live_volume:             number | null;
+}
+
+/** One headline for the Micro Pullback overlay (mirrors CardNews in
+ *  commands/mod.rs), fetched per displayed ticker via Alpaca REST. `created_at`
+ *  is the publish time (RFC 3339). */
+export interface CardNews {
+  headline:   string;
+  created_at: string;
+  source:     string | null;
 }
 
 // ─── Strategy display config ──────────────────────────────────────────────────
@@ -132,6 +151,10 @@ export interface PaneSpec {
   /** The pane that carries SL/TP/order/drawing interactions (e.g. the 5s pane
    *  even when it sits to the right of a daily context pane). */
   interactive: boolean;
+  /** Optional layout column. Panes sharing a column are stacked vertically (in
+   *  declaration order); columns lay out left-to-right. null/undefined = the pane
+   *  gets its own column (legacy side-by-side). */
+  column?: number | null;
 }
 
 export interface LlmSpec {
@@ -674,4 +697,65 @@ export interface ReplayStatus {
   events_done: number;
   error: string | null;
   next_alert_armed: boolean;
+}
+
+// ─── Tickers data table (mirrors TickerTableRow in company_intel/model.rs) ───────
+// One flattened row: universe asset + every enrichment (fundamentals, company
+// meta, company intel) + news/filings counts. All-Option = "not collected".
+export interface TickerTableRow {
+  symbol: string;
+  name: string | null;
+  exchange: string | null;
+  tradable: boolean;
+  shortable: boolean;
+  float_shares: number | null;
+  market_cap: number | null;
+  avg_volume: number | null;
+  outstanding_shares: number | null;
+  free_float: number | null;
+  prev_close: number | null;
+  atr: number | null;
+  change_1d_pct: number | null;
+  change_2d_pct: number | null;
+  change_3d_pct: number | null;
+  change_4d_pct: number | null;
+  change_5d_pct: number | null;
+  change_6d_pct: number | null;
+  pump_dump_score: number | null;
+  dilution_score: number | null;
+  dilution_pct_12m: number | null;
+  shares_outstanding_12m: number | null;
+  dilution_capacity_score: number | null;
+  dilution_need_score: number | null;
+  short_interest_score: number | null;
+  last_split_date: string | null;
+  last_split_label: string | null;
+  split_count_1y: number | null;
+  country: string | null;
+  industry: string | null;
+  sector: string | null;
+  sic: string | null;
+  short_interest: number | null;
+  days_to_cover: number | null;
+  short_interest_settlement: string | null;
+  net_income_last_q: number | null;
+  net_income_ttm: number | null;
+  negative_quarters_last4: number | null;
+  operating_cash_flow_ttm: number | null;
+  cash_and_equivalents: number | null;
+  financials_period_end: string | null;
+  has_recent_shelf: boolean;
+  latest_dilution_form: string | null;
+  latest_dilution_date: string | null;
+  dilution_atm: boolean;
+  dilution_resale: boolean;
+  dilution_warrants: boolean;
+  offering_amount: number | null;
+  institutional_ownership_pct: number | null;
+  insider_ownership_pct: number | null;
+  holders_5pct_count: number | null;
+  restricted_shares: number | null;
+  filings_count: number;
+  news_count: number;
+  intel_updated_at: string | null;
 }

@@ -20,6 +20,7 @@ import type { CrosshairSync } from "@/lib/crosshairSync";
 import { nyTime, nyDateTime, nyDayMonth, nyMonth, nyYear } from "@/lib/nyTime";
 import { ExecutionsPrimitive } from "@/charts/executionsPrimitive";
 import { BollingerPrimitive } from "@/charts/bollingerPrimitive";
+import { GridPrimitive } from "@/charts/gridPrimitive";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
 import {
   BACKFILL_THRESHOLD,
@@ -38,6 +39,7 @@ import { useDeleteButtons } from "@/charts/useDeleteButtons";
 import { useBarSeries } from "@/charts/useBarSeries";
 import { useLiveTicks } from "@/charts/useLiveTicks";
 import { useChartBars } from "@/charts/useChartBars";
+import { useBarTooltip } from "@/charts/useBarTooltip";
 
 // ─── Geometry helpers ───────────────────────────────────────────────────────
 
@@ -56,11 +58,25 @@ const SEG_HIT    = 6;   // px distance to grab a segment body
 const PRICE_HIT  = 7;   // px to grab a horizontal price line
 
 // Default chart scale options, re-applied after a drag temporarily froze them.
+// `mouseWheel` is off: the main-wheel time zoom is driven by our `onWheel` handler
+// (which pins the current bar at the default view, anchors on the cursor once
+// panned) — native wheel zoom always anchors on the cursor, which we don't want.
 const DEFAULT_SCALE = {
   mouseWheel:           false,
   pinch:                true,
   axisPressedMouseMove: true,
   axisDoubleClickReset: true,
+};
+
+// Scroll handling: the chart's OWN mouse-wheel scroll is disabled so the wheel is
+// driven entirely by our `onWheel` handler (2nd/horizontal wheel = vertical
+// price-axis zoom, main wheel = time zoom). Click-drag panning and touch dragging
+// stay enabled. Re-applied after an in-chart drag froze them.
+const DEFAULT_SCROLL = {
+  mouseWheel:       false,
+  pressedMouseMove: true,
+  horzTouchDrag:    true,
+  vertTouchDrag:    true,
 };
 
 // ─── Drag state ───────────────────────────────────────────────────────────────
@@ -246,7 +262,7 @@ export function LightweightChart({
 
   // ── Bar-loading pipeline (history refresh + RAM poll + lazy back-fill) — hook ─
   const { bars, loadOlderBars } = useChartBars(
-    symbol, timeframe, chartRef, symbolRef, timeframeRef,
+    symbol, timeframe, symbolRef, timeframeRef,
     barsRef, renderedFirstRef, renderedLastRef,
   );
 
@@ -313,8 +329,10 @@ export function LightweightChart({
           nyDateTime(Number(t), timeframe === "5s" || timeframe === "10s"),
       },
       grid: {
-        vertLines: { color: "#111" },
-        horzLines: { color: "#111" },
+        // Native grid fully off: vertical lines removed; horizontal lines are
+        // drawn by GridPrimitive (snapped to round/half-dollar, never < $0.50).
+        vertLines: { visible: false },
+        horzLines: { visible: false },
       },
       crosshair: {
         mode:     CrosshairMode.Normal,
@@ -325,7 +343,7 @@ export function LightweightChart({
         borderColor:      "#1e1e1e",
         timeVisible:      true,
         secondsVisible:   timeframe === "5s" || timeframe === "10s",
-        rightOffset:      5,
+        rightOffset:      7, // bars of empty space past the latest bar (official option)
         fixLeftEdge:      false,
         fixRightEdge:     false,
         tickMarkFormatter: (t: Time, tickMarkType: TickMarkType) => {
@@ -343,7 +361,7 @@ export function LightweightChart({
         borderColor:  "#1e1e1e",
         scaleMargins: { top: 0.08, bottom: 0.08 },
       },
-      handleScroll: true,
+      handleScroll: { ...DEFAULT_SCROLL },
       handleScale: { ...DEFAULT_SCALE },
     });
 
@@ -368,6 +386,10 @@ export function LightweightChart({
 
     chartRef.current  = chart;
     candleRef.current = candle;
+
+    // Horizontal grid (round/half-dollar levels). Attached first so it sits
+    // behind the other bottom-z primitives (Bollinger fill) and the candles.
+    candle.attachPrimitive(new GridPrimitive());
 
     const execPrim = new ExecutionsPrimitive();
     candle.attachPrimitive(execPrim);
@@ -451,30 +473,52 @@ export function LightweightChart({
     });
 
     const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-
-      // ── Horizontal wheel (2nd wheel) → vertical price-axis zoom ──────────────
-      // Adjusting the price-scale margins symmetrically squashes/expands the
-      // candles vertically (smaller margins = taller candles = zoom in).
+      // ── Horizontal wheel (Logitech 2nd wheel / tilt) → vertical price-axis zoom ─
+      // Squash / expand the candles vertically by adjusting the price-scale margins
+      // symmetrically (smaller margins = taller candles = zoom in).
       if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        e.preventDefault();
         const scale = candle.priceScale();
         const m = scale.options().scaleMargins ?? { top: 0.08, bottom: 0.08 };
-        const step = e.deltaX < 0 ? -0.02 : 0.02; // scroll left = zoom in
+        const step = e.deltaX < 0 ? -0.02 : 0.02; // one way zooms in, the other out
         const clamp = (v: number) => Math.max(0, Math.min(0.45, v));
         scale.applyOptions({ scaleMargins: { top: clamp(m.top + step), bottom: clamp(m.bottom + step) } });
         return;
       }
 
-      // ── Vertical wheel → time-axis zoom, keeping the latest bar pinned ───────
-      // rightOffset is measured in bars, so a fixed bar-count offset drifts in
-      // pixels as barSpacing changes. Recompute it to hold the current pixel gap
-      // (last bar → right edge) constant, so the current bar stays immobile.
-      const ts   = chart.timeScale();
-      const opts = ts.options();
-      const pxOffset = opts.rightOffset * opts.barSpacing;
-      const factor  = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-      const next    = Math.max(opts.minBarSpacing, Math.min(opts.barSpacing * factor, 80));
-      ts.applyOptions({ barSpacing: next, rightOffset: pxOffset / next });
+      // ── Main wheel → time-axis zoom ─────────────────────────────────────────
+      if (e.deltaY === 0) return;
+      e.preventDefault();
+      const ts      = chart.timeScale();
+      const logical = ts.getVisibleLogicalRange();
+      if (!logical) return;
+      const n       = barsRef.current?.length ?? 0;
+      const lastIdx = n - 1;
+      const factor  = e.deltaY < 0 ? 1.1 : 1 / 1.1; // wheel up = zoom in
+
+      // Default view (the latest bar is still the rightmost thing on screen, nothing
+      // newer scrolled past) → keep the CURRENT bar fixed: hold the last-bar →
+      // right-edge pixel gap constant while changing bar spacing. This also keeps the
+      // chart pinned to realtime, so new bars still scroll in.
+      if (n === 0 || logical.to >= lastIdx) {
+        const opts     = ts.options();
+        const pxOffset = opts.rightOffset * opts.barSpacing;
+        const next     = Math.max(opts.minBarSpacing, Math.min(opts.barSpacing * factor, 80));
+        ts.applyOptions({ barSpacing: next, rightOffset: pxOffset / next });
+        return;
+      }
+
+      // Panned into history → zoom focused on the bar under the cursor: scale the
+      // visible logical range around the cursor's bar (the chart stays where it is,
+      // no snap-back to the latest bar).
+      const anchor = ts.coordinateToLogical(e.clientX - container.getBoundingClientRect().left)
+        ?? (logical.from + logical.to) / 2;
+      const inv  = 1 / factor; // the visible range scales inversely to bar spacing
+      const from = anchor - (anchor - logical.from) * inv;
+      const to   = anchor + (logical.to - anchor) * inv;
+      // Cap zoom-in at ~80px/bar (matches the bar-spacing ceiling above).
+      if (factor > 1 && to - from < container.clientWidth / 80) return;
+      ts.setVisibleLogicalRange({ from, to });
     };
     container.addEventListener("wheel", onWheel, { passive: false });
 
@@ -523,6 +567,9 @@ export function LightweightChart({
 
   // ── Volume histogram — always on, every pane (extracted hook) ──────────────
   useVolumeSeries(chartRef, volumeSeriesRef, bars);
+
+  // ── Press-and-hold tooltip (bar volume + body % above the bar) — extracted hook ─
+  useBarTooltip(chartRef, candleRef, volumeSeriesRef, containerRef);
 
   // ── Pre/post-market background shading (extracted hook) ────────────────────
   useSessionShading(sessionBgRef, bars, timeframe);
@@ -577,7 +624,7 @@ export function LightweightChart({
     chartRef.current?.applyOptions(
       freeze
         ? { handleScroll: false, handleScale: false }
-        : { handleScroll: true, handleScale: { ...DEFAULT_SCALE } },
+        : { handleScroll: { ...DEFAULT_SCROLL }, handleScale: { ...DEFAULT_SCALE } },
     );
   }, []);
 

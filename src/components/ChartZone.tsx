@@ -17,7 +17,7 @@ import {
 import { JournalModal } from "./JournalModal";
 import { DrawingContextMenu } from "./DrawingContextMenu";
 import { useQuery } from "@tanstack/react-query";
-import type { AlertSignal, PaneSpec, StrategyCard, Timeframe, ZoneAssignment } from "@/types";
+import type { PaneSpec, StrategyCard, Timeframe, ZoneAssignment } from "@/types";
 import { useLayoutStore, MANUAL_STRATEGY_ID } from "@/stores/layoutStore";
 import {
   useChartStore, type DrawMode, type DrawScope, type ChartLine,
@@ -42,8 +42,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   PRIORITY_STYLES, TIMEFRAMES,
-  ChartInfoBar, StrategyInfoOverlay, TBtn, Sep, EmptyZone,
+  ChartInfoBar, StrategyInfoOverlay, MicroInfoOverlay, TBtn, Sep, EmptyZone,
 } from "./chartZoneParts";
+
+// Micro Pullback gets the rich on-chart risk overlay (on its sub-minute pane);
+// every other strategy uses the generic field overlay (on its left pane).
+const MICRO_PULLBACK_ID = "micro_pullback";
 
 // Mood emojis offered by the toolbar (euphoric / angry / panicked / in the clouds).
 const EMOJIS: { glyph: string; title: string }[] = [
@@ -84,7 +88,6 @@ interface ChartZoneProps {
 }
 
 export function ChartZone({ zone }: ChartZoneProps) {
-  const [isDragOver, setIsDragOver] = useState(false);
   const headerRef   = useRef<HTMLDivElement>(null);
   const chartAreaRef = useRef<HTMLDivElement>(null);
   const infoBandRef  = useRef<HTMLDivElement>(null);
@@ -93,13 +96,16 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const crosshairSyncRef = useRef(createCrosshairSync());
   const [narrowToolbar, setNarrowToolbar] = useState(false);
 
-  // Journal modal
-  const [journalOpen, setJournalOpen] = useState(false);
+  // Journal modal — pinned to the trade it was opened for. The mono-chart zone
+  // can switch tickers underneath an open journal; capturing the target here
+  // keeps the modal (and any in-progress notes) on the original trade instead
+  // of reloading the newly-arrived ticker's entry.
+  const [journalTarget, setJournalTarget] =
+    useState<{ tradeId: string; symbol: string } | null>(null);
 
   // Capture status: idle | pending | success | error
   const [captureStatus, setCaptureStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
 
-  const placeAlertInZone = useLayoutStore((s) => s.placeAlertInZone);
   const releaseZone      = useLayoutStore((s) => s.releaseZone);
 
   const chartStore   = useChartStore();
@@ -113,6 +119,12 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const hasTp      = context?.take_profit != null;
   const hasTradeId = !!context?.trade_id;
 
+  // Snapshot the current trade and open the journal pinned to it.
+  const openJournal = useCallback(() => {
+    const tradeId = context?.trade_id;
+    if (tradeId && zone.symbol) setJournalTarget({ tradeId, symbol: zone.symbol });
+  }, [context?.trade_id, zone.symbol]);
+
   // ── Strategy identity card → panes + info-band fields ──────────────────────
   const { data: cards } = useStrategyCards();
   const isManual = zone.strategy_id === MANUAL_STRATEGY_ID;
@@ -125,6 +137,26 @@ export function ChartZone({ zone }: ChartZoneProps) {
     : [{ timeframe, symbol: null, indicators: [], interactive: true }];
   // The pane that carries SL/TP/orders/drawing (the 5s pane for micro_pullback).
   const interactiveIdx = Math.max(0, panes.findIndex((p) => p.interactive));
+
+  // Layout columns: panes sharing a `column` stack vertically (declaration
+  // order); panes without one each get their own column. Legacy cards (no
+  // column) → the previous side-by-side layout. Micro Pullback uses this to put
+  // daily + 5m in the left column and the 10s pane in the right.
+  const columns: number[][] = (() => {
+    const order: (number | string)[] = [];
+    const map = new Map<number | string, number[]>();
+    panes.forEach((p, i) => {
+      const key = p.column ?? `solo-${i}`;
+      if (!map.has(key)) { map.set(key, []); order.push(key); }
+      map.get(key)!.push(i);
+    });
+    return order.map((k) => map.get(k)!);
+  })();
+  // Pane that carries the strategy info overlay: Micro Pullback draws its rich
+  // risk overlay on the sub-minute (interactive) pane; other strategies keep the
+  // generic field overlay on the left-most pane.
+  const isMicro = zone.strategy_id === MICRO_PULLBACK_ID;
+  const overlayPaneIdx = isMicro ? interactiveIdx : 0;
 
   // ── Progressive alert enrichment (info band + daily pane data) ─────────────
   // Kicked off when an alert lands; only runs for strategies whose card declares
@@ -170,6 +202,17 @@ export function ChartZone({ zone }: ChartZoneProps) {
     queryFn:  () => api.getCardInfo(zone.symbol!),
     enabled:  !!zone.symbol,
     refetchInterval: 3000,
+  });
+
+  // ── Recent single-ticker headlines (Alpaca news REST) for the Micro overlay ─
+  // Fetched as soon as the ticker is displayed; refreshed periodically to pick up
+  // new headlines. The overlay derives the freshness badge from each created_at.
+  const { data: tickerNews } = useQuery({
+    queryKey: ["ticker_news", zone.symbol],
+    queryFn:  () => api.getTickerNews(zone.symbol!),
+    enabled:  !!zone.symbol && zone.strategy_id === MICRO_PULLBACK_ID,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
   });
 
   // ── Current (forming) bar volume on the displayed timeframe ────────────────
@@ -668,8 +711,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
         // Opaque box (the live backdrop-blur can't be reproduced on canvas).
         ctx.fillStyle = "rgba(0,0,0,0.55)";
         ctx.fillRect(x, y, w, h);
-        const label = cell.children[0]?.textContent?.trim() ?? "";
-        const value = cell.children[1]?.textContent?.trim() ?? "";
+        // Prefer explicit data-cap-label / data-cap-value (rich Micro overlay,
+        // where a bar sits between them); fall back to the generic overlay's
+        // first two children (label over value).
+        const labelEl = cell.querySelector<HTMLElement>("[data-cap-label]") ?? cell.children[0];
+        const valueEl = cell.querySelector<HTMLElement>("[data-cap-value]") ?? cell.children[1];
+        const label = labelEl?.textContent?.trim() ?? "";
+        const value = valueEl?.textContent?.trim() ?? "";
         if (label) {
           ctx.font = "9px ui-monospace, monospace";
           ctx.textBaseline = "top";
@@ -730,7 +778,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       case "line":       toggleMode("line"); break;
       case "text":       toggleMode("text"); break;
       case "capture":    if (captureStatus === "idle") handleCapture(); break;
-      case "journal":    if (hasTradeId) setJournalOpen(true); break;
+      case "journal":    openJournal(); break;
       case "order_mode": chartStore.setOrderMode(zone.zone_id, orderMode === "market" ? "limit" : "market"); break;
       case "order_25":   handleOrder(25); break;
       case "order_50":   handleOrder(50); break;
@@ -746,33 +794,15 @@ export function ChartZone({ zone }: ChartZoneProps) {
         if (tf) chartStore.setTimeframe(zone.zone_id, tf);
       }
     }
-  }, [handleRelease, toggleMode, captureStatus, handleCapture, hasTradeId,
+  }, [handleRelease, toggleMode, captureStatus, handleCapture, openJournal,
       chartStore, zone.zone_id, zone.symbol, zone.strategy_id, orderMode,
       handleOrder, handleClose, card]);
 
   useEffect(() => registerZoneHotkeys(zone.zone_id, runAction), [zone.zone_id, runAction]);
 
-  // ── Drag-and-drop handlers (alert → zone only; zone-to-zone removed) ────────
-  function handleDragOver(e: React.DragEvent) {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
-    setIsDragOver(true);
-  }
-  function handleDragLeave(e: React.DragEvent) {
-    if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragOver(false);
-  }
-  function handleDrop(e: React.DragEvent) {
-    e.preventDefault();
-    setIsDragOver(false);
-    const alertData = e.dataTransfer.getData("application/tagdash-alert");
-    if (alertData) {
-      try { placeAlertInZone(JSON.parse(alertData) as AlertSignal, zone.zone_id); } catch { /* */ }
-    }
-  }
-
   // ── Empty zone ─────────────────────────────────────────────────────────────
   if (!zone.symbol) {
-    return <EmptyZone zone={zone} onDrop={handleDrop} />;
+    return <EmptyZone zone={zone} />;
   }
 
   const styles = zone.priority != null ? PRIORITY_STYLES[zone.priority] ?? null : null;
@@ -972,7 +1002,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       key="journal"
       title={hasTradeId ? "Journal" : "TradeID requis (placer SL ou TP d'abord)"}
       disabled={!hasTradeId}
-      onClick={() => hasTradeId && setJournalOpen(true)}
+      onClick={openJournal}
     >
       <NotebookPen className="h-3 w-3" />
     </TBtn>
@@ -990,12 +1020,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
       className={cn(
         "relative flex h-full w-full flex-col overflow-hidden rounded-md border border-border bg-card transition-colors",
         styles?.accent,
-        isDragOver && "border-blue-500/70 bg-blue-900/5"
       )}
       onMouseEnter={() => setHoveredZone(zone.zone_id)}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
     >
       {/* ── Header row: symbol + toolbar ─────────────────────────────────── */}
       <div
@@ -1128,7 +1154,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   disabled={!hasTradeId}
-                  onClick={() => hasTradeId && setJournalOpen(true)}
+                  onClick={openJournal}
                   className="gap-2 text-xs"
                 >
                   <NotebookPen className="h-3 w-3" /> Journal
@@ -1150,6 +1176,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
           card={card}
           cardInfo={cardInfo ?? null}
           enrichment={enrichment ?? null}
+          dayVolume={liveState?.volume_day ?? null}
           currentBarVolume={currentBarVolume}
           onRunLlm={() => {
             if (zone.symbol && zone.strategy_id) {
@@ -1180,93 +1207,115 @@ export function ChartZone({ zone }: ChartZoneProps) {
           (history + red split markers) when available, else the cached daily
           history, else the live daily aggregate. */}
       <div ref={chartAreaRef} className="relative mx-1 mb-1 mt-0.5 flex min-h-0 flex-1 gap-1 overflow-hidden rounded">
-        {panes.map((pane, i) => {
-          const isInteractive = i === interactiveIdx;
-          const paneSymbol    = pane.symbol ?? zone.symbol!;
-          const paneTf        = isInteractive ? timeframe : pane.timeframe;
-          const isDaily       = paneTf === "daily";
-          // Drawings belong to a timeframe class: an intraday pane only shows
-          // intraday drawings, the daily pane only shows daily ones.
-          const paneScope: DrawScope = isDaily ? "daily" : "intraday";
-          const paneLines       = lines.filter((l) => l.scope === paneScope);
-          const paneAnnotations = annotations.filter((a) => a.scope === paneScope);
-          // The daily pane loads its bars through the unified path (Alpaca-fresh,
-          // today's session included) like every other pane; only the split-day
-          // markers come from the enrichment payload.
-          const splitMarkers =
-            isDaily && enrichment?.split_markers?.length
-              ? enrichment.split_markers.map((m) => ({ time: m.time, color: "#ef4444", text: m.label }))
-              : undefined;
-          return (
-            <div
-              key={i}
-              className={cn("relative min-w-0 flex-1", i > 0 && "border-l border-border/40")}
-            >
-              {!isInteractive && (
-                <span className={cn(
-                  "pointer-events-none absolute top-1 z-10 rounded bg-black/40 px-1 text-[8px] tabular-nums text-muted-foreground/70",
-                  // Left pane carries the strategy overlay top-left → label goes right.
-                  i === 0 ? "right-1" : "left-1",
-                )}>
-                  {paneSymbol} · {pane.timeframe}
-                </span>
-              )}
-              {/* Strategy-specific info, drawn on the left pane only. */}
-              {i === 0 && (
-                <StrategyInfoOverlay
-                  card={card}
-                  live={liveState}
-                  cardInfo={cardInfo ?? null}
-                  enrichment={enrichment ?? null}
-                />
-              )}
-              <LightweightChart
-                symbol={paneSymbol}
-                timeframe={paneTf}
-                drawMode={drawMode}
-                paneScope={paneScope}
-                pendingEmoji={pendingEmoji}
-                slPrice={context?.stop_loss ?? null}
-                tpPrice={context?.take_profit ?? null}
-                entryPrice={openPosition?.avg_entry_price ?? null}
-                bid={liveState?.bid ?? null}
-                ask={liveState?.ask ?? null}
-                ordersActive={hasPosition}
-                lines={paneLines}
-                annotations={paneAnnotations}
-                alarms={alarms}
-                linePoint1={linePoint1}
-                indicators={pane.indicators}
-                markers={splitMarkers}
-                crosshairSync={crosshairSyncRef.current}
-                paneId={`${zone.zone_id}-${i}`}
-                onPriceClick={handlePriceClick}
-                onSlDragEnd={handleSlDragEnd}
-                onTpDragEnd={handleTpDragEnd}
-                onSlDblClick={handleSlDragEnd}
-                onDeleteSl={handleDeleteSl}
-                onDeleteTp={handleDeleteTp}
-                onDeleteAlarm={handleDeleteAlarm}
-                onAlarmDragEnd={handleAlarmDragEnd}
-                onLineChange={handleLineChange}
-                onAnnotationMove={handleAnnotationMove}
-                onCreateAnnotation={(kind, time, price, text) => handleCreateAnnotation(kind, time, price, text, paneScope)}
-                onEditAnnotation={handleEditAnnotation}
-                onContextMenu={handleContextMenu}
-                onCancelTool={() => chartStore.setDrawMode(zone.zone_id, "none")}
-              />
-            </div>
-          );
-        })}
+        {columns.map((paneIdxs, ci) => (
+          <div
+            key={ci}
+            className={cn(
+              "flex min-h-0 min-w-0 flex-1 flex-col gap-1",
+              ci > 0 && "border-l border-border/40 pl-1",
+            )}
+          >
+            {paneIdxs.map((i, ri) => {
+              const pane          = panes[i];
+              const isInteractive = i === interactiveIdx;
+              const paneSymbol    = pane.symbol ?? zone.symbol!;
+              const paneTf        = isInteractive ? timeframe : pane.timeframe;
+              const isDaily       = paneTf === "daily";
+              // Drawings belong to a timeframe class: an intraday pane only shows
+              // intraday drawings, the daily pane only shows daily ones.
+              const paneScope: DrawScope = isDaily ? "daily" : "intraday";
+              const paneLines       = lines.filter((l) => l.scope === paneScope);
+              const paneAnnotations = annotations.filter((a) => a.scope === paneScope);
+              // The daily pane loads its bars through the unified path (Alpaca-fresh,
+              // today's session included) like every other pane; only the split-day
+              // markers come from the enrichment payload.
+              const splitMarkers =
+                isDaily && enrichment?.split_markers?.length
+                  ? enrichment.split_markers.map((m) => ({ time: m.time, color: "#ef4444", text: m.label }))
+                  : undefined;
+              const hasOverlay = overlayPaneIdx === i;
+              return (
+                <div
+                  key={i}
+                  className={cn("relative min-h-0 min-w-0 flex-1", ri > 0 && "border-t border-border/40 pt-1")}
+                >
+                  {!isInteractive && (
+                    <span className={cn(
+                      "pointer-events-none absolute top-1 z-10 rounded bg-black/40 px-1 text-[8px] tabular-nums text-muted-foreground/70",
+                      // Avoid the strategy overlay (top-left): label goes right when
+                      // this pane carries it.
+                      hasOverlay ? "right-1" : "left-1",
+                    )}>
+                      {paneSymbol} · {pane.timeframe}
+                    </span>
+                  )}
+                  {/* Strategy-specific info overlay (rich for Micro Pullback). */}
+                  {hasOverlay && (
+                    isMicro ? (
+                      <MicroInfoOverlay
+                        cardInfo={cardInfo ?? null}
+                        enrichment={enrichment ?? null}
+                        news={tickerNews ?? []}
+                      />
+                    ) : (
+                      <StrategyInfoOverlay
+                        card={card}
+                        live={liveState}
+                        cardInfo={cardInfo ?? null}
+                        enrichment={enrichment ?? null}
+                      />
+                    )
+                  )}
+                  <LightweightChart
+                    symbol={paneSymbol}
+                    timeframe={paneTf}
+                    drawMode={drawMode}
+                    paneScope={paneScope}
+                    pendingEmoji={pendingEmoji}
+                    slPrice={context?.stop_loss ?? null}
+                    tpPrice={context?.take_profit ?? null}
+                    entryPrice={openPosition?.avg_entry_price ?? null}
+                    bid={liveState?.bid ?? null}
+                    ask={liveState?.ask ?? null}
+                    ordersActive={hasPosition}
+                    lines={paneLines}
+                    annotations={paneAnnotations}
+                    alarms={alarms}
+                    linePoint1={linePoint1}
+                    indicators={pane.indicators}
+                    markers={splitMarkers}
+                    crosshairSync={crosshairSyncRef.current}
+                    paneId={`${zone.zone_id}-${i}`}
+                    onPriceClick={handlePriceClick}
+                    onSlDragEnd={handleSlDragEnd}
+                    onTpDragEnd={handleTpDragEnd}
+                    onSlDblClick={handleSlDragEnd}
+                    onDeleteSl={handleDeleteSl}
+                    onDeleteTp={handleDeleteTp}
+                    onDeleteAlarm={handleDeleteAlarm}
+                    onAlarmDragEnd={handleAlarmDragEnd}
+                    onLineChange={handleLineChange}
+                    onAnnotationMove={handleAnnotationMove}
+                    onCreateAnnotation={(kind, time, price, text) => handleCreateAnnotation(kind, time, price, text, paneScope)}
+                    onEditAnnotation={handleEditAnnotation}
+                    onContextMenu={handleContextMenu}
+                    onCancelTool={() => chartStore.setDrawMode(zone.zone_id, "none")}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        ))}
       </div>
 
-      {/* Journal modal */}
-      {journalOpen && hasTradeId && (
+      {/* Journal modal — pinned to the trade captured at open time, so a ticker
+          switch in the zone behind it can't swap its contents or unmount it. */}
+      {journalTarget && (
         <JournalModal
-          open={journalOpen}
-          onClose={() => setJournalOpen(false)}
-          tradeId={context!.trade_id!}
-          symbol={zone.symbol!}
+          open={true}
+          onClose={() => setJournalTarget(null)}
+          tradeId={journalTarget.tradeId}
+          symbol={journalTarget.symbol}
         />
       )}
 

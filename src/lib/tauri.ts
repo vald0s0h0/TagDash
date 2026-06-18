@@ -8,6 +8,7 @@ import type {
   Bar,
   BugReport,
   CardInfo,
+  CardNews,
   ChartDrawing,
   FeedDiagnostics,
   Fill,
@@ -29,6 +30,7 @@ import type {
   StrategyCard,
   StreamableSymbol,
   SyncQueueStatus,
+  TickerTableRow,
   Timeframe,
   TradeExecutions,
   TradeLifecycle,
@@ -120,6 +122,15 @@ export const api = {
     invoke<PrevDayLevels | null>("get_previous_day_levels", { symbol }),
   getCardInfo: (symbol: string) =>
     invoke<CardInfo>("get_card_info", { symbol }),
+  // Most recent single-ticker headlines for a displayed ticker (Alpaca news REST,
+  // headlines only, multi-ticker news dropped). Up to 4, newest first.
+  getTickerNews: (symbol: string) =>
+    invoke<CardNews[]>("get_ticker_news", { symbol }),
+  // Bounded extract of the tickers data table (universe DB + all enrichments +
+  // news/filings counts). Empty query → most recently collected rows; otherwise →
+  // tickers matching the query (symbol prefix / name contains). Capped server-side.
+  getTickersTable: (query: string, limit: number) =>
+    invoke<TickerTableRow[]>("get_tickers_table", { query, limit }),
   getLatencyStatus: () => invoke<LatencyStatus>("get_latency_status"),
   getFeedDiagnostics: () => invoke<FeedDiagnostics>("get_feed_diagnostics"),
   getNewsDiagnostics: () => invoke<NewsDiagnostics>("get_news_diagnostics"),

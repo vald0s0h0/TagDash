@@ -58,6 +58,7 @@ function condense(alarms: AlarmView[]): AlarmView[] {
 export function AlarmsPanel() {
   const qc                = useQueryClient();
   const setSelectedTicker = useUiStore((s) => s.setSelectedTicker);
+  const setActiveSession  = useUiStore((s) => s.setActiveSession);
   const openInActiveZone  = useLayoutStore((s) => s.openInActiveZone);
 
   const { data: alarms = [] } = useQuery({
@@ -79,6 +80,9 @@ export function AlarmsPanel() {
   function open(a: AlarmView) {
     setSelectedTicker(a.symbol);
     openInActiveZone(alarmToAlert(a));
+    // Alarms route to the Open session — surface that chart so the click is
+    // visible even when the user is on another session tab.
+    setActiveSession("open");
   }
 
   // Each row is condensed per-ticker, so the trash removes every armed alarm on

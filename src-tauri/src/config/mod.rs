@@ -21,6 +21,10 @@ pub struct AppConfig {
     pub tradetally: TradeTallyConfig,
     #[serde(default)]
     pub journal: JournalConfig,
+    /// "Company intelligence" collection job (short interest, financials, dilution
+    /// filings, ownership). Isolated background job — see `crate::company_intel`.
+    #[serde(default)]
+    pub company_intel: CompanyIntelConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +120,54 @@ fn default_journal_tags() -> Vec<String> {
     .collect()
 }
 
+/// Settings for the company-intelligence collection job. Per-provider rate
+/// limits (requests/minute), the cache TTL (how stale a ticker may be before it's
+/// recollected) and a per-run cap (so a startup pass never tries the whole
+/// universe at once). All `#[serde(default)]` so older configs still load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanyIntelConfig {
+    /// Master switch for the background collection job.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Re-collect a ticker only when its cached record is older than this many
+    /// hours (TTL). 0 = always refresh.
+    #[serde(default = "default_intel_ttl_hours")]
+    pub ttl_hours: u64,
+    /// Max tickers processed per collection run (bounds a startup pass; the rest
+    /// are picked up on later runs / by the future background worker).
+    #[serde(default = "default_intel_batch_cap")]
+    pub max_tickers_per_run: usize,
+    /// SEC EDGAR budget (req/min). SEC allows ~10 req/s; stay well under.
+    #[serde(default = "default_sec_rpm")]
+    pub sec_rpm: f64,
+    /// Massive budget (req/min). Free tier ≈ 1 req / 13 s ⇒ ~5 req/min.
+    #[serde(default = "default_massive_rpm")]
+    pub massive_rpm: f64,
+    /// FMP budget (req/min). Free tier is small; keep it gentle.
+    #[serde(default = "default_fmp_rpm")]
+    pub fmp_rpm: f64,
+}
+
+fn default_true() -> bool { true }
+fn default_intel_ttl_hours() -> u64 { 24 }
+fn default_intel_batch_cap() -> usize { 50 }
+fn default_sec_rpm() -> f64 { 300.0 }
+fn default_massive_rpm() -> f64 { 4.0 }
+fn default_fmp_rpm() -> f64 { 30.0 }
+
+impl Default for CompanyIntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            ttl_hours: default_intel_ttl_hours(),
+            max_tickers_per_run: default_intel_batch_cap(),
+            sec_rpm: default_sec_rpm(),
+            massive_rpm: default_massive_rpm(),
+            fmp_rpm: default_fmp_rpm(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeTallyConfig {
     pub api_base_url:  String,
@@ -171,6 +223,7 @@ impl Default for AppConfig {
                 mock_delay_ms: 0,
             },
             journal: JournalConfig::default(),
+            company_intel: CompanyIntelConfig::default(),
         }
     }
 }

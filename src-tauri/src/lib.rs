@@ -2,6 +2,7 @@ pub mod alpaca;
 pub mod chart_state;
 pub mod chart_payloads;
 pub mod commands;
+pub mod company_intel;
 pub mod config;
 pub mod enrichment;
 pub mod fmp;
@@ -163,6 +164,10 @@ pub fn run() {
                 match WebviewWindowBuilder::new(app.handle(), "flash", WebviewUrl::App("index.html".into()))
                     .title("")
                     .decorations(false)
+                    // No drop shadow / frame: a borderless window still gets a DWM
+                    // shadow on Windows, which shows as a faint outline around the
+                    // (otherwise invisible) transparent overlay. Kill it.
+                    .shadow(false)
                     .transparent(true)
                     .always_on_top(true)
                     .skip_taskbar(true)
@@ -208,6 +213,12 @@ pub fn run() {
                 let focus_rx          = state.focus_symbols_tx.subscribe();
                 let app_handle        = app.handle().clone();
                 let news_feed_running = state.news_feed_running.clone();
+                // Dedicated handles for the company-intel collection job (kept as
+                // its own clones so it can run after the pipeline without fighting
+                // the moves above).
+                let ci_db      = db.clone();
+                let ci_config  = config.clone();
+                let ci_secrets = secrets.clone();
                 tauri::async_runtime::spawn(async move {
                     startup::run_pipeline(db.clone(), config.clone(), secrets.clone(), startup).await;
                     match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, live_feed_running, focus_rx, app_handle) {
@@ -217,6 +228,21 @@ pub fn run() {
                     // Premarket news investor — independent of the data feed.
                     if let Err(e) = commands::spawn_news_feed(market, secrets, news_feed_running) {
                         eprintln!("[tagdash] news feed not started: {e}");
+                    }
+                    // Company-intelligence collection (short interest, financials,
+                    // dilution filings, ownership). Runs ONCE here, after the
+                    // universe is built, as a bounded TTL-gated pass. This is the
+                    // exact entry point a future OS background worker will call —
+                    // it never blocks the scanner / feed and makes no UI calls.
+                    let rs_db = ci_db.clone();
+                    crate::company_intel::run_collection_job(ci_db, ci_config, ci_secrets).await;
+                    // Re-score dilution capacity / need now that the per-ticker SEC
+                    // sections this launch collected are in the DB (the pipeline pass
+                    // ran before them). Cheap CPU pass; never blocks the scanner.
+                    {
+                        let today = crate::time::et_date(crate::time::now());
+                        let conn = rs_db.lock().unwrap();
+                        let _ = crate::local_db::cache_repository::recompute_risk_scores(&conn, &today);
                     }
                 });
             }
@@ -282,6 +308,16 @@ pub fn run() {
                 let chart         = state.chart.clone();
                 commands::spawn_trading_loop(running, market, internal_book, db, config, chart);
             }
+
+            // 5. On-demand "capacité à diluer" collector: a background worker that
+            //    refreshes a ticker's SEC dilution section the moment it surfaces on
+            //    the premarket scanners (scanner calls company_intel::ondemand::request).
+            //    Never blocks the scanner; interim until a real background worker exists.
+            if let Some(rx) = crate::company_intel::ondemand::take_channel() {
+                let (db, config) = (state.db.clone(), state.config.clone());
+                tauri::async_runtime::spawn(crate::company_intel::ondemand::run_worker(db, config, rx));
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -355,6 +391,12 @@ pub fn run() {
             commands::get_mean_reversion_scores,
             commands::force_recompute_scores,
             commands::get_card_info,
+            commands::get_ticker_news,
+            // Company intelligence (read-only cache + background refresh trigger)
+            commands::get_company_intel_catalog,
+            commands::get_company_intel,
+            commands::refresh_company_intel,
+            commands::get_tickers_table,
             // Chart / trade context
             commands::get_zone_trade_context,
             commands::create_or_get_trade_id_for_zone,

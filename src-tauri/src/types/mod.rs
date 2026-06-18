@@ -222,6 +222,27 @@ pub struct Fill {
     pub filled_at:  DateTime<Utc>,
 }
 
+/// The price path a symbol traced between two fill polls — a micro-bar the
+/// internal book consumes to detect order crossings. Unlike a single (bid, ask)
+/// snapshot it preserves the *range* (so a level the price spiked through and
+/// retraced is still caught) and the *order* in which the extremes were reached
+/// (so SL vs TP inside the same window resolve by which one the price actually
+/// touched first — not by an arbitrary HashMap iteration order, nor a naive
+/// "red bar ⇒ SL" rule). `first` is the window's opening print, used to fill at
+/// the gap price when a day/session boundary opens straight through a level.
+#[derive(Debug, Clone, Copy)]
+pub struct FillWindow {
+    pub first: f64,
+    pub high:  f64,
+    pub low:   f64,
+    pub last:  f64,
+    /// True when the low extreme was reached before the high extreme. Drives the
+    /// SL/TP tie-break: a "low-side" exit (long SL / short TP) fills first iff
+    /// the low came first. Ties (a single flat print) resolve `true` — the
+    /// conservative worst-case assumption that the adverse level filled.
+    pub low_first: bool,
+}
+
 /// Result of position-sizing calculation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskSizingResult {
@@ -337,6 +358,12 @@ pub struct PaneSpec {
     /// If no pane is flagged, the UI falls back to the first pane.
     #[serde(default)]
     pub interactive: bool,
+    /// Optional layout column. Panes sharing a column are STACKED vertically (in
+    /// declaration order); columns are laid left-to-right. `None` = the pane gets
+    /// its own column (legacy side-by-side behaviour). E.g. Micro Pullback puts
+    /// daily + 5m in column 0 (left, stacked) and the 10s pane in column 1 (right).
+    #[serde(default)]
+    pub column: Option<u8>,
 }
 
 /// LLM enrichment requested by a strategy.

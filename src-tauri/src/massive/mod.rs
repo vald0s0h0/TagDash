@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 pub mod news;
+pub mod short_interest;
 pub mod splits;
 
 /// Free tier allows ~5 requests/minute → 1 request every 13 s (with margin).

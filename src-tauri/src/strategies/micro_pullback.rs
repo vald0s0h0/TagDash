@@ -77,10 +77,12 @@ impl ScanStrategy for MicroPullback {
         StrategyCard {
             // Premarket low-float observation, tick to tick.
             universe: UniverseKey::LowFloat,
-            // Left: daily context (SMA 200/20, volume, red dots on split days) —
-            // read-only. Right: the 10s execution pane (volume) the engine reasons
-            // on — interactive (SL/TP, orders). The daily pane's data + split markers
-            // are supplied by the enrichment payload, not the live ring buffer.
+            // Left column (stacked): daily context (SMA 200/20, volume, red dots on
+            // split days) on top, a 5-minute context chart (volume) below — both
+            // read-only. Right column: the 10s execution pane (volume) the engine
+            // reasons on — interactive (SL/TP, orders), and the pane that carries the
+            // strategy info overlay. The daily pane's split markers are supplied by
+            // the enrichment payload; all bars load through the unified path.
             panes: vec![
                 PaneSpec {
                     timeframe:   "daily".into(),
@@ -91,12 +93,21 @@ impl ScanStrategy for MicroPullback {
                         PaneIndicator { kind: IndicatorKind::Volume, period: None },
                     ],
                     interactive: false,
+                    column:      Some(0),
+                },
+                PaneSpec {
+                    timeframe:   "5m".into(),
+                    symbol:      None,
+                    indicators:  vec![PaneIndicator { kind: IndicatorKind::Volume, period: None }],
+                    interactive: false,
+                    column:      Some(0),
                 },
                 PaneSpec {
                     timeframe:   "10s".into(),
                     symbol:      None,
                     indicators:  vec![PaneIndicator { kind: IndicatorKind::Volume, period: None }],
                     interactive: true,
+                    column:      Some(1),
                 },
             ],
             // Strategy-specific overlay fields (shown top-left on the left pane).

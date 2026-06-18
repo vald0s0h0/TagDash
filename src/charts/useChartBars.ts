@@ -1,24 +1,21 @@
 import { useState, useEffect, useRef, useCallback, type MutableRefObject } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { IChartApi } from "lightweight-charts";
 import type { Bar, Timeframe } from "@/types";
 import { api } from "@/lib/tauri";
-import { toUTC, BACKFILL_THRESHOLD, BACKFILL_BATCH } from "@/charts/chartOptions";
+import { toUTC, BACKFILL_BATCH } from "@/charts/chartOptions";
 
 /** Bar-loading pipeline for a (symbol, timeframe): a slow "history refresh" query
  *  (backend refetches from Alpaca — fills gaps + today's forming bar) nudges a fast
  *  RAM poll; both are merged into an accumulator (live wins per time slot) that also
  *  takes lazily back-filled older history, producing one continuous ascending
  *  series. Returns the rendered `bars` + `loadOlderBars` (called by the chart's
- *  visible-range handler). Shared refs are passed in: `chartRef` (read the visible
- *  range), `symbol/timeframeRef` (current values for in-flight guards), `barsRef`
- *  (kept in sync for the click R-ratio), and `renderedFirst/LastRef` (reset on
- *  series change so the next render is a full setData). Extracted verbatim from
- *  LightweightChart. */
+ *  visible-range handler). Shared refs are passed in: `symbol/timeframeRef` (current
+ *  values for in-flight guards), `barsRef` (kept in sync for the click R-ratio), and
+ *  `renderedFirst/LastRef` (reset on series change so the next render is a full
+ *  setData). Extracted verbatim from LightweightChart. */
 export function useChartBars(
   symbol: string,
   timeframe: Timeframe,
-  chartRef: MutableRefObject<IChartApi | null>,
   symbolRef: MutableRefObject<string>,
   timeframeRef: MutableRefObject<Timeframe>,
   barsRef: MutableRefObject<Bar[] | undefined>,
@@ -85,61 +82,47 @@ export function useChartBars(
     setBars([...accum.entries()].sort((a, c) => a[0] - c[0]).map((e) => e[1]));
   }, [fetchedBars]);
 
-  // ── Lazy back-fill of older history (scroll/zoom into the past). When the
-  // visible range nears the left edge, fetch a batch of older bars from Alpaca
-  // (ending before the oldest loaded bar) and prepend them. Guarded against
-  // concurrent / dead-end fetches.
+  // ── Lazy "infinite history" back-fill (scroll/zoom into the past). When the
+  // visible range nears the left edge, fetch ONE batch of older bars from Alpaca
+  // (ending before the oldest loaded bar) and prepend them. After the prepend
+  // lightweight-charts keeps the visible TIME range, so the logical `from` jumps up
+  // by the batch size; as the user keeps scrolling left the chart's range-change
+  // handler re-fires and the next step loads — history grows in BACKFILL_BATCH-bar
+  // steps. Guarded against concurrent / dead-end fetches.
   const loadOlderBars = useCallback(async () => {
     const sym = symbolRef.current;
     const tf  = timeframeRef.current;
     if (loadingOlderRef.current || noMoreOlderRef.current) return;
     if (tf === "5s" || tf === "10s") return; // Alpaca REST can't serve sub-minute
-    if (accumRef.current.size === 0) return;
+    const accum = accumRef.current;
+    if (accum.size === 0) return;
 
     loadingOlderRef.current = true;
     try {
-      // Read the visible range once and estimate the new left-edge index from the
-      // bars we prepend (the chart can't re-render mid-loop; data lands via the
-      // render effect asynchronously). After setData, lightweight-charts preserves
-      // the visible TIME range, so the logical `from` jumps up by the prepended
-      // count and the next range-change event only re-fires if the user keeps
-      // scrolling — self-correcting.
-      const startRange = chartRef.current?.timeScale().getVisibleLogicalRange();
-      const from0  = startRange ? startRange.from : 0;
-      const target = BACKFILL_THRESHOLD + BACKFILL_BATCH;
-      const accum  = accumRef.current;
-      let totalAdded = 0;
-
-      for (let i = 0; i < 10; i++) {
-        // Oldest currently-loaded bar = the back-fill cutoff.
-        let oldestSec = Infinity;
-        let oldestIso = "";
-        for (const [sec, b] of accum) {
-          if (sec < oldestSec) { oldestSec = sec; oldestIso = b.time; }
-        }
-        if (!oldestIso) break;
-
-        const older = await api.loadOlderBars(sym, tf, oldestIso, BACKFILL_BATCH);
-        // The chart may have switched symbol/timeframe while the request was in
-        // flight — discard the stale batch rather than poison the new accumulator.
-        if (symbolRef.current !== sym || timeframeRef.current !== tf) return;
-        if (!older?.length) { noMoreOlderRef.current = true; break; }
-
-        let added = 0;
-        for (const b of older) {
-          const sec = toUTC(b.time) as number;
-          if (!accum.has(sec)) { accum.set(sec, b); added++; }
-        }
-        if (added === 0) { noMoreOlderRef.current = true; break; } // reached data start
-        totalAdded += added;
-        if (from0 + totalAdded > target) break;
+      // Oldest currently-loaded bar = the back-fill cutoff.
+      let oldestSec = Infinity;
+      let oldestIso = "";
+      for (const [sec, b] of accum) {
+        if (sec < oldestSec) { oldestSec = sec; oldestIso = b.time; }
       }
+      if (!oldestIso) return;
 
-      // One render after the whole batch: the render effect sees a changed FIRST
-      // timestamp → full setData (which keeps the user's view) instead of update().
-      if (totalAdded > 0) {
-        setBars([...accum.entries()].sort((a, c) => a[0] - c[0]).map((e) => e[1]));
+      const older = await api.loadOlderBars(sym, tf, oldestIso, BACKFILL_BATCH);
+      // The chart may have switched symbol/timeframe while the request was in
+      // flight — discard the stale batch rather than poison the new accumulator.
+      if (symbolRef.current !== sym || timeframeRef.current !== tf) return;
+      if (!older?.length) { noMoreOlderRef.current = true; return; }
+
+      let added = 0;
+      for (const b of older) {
+        const sec = toUTC(b.time) as number;
+        if (!accum.has(sec)) { accum.set(sec, b); added++; }
       }
+      if (added === 0) { noMoreOlderRef.current = true; return; } // reached data start
+
+      // One render: the bar-series effect sees a changed FIRST timestamp → full
+      // setData (which preserves the user's view) instead of update().
+      setBars([...accum.entries()].sort((a, c) => a[0] - c[0]).map((e) => e[1]));
     } catch { /* soft-fail */ }
     finally { loadingOlderRef.current = false; }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps

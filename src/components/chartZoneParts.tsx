@@ -3,10 +3,10 @@
 // self-contained (no shared refs, no ChartZone state), so they live here to keep
 // ChartZone focused on orchestration.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { LoaderCircle, Sparkles } from "lucide-react";
 import type {
-  AlertEnrichment, CardInfo, InfoField, StrategyCard,
+  AlertEnrichment, CardInfo, CardNews, InfoField, StrategyCard,
   TickerLiveState, Timeframe, ZoneAssignment,
 } from "@/types";
 import { cn } from "@/lib/utils";
@@ -179,6 +179,7 @@ export function ChartInfoBar({
   card,
   cardInfo,
   enrichment,
+  dayVolume,
   currentBarVolume,
   onRunLlm,
 }: {
@@ -186,6 +187,7 @@ export function ChartInfoBar({
   card: StrategyCard | null;
   cardInfo: CardInfo | null;
   enrichment: AlertEnrichment | null;
+  dayVolume: number | null;
   currentBarVolume: number | null;
   onRunLlm: () => void;
 }) {
@@ -221,6 +223,13 @@ export function ChartInfoBar({
       <BarChip label="Vol PM">
         {cardInfo?.premarket_volume != null
           ? fmtCompact(cardInfo.premarket_volume)
+          : <span className="text-muted-foreground/30">—</span>}
+      </BarChip>
+
+      {/* Cumulative volume traded so far today — live */}
+      <BarChip label="Vol Day">
+        {dayVolume != null
+          ? fmtCompact(dayVolume)
           : <span className="text-muted-foreground/30">—</span>}
       </BarChip>
 
@@ -345,6 +354,248 @@ export function StrategyInfoOverlay({
   );
 }
 
+// ─── Micro Pullback info overlay (rich, top-left of the right/sub-minute pane) ─
+
+const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+
+/** Float "tightness" fill: a LOWER float reads as a fuller bar (more explosive —
+ *  the whole point of a low-float scanner). Plain linear scale, full at ≤500K,
+ *  empty at ≥30M (the low-float ceiling). The exact share count is shown
+ *  alongside, so the bar is the at-a-glance. */
+function floatFill(f: number): number {
+  const lo = 500_000;
+  const hi = 30_000_000;
+  return clamp01(1 - (f - lo) / (hi - lo));
+}
+
+/** Real-time liquidity fill from the last-60s share volume: log scale, empty at
+ *  ≤1K shares/min, full at ≥1M shares/min. */
+function volumeFill(v: number): number {
+  const lo = Math.log10(1_000);
+  const hi = Math.log10(1_000_000);
+  return clamp01((Math.log10(Math.max(v, 1)) - lo) / (hi - lo));
+}
+
+/** A 0..100 score as a 0..1 bar fill (clamped). */
+const scoreFill = (s: number) => clamp01(s / 100);
+
+type Tone = "blue" | "red" | "muted";
+
+const FILL_CLS: Record<Tone, string> = {
+  blue:  "bg-sky-400/85",
+  red:   "bg-rose-500/85",
+  muted: "bg-zinc-500/40",
+};
+
+/** One aligned metric row: fixed label · flexible bar · fixed value. `fill` null
+ *  → no data (greyed, faded). `value` null → number hidden (abstract 0..100
+ *  scores) while the bar still conveys the magnitude. */
+function MetricBar({
+  label, fill, value, tone,
+}: {
+  label: string;
+  fill:  number | null;
+  value: string | null;
+  tone:  Tone;
+}) {
+  const absent = fill == null;
+  return (
+    <div
+      data-capture-cell
+      className={cn(
+        "grid grid-cols-[62px_minmax(0,1fr)_40px] items-center gap-2",
+        absent && "opacity-40",
+      )}
+    >
+      <span
+        data-cap-label
+        className="truncate text-[9px] uppercase leading-none tracking-wide text-muted-foreground/60"
+      >
+        {label}
+      </span>
+      <span className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+        {!absent && (
+          <span
+            className={cn("block h-full rounded-full", FILL_CLS[tone])}
+            style={{ width: `${Math.round((fill ?? 0) * 100)}%` }}
+          />
+        )}
+      </span>
+      <span
+        data-cap-value
+        className="text-right text-[13px] font-semibold leading-none tabular-nums text-foreground/90"
+      >
+        {value ?? ""}
+      </span>
+    </div>
+  );
+}
+
+/** News freshness badge from an ISO publish time: "20sec" / "1min" / "2h" / "3j",
+ *  to the second under a minute. Green < 20 min, orange < 60 min, red beyond. */
+function newsFreshness(createdAt: string, nowMs: number): { text: string; cls: string } {
+  const ms = Date.parse(createdAt);
+  const sec = Number.isFinite(ms) ? Math.max(0, Math.round((nowMs - ms) / 1000)) : 0;
+  const text =
+    sec < 60 ? `${sec}sec`
+    : sec < 3600 ? `${Math.floor(sec / 60)}min`
+    : sec < 86_400 ? `${Math.floor(sec / 3600)}h`
+    : `${Math.floor(sec / 86_400)}j`;
+  const cls = sec < 20 * 60
+    ? "bg-emerald-900/70 text-emerald-300"
+    : sec < 60 * 60
+    ? "bg-amber-900/70 text-amber-300"
+    : "bg-red-900/70 text-red-300";
+  return { text, cls };
+}
+
+/** A row in the news list: freshness badge + headline (2 lines max). */
+function NewsRow({ item, nowMs }: { item: CardNews; nowMs: number }) {
+  const { text, cls } = newsFreshness(item.created_at, nowMs);
+  return (
+    <div data-capture-cell className="flex items-start gap-1.5">
+      <span
+        data-cap-label
+        className={cn("mt-px shrink-0 rounded px-1 py-0.5 text-[8px] font-semibold tabular-nums", cls)}
+      >
+        {text}
+      </span>
+      <span
+        data-cap-value
+        className="line-clamp-2 text-[10px] leading-snug text-foreground/80"
+        title={item.headline}
+      >
+        {item.headline}
+      </span>
+    </div>
+  );
+}
+
+/** Re-render every `ms` so the live-derived news ages stay accurate to the second. */
+function useNowTick(ms: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), ms);
+    return () => clearInterval(id);
+  }, [ms]);
+  return now;
+}
+
+/** The Micro Pullback overlay: a compact, at-a-glance risk panel drawn top-left
+ *  of the right (sub-minute) pane. Keeps the generic overlay's look (transparent
+ *  dark backdrop, muted uppercase labels, semibold tabular values) but lays the
+ *  values out as aligned horizontal bars: blue = liquidity / interest (float,
+ *  premarket volume, short interest), red = dilution / manipulation risk, plus a
+ *  (not-yet-wired) news-score placeholder and the most recent headlines with a
+ *  freshness badge. Missing data greys its row out. */
+export function MicroInfoOverlay({
+  cardInfo,
+  enrichment,
+  news,
+}: {
+  cardInfo: CardInfo | null;
+  enrichment: AlertEnrichment | null;
+  news: CardNews[];
+}) {
+  const nowMs = useNowTick(1000);
+
+  const country  = enrichment?.country  ?? cardInfo?.country  ?? null;
+  const industry = enrichment?.industry ?? cardInfo?.industry ?? null;
+  const float    = enrichment?.float_shares ?? cardInfo?.float_shares ?? null;
+  const liveVol  = cardInfo?.live_volume ?? null;
+
+  return (
+    <div
+      data-capture-overlay
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[246px] max-w-[78%] flex-col gap-1.5 rounded bg-black/40 px-2 py-1.5 backdrop-blur-[1px]"
+    >
+      {/* Pays · Industrie */}
+      <div data-capture-cell className="flex items-baseline gap-1.5 leading-none">
+        <span data-cap-label className="hidden" />
+        <span
+          data-cap-value
+          className="truncate text-[11px] font-semibold text-foreground/90"
+          title={[country, industry].filter(Boolean).join(" · ")}
+        >
+          {country || industry ? (
+            <>
+              {country ?? "—"}
+              {industry && (
+                <span className="font-normal text-muted-foreground/70"> · {industry}</span>
+              )}
+            </>
+          ) : (
+            <span className="text-muted-foreground/40">Pays · Industrie</span>
+          )}
+        </span>
+      </div>
+
+      <div className="h-px w-full bg-white/10" />
+
+      {/* Liquidity / interest — blue (numbers shown for float & volume) */}
+      <MetricBar
+        label="Float"
+        fill={float != null ? floatFill(float) : null}
+        value={float != null ? fmtCompact(float) : null}
+        tone="blue"
+      />
+      <MetricBar
+        label="Vol/min"
+        fill={liveVol != null ? volumeFill(liveVol) : null}
+        value={liveVol != null ? fmtCompact(liveVol) : null}
+        tone="blue"
+      />
+      <MetricBar
+        label="Short int"
+        fill={cardInfo?.short_interest_score != null ? scoreFill(cardInfo.short_interest_score) : null}
+        value={null}
+        tone="blue"
+      />
+
+      {/* Dilution / manipulation risk — red (abstract scores, bar only) */}
+      <MetricBar
+        label="Capa. dil."
+        fill={cardInfo?.dilution_capacity_score != null ? scoreFill(cardInfo.dilution_capacity_score) : null}
+        value={null}
+        tone="red"
+      />
+      <MetricBar
+        label="Besoin dil."
+        fill={cardInfo?.dilution_need_score != null ? scoreFill(cardInfo.dilution_need_score) : null}
+        value={null}
+        tone="red"
+      />
+      <MetricBar
+        label="Dil. hist."
+        fill={cardInfo?.dilution_score != null ? scoreFill(cardInfo.dilution_score) : null}
+        value={null}
+        tone="red"
+      />
+      <MetricBar
+        label="Pump&Dump"
+        fill={cardInfo?.pump_dump_score != null ? scoreFill(cardInfo.pump_dump_score) : null}
+        value={null}
+        tone="red"
+      />
+
+      {/* News score — placeholder bar, wired in a later iteration. */}
+      <MetricBar label="News score" fill={null} value={null} tone="muted" />
+
+      {/* Recent headlines with a freshness badge (up to 4, newest first). */}
+      <div className="h-px w-full bg-white/10" />
+      <div className="flex flex-col gap-1">
+        {news.length > 0 ? (
+          news.slice(0, 4).map((n, i) => <NewsRow key={`${n.created_at}-${i}`} item={n} nowMs={nowMs} />)
+        ) : (
+          <span className="text-[9px] uppercase tracking-wide text-muted-foreground/40">
+            Aucune news
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Small toolbar button ─────────────────────────────────────────────────────
 
 export function TBtn({
@@ -421,28 +672,17 @@ export function TextInput({
 
 // ─── Empty zone ───────────────────────────────────────────────────────────────
 
-export function EmptyZone({
-  zone,
-  onDrop,
-}: {
-  zone: ZoneAssignment;
-  onDrop: (e: React.DragEvent) => void;
-}) {
-  const [over, setOver] = useState(false);
+export function EmptyZone({ zone }: { zone: ZoneAssignment }) {
   return (
     <div
       data-zone-id={zone.zone_id}
-      className={cn(
-        "flex h-full w-full flex-col rounded-md border border-dashed border-border/50 bg-card/10 transition-colors",
-        over && "border-blue-500/70 bg-blue-900/10"
-      )}
-      onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver(false); }}
-      onDrop={(e) => { setOver(false); onDrop(e); }}
+      className="flex h-full w-full flex-col rounded-md border border-dashed border-border/50 bg-card/10"
     >
       <div className="flex flex-1 flex-col items-center justify-center gap-1.5 select-none">
         <span className="text-xs text-muted-foreground/40">Zone vide</span>
-        <span className="text-[10px] text-muted-foreground/25">Glisser une alerte ici</span>
+        <span className="text-[10px] text-muted-foreground/25">
+          Sélectionne un ticker dans les alertes
+        </span>
       </div>
     </div>
   );

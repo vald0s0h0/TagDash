@@ -97,7 +97,12 @@ fn default_steps() -> Vec<StartupStep> {
         StartupStep::new("fetch_massive",    "Fetch Massive float data"),
         StartupStep::new("fetch_sec",        "Fetch SEC company data (country · industry)"),
         StartupStep::new("load_daily",       "Load daily / historical data (250d)"),
+        StartupStep::new("compute_metrics",  "Compute ATR · prev close · Pump&Dump score"),
+        StartupStep::new("fetch_short_interest", "Fetch short interest (Massive bulk)"),
+        StartupStep::new("fetch_splits",     "Fetch stock splits (corporate actions)"),
+        StartupStep::new("fetch_dilution",   "Fetch dilution + financials (SEC XBRL) · scores"),
         StartupStep::new("compute_universe", "Persist float & average volume"),
+        StartupStep::new("compute_risk_scores", "Score dilution capacity · need · short interest"),
         StartupStep::new("build_universe",   "Finalize universe (all US stocks)"),
         StartupStep::new("ready",            "Ready for WebSocket"),
     ]
@@ -126,7 +131,7 @@ fn push_warning(state: &Arc<RwLock<StartupState>>, msg: &str) {
 
 pub async fn run_pipeline(
     db: Arc<Mutex<rusqlite::Connection>>,
-    _config: Arc<RwLock<AppConfig>>,
+    config: Arc<RwLock<AppConfig>>,
     secrets: Arc<RwLock<Secrets>>,
     state: Arc<RwLock<StartupState>>,
 ) {
@@ -552,6 +557,126 @@ pub async fn run_pipeline(
         }
     }
 
+    // ── Step 7b: compute_metrics (ATR + prev_close + Pump&Dump score) ─────────
+    // CPU-only passes over the daily cache (no network). prev_close/ATR fill the
+    // columns the pipeline previously left NULL; the Pump&Dump score is a DB-wide
+    // percentile of the daily-wick behaviour (100 = most pump&dump-like).
+    set_step(&state, "compute_metrics", StepStatus::Running, None);
+    {
+        let (pc, pd) = {
+            let db_guard = db.lock().unwrap();
+            let pc = cache_repository::recompute_atr_prev_close(&db_guard).unwrap_or(0);
+            let pd = cache_repository::recompute_pump_dump_scores(&db_guard).unwrap_or(0);
+            (pc, pd)
+        };
+        set_step(&state, "compute_metrics", StepStatus::Success,
+            Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
+        let _ = log(&db, "info", &format!("startup: ATR/prev_close {pc}, Pump&Dump scored {pd}"));
+    }
+
+    // ── Step 7c: fetch_short_interest (Massive bulk, once/day) ────────────────
+    // The whole-universe dump replaces the per-ticker company_intel path (which
+    // only ever reached ~50 tickers/launch). Persisted into the company_intel
+    // short-interest columns the UI already reads.
+    set_step(&state, "fetch_short_interest", StepStatus::Running, None);
+    const SI_DATE_KEY: &str = "short_interest_fetch_date";
+    let si_fresh_today = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, SI_DATE_KEY).as_deref() == Some(today.as_str())
+    };
+    if si_fresh_today {
+        set_step(&state, "fetch_short_interest", StepStatus::Success, Some("cached today"));
+    } else if !has_massive {
+        push_warning(&state, "No Massive key — short interest not collected");
+        set_step(&state, "fetch_short_interest", StepStatus::Warning, Some("no Massive key"));
+    } else {
+        match crate::company_intel::collect_short_interest_bulk(db.clone(), secrets.clone()).await {
+            Ok(n) => {
+                let g = db.lock().unwrap();
+                let _ = cache_repository::set_app_meta(&g, SI_DATE_KEY, &today);
+                drop(g);
+                set_step(&state, "fetch_short_interest", StepStatus::Success, Some(&format!("{n} tickers")));
+                let _ = log(&db, "info", &format!("startup: short interest bulk — {n} tickers"));
+            }
+            Err(e) => {
+                push_warning(&state, &format!("short interest fetch failed: {e}"));
+                set_step(&state, "fetch_short_interest", StepStatus::Warning, Some(&format!("error: {e}")));
+            }
+        }
+    }
+
+    // ── Step 7d: fetch_splits (Alpaca corporate actions, once/day) ────────────
+    // Persist the last ~13 months of splits into `ticker_splits` (display + the
+    // dilution score's split-neutralisation), then roll up the display columns.
+    set_step(&state, "fetch_splits", StepStatus::Running, None);
+    const SPLITS_DATE_KEY: &str = "splits_full_fetch_date";
+    let splits_fresh_today = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, SPLITS_DATE_KEY).as_deref() == Some(today.as_str())
+    };
+    if !splits_fresh_today && !mock_alpaca {
+        let key = sec.alpaca_key.as_deref().unwrap_or_default();
+        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
+        let start = (Utc::now() - chrono::Duration::days(400)).format("%Y-%m-%d").to_string();
+        match crate::alpaca::corporate_actions::fetch_all_splits(key, secret, &symbols_for_bars, &start).await {
+            Ok(events) => {
+                let rows: Vec<cache_repository::SplitRow> = events
+                    .into_iter()
+                    .map(|e| cache_repository::SplitRow {
+                        symbol: e.symbol, ex_date: e.date, label: e.label,
+                        from_factor: e.from, to_factor: e.to,
+                    })
+                    .collect();
+                let n = {
+                    let g = db.lock().unwrap();
+                    let n = cache_repository::replace_ticker_splits(&g, &rows).unwrap_or(0);
+                    let _ = cache_repository::set_app_meta(&g, SPLITS_DATE_KEY, &today);
+                    n
+                };
+                let _ = log(&db, "info", &format!("startup: splits bulk — {n} events"));
+            }
+            Err(e) => push_warning(&state, &format!("splits fetch failed: {e}")),
+        }
+    }
+    {
+        let one_year_ago = (Utc::now() - chrono::Duration::days(365)).format("%Y-%m-%d").to_string();
+        let n = {
+            let g = db.lock().unwrap();
+            cache_repository::recompute_split_rollups(&g, &one_year_ago).unwrap_or(0)
+        };
+        set_step(&state, "fetch_splits", StepStatus::Success, Some(&format!("{n} tickers with splits")));
+    }
+
+    // ── Step 7e: fetch_dilution (SEC XBRL frames, once/day) + dilution score ──
+    // Bulk historical shares-outstanding snapshots → `dilution_snapshots`; then the
+    // split-adjusted 12-month dilution % + DB-wide percentile (100 = most dilutive).
+    set_step(&state, "fetch_dilution", StepStatus::Running, None);
+    const DIL_DATE_KEY: &str = "dilution_fetch_date";
+    let dil_fresh_today = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, DIL_DATE_KEY).as_deref() == Some(today.as_str())
+    };
+    if !dil_fresh_today && !mock_alpaca {
+        match crate::company_intel::collect_sec_bulk(db.clone(), config.clone()).await {
+            Ok((snaps, fins)) => {
+                let g = db.lock().unwrap();
+                let _ = cache_repository::set_app_meta(&g, DIL_DATE_KEY, &today);
+                drop(g);
+                let _ = log(&db, "info",
+                    &format!("startup: SEC bulk — {snaps} shares snapshots, {fins} financials"));
+            }
+            Err(e) => push_warning(&state, &format!("SEC bulk fetch failed: {e}")),
+        }
+    }
+    {
+        let n = {
+            let g = db.lock().unwrap();
+            cache_repository::recompute_dilution_scores(&g, &today).unwrap_or(0)
+        };
+        set_step(&state, "fetch_dilution", StepStatus::Success, Some(&format!("{n} scored")));
+        let _ = log(&db, "info", &format!("startup: dilution scored {n} symbols"));
+    }
+
     // ── Step 8: persist float / market cap / avg volume ───────────────────────
     // There are no more "universes": we stream the whole US market (wildcard) and
     // each strategy does its own filtering (e.g. micro_pullback gates on float).
@@ -592,6 +717,22 @@ pub async fn run_pipeline(
     set_step(&state, "compute_universe", StepStatus::Success,
         Some(&format!("{us_stocks_count} US stocks · {with_float} with float")));
     let _ = log(&db, "info", &format!("startup: persisted {us_stocks_count} US stocks ({with_float} with float)"));
+
+    // ── Step 8b: compute_risk_scores (absolute per-ticker, 0..100) ────────────
+    // Capacité à diluer / Besoin de diluer / Short interest score, from the SEC
+    // dilution + financials sections and the bulk short interest. CPU-only; runs
+    // after compute_universe (needs market_cap / float). NULL where inputs are
+    // missing (never invented). Recomputed again after the per-ticker collection
+    // job (lib.rs) so same-day fills are reflected.
+    set_step(&state, "compute_risk_scores", StepStatus::Running, None);
+    {
+        let n = {
+            let g = db.lock().unwrap();
+            cache_repository::recompute_risk_scores(&g, &today).unwrap_or(0)
+        };
+        set_step(&state, "compute_risk_scores", StepStatus::Success, Some(&format!("{n} tickers scored")));
+        let _ = log(&db, "info", &format!("startup: risk scores computed for {n} tickers"));
+    }
 
     // The Panic Mean Reversion watchlist is no longer built here: it depends on the
     // premarket session's volume, so it's built once at 09:00 ET by a dedicated

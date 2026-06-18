@@ -89,6 +89,30 @@ pub fn et_session_open_utc(instant: DateTime<Utc>) -> DateTime<Utc> {
     et_clock_utc(instant, 9, 30)
 }
 
+/// UTC instant of NY midnight (00:00 ET) on `instant`'s ET calendar day
+/// (DST-aware): 04:00Z in summer / 05:00Z in winter. This is exactly Alpaca's own
+/// daily-bar stamp, so a forming daily candle bucketed here collapses cleanly onto
+/// the authoritative bar (and `ny_date` of the result is the trading day, never the
+/// previous one — which UTC-midnight bucketing would wrongly produce).
+pub fn et_midnight_utc(instant: DateTime<Utc>) -> DateTime<Utc> {
+    et_clock_utc(instant, 0, 0)
+}
+
+/// True when `instant` falls inside the 09:30–16:00 ET regular cash session
+/// (DST-aware). Daily candles are built from regular-session trades only — pre /
+/// post-market prints belong on intraday charts but must never enter a daily bar.
+pub fn is_regular_session(instant: DateTime<Utc>) -> bool {
+    (570..960).contains(&et_minutes(instant)) // 09:30 (570) .. 16:00 (960)
+}
+
+/// True when `instant` is in the 04:00–09:30 ET premarket window (DST-aware).
+/// Over this window the daily chart shows a provisional "premarket bar" (built
+/// from premarket prints + an Alpaca premarket aggregate); it is dropped at the
+/// 09:30 cash open so the regular-session candle becomes the current daily bar.
+pub fn is_premarket(instant: DateTime<Utc>) -> bool {
+    (240..570).contains(&et_minutes(instant)) // 04:00 (240) .. 09:30 (570)
+}
+
 /// Market session at `instant`, from ET wall time. Boundaries are unchanged from
 /// the previous `scanner::current_session`:
 ///   • 04:00–09:29 premarket · 09:30–09:49 pre-open · 09:50–15:59 open · else AH.
@@ -153,5 +177,25 @@ mod tests {
     fn session_open_utc_is_dst_aware() {
         assert_eq!(et_session_open_utc(utc("2026-06-08T12:00:00Z")), utc("2026-06-08T13:30:00Z"));
         assert_eq!(et_session_open_utc(utc("2026-01-15T12:00:00Z")), utc("2026-01-15T14:30:00Z"));
+    }
+
+    #[test]
+    fn et_midnight_lands_on_the_right_ny_day() {
+        // A Monday regular-session trade buckets to Monday 00:00 ET (= 04:00Z in
+        // summer), NOT Monday 00:00 UTC (which is the NY Sunday — the phantom-bar bug).
+        let trade = utc("2026-06-15T14:00:00Z"); // Mon 10:00 ET
+        assert_eq!(et_midnight_utc(trade), utc("2026-06-15T04:00:00Z"));
+        assert_eq!(et_date(et_midnight_utc(trade)), "2026-06-15");
+        // Winter: NY midnight is 05:00Z.
+        let winter = utc("2026-01-20T15:00:00Z"); // Tue 10:00 ET
+        assert_eq!(et_midnight_utc(winter), utc("2026-01-20T05:00:00Z"));
+    }
+
+    #[test]
+    fn regular_session_excludes_extended_hours() {
+        assert!(!is_regular_session(utc("2026-06-15T12:00:00Z"))); // 08:00 ET premarket
+        assert!(is_regular_session(utc("2026-06-15T13:30:00Z")));  // 09:30 ET open
+        assert!(is_regular_session(utc("2026-06-15T19:59:00Z")));  // 15:59 ET
+        assert!(!is_regular_session(utc("2026-06-15T20:00:00Z"))); // 16:00 ET close → AH
     }
 }

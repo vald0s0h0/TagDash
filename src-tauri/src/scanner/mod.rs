@@ -76,6 +76,9 @@ impl ScannerEngine {
             let mut alarms = load_untriggered_alarms(&db);
             let mut alarms_loaded = Instant::now();
             let mut alarm_prev: HashMap<String, f64> = HashMap::new();
+            // Symbols already queued for on-demand "capacité à diluer" collection this
+            // session, so we don't re-request the screener list every scan pass.
+            let mut intel_requested: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             while running.load(Ordering::Relaxed) {
                 {
@@ -271,6 +274,14 @@ impl ScannerEngine {
                 });
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 screener_now.retain(|m| seen.insert(m.symbol.clone()));
+                // Queue any newly-surfaced screener ticker for on-demand "capacité à
+                // diluer" collection (premarket dilution readiness). Deduped here so we
+                // don't re-request every 500 ms pass; the worker also TTL-gates.
+                for m in &screener_now {
+                    if intel_requested.insert(m.symbol.clone()) {
+                        crate::company_intel::ondemand::request(&m.symbol);
+                    }
+                }
                 *screener.write().unwrap() = screener_now;
 
                 // ── Alarm watcher: fire an Open alert on a level crossing ───────
@@ -298,6 +309,9 @@ pub fn push_alert(
     // gated, so this is the right place to fire the low-latency desktop attention
     // cue (white flash / foreground) for a genuinely new alert.
     let session = alert.session;
+    // Just-in-time "capacité à diluer" collection for an alerted ticker (premarket
+    // dilution readiness). Non-blocking; the worker dedups + TTL-gates.
+    crate::company_intel::ondemand::request(&alert.symbol);
     {
         let mut active = active_alerts.write().unwrap();
         // Keep only one entry per (symbol, strategy) in the active list

@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { Session } from "@/types";
 import { api } from "@/lib/tauri";
 
-type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | null;
+type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | null;
 
 interface UiState {
   activeSession:     Session;

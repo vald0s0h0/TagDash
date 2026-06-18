@@ -11,7 +11,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    Fill, InternalOrder, OrderStatus, OrderType, Position, RiskSizingResult,
+    Fill, FillWindow, InternalOrder, OrderStatus, OrderType, Position, RiskSizingResult,
     Side, Trade, TradeLifecycle,
 };
 
@@ -345,55 +345,85 @@ impl InternalBook {
         }
     }
 
-    // ── Try to fill pending limit orders (called on each market poll) ─────────
-
+    // ── Try to fill pending orders against the per-symbol price window ─────────
+    //
+    // The trading loop drains a `FillWindow` per symbol each poll (the price path
+    // since the last drain) and hands them here. Two properties matter and both
+    // come from the window, not from a sampled snapshot:
+    //   • a level the price *traversed* and retraced inside one window still fills
+    //     (we test the high/low extremes, not just the last price), so an order is
+    //     never skipped because the snapshot happened to land back on the far side;
+    //   • when an OCO bracket's SL *and* TP both trigger in the same window, the
+    //     leg the price actually reached first fills (via `window.low_first`) and
+    //     cancels its sibling — deterministic, and not the naive "red bar ⇒ SL".
+    // A symbol absent from `windows` (no print this poll) is never actioned, so a
+    // resting stop can't fire against a fabricated/zero price (e.g. just after a
+    // replay day rolls over before the symbol's first new-day trade).
     pub fn try_fill_pending(
         &mut self,
-        prices: &HashMap<String, (f64, f64)>, // symbol -> (bid, ask)
+        windows: &HashMap<String, FillWindow>,
     ) -> Vec<Fill> {
         let now = crate::time::now();
-        let mut to_fill: Vec<(String, InternalOrder, f64)> = vec![];
+
+        // A triggered order: its gap-aware fill price, and a per-symbol rank so
+        // OCO siblings are processed in the order the price reached them.
+        struct Candidate {
+            oid:        String,
+            order:      InternalOrder,
+            fill_price: f64,
+            rank:       u8,
+        }
+        let mut cands: Vec<Candidate> = vec![];
 
         for (oid, order) in &self.orders {
             if order.status != OrderStatus::Pending {
                 continue;
             }
-            let Some(&(bid, ask)) = prices.get(&order.symbol) else { continue };
+            let Some(w) = windows.get(&order.symbol) else { continue };
 
-            let hit = match order.order_type {
-                // Limit: buy fills when ask ≤ limit; sell fills when bid ≥ limit.
-                // Covers both entry limits and protective TP exits.
+            // (hit, touch_is_low, fill_price). `touch_is_low` = the price had to
+            // reach the window LOW to trigger this order. `fill_price` fills at the
+            // level, or at the window open when it gapped straight through it.
+            let (hit, touch_is_low, fill_price) = match order.order_type {
                 OrderType::Limit => {
                     let Some(limit) = order.limit_price else { continue };
                     match order.side {
-                        Side::Long  => ask <= limit,
-                        Side::Short => bid >= limit,
+                        // buy limit (long entry / short TP): fills on the low.
+                        Side::Long  => (w.low  <= limit, true,  w.first.min(limit)),
+                        // sell limit (short entry / long TP): fills on the high.
+                        Side::Short => (w.high >= limit, false, w.first.max(limit)),
                     }
                 }
-                // Protective stop (SL): triggers a market exit when price crosses
-                // the stop. Sell stop (exits a long) → bid ≤ stop; buy stop
-                // (exits a short) → ask ≥ stop.
                 OrderType::Stop => {
                     let Some(stop) = order.stop_price else { continue };
                     match order.side {
-                        Side::Short => bid <= stop,
-                        Side::Long  => ask >= stop,
+                        // sell stop (long SL): fills on the low.
+                        Side::Short => (w.low  <= stop, true,  w.first.min(stop)),
+                        // buy stop (short SL): fills on the high.
+                        Side::Long  => (w.high >= stop, false, w.first.max(stop)),
                     }
                 }
                 OrderType::Market => continue,
             };
-            if hit {
-                let fp = fills::price_for_side(order.side, bid, ask);
-                to_fill.push((oid.clone(), order.clone(), fp));
+            if !hit || fill_price <= 0.0 {
+                continue;
             }
+            // The low-touch leg was reached first iff the low came first.
+            let rank = u8::from(touch_is_low != w.low_first);
+            cands.push(Candidate { oid: oid.clone(), order: order.clone(), fill_price, rank });
         }
+
+        // Within a symbol, fill the path-first leg before its OCO sibling.
+        cands.sort_by(|a, b| {
+            a.order.symbol.cmp(&b.order.symbol).then(a.rank.cmp(&b.rank))
+        });
 
         let mut new_fills = vec![];
 
-        for (oid, order, fill_price) in to_fill {
+        for Candidate { oid, order, fill_price, .. } in cands {
             // Skip if an OCO sibling that filled earlier in this same batch
             // already cancelled this order (prevents a double exit / phantom
-            // position when SL and TP both trigger in one poll).
+            // position when SL and TP both trigger in one window).
             match self.orders.get(&oid) {
                 Some(o) if o.status == OrderStatus::Pending => {}
                 _ => continue,
@@ -674,6 +704,21 @@ mod tests {
         m
     }
 
+    /// A full price-path window for one symbol (open, high, low, last + the order
+    /// the extremes were reached in).
+    fn window(
+        sym: &str, first: f64, high: f64, low: f64, last: f64, low_first: bool,
+    ) -> HashMap<String, FillWindow> {
+        let mut m = HashMap::new();
+        m.insert(sym.to_string(), FillWindow { first, high, low, last, low_first });
+        m
+    }
+
+    /// A flat one-print window (price didn't move within the poll).
+    fn tick(sym: &str, p: f64) -> HashMap<String, FillWindow> {
+        window(sym, p, p, p, p, true)
+    }
+
     // TP placed AFTER a market entry (the "drag the TP line while in a position"
     // flow) must materialise a pending limit exit and fill it when crossed.
     #[test]
@@ -697,9 +742,9 @@ mod tests {
         assert_eq!(tp_orders.len(), 1, "expected one resting TP limit order");
         assert_eq!(tp_orders[0].limit_price, Some(11.00));
 
-        // Price crosses the TP (bid reaches 11.00) → must fill and flatten.
-        let fills = book.try_fill_pending(&prices("AAA", 11.00, 11.02));
-        assert_eq!(fills.len(), 1, "TP should fill when bid >= limit");
+        // Price crosses the TP (high reaches 11.00) → must fill and flatten.
+        let fills = book.try_fill_pending(&tick("AAA", 11.00));
+        assert_eq!(fills.len(), 1, "TP should fill when high >= limit");
         assert!(book.positions.get("AAA").is_none(), "position should be flat after TP");
     }
 
@@ -719,7 +764,7 @@ mod tests {
         book.update_protective_levels("AAA", Some(9.50), Some(11.00));
 
         // Entry fills.
-        let entry = book.try_fill_pending(&prices("AAA", 9.99, 10.00));
+        let entry = book.try_fill_pending(&tick("AAA", 10.00));
         assert_eq!(entry.len(), 1, "entry limit should fill");
         book.sync_bracket_orders("AAA");
 
@@ -791,8 +836,9 @@ mod tests {
         book.positions_with_pnl(&prices("AAA", 10.99, 11.01)); // mid 11.00
         book.positions_with_pnl(&prices("AAA", 9.39, 9.41));   // mid 9.40 → SL hit
 
-        // SL fills (bid 9.39 <= 9.50) and flattens the position.
-        let fills = book.try_fill_pending(&prices("AAA", 9.39, 9.41));
+        // SL fills (gap-through: window opens at 9.39, below the 9.50 stop) and
+        // flattens the position at the gapped price.
+        let fills = book.try_fill_pending(&tick("AAA", 9.39));
         assert_eq!(fills.len(), 1, "SL should fill");
 
         let trade = book.trades.get("T3").unwrap();
@@ -801,5 +847,85 @@ mod tests {
         assert!((trade.mfe.unwrap() - 100.0).abs() < 1e-6, "mfe={:?}", trade.mfe);
         // MAE = (10.00 - 9.39) * 100 = 61.0 (SL exit fill 9.39 is the low)
         assert!((trade.mae.unwrap() - 61.0).abs() < 1e-6, "mae={:?}", trade.mae);
+    }
+
+    /// Helper: a long with both an SL and a TP bracket armed.
+    fn long_with_bracket(sl: f64, tp: f64) -> InternalBook {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(sl), Some(tp),
+        );
+        book.sync_bracket_orders("AAA");
+        book
+    }
+
+    // SL and TP both inside ONE window. When the price reached the low (SL) before
+    // the high (TP), the SL must fill — and only the SL. This is the case the old
+    // snapshot engine resolved by arbitrary HashMap order.
+    #[test]
+    fn oco_same_window_low_first_fills_sl() {
+        let mut book = long_with_bracket(9.50, 11.00);
+        // Dipped to 9.40 (≤ SL) before spiking to 11.20 (≥ TP).
+        let fills = book.try_fill_pending(&window("AAA", 10.00, 11.20, 9.40, 10.50, true));
+        assert_eq!(fills.len(), 1, "exactly one bracket leg fills");
+        assert!((fills[0].fill_price - 9.50).abs() < 1e-6, "SL leg, fill at stop");
+        assert!(book.positions.get("AAA").is_none(), "flat after SL");
+        // The TP sibling must be cancelled, not left resting.
+        assert!(book.get_pending_orders().is_empty(), "TP sibling cancelled");
+    }
+
+    // Same window, opposite path: price reached the high (TP) first → TP fills.
+    #[test]
+    fn oco_same_window_high_first_fills_tp() {
+        let mut book = long_with_bracket(9.50, 11.00);
+        // Spiked to 11.20 (≥ TP) before dropping to 9.40 (≤ SL).
+        let fills = book.try_fill_pending(&window("AAA", 10.00, 11.20, 9.40, 10.50, false));
+        assert_eq!(fills.len(), 1, "exactly one bracket leg fills");
+        assert!((fills[0].fill_price - 11.00).abs() < 1e-6, "TP leg, fill at limit");
+        assert!(book.positions.get("AAA").is_none(), "flat after TP");
+        assert!(book.get_pending_orders().is_empty(), "SL sibling cancelled");
+    }
+
+    // A symbol that didn't print this poll (absent from the windows) must NOT
+    // fill — the old engine fabricated a (0.0, 0.0) price and a sell-stop fired at
+    // $0. This is the day-boundary phantom-fill bug, killed at its root.
+    #[test]
+    fn no_window_means_no_fill() {
+        let mut book = long_with_bracket(9.50, 11.00);
+        let fills = book.try_fill_pending(&HashMap::new());
+        assert!(fills.is_empty(), "no price ⇒ no fill");
+        assert!(book.positions.get("AAA").is_some(), "position still open");
+        // Both bracket legs still resting.
+        assert_eq!(book.get_pending_orders().len(), 2);
+    }
+
+    // A new day/session that opens straight through the SL fills at the gap price
+    // (the window's open), not at the stop and not skipped.
+    #[test]
+    fn gap_through_sl_fills_at_open() {
+        let mut book = long_with_bracket(9.50, 11.00);
+        // First new-day print is 8.00, a gap below the 9.50 stop.
+        let fills = book.try_fill_pending(&tick("AAA", 8.00));
+        assert_eq!(fills.len(), 1, "gapped stop fills");
+        assert!((fills[0].fill_price - 8.00).abs() < 1e-6, "fill at the gap open, not the stop");
+        assert!(book.positions.get("AAA").is_none(), "flat after gap stop");
+    }
+
+    // A level the price spiked through and retraced inside one window still fills
+    // (range-based), where a snapshot of the last price (back below the TP) missed it.
+    #[test]
+    fn intrabar_spike_through_tp_still_fills() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, None, Some(11.00),
+        );
+        book.sync_bracket_orders("AAA");
+        // Spiked to 11.50 (≥ TP) but the window closed back at 10.20 (< TP).
+        let fills = book.try_fill_pending(&window("AAA", 10.00, 11.50, 9.95, 10.20, true));
+        assert_eq!(fills.len(), 1, "TP fills on the spike even though last < TP");
+        assert!((fills[0].fill_price - 11.00).abs() < 1e-6);
+        assert!(book.positions.get("AAA").is_none(), "flat after TP");
     }
 }

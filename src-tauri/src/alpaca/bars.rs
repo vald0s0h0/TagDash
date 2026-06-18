@@ -269,6 +269,56 @@ pub async fn fetch_minute_bars_since(
     Ok(out)
 }
 
+/// Aggregate today's premarket session (04:00 ET → 09:30 ET cap) into ONE
+/// daily-style OHLCV bar for `symbol`, stamped at NY midnight so it lands on
+/// today's daily slot. Built from Alpaca split-adjusted 1-minute bars. Returns
+/// None when the symbol hasn't printed in premarket yet. Lets a daily chart opened
+/// mid-premarket show the full premarket range as the provisional daily candle,
+/// instead of only the slice since the live feed warmed up. App clock: in replay
+/// the window lands on the simulated day (the minute fetch is itself end-clamped).
+pub async fn fetch_premarket_daily_bar(
+    key: &str,
+    secret: &str,
+    symbol: &str,
+) -> Result<Option<crate::market_state::aggregators::Bar>, String> {
+    use crate::market_state::aggregators::Bar;
+
+    let now = crate::time::now();
+    let start = crate::time::et_clock_utc(now, 4, 0)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    // Cap at the 09:30 cash open so a call right after the open still measures only
+    // the premarket session (the regular candle takes over once premarket ends).
+    let cap = crate::time::et_session_open_utc(now);
+
+    let syms = [symbol.to_string()];
+    let map = fetch_minute_bars_since(key, secret, &syms, &start).await?;
+    let Some(mbars) = map.get(symbol) else { return Ok(None) };
+
+    let mut bars = mbars.iter().filter(|b| b.time < cap);
+    let Some(first) = bars.next() else { return Ok(None) };
+    let (mut high, mut low, mut close) = (first.high, first.low, first.close);
+    let open = first.open;
+    let mut volume: u64 = first.volume;
+    let mut pv: f64 = first.vwap.unwrap_or(first.close) * first.volume as f64;
+    let mut trades: u64 = first.trade_count.unwrap_or(0);
+    for b in bars {
+        high   = high.max(b.high);
+        low    = low.min(b.low);
+        close  = b.close;
+        volume += b.volume;
+        pv     += b.vwap.unwrap_or(b.close) * b.volume as f64;
+        trades += b.trade_count.unwrap_or(0);
+    }
+
+    Ok(Some(Bar {
+        time:        crate::time::et_midnight_utc(now),
+        open, high, low, close, volume,
+        vwap:        if volume > 0 { Some(pv / volume as f64) } else { None },
+        trade_count: Some(trades),
+    }))
+}
+
 /// Map an internal Timeframe to the Alpaca bars `timeframe` parameter. Returns
 /// None for sub-minute timeframes (5s/10s) which Alpaca's REST bars don't serve.
 pub fn alpaca_timeframe(tf: crate::market_state::aggregators::Timeframe) -> Option<&'static str> {

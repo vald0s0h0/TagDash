@@ -64,12 +64,14 @@ impl ScanStrategy for BacksideParabolic {
                         PaneIndicator { kind: IndicatorKind::Volume, period: None },
                     ],
                     interactive: true,
+                    column:      None,
                 },
                 PaneSpec {
                     timeframe:   "2m".into(),
                     symbol:      None,
                     indicators:  vec![PaneIndicator { kind: IndicatorKind::Vwap, period: None }],
                     interactive: false,
+                    column:      None,
                 },
             ],
             info_fields: vec![
