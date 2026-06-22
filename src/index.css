@@ -1,3 +1,5 @@
+@import "./fonts.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -104,15 +106,43 @@
   }
 }
 
-/* ─── Dashboard (moodboard) glass cards ──────────────────────────────────────
-   Frosted-glass effect for the KPI dashboard cards ONLY (over the daily photo
-   background). Adapted from css.glass to the shadcn dark theme: a low-alpha white
-   tint + 1px hairline + blur. Not used anywhere else in the app. */
-.glass-card {
-  background: hsl(0 0% 100% / 0.05);
-  border-radius: var(--radius);
-  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.25);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid hsl(0 0% 100% / 0.11);
+/* ─── Frosted / Brutal — dashboard surfaces ──────────────────────────────────
+   Design-system surfaces for the KPI dashboard cards ONLY (over the daily photo
+   background). Three variants — glass (default), heavy, invisible — chosen per
+   card in edit mode. Monochromatic: a low-alpha white tint + a single hairline
+   border + blur. Used nowhere else. */
+:root {
+  --surface-radius: 16px;
 }
+
+.surface-glass,
+.surface-heavy,
+.surface-invisible {
+  position: relative;
+  border-radius: var(--surface-radius);
+  overflow: hidden;
+}
+
+.surface-glass {
+  /* From https://css.glass */
+  background: rgba(255, 255, 255, 0.01);
+  backdrop-filter: blur(14.2px);
+  -webkit-backdrop-filter: blur(14.2px);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+}
+
+.surface-heavy {
+  background: rgba(255, 255, 255, 0.15);
+  backdrop-filter: blur(17.3px);
+  -webkit-backdrop-filter: blur(17.3px);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+}
+
+.surface-invisible {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+

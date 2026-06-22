@@ -66,6 +66,34 @@ export interface ScreenerMatch {
   updated_at:    string;
 }
 
+/** One ticker on the Market Attention top list (mirrors AttentionEntry in
+ *  src-tauri/src/types/mod.rs). Direction-agnostic snapshot of how much attention
+ *  the market is paying to a ticker over the rolling 5-minute window (09:30–12:30
+ *  ET). Surfaced only via the get_market_attention debug command. */
+export interface AttentionEntry {
+  symbol:                   string;
+  /** Composite attention score, 0..100. */
+  attention_score:          number;
+  dollar_volume_5m:         number;
+  volume_5m:                number;
+  trade_count_5m:           number;
+  /** Cross-sectional percentile ranks among gate-1/2 survivors, 0..1. */
+  pr_dollar_volume_5m:      number;
+  pr_volume_5m:             number;
+  pr_trade_count_5m:        number;
+  /** Current 5m $vol vs the ticker's own historical average at this time of day;
+   *  null until the historical baseline is cached. */
+  relative_attention_5m:    number | null;
+  market_share_5m:          number;
+  smallcap_market_share_5m: number;
+  under20_market_share_5m:  number;
+  active_minutes_5m:        number;
+  max_1m_volume_share:      number;
+  /** Current 5m $vol vs the prior 5m (−10..−5 min); null when prior was empty. */
+  acceleration_5m:          number | null;
+  updated_at:               string;
+}
+
 /** Per-symbol info-band extras not in the live snapshot (mirrors CardInfo in
  *  commands/mod.rs): market cap, float, and the mean-reversion score. All
  *  optional ("si dispo"). */
@@ -210,6 +238,26 @@ export interface DailyBackground {
   data_url:  string | null;
 }
 
+/** One random inspiration image (mirrors MoodImage in dashboard/mod.rs). */
+export interface MoodImage {
+  file_name: string;
+  data_url:  string;
+}
+
+/** A fresh random mood pick (mirrors Mood in dashboard/mod.rs): one image + one
+ *  short phrase + one long phrase. Each field is null when its folder/file is
+ *  empty. The paths are returned so the UI can open them. */
+export interface Mood {
+  images_dir:   string;
+  short_path:   string;
+  long_path:    string;
+  image:        MoodImage | null;
+  short_phrase: string | null;
+  /** Second short phrase, distinct from short_phrase — drives the H1 card. */
+  heading_phrase: string | null;
+  long_phrase:  string | null;
+}
+
 export interface Trade {
   trade_id: string;
   symbol: string;
@@ -345,6 +393,33 @@ export interface AppConfig {
   tradetally: { api_base_url: string };
   /** User-defined journal tags (replaces TradeTally-fetched tags). */
   journal: { tags: string[] };
+  /** Where market data comes from: live Alpaca API or on-disk flat files. In
+   *  flat-files mode there is no real-time feed — Market Replay only. */
+  data_source: { mode: "api" | "flat_files" };
+}
+
+/** Background flat-files download progress (polled while running). */
+export interface FlatFilesStatus {
+  running:     boolean;
+  /** idle | running | done | cancelled | error */
+  state:       string;
+  current_day: string | null;
+  day_index:   number;
+  day_total:   number;
+  /** 0..1 within the current day. */
+  progress:    number;
+  error:       string | null;
+  last_done:   string | null;
+}
+
+/** One day present on disk (downloaded or imported), shown in the calendar. */
+export interface FlatFileDay {
+  day:          string;
+  bytes:        number;
+  symbol_count: number;
+  bar_count:    number;
+  /** false for a partial/interrupted download. */
+  complete:     boolean;
 }
 
 export interface AppStatus {

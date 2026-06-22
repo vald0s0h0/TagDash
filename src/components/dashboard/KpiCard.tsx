@@ -1,53 +1,50 @@
 import { cn } from "@/lib/utils";
 import type { DashboardTrade } from "@/types";
 import { closedTrades, summarize, formatMoney, formatPf, formatPct } from "./kpis";
+import { EmptyCard } from "./frosted";
 
-function Stat({
-  label,
+function Cell({
   value,
-  tone,
+  label,
+  italic,
 }: {
-  label: string;
   value: string;
-  tone?: "pos" | "neg" | "neutral";
+  label: string;
+  italic?: boolean;
 }) {
   return (
-    <div className="flex flex-col justify-center">
-      <span className="text-[10px] uppercase tracking-wider text-foreground/50">{label}</span>
+    <div className="flex flex-1 flex-col items-center justify-center text-center">
       <span
         className={cn(
-          "tabular-nums text-lg font-semibold leading-tight",
-          tone === "pos" && "text-emerald-400",
-          tone === "neg" && "text-red-400",
-          (!tone || tone === "neutral") && "text-foreground"
+          "font-display text-[38px] leading-[0.9] tracking-[-0.02em] tabular-nums text-white",
+          italic && "italic"
         )}
       >
         {value}
+      </span>
+      <span className="mt-2 font-spacemono text-[10px] uppercase tracking-[0.10em] text-white/55">
+        {label}
       </span>
     </div>
   );
 }
 
-/** Headline trading KPIs derived from the closed trades. */
+/** Headline trading KPIs as a Frosted/Brutal card 07 (KPI×3): three cells split by
+ *  hairline dividers. Monochrome — no gain/loss colour. */
 export function KpiCard({ trades }: { trades: DashboardTrade[] }) {
   const k = summarize(closedTrades(trades));
 
   if (k.count === 0) {
-    return (
-      <div className="flex h-full items-center justify-center text-xs text-foreground/50">
-        Aucun trade clôturé
-      </div>
-    );
+    return <EmptyCard label="Performance" message="Aucun trade clôturé" />;
   }
 
   return (
-    <div className="grid h-full grid-cols-3 gap-x-4 gap-y-2 content-center">
-      <Stat label="Facteur de profit" value={formatPf(k.profitFactor)} tone={(k.profitFactor ?? 0) >= 1 ? "pos" : "neg"} />
-      <Stat label="Réussite" value={formatPct(k.winRate)} />
-      <Stat label="PnL total" value={formatMoney(k.totalPnl)} tone={k.totalPnl >= 0 ? "pos" : "neg"} />
-      <Stat label="Trades" value={String(k.count)} />
-      <Stat label="Gain moyen" value={formatMoney(k.avgWin)} tone="pos" />
-      <Stat label="Perte moyenne" value={formatMoney(-k.avgLoss)} tone="neg" />
+    <div className="flex h-full w-full items-center px-2 py-6">
+      <Cell value={formatMoney(k.totalPnl)} label="PnL Total" />
+      <div className="h-[54px] w-px bg-white/[0.14]" />
+      <Cell value={formatPf(k.profitFactor)} label="Facteur Profit" />
+      <div className="h-[54px] w-px bg-white/[0.14]" />
+      <Cell value={formatPct(k.winRate)} label="Réussite" italic />
     </div>
   );
 }

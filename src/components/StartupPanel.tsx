@@ -20,6 +20,7 @@ import {
   useStreamableUniverse,
   useRefetchUniverseOnComplete,
 } from "@/queries/useStartup";
+import { useUpdaterStore } from "@/stores/updaterStore";
 import type { StartupStep, StepStatus, StreamableSymbol } from "@/types";
 
 // ─── Step icon ────────────────────────────────────────────────────────────────
@@ -64,6 +65,46 @@ function StepRow({ step }: { step: StartupStep }) {
       </div>
     </div>
   );
+}
+
+// ─── Auto-update step (frontend-driven, always the first row) ──────────────────
+
+/** The launch-time auto-update check, shown as the first step of the pipeline.
+ *  Reflects the `updaterStore` flow (check → download → install → relaunch). */
+function UpdaterStep() {
+  const status = useUpdaterStore((s) => s.status);
+  const version = useUpdaterStore((s) => s.version);
+  const progress = useUpdaterStore((s) => s.progress);
+  const error = useUpdaterStore((s) => s.error);
+
+  const stepStatus: StepStatus =
+    status === "checking" || status === "available" ||
+    status === "downloading" || status === "installing"
+      ? "running"
+      : status === "uptodate"
+        ? "success"
+        : status === "error"
+          ? "warning"
+          : "pending";
+
+  const label =
+    status === "checking"      ? "Recherche d'une mise à jour…"
+    : status === "available"   ? `Mise à jour ${version ?? ""} disponible`
+    : status === "downloading" ? `Téléchargement de la mise à jour… ${Math.round(progress * 100)} %`
+    : status === "installing"  ? "Installation de la mise à jour…"
+    : status === "uptodate"    ? "Application à jour"
+    : status === "error"       ? "Vérification des mises à jour indisponible"
+    : status === "disabled"    ? "Mises à jour (ignorées en développement)"
+    : "Vérifier les mises à jour";
+
+  const detail =
+    status === "available" || status === "downloading" || status === "installing"
+      ? "Redémarrage automatique après installation"
+      : status === "error"
+        ? error
+        : null;
+
+  return <StepRow step={{ id: "auto_update", label, status: stepStatus, detail }} />;
 }
 
 // ─── Stats bar ────────────────────────────────────────────────────────────────
@@ -204,23 +245,26 @@ export function StartupPanel() {
         </div>
       )}
 
-      {/* Steps */}
-      {startupData ? (
-        <div className="rounded-lg border border-border bg-card px-4 py-2">
-          {startupData.steps.map((step, i) => (
+      {/* Steps — the auto-update check is always rendered first, even before the
+          backend pipeline status has loaded. */}
+      <div className="rounded-lg border border-border bg-card px-4 py-2">
+        <UpdaterStep />
+        {startupData ? (
+          startupData.steps.map((step) => (
             <div key={step.id}>
+              <div className="ml-7 h-px bg-border/30" />
               <StepRow step={step} />
-              {i < startupData.steps.length - 1 && (
-                <div className="ml-7 h-px bg-border/30" />
-              )}
             </div>
-          ))}
-        </div>
-      ) : (
-        <div className="rounded-lg border border-border bg-card px-4 py-6 text-center text-sm text-muted-foreground">
-          Click "Run pipeline" to start
-        </div>
-      )}
+          ))
+        ) : (
+          <>
+            <div className="ml-7 h-px bg-border/30" />
+            <p className="py-2 pl-7 text-sm text-muted-foreground">
+              Cliquez sur « Run pipeline » pour démarrer
+            </p>
+          </>
+        )}
+      </div>
 
       {/* Stats */}
       {startupData && (

@@ -7,7 +7,9 @@ import { LogsPanel } from "@/components/LogsPanel";
 import { ReplayToolbar } from "@/components/ReplayToolbar";
 import { TickerSpotlight } from "@/components/TickerSpotlight";
 import { Dashboard } from "@/components/dashboard/Dashboard";
+import { TradeTally } from "@/components/TradeTally";
 import { useUiStore } from "@/stores/uiStore";
+import { useUpdaterStore } from "@/stores/updaterStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertNotifications } from "@/queries/useAlertNotifications";
 import { useHotkeys } from "@/hooks/useHotkeys";
@@ -17,6 +19,14 @@ export default function App() {
   const logsOpen = useUiStore((s) => s.logsOpen);
   const activeView = useUiStore((s) => s.activeView);
   const setDismissedScreener = useUiStore((s) => s.setDismissedScreener);
+
+  // Auto-update check at launch (first step of the startup pipeline) — deployed
+  // builds only; downloads + installs a newer version and relaunches. Skipped in
+  // dev. Runs once.
+  const runUpdate = useUpdaterStore((s) => s.run);
+  useEffect(() => {
+    runUpdate();
+  }, [runUpdate]);
 
   // App-level OS notifications on every new scanner alert (opt-in in Settings).
   useAlertNotifications();
@@ -30,6 +40,18 @@ export default function App() {
   useEffect(() => {
     api.getScreenerDismissals().then(setDismissedScreener).catch(() => {});
   }, [setDismissedScreener]);
+
+  // In flat-files mode there is no live feed, so open the Market Replay transport
+  // bar by default — replay is the only way to drive data from the stored days.
+  useEffect(() => {
+    api.getLocalConfig()
+      .then((cfg) => {
+        if (cfg?.data_source?.mode === "flat_files") {
+          useUiStore.setState({ replayOpen: true });
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // Tell the backend which symbols are displayed — the union of every assigned
   // zone across ALL tabs and sessions (not just the active tab). The live feed
@@ -66,6 +88,9 @@ export default function App() {
         {activeView === "dashboard" ? (
           // KPI moodboard — full-bleed, no sidebar.
           <Dashboard />
+        ) : activeView === "tradetally" ? (
+          // Embedded TradeTally web app — full-bleed, no sidebar.
+          <TradeTally />
         ) : (
           <>
             <Sidebar />

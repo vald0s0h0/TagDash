@@ -2,10 +2,12 @@ import {
   Activity,
   Bug,
   CircleDot,
+  Database,
   History,
   Moon,
   MoreVertical,
   Newspaper,
+  Orbit,
   Play,
   Radio,
   RefreshCw,
@@ -32,6 +34,7 @@ import { FeedDiagnosticsModal } from "@/components/FeedDiagnosticsModal";
 import { NewsDebugModal } from "@/components/NewsDebugModal";
 import { BugReportModal } from "@/components/BugReportModal";
 import { TickersTableModal } from "@/components/TickersTableModal";
+import { FlatFilesModal } from "@/components/FlatFilesModal";
 import type { Session } from "@/types";
 
 const TABS: { id: Session; label: string; icon: typeof Sun }[] = [
@@ -75,6 +78,21 @@ export function LeftRail() {
           >
             <Moon className="h-5 w-5" />
           </button>
+
+          {/* TradeTally — embedded web app (no sidebar). */}
+          <button
+            onClick={() => setActiveView("tradetally")}
+            title="TradeTally"
+            className={cn(
+              "flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
+              activeView === "tradetally" && "bg-accent text-foreground"
+            )}
+          >
+            <Orbit className="h-5 w-5" />
+          </button>
+
+          {/* Separator between the standalone views and the trading sessions. */}
+          <div className="my-1 h-px w-6 bg-border" />
 
           {TABS.map((tab) => {
             const Icon     = tab.icon;
@@ -163,6 +181,10 @@ export function LeftRail() {
                 <Table2 className="mr-2 h-4 w-4" />
                 Données tickers (DB)
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => showModal("flat-files")}>
+                <Database className="mr-2 h-4 w-4" />
+                Gestion Flat Files
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={toggleLogs}>
                 <ScrollText className="mr-2 h-4 w-4" />
@@ -205,6 +227,10 @@ export function LeftRail() {
       />
       <TickersTableModal
         open={openModal === "tickers-table"}
+        onClose={closeModal}
+      />
+      <FlatFilesModal
+        open={openModal === "flat-files"}
         onClose={closeModal}
       />
     </>

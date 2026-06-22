@@ -168,10 +168,15 @@ pub fn start(
         }
     }
     NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "date invalide".to_string())?;
+    // In flat-files mode the data comes from disk, so missing Alpaca keys is fine
+    // (the API may be gone). `load_day` then errors clearly on any day not yet
+    // downloaded. In API mode the keys remain mandatory.
+    let flat_mode = deps.config.read().unwrap().data_source.is_flat_files();
     let (key, secret) = {
         let s = deps.secrets.read().unwrap();
         match (s.alpaca_key.clone(), s.alpaca_secret.clone()) {
             (Some(k), Some(sec)) if !k.is_empty() && !sec.is_empty() => (k, sec),
+            _ if flat_mode => (String::new(), String::new()),
             _ => return Err("clés Alpaca non configurées".into()),
         }
     };
@@ -564,7 +569,7 @@ fn emit_until(
 
 /// Jour ouvré suivant (saute samedi/dimanche — les jours fériés produiront
 /// simplement « aucune donnée » et l'utilisateur peut re-cliquer).
-fn next_weekday(day: &str) -> String {
+pub(crate) fn next_weekday(day: &str) -> String {
     let mut d = NaiveDate::parse_from_str(day, "%Y-%m-%d")
         .unwrap_or_else(|_| Utc::now().date_naive());
     loop {

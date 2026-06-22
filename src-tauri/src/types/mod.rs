@@ -132,6 +132,41 @@ pub struct ScreenerMatch {
     pub updated_at:    DateTime<Utc>,
 }
 
+/// One ticker on the Market Attention top list (see `crate::market_attention`).
+/// Direction-agnostic snapshot of how much attention the market is paying to a
+/// ticker over the rolling 5-minute window — it answers "which tickers are the
+/// most watched/traded right now?", NOT whether to go long or short. Produced
+/// once a minute (09:30–12:30 ET) and consumed by the Perfect Pullback engine to
+/// pick which tickers to watch. Serialised for the `get_market_attention` debug
+/// command. Mirrors `src/types/index.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionEntry {
+    pub symbol:                   String,
+    /// Composite attention score, 0..100 (higher = more attention).
+    pub attention_score:          f64,
+    pub dollar_volume_5m:         f64,
+    pub volume_5m:                u64,
+    pub trade_count_5m:           u64,
+    /// Cross-sectional percentile ranks among the gate-1/2 survivors, 0..1.
+    pub pr_dollar_volume_5m:      f64,
+    pub pr_volume_5m:             f64,
+    pub pr_trade_count_5m:        f64,
+    /// Current 5m dollar volume vs the ticker's own historical average at the same
+    /// time of day (≤20 trading days). None until the historical baseline is cached.
+    pub relative_attention_5m:    Option<f64>,
+    pub market_share_5m:          f64,
+    pub smallcap_market_share_5m: f64,
+    pub under20_market_share_5m:  f64,
+    /// Minutes (of the last 5) with significant volume (persistence filter input).
+    pub active_minutes_5m:        u8,
+    /// Largest single-minute share of the 5m volume (spike-concentration filter).
+    pub max_1m_volume_share:      f64,
+    /// Current 5m dollar volume vs the prior 5m (−10..−5 min). None when the prior
+    /// window had no dollar volume.
+    pub acceleration_5m:          Option<f64>,
+    pub updated_at:               DateTime<Utc>,
+}
+
 /// Static description of a compiled strategy (the runtime impl lives in `strategies`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Strategy {

@@ -30,7 +30,7 @@ use crate::state::AppState;
 use crate::strategies::registry;
 use crate::tradetally;
 use crate::types::{
-    AlertEnrichment, AlertSignal, Fill, InternalOrder, LatencyStatus, Position,
+    AlertEnrichment, AlertSignal, AttentionEntry, Fill, InternalOrder, LatencyStatus, Position,
     ScreenerMatch, Session, Side, Strategy, StrategyCard, TradeLifecycle,
 };
 
@@ -1013,6 +1013,14 @@ pub fn get_screener_matches(state: tauri::State<'_, AppState>) -> Vec<ScreenerMa
     state.screener.read().unwrap().clone()
 }
 
+/// Market Attention top list (direction-agnostic, top 10, refreshed once a minute
+/// 09:30–12:30 ET; see `crate::market_attention`). Read-only debug/inspection
+/// command — the list's primary consumer is the Perfect Pullback engine.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_market_attention(state: tauri::State<'_, AppState>) -> Vec<AttentionEntry> {
+    state.attention.read().unwrap().clone()
+}
+
 /// Today's ET trading date (DST-aware, matching the rest of the app), used to
 /// scope screener dismissals to a single day. App clock: the simulated day
 /// during a Market Replay.
@@ -1970,6 +1978,62 @@ pub fn get_replay_status(state: tauri::State<'_, AppState>) -> crate::replay::Re
     state.replay.status.read().unwrap().clone()
 }
 
+// ─── Flat files (offline market-data download for Market Replay) ────────────────
+
+/// Download 1-minute bars (premarket + regular + after-hours) of the liquid US
+/// universe for every weekday in [start_day, end_day], persisting one SQLite file
+/// per day under `<app_dir>/flat_files/`. Runs in the background — poll
+/// `get_flat_files_status`. Errors if a download is already running or the Alpaca
+/// keys are missing.
+#[tauri::command(rename_all = "snake_case")]
+pub fn flat_files_download(
+    start_day: String,
+    end_day:   String,
+    state:     tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let (key, secret) = {
+        let s = state.secrets.read().unwrap();
+        (s.alpaca_key.clone().unwrap_or_default(), s.alpaca_secret.clone().unwrap_or_default())
+    };
+    crate::flat_files::start_download(
+        state.flat_files.clone(),
+        state.app_dir.clone(),
+        state.db.clone(),
+        key,
+        secret,
+        start_day,
+        end_day,
+    )
+}
+
+/// Request cancellation of the running download (takes effect between days).
+#[tauri::command(rename_all = "snake_case")]
+pub fn flat_files_cancel(state: tauri::State<'_, AppState>) {
+    state.flat_files.request_cancel();
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_flat_files_status(
+    state: tauri::State<'_, AppState>,
+) -> crate::flat_files::FlatFilesStatus {
+    state.flat_files.status.read().unwrap().clone()
+}
+
+/// Every day present on disk (downloaded or imported from another user), for the
+/// calendar. Picks up dropped-in `flat-*.db` files on the next call.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_flat_files_calendar(
+    state: tauri::State<'_, AppState>,
+) -> Vec<crate::flat_files::FlatFileDay> {
+    crate::flat_files::calendar(&state.app_dir)
+}
+
+/// Open the flat-files folder in the OS file manager (to copy/share the files).
+#[tauri::command(rename_all = "snake_case")]
+pub fn open_flat_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::dashboard::open_folder(&crate::flat_files::flat_dir(&state.app_dir))
+}
+
 // ─── Company intelligence (read-only; collection happens in the background) ────
 // These commands NEVER make network calls themselves — they only read the local
 // SQLite cache the `crate::company_intel` job populates in the background. The one
@@ -2102,4 +2166,93 @@ pub fn get_daily_background(state: tauri::State<'_, AppState>) -> crate::dashboa
 #[tauri::command(rename_all = "snake_case")]
 pub fn open_backgrounds_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
     crate::dashboard::open_folder(&state.app_dir.join("backgrounds"))
+}
+
+/// A fresh random mood pick (image + short + long phrase) from the user's `mood/`
+/// folder. Re-randomises on every call (each dashboard open / refresh).
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_mood(state: tauri::State<'_, AppState>) -> crate::dashboard::Mood {
+    crate::dashboard::pick_mood(&state.app_dir)
+}
+
+/// Open a mood drop target: `"images"` folder, or the `"short"` / `"long"` phrases
+/// `.txt` file (in the OS default editor).
+#[tauri::command(rename_all = "snake_case")]
+pub fn open_mood_target(
+    state: tauri::State<'_, AppState>,
+    target: String,
+) -> Result<(), String> {
+    crate::dashboard::open_mood_target(&state.app_dir, &target)
+}
+
+// ─── Embedded TradeTally webview ──────────────────────────────────────────────
+//
+// The self-hosted TradeTally site refuses to be framed (`X-Frame-Options: DENY`
+// + CSP `frame-ancestors 'none'`), so it can't live in an <iframe>. Instead we
+// embed a real native child webview inside the main window: it loads the site as
+// a top-level document, so the frame-blocking headers don't apply, and WebView2 /
+// WKWebView persists its cookies + localStorage in the app's user-data dir — log
+// in once and the session survives restarts (lands straight on the main page).
+//
+// The frontend owns layout, so it tells us the content rect (CSS px == window
+// logical px) to place the webview over, and hides it when the TradeTally tab is
+// left or a modal opens — native webviews always paint above the DOM, so they'd
+// otherwise cover the app's own overlays.
+
+const TRADETALLY_LABEL: &str = "tradetally";
+const TRADETALLY_URL:   &str = "https://trade.fabrelexos.synology.me/";
+
+/// Position + size the embedded TradeTally webview over the given rect and show
+/// it. Lazily creates the child webview (loading the site) on the first call.
+///
+/// `async` is load-bearing: `Window::add_child` blocks waiting on the main thread
+/// to build the webview, so it must NOT run *on* the main thread. Sync Tauri
+/// commands execute on the main thread (→ self-deadlock); async ones run on the
+/// async runtime, leaving the main thread free to service the build.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tradetally_set_bounds(
+    app:    tauri::AppHandle,
+    x:      f64,
+    y:      f64,
+    width:  f64,
+    height: f64,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let pos  = tauri::LogicalPosition::new(x, y);
+    // Clamp to a sane minimum so a transient zero-size measurement can't make the
+    // webview collapse / vanish.
+    let size = tauri::LogicalSize::new(width.max(1.0), height.max(1.0));
+
+    if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
+        wv.set_position(pos).map_err(|e| e.to_string())?;
+        wv.set_size(size).map_err(|e| e.to_string())?;
+        wv.show().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // First show: create the child webview as a top-level document over the rect.
+    let window = app.get_window("main").ok_or("main window not found")?;
+    let url = tauri::Url::parse(TRADETALLY_URL).map_err(|e| e.to_string())?;
+    window
+        .add_child(
+            tauri::webview::WebviewBuilder::new(
+                TRADETALLY_LABEL,
+                tauri::WebviewUrl::External(url),
+            ),
+            pos,
+            size,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Hide the embedded TradeTally webview (left the tab, or a modal opened over it).
+/// Keeps the webview alive so its session/scroll position survive the round-trip.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tradetally_hide(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
+        wv.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

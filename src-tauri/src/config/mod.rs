@@ -25,6 +25,12 @@ pub struct AppConfig {
     /// filings, ownership). Isolated background job — see `crate::company_intel`.
     #[serde(default)]
     pub company_intel: CompanyIntelConfig,
+    /// Where market data comes from: the live Alpaca API ("api") or pre-downloaded
+    /// on-disk flat files ("flat_files"). In flat-files mode there is no real-time
+    /// feed — the platform runs in Market Replay against the stored days. See
+    /// `crate::flat_files`.
+    #[serde(default)]
+    pub data_source: DataSourceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +174,32 @@ impl Default for CompanyIntelConfig {
     }
 }
 
+/// Data-source selection. `mode` is "api" (live Alpaca feed) or "flat_files"
+/// (offline replay from `<app_dir>/flat_files/flat-YYYY-MM-DD.db`). Stored in
+/// tagdash.toml so the choice survives a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSourceConfig {
+    #[serde(default = "default_data_mode")]
+    pub mode: String,
+}
+
+fn default_data_mode() -> String {
+    "api".into()
+}
+
+impl Default for DataSourceConfig {
+    fn default() -> Self {
+        Self { mode: default_data_mode() }
+    }
+}
+
+impl DataSourceConfig {
+    /// True when running off pre-downloaded flat files (no live feed).
+    pub fn is_flat_files(&self) -> bool {
+        self.mode == "flat_files"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeTallyConfig {
     pub api_base_url:  String,
@@ -224,6 +256,7 @@ impl Default for AppConfig {
             },
             journal: JournalConfig::default(),
             company_intel: CompanyIntelConfig::default(),
+            data_source: DataSourceConfig::default(),
         }
     }
 }

@@ -28,9 +28,9 @@ use crate::types::NewsHeadline;
 
 /// Minimum day volume (shares) for a symbol to be loaded in minute-bar mode.
 /// Anything quieter cannot trip a strategy gate; this bounds the REST volume.
-const MIN_DAY_VOLUME: i64 = 50_000;
+pub(crate) const MIN_DAY_VOLUME: i64 = 50_000;
 /// Cap on the number of symbols replayed (most active first).
-const MAX_SYMBOLS: usize = 2_000;
+pub(crate) const MAX_SYMBOLS: usize = 2_000;
 /// 10-second synthetic slices per 1-minute bar.
 const SLICES_PER_MIN: i64 = 6;
 
@@ -70,28 +70,28 @@ struct BarsResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawBar {
-    t: String,
-    o: f64,
-    h: f64,
-    l: f64,
-    c: f64,
-    v: i64,
+pub(crate) struct RawBar {
+    pub(crate) t: String,
+    pub(crate) o: f64,
+    pub(crate) h: f64,
+    pub(crate) l: f64,
+    pub(crate) c: f64,
+    pub(crate) v: i64,
     #[serde(default)]
-    n: Option<i64>,
+    pub(crate) n: Option<i64>,
     #[serde(default)]
-    vw: Option<f64>,
+    pub(crate) vw: Option<f64>,
 }
 
-struct MinBar {
-    time: DateTime<Utc>,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: u64,
-    trades: u64,
-    vwap: Option<f64>,
+pub(crate) struct MinBar {
+    pub(crate) time: DateTime<Utc>,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
+    pub(crate) volume: u64,
+    pub(crate) trades: u64,
+    pub(crate) vwap: Option<f64>,
 }
 
 /// True when `s` looks like a symbol Alpaca's REST bars endpoint accepts.
@@ -120,7 +120,7 @@ fn invalid_symbol_of(body: &str) -> Option<String> {
     (!sym.is_empty()).then_some(sym)
 }
 
-async fn fetch_bars_window(
+pub(crate) async fn fetch_bars_window(
     key: &str,
     secret: &str,
     symbols: &[String],
@@ -221,7 +221,7 @@ struct RawNews {
 }
 
 /// Every Alpaca headline published in [start, end] (all symbols), ascending.
-async fn fetch_news_window(
+pub(crate) async fn fetch_news_window(
     key: &str,
     secret: &str,
     start: &str,
@@ -287,7 +287,7 @@ async fn fetch_news_window(
 /// Decompose one minute bar into SLICES_PER_MIN synthetic trades following a
 /// plausible O→L→H→C (green) / O→H→L→C (red) path. Total volume and trade count
 /// are preserved, so windowed ratios are exact at the 60-second horizon.
-fn slices_of(bar: &MinBar) -> Vec<(i64, f64, u64, u64)> {
+pub(crate) fn slices_of(bar: &MinBar) -> Vec<(i64, f64, u64, u64)> {
     let (o, h, l, c) = (bar.open, bar.high, bar.low, bar.close);
     let path: [f64; SLICES_PER_MIN as usize] = if c >= o {
         [o, (o + l) / 2.0, l, (l + h) / 2.0, h, c]
@@ -328,6 +328,24 @@ pub async fn load_day(
     let nd = NaiveDate::parse_from_str(day, "%Y-%m-%d")
         .map_err(|_| format!("invalid replay date: {day}"))?;
 
+    // Offline reuse: when a complete flat file exists for this day, replay reads it
+    // straight from disk — zero network — in BOTH data-source modes. In flat-files
+    // mode this is the only path (the live API may be gone).
+    if crate::flat_files::has_day(app_dir, day) {
+        progress(0.1);
+        let dd = crate::flat_files::read_day(app_dir, day)?;
+        progress(1.0);
+        return Ok(dd);
+    }
+    // No flat file and no API credentials ⇒ flat-files mode without this day
+    // downloaded. Give a clear, actionable error instead of an opaque auth failure.
+    if key.is_empty() || secret.is_empty() {
+        return Err(format!(
+            "jour {day} non téléchargé — téléchargez-le via « Gestion Flat Files » \
+             (mode flat files actif)"
+        ));
+    }
+
     // ET wall-clock anchors of the day (DST-aware via crate::time).
     let noon = noon_utc(nd);
     let pm_start = crate::time::et_clock_utc(noon, 4, 0); // 04:00 ET
@@ -354,42 +372,14 @@ pub async fn load_day(
     )
     .await?;
 
-    let mut prev_closes: HashMap<String, f64> = HashMap::new();
-    let mut day_volume: HashMap<String, i64> = HashMap::new();
-    for (sym, bars) in &daily {
-        let mut prev: Option<f64> = None;
-        for b in bars {
-            let bdate = b.t.get(..10).unwrap_or("");
-            if bdate < day {
-                prev = Some(b.c);
-            } else if bdate == day {
-                day_volume.insert(sym.clone(), b.v);
-            }
-        }
-        if let Some(pc) = prev {
-            prev_closes.insert(sym.clone(), pc);
-        }
-    }
+    let (prev_closes, day_volume) = split_daily(&daily, day);
 
     // Active set: symbols that actually traded that day (bounded), plus the
     // currently displayed (focus) symbols so their charts always replay.
-    let mut ranked: Vec<(String, i64)> = day_volume
-        .iter()
-        .filter(|(_, v)| **v >= MIN_DAY_VOLUME)
-        .map(|(s, v)| (s.clone(), *v))
-        .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
-    ranked.truncate(MAX_SYMBOLS);
-    let mut active: HashSet<String> = ranked.into_iter().map(|(s, _)| s).collect();
-    for f in focus {
-        if day_volume.contains_key(f) {
-            active.insert(f.clone());
-        }
-    }
-    if active.is_empty() {
+    let active_vec = rank_active(&day_volume, focus);
+    if active_vec.is_empty() {
         return Err(format!("aucune donnée de marché pour le {day} (jour non ouvré ?)"));
     }
-    let active_vec: Vec<String> = active.iter().cloned().collect();
     progress(0.22);
 
     // 3. Minute bars of the day for the active set.
@@ -477,7 +467,7 @@ pub async fn load_day(
     progress(0.95);
 
     events.sort_by_key(|e| e.ts_ms);
-    let symbols = active.len();
+    let symbols = active_vec.len();
     progress(1.0);
 
     Ok(DayData {
@@ -486,6 +476,53 @@ pub async fn load_day(
         source: if tape_available { "tape" } else { "minutes" },
         symbols,
     })
+}
+
+/// Split a daily-bars window into (previous close, this-day volume) per symbol.
+/// Shared by `load_day` (Alpaca path) and the flat-file downloader so both derive
+/// the change% seed and the activity filter identically.
+pub(crate) fn split_daily(
+    daily: &HashMap<String, Vec<RawBar>>,
+    day: &str,
+) -> (HashMap<String, f64>, HashMap<String, i64>) {
+    let mut prev_closes: HashMap<String, f64> = HashMap::new();
+    let mut day_volume: HashMap<String, i64> = HashMap::new();
+    for (sym, bars) in daily {
+        let mut prev: Option<f64> = None;
+        for b in bars {
+            let bdate = b.t.get(..10).unwrap_or("");
+            if bdate < day {
+                prev = Some(b.c);
+            } else if bdate == day {
+                day_volume.insert(sym.clone(), b.v);
+            }
+        }
+        if let Some(pc) = prev {
+            prev_closes.insert(sym.clone(), pc);
+        }
+    }
+    (prev_closes, day_volume)
+}
+
+/// The bounded active set: symbols with day volume ≥ MIN_DAY_VOLUME (top
+/// MAX_SYMBOLS by volume), plus any focus symbol that traded that day. Shared by
+/// `load_day` and the flat-file downloader so a downloaded day holds exactly the
+/// same symbols replay would otherwise fetch live.
+pub(crate) fn rank_active(day_volume: &HashMap<String, i64>, focus: &[String]) -> Vec<String> {
+    let mut ranked: Vec<(String, i64)> = day_volume
+        .iter()
+        .filter(|(_, v)| **v >= MIN_DAY_VOLUME)
+        .map(|(s, v)| (s.clone(), *v))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.truncate(MAX_SYMBOLS);
+    let mut active: HashSet<String> = ranked.into_iter().map(|(s, _)| s).collect();
+    for f in focus {
+        if day_volume.contains_key(f) {
+            active.insert(f.clone());
+        }
+    }
+    active.into_iter().collect()
 }
 
 /// Noon UTC of a calendar date — a safe instant whose ET day equals that date

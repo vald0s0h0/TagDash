@@ -2,11 +2,12 @@ import { create } from "zustand";
 import type { Session } from "@/types";
 import { api } from "@/lib/tauri";
 
-type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | null;
+type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | "flat-files" | null;
 
-/** Top-level view: the trading workspace (sessions + charts + sidebar) vs the
- *  standalone KPI dashboard (moodboard, no sidebar). */
-export type View = "trading" | "dashboard";
+/** Top-level view: the trading workspace (sessions + charts + sidebar), the
+ *  standalone KPI dashboard (moodboard, no sidebar), or the embedded TradeTally
+ *  web app (no sidebar). */
+export type View = "trading" | "dashboard" | "tradetally";
 
 interface UiState {
   /** Which top-level view is shown. The dashboard (Moon, first in the rail) hides

@@ -6,10 +6,12 @@ pub mod company_intel;
 pub mod config;
 pub mod dashboard;
 pub mod enrichment;
+pub mod flat_files;
 pub mod fmp;
 pub mod internal_trading;
 pub mod llm;
 pub mod local_db;
+pub mod market_attention;
 pub mod market_state;
 pub mod massive;
 pub mod micro_pullback;
@@ -125,6 +127,7 @@ pub fn run() {
         news_feed_running: Arc::new(AtomicBool::new(false)),
         scanner_running:   Arc::new(AtomicBool::new(false)),
         perfect_pullback_running: Arc::new(AtomicBool::new(false)),
+        market_attention_running: Arc::new(AtomicBool::new(false)),
         micro_pullback_running: Arc::new(AtomicBool::new(false)),
         panic_watchlist_running: Arc::new(AtomicBool::new(false)),
         trading_loop_running: Arc::new(AtomicBool::new(false)),
@@ -133,20 +136,34 @@ pub fn run() {
         active_alerts:     Arc::new(RwLock::new(Vec::new())),
         alert_history:     Arc::new(RwLock::new(Vec::new())),
         screener:          Arc::new(RwLock::new(Vec::new())),
+        attention:         Arc::new(RwLock::new(Vec::new())),
         chart:             Arc::new(RwLock::new(chart_state)),
         internal_book:     Arc::new(RwLock::new(internal_book)),
         enrichments:       Arc::new(RwLock::new(std::collections::HashMap::new())),
         focus_symbols_tx,
         replay:            Arc::new(replay::ReplayShared::default()),
+        flat_files:        Arc::new(flat_files::FlatFilesShared::default()),
     };
 
     // ── Start Tauri ───────────────────────────────────────────────────────
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        // `relaunch()` after an auto-update is installed.
+        .plugin(tauri_plugin_process::init())
         .manage(app_state)
         // Spawn background workers once the app is set up.
         .setup(|app| {
+            // Automatic updates — deployed (release) desktop builds only. The
+            // actual check / download / install / relaunch is driven from the
+            // frontend at launch (first step of the startup pipeline) via
+            // @tauri-apps/plugin-updater; here we just register the plugin so those
+            // JS calls are available. In `tauri dev` (debug) the plugin is not
+            // registered at all, so development is never interrupted (the frontend
+            // also guards with import.meta.env.DEV).
+            #[cfg(all(desktop, not(debug_assertions)))]
+            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+
             let state = app.state::<AppState>();
             let db      = state.db.clone();
             let config  = state.config.clone();
@@ -222,13 +239,21 @@ pub fn run() {
                 let ci_secrets = secrets.clone();
                 tauri::async_runtime::spawn(async move {
                     startup::run_pipeline(db.clone(), config.clone(), secrets.clone(), startup).await;
-                    match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, live_feed_running, focus_rx, app_handle) {
-                        Ok(n)  => eprintln!("[tagdash] live feed: {n} US-stock universe ready"),
-                        Err(e) => eprintln!("[tagdash] live feed not started: {e}"),
-                    }
-                    // Premarket news investor — independent of the data feed.
-                    if let Err(e) = commands::spawn_news_feed(market, secrets, news_feed_running) {
-                        eprintln!("[tagdash] news feed not started: {e}");
+                    // In flat-files mode there is no real-time feed: the platform
+                    // runs off the downloaded days via Market Replay, so neither the
+                    // live data feed nor the premarket news feed are started (the
+                    // Alpaca API may be unavailable entirely).
+                    if config.read().unwrap().data_source.is_flat_files() {
+                        eprintln!("[tagdash] mode flat files actif: flux live + news non démarrés (replay hors-ligne)");
+                    } else {
+                        match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, live_feed_running, focus_rx, app_handle) {
+                            Ok(n)  => eprintln!("[tagdash] live feed: {n} US-stock universe ready"),
+                            Err(e) => eprintln!("[tagdash] live feed not started: {e}"),
+                        }
+                        // Premarket news investor — independent of the data feed.
+                        if let Err(e) = commands::spawn_news_feed(market, secrets, news_feed_running) {
+                            eprintln!("[tagdash] news feed not started: {e}");
+                        }
                     }
                     // Company-intelligence collection (short interest, financials,
                     // dilution filings, ownership). Runs ONCE here, after the
@@ -248,21 +273,39 @@ pub fn run() {
                 });
             }
 
-            // 3. Perfect Pullback engine (stateful, multi-timeframe): watches every
-            //    active ticker on 1/2/5/10m for a strong move (gate 1) then fires on
-            //    the first healthy pullback (gate 2). Auto-started; idles outside the
-            //    regular session and honours the Settings toggle.
+            // 3. Market Attention Gate engine (direction-agnostic ticker selection):
+            //    once a minute between 09:30 and 12:30 ET it ranks the most-watched/
+            //    traded tickers on a rolling 5-minute window and publishes the top 10.
+            //    Perfect Pullback consumes this list (and memorises it). Never fires
+            //    an alert / never trades; idles outside its window.
+            {
+                let ma_running = state.market_attention_running.clone();
+                let market     = state.market.clone();
+                let db         = state.db.clone();
+                let secrets    = state.secrets.clone();
+                let attention  = state.attention.clone();
+                ma_running.store(true, std::sync::atomic::Ordering::Relaxed);
+                market_attention::MarketAttentionEngine::start(
+                    ma_running, market, db, secrets, attention,
+                );
+            }
+
+            // 3a. Perfect Pullback engine (stateful, multi-timeframe): watches the
+            //     tickers selected by Market Attention (memorised for the session) on
+            //     1/2/5/10m for a strong move (gate 1) then fires on the first healthy
+            //     pullback (gate 2). Auto-started; idles outside the regular session
+            //     and honours the Settings toggle.
             {
                 let pp_running       = state.perfect_pullback_running.clone();
                 let market           = state.market.clone();
                 let db               = state.db.clone();
-                let secrets          = state.secrets.clone();
                 let active_alerts    = state.active_alerts.clone();
                 let alert_history    = state.alert_history.clone();
                 let strategy_enabled = state.strategy_enabled.clone();
+                let attention        = state.attention.clone();
                 pp_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 perfect_pullback::PerfectPullbackEngine::start(
-                    pp_running, market, db, secrets, active_alerts, alert_history, strategy_enabled,
+                    pp_running, market, db, active_alerts, alert_history, strategy_enabled, attention,
                 );
             }
 
@@ -385,6 +428,7 @@ pub fn run() {
             commands::get_active_alerts,
             commands::get_alert_history,
             commands::get_screener_matches,
+            commands::get_market_attention,
             commands::dismiss_screener,
             commands::get_screener_dismissals,
             commands::start_scanner,
@@ -404,6 +448,11 @@ pub fn run() {
             commands::save_diary_entry,
             commands::get_daily_background,
             commands::open_backgrounds_folder,
+            commands::get_mood,
+            commands::open_mood_target,
+            // Embedded TradeTally webview (native child webview over the tab)
+            commands::tradetally_set_bounds,
+            commands::tradetally_hide,
             // Chart / trade context
             commands::get_zone_trade_context,
             commands::create_or_get_trade_id_for_zone,
@@ -434,6 +483,12 @@ pub fn run() {
             commands::replay_next_alert,
             commands::replay_next_day,
             commands::get_replay_status,
+            // Flat files (download / calendar / open folder)
+            commands::flat_files_download,
+            commands::flat_files_cancel,
+            commands::get_flat_files_status,
+            commands::get_flat_files_calendar,
+            commands::open_flat_files_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

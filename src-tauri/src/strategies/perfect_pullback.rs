@@ -2,13 +2,14 @@
 //
 // The real detection logic is NOT here: it is a stateful, multi-timeframe gate
 // engine that lives in `crate::perfect_pullback` and runs in its own tokio task
-// during the regular session. It watches every active premarket gapper (open vs
-// previous close gapped ≥ ±10%) on its enabled timeframes (the 5m by default;
-// 1m/2m/10m toggleable via ENABLE_* flags in the engine) for a strong directional
-// move with high relative volume (gate 1), then fires on the first healthy pullback
-// into it (gate 2). That can't fit the stateless per-ticker `should_alert(ctx)`
-// contract, so the engine pushes its AlertSignals straight into the active-alert
-// list (the same escape hatch the price-alarm watcher uses).
+// during the regular session. Ticker SELECTION comes from the Market Attention Gate
+// (`crate::market_attention`) — the engine watches the most-watched/traded tickers
+// it publishes (and memorises them for the session) on its enabled timeframes (the
+// 5m by default; 1m/2m/10m toggleable via ENABLE_* flags in the engine) for a strong
+// directional move with high relative volume (gate 1), then fires on the first
+// healthy pullback into it (gate 2). That can't fit the stateless per-ticker
+// `should_alert(ctx)` contract, so the engine pushes its AlertSignals straight into
+// the active-alert list (the same escape hatch the price-alarm watcher uses).
 //
 // This file exists so the strategy still has a proper identity in the registry: a
 // Settings on/off toggle, a name + priority, and the identity card the UI uses to

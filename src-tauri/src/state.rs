@@ -15,7 +15,7 @@ use crate::config::{secrets::Secrets, AppConfig};
 use crate::internal_trading::InternalBook;
 use crate::market_state::MarketState;
 use crate::startup::StartupState;
-use crate::types::{AlertEnrichment, AlertSignal, ScreenerMatch};
+use crate::types::{AlertEnrichment, AlertSignal, AttentionEntry, ScreenerMatch};
 
 pub struct AppState {
     /// Directory where tagdash.toml, tagdash.secrets.toml and tagdash.db live.
@@ -47,6 +47,9 @@ pub struct AppState {
     pub scanner_running: Arc<AtomicBool>,
     /// Controls the Perfect Pullback engine task lifecycle.
     pub perfect_pullback_running: Arc<AtomicBool>,
+    /// Controls the Market Attention Gate engine task lifecycle (direction-agnostic
+    /// 09:30–12:30 ET ticker selection; see `crate::market_attention`).
+    pub market_attention_running: Arc<AtomicBool>,
     /// Controls the Micro Pullback engine task lifecycle (premarket dormancy →
     /// ignition → confirmation state machine; see `crate::micro_pullback`).
     pub micro_pullback_running: Arc<AtomicBool>,
@@ -72,6 +75,10 @@ pub struct AppState {
     /// Live pre-open screener matches (replaced wholesale every scan pass;
     /// tickers disappear the instant they stop matching). Drives the pre-open tab.
     pub screener: Arc<RwLock<Vec<ScreenerMatch>>>,
+    /// Market Attention top list (direction-agnostic, top 10, refreshed once a
+    /// minute 09:30–12:30 ET). Consumed by the Perfect Pullback engine as its
+    /// candidate source; exposed read-only via `get_market_attention` for debug.
+    pub attention: Arc<RwLock<Vec<AttentionEntry>>>,
     /// Per-zone trade context (SL, TP, tradeID) stored in RAM.
     pub chart: Arc<RwLock<ChartState>>,
     /// Internal simulated order book (no real broker orders in V1).
@@ -83,4 +90,8 @@ pub struct AppState {
     /// channel to the (single) replay engine task. The simulated clock itself is
     /// global (see `replay::clock` / `time::now`).
     pub replay: Arc<crate::replay::ReplayShared>,
+    /// Flat-files download handle: status polled by the Gestion Flat Files modal +
+    /// a cancel flag for the (single) background download task. See
+    /// `crate::flat_files`.
+    pub flat_files: Arc<crate::flat_files::FlatFilesShared>,
 }

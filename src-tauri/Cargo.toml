@@ -14,11 +14,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri        = { version = "2", features = ["macos-private-api"] }
+# `unstable` enables the multi-webview API (Window::add_child / Webview show/hide)
+# used to embed the TradeTally site as a native child webview over its tab.
+tauri        = { version = "2", features = ["macos-private-api", "unstable"] }
 tauri-plugin-shell = "2"
 # Native OS notifications (Windows toast / macOS Notification Center) — opt-in
 # desktop alert when a scanner alert fires (gated by ui.desktop_alerts).
 tauri-plugin-notification = "2"
+# Automatic updates (Tauri official updater) — checks GitHub Releases at launch,
+# downloads + installs a newer signed bundle, then relaunches via the process
+# plugin. Desktop-only; gated behind `#[cfg(desktop)]` at registration.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

@@ -540,6 +540,35 @@ export function SettingsModal({ open, onClose }: Props) {
 
           {/* ── API Keys (status only) ── */}
           <TabsContent value="secrets" className="mt-4 space-y-1">
+            {/* Data source: live API vs offline flat files (same toggle as in
+                Gestion Flat Files). Persisted in tagdash.toml. */}
+            <div className="mb-3 flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">Source de données</div>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {(draft.data_source?.mode ?? "api") === "flat_files"
+                    ? "Flat files — pas de temps réel, Market Replay uniquement (ouvert par défaut)."
+                    : "API Alpaca — données temps réel."}
+                </p>
+              </div>
+              <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
+                {(["api", "flat_files"] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => set("data_source", "mode", m)}
+                    className={cn(
+                      "px-3 py-1.5 text-xs transition-colors",
+                      (draft.data_source?.mode ?? "api") === m
+                        ? "bg-accent text-foreground"
+                        : "text-muted-foreground hover:bg-accent/50",
+                    )}
+                  >
+                    {m === "api" ? "API" : "Flat files"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <Separator className="mb-3" />
             <p className="mb-3 text-xs text-muted-foreground">
               Keys are stored in{" "}
               <code className="rounded bg-muted px-1 py-0.5 text-[11px]">

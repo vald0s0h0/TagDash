@@ -1,0 +1,74 @@
+# Build, sign and publish a TagDash release (auto-update artifacts included).
+#
+# Trigger: push a version tag (e.g. `v0.1.0`) — the tag's version must match the
+# `version` in src-tauri/tauri.conf.json. tauri-action then:
+#   • builds the app (runs `npm run build` via beforeBuildCommand),
+#   • signs the bundles with the minisign private key (createUpdaterArtifacts),
+#   • creates the GitHub Release and uploads the installers + their `.sig` files
+#     and the updater manifest `latest.json`.
+#
+# The running app checks `…/releases/latest/download/latest.json` at launch
+# (see plugins.updater.endpoints) and updates itself when the published version is
+# newer than the installed one.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   • TAURI_SIGNING_PRIVATE_KEY          — the full contents of your private key
+#                                          file (~/.tauri/tagdash.key). NEVER commit it.
+#   • TAURI_SIGNING_PRIVATE_KEY_PASSWORD — the password set at key generation
+#                                          (leave empty if you chose none).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow a manual run from the Actions tab as well.
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is TagDash's target platform. Add 'macos-latest' / 'ubuntu-22.04'
+        # here to also ship those bundles.
+        include:
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "TagDash ${{ github.ref_name }}"
+          releaseBody: "Téléchargez l'installeur ci-dessous. La mise à jour automatique se fait au lancement de l'app."
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}

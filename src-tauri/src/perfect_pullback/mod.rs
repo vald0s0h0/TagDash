@@ -6,8 +6,18 @@
 // so a continuation can be traded in the direction of the move. There is a long and
 // a short side (up move → long bias, down move → short bias). The engine can run in
 // parallel on the 1, 2, 5 and 10-minute timeframes, each toggled by an ENABLE_* flag
-// below; for now only the 5-minute timeframe is active. Gate 1 additionally only
-// considers premarket gappers (open vs previous close gapped ≥ ±10%).
+// below; for now only the 5-minute timeframe is active.
+//
+// Ticker SELECTION is NOT done here: it comes from the Market Attention Gate
+// (`crate::market_attention`), which publishes, once a minute between 09:30 and
+// 12:30 ET, the top-10 most-watched/traded tickers (direction-agnostic). This engine
+// reads that list and MEMORISES the symbols for the whole session: during a pullback
+// a ticker's volume falls and it can drop off the attention list, yet it stays worth
+// trading — so once a symbol has been on the list it remains watched until the end of
+// the session (16:00) regardless of whether it is still on the list. Gate 1 here is
+// purely a move-strength check (consecutive bars + relative volume + dollar volume);
+// the moving-average / VWAP location filters were removed (selection is Market
+// Attention's job now).
 //
 // Why an engine and not a `ScanStrategy::should_alert`: the gates form a per-(symbol,
 // timeframe) state machine spanning many bars (count the consecutive move bars,
@@ -33,13 +43,12 @@ use std::sync::{
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use tokio::time::Duration;
 
-use crate::config::secrets::Secrets;
 use crate::local_db::universe_repository;
 use crate::market_state::aggregators::{Bar, Timeframe};
 use crate::market_state::MarketState;
 use crate::scanner::push_alert;
 use crate::strategies::perfect_pullback::ID as STRATEGY_ID;
-use crate::types::{AlertSignal, Session, Side};
+use crate::types::{AlertSignal, AttentionEntry, Session, Side};
 
 // ─── Tunable parameters (recompile to apply) ──────────────────────────────────
 /// Per-(symbol, timeframe) re-arm cooldown after a fire (a fresh move→pullback can
@@ -54,26 +63,6 @@ const AVG_VOL_REFRESH_SECS: u64 = 300;
 /// Tradeable price band (USD). Keeps the engine off sub-penny noise and ultra-highs.
 const PRICE_MIN: f64 = 1.0;
 const PRICE_MAX: f64 = 1000.0;
-
-/// Premarket gap gate (gate 1, entry filter): only tickers whose regular-session
-/// open gapped at least this far from the previous day's close — up (gappers up,
-/// ≥ +10%) or down (gappers down, ≤ −10%) — are watched at all. The gap is computed
-/// once per day from the 09:30 open and then cached (see the gap-map build below);
-/// it is never recomputed, since the open is a fixed value set at 09:30.
-const MIN_GAP_PCT: f64 = 10.0;
-
-/// Don't build the day's gap map before 09:30 + this many minutes: the 09:30 opening
-/// minute bar only lands in the live ring at ~09:31, so a 2-minute grace lets a
-/// normal (pre-open) launch read the real open from RAM without any REST call.
-const GAP_BUILD_OFFSET_MIN: u32 = 2;
-/// Late-start recovery: if by 09:30 + this many minutes some candidates still have no
-/// 09:30 open in the live ring (TagDash was launched after the open, so the ring
-/// never saw the opening bar), fetch today's first 1-minute bar per symbol from
-/// Alpaca REST to recover the open. Below this offset we wait for the live bar.
-const GAP_LATE_START_OFFSET_MIN: u32 = 5;
-/// Minimum spacing between gap-map build attempts (seconds) — bounds REST calls on a
-/// non-trading day where the build never resolves.
-const GAP_ATTEMPT_INTERVAL_SECS: u64 = 15;
 
 // ── Timeframe on/off switches ───────────────────────────────────────────────
 // Flip a flag to true/false to watch / ignore that timeframe. When a timeframe is
@@ -94,8 +83,6 @@ const MIN_MOVE_BARS: usize = 2;
 const RVOL_MIN: f64 = 2.0;
 /// Minimum dollar volume traded during the whole move, to avoid thin-name noise.
 const MIN_MOVE_DOLLAR_VOLUME: f64 = 250_000.0;
-/// Moving-average period used for the "price on the right side of the 20MA" gate.
-const SMA_PERIOD: usize = 20;
 /// Regular-session length in minutes, used to pro-rate the daily average volume
 /// down to a per-bar expectation for the relative-volume calc.
 const REGULAR_MINUTES_PER_DAY: f64 = 390.0;
@@ -110,7 +97,10 @@ const MAX_RETRACE: f64 = 0.60;
 /// average true range of the move candles — rejects a violent reversal bar.
 const ATR_MAX_MULT: f64 = 2.0;
 
-/// Regular cash session in ET wall-clock minutes since midnight: 09:30–16:00.
+/// Regular cash session in ET wall-clock minutes since midnight: 09:30–16:00. Perfect
+/// Pullback watches and fires across the whole session; Market Attention only feeds
+/// NEW candidate names during its own 09:30–12:30 window, but a memorised ticker
+/// stays tradeable here until 16:00.
 const SESSION_START_MIN: u32 = 9 * 60 + 30; // 570
 const SESSION_END_MIN:   u32 = 16 * 60;     // 960
 
@@ -134,13 +124,9 @@ struct TickerInput {
     /// Closed 1-minute bars (oldest → newest); higher timeframes are aggregated.
     m1:             Vec<Bar>,
     price:          f64,
-    vwap:           Option<f64>,
     volume_day:     u64,
     change_day_pct: Option<f64>,
     avg_vol:        u64,
-    /// Premarket gap %: (regular-session open − previous close) / previous close.
-    /// Positive = gap up, negative = gap down. Always |·| ≥ MIN_GAP_PCT (gate 1).
-    gap_pct:        f64,
 }
 
 // ─── Per-(symbol, timeframe) gate state ───────────────────────────────────────
@@ -207,10 +193,10 @@ impl PerfectPullbackEngine {
         running:          Arc<AtomicBool>,
         market:           Arc<RwLock<MarketState>>,
         db:               Arc<Mutex<rusqlite::Connection>>,
-        secrets:          Arc<RwLock<Secrets>>,
         active_alerts:    Arc<RwLock<Vec<AlertSignal>>>,
         alert_history:    Arc<RwLock<Vec<AlertSignal>>>,
         strategy_enabled: Arc<RwLock<HashMap<String, bool>>>,
+        attention:        Arc<RwLock<Vec<AttentionEntry>>>,
     ) {
         // Use the Tauri-managed runtime so this can be launched from the sync
         // `setup` hook (a bare `tokio::spawn` there panics: no reactor running).
@@ -221,22 +207,15 @@ impl PerfectPullbackEngine {
             // periodically from the universe table.
             let mut avg_volumes = load_avg_volumes(&db);
             let mut avg_vol_loaded = std::time::Instant::now();
-            // Premarket-gapper candidate list: symbol → gap %, built once per day from
-            // the 09:30 open (see `build_gaps`) and cached for the whole session. Only
-            // symbols present here clear gate 1's entry filter. `gap_day` is the ET
-            // date the map was built for (rebuilt at each new day); `last_gap_attempt`
-            // throttles build retries until the open is available.
-            let mut gaps: HashMap<String, f64> = HashMap::new();
-            let mut gap_day: Option<String> = None;
-            let mut last_gap_attempt: Option<std::time::Instant> = None;
-            // Per-(symbol, timeframe) SMA-20 seed: the closes of the ~20 timeframe bars
-            // immediately BEFORE today's open, downloaded once from Alpaca for the
-            // gapper candidates only. Concatenated ahead of the live closes so the
-            // "right side of the 20MA" gate has a valid SMA from the very first live
-            // bar (~09:35 on 5m) instead of waiting ~100 min to accrue 20 live bars.
-            let mut sma_seeds: HashMap<(String, String), Vec<f64>> = HashMap::new();
+            // Memorised candidate set: every symbol Market Attention has selected
+            // today (symbol → first time seen). A ticker stays here for the whole
+            // session even after it leaves the attention list, so a pullback whose
+            // falling volume drops it off the list never loses the candidate.
+            // `watched_day` is the ET date the set is built for (cleared at a new day).
+            let mut watched: HashMap<String, DateTime<Utc>> = HashMap::new();
+            let mut watched_day: Option<String> = None;
             // Market Replay reset watch: replay start / backward seek / new day →
-            // drop gate machines, the gap map and the SMA seeds so the replayed
+            // drop gate machines and the memorised candidate set so the replayed
             // session is rebuilt from the simulated clock.
             let mut replay_gen = crate::replay::clock::generation();
 
@@ -246,10 +225,8 @@ impl PerfectPullbackEngine {
                     if g != replay_gen {
                         replay_gen = g;
                         gates.clear();
-                        gaps.clear();
-                        sma_seeds.clear();
-                        gap_day = None;
-                        last_gap_attempt = None;
+                        watched.clear();
+                        watched_day = None;
                     }
                 }
                 // Respect the Settings on/off toggle (compiled default if absent).
@@ -271,6 +248,14 @@ impl PerfectPullbackEngine {
 
                 // App clock: simulated instant during a Market Replay.
                 let now = crate::time::now();
+
+                // New trading day: forget yesterday's memorised candidates.
+                let today = et_date(now);
+                if watched_day.as_deref() != Some(today.as_str()) {
+                    watched.clear();
+                    watched_day = Some(today);
+                }
+
                 let mock = market.read().unwrap().mock_running;
                 let in_session = mock
                     || {
@@ -282,52 +267,19 @@ impl PerfectPullbackEngine {
                     continue;
                 }
 
-                // ── Build the day's premarket-gapper list, once, from the 09:30 open.
-                // The open is fixed at 09:30, so the gap is computed a single time and
-                // cached for the session. We can only build it once the open exists:
-                // for a normal (pre-open) launch the 09:30 bar reaches the live ring at
-                // ~09:31; for a launch *after* the open the ring never saw it, so we
-                // recover the open from Alpaca REST. Either way the candidate list (and
-                // thus everything gate 1+ sees) is established once at/after 09:30.
-                let today = et_date(now);
-                let built_today = gap_day.as_deref() == Some(today.as_str());
-                // New trading day: drop yesterday's gappers until today's list is
-                // rebuilt, so the prefilter never matches a stale candidate.
-                if !built_today && gap_day.is_some() {
-                    gaps.clear();
-                    sma_seeds.clear();
-                    gap_day = None;
-                }
-                let due = last_gap_attempt
-                    .map(|t| t.elapsed() >= Duration::from_secs(GAP_ATTEMPT_INTERVAL_SECS))
-                    .unwrap_or(true);
-                if !built_today
-                    && due
-                    && (mock || et_minutes(now) >= SESSION_START_MIN + GAP_BUILD_OFFSET_MIN)
+                // Pull in the latest Market Attention selection and memorise it.
                 {
-                    last_gap_attempt = Some(std::time::Instant::now());
-                    if let Some(map) = build_gaps(&market, &secrets, &avg_volumes, now).await {
-                        // Download the SMA-20 seed for the candidates only, so gate 1's
-                        // moving-average check is armed from the first live bar.
-                        let candidates: Vec<String> = map.keys().cloned().collect();
-                        sma_seeds = fetch_sma_seeds(&secrets, &candidates, now).await;
-                        eprintln!(
-                            "[tagdash] perfect_pullback: gap list built — {} gappers (≥±{:.0}%), \
-                             {} SMA seeds",
-                            map.len(), MIN_GAP_PCT, sma_seeds.len(),
-                        );
-                        gaps = map;
-                        gap_day = Some(today);
+                    let list = attention.read().unwrap();
+                    for e in list.iter() {
+                        watched.entry(e.symbol.clone()).or_insert(now);
                     }
                 }
 
-                // Snapshot the per-symbol inputs (M1 closed bars + live price/vwap)
-                // under a brief read lock; all gate logic runs outside the lock.
-                // Pre-filter to active names — this is gate 1's entry filter: a known
-                // avg volume (so rvol is meaningful), a price in band, at least a
-                // couple of M1 bars, and — the only names we trade — a premarket
-                // gapper, i.e. the regular-session open gapped ≥ MIN_GAP_PCT up or
-                // down vs the previous day's close.
+                // Snapshot the per-symbol inputs (M1 closed bars + live price) under a
+                // brief read lock; all gate logic runs outside the lock. Pre-filter to
+                // active names: a known avg volume (so rvol is meaningful), a price in
+                // band, at least a couple of M1 bars, and — the candidate gate — a
+                // symbol Market Attention has selected (and we've memorised) today.
                 let inputs: Vec<TickerInput> = {
                     let ms = market.read().unwrap();
                     ms.tickers
@@ -342,18 +294,17 @@ impl PerfectPullbackEngine {
                             if m1.len() < MIN_MOVE_BARS + 1 {
                                 return None;
                             }
-                            // Premarket gap gate: only today's cached gappers pass.
-                            // Absent symbol = not a gapper (or list not built yet).
-                            let gap_pct = *gaps.get(&t.symbol)?;
+                            // Candidate gate: only Market-Attention-selected tickers.
+                            if !watched.contains_key(&t.symbol) {
+                                return None;
+                            }
                             Some(TickerInput {
                                 symbol: t.symbol.clone(),
                                 m1,
                                 price,
-                                vwap: t.vwap,
                                 volume_day: t.volume_day,
                                 change_day_pct: t.change_day_pct,
                                 avg_vol,
-                                gap_pct,
                             })
                         })
                         .collect()
@@ -370,15 +321,9 @@ impl PerfectPullbackEngine {
                             continue;
                         }
                         let key = (inp.symbol.clone(), tf_label.to_string());
-                        // SMA-20 over the downloaded seed closes (pre-open) followed by
-                        // the live closes — gives a valid 20MA from the first live bar.
-                        let mut closes: Vec<f64> =
-                            sma_seeds.get(&key).cloned().unwrap_or_default();
-                        closes.extend(bars.iter().map(|b| b.close));
-                        let sma20 = sma_last(&closes, SMA_PERIOD);
                         let gs = gates.entry(key).or_insert_with(GateState::new);
                         if let Some(fire) =
-                            process(gs, &inp, tf_label, bucket_secs, &bars, sma20, now)
+                            process(gs, &inp, tf_label, bucket_secs, &bars, now)
                         {
                             fires.push(fire);
                         }
@@ -410,7 +355,6 @@ fn process(
     tf_label:    &str,
     bucket_secs: i64,
     bars:        &[Bar],
-    sma20:       Option<f64>,
     now:         DateTime<Utc>,
 ) -> Option<AlertSignal> {
     // Cooldown: skip until it elapses, then resume watching fresh.
@@ -455,9 +399,9 @@ fn process(
                 } else {
                     // Opposite (or doji) candle = potential pullback start. Only
                     // hand off to gate 2 if the move is long enough AND qualified
-                    // (relative volume, dollar volume, right side of 20MA & VWAP).
+                    // (relative volume + dollar volume — move strength only).
                     let qualified = gs.move_bars.len() >= MIN_MOVE_BARS
-                        && move_qualifies(gs, sma20, inp.vwap, inp.avg_vol, bucket_secs);
+                        && move_qualifies(gs, inp.avg_vol, bucket_secs);
                     if qualified {
                         gs.pullback_bars = vec![b.clone()];
                         gs.phase = Phase::Pullback;
@@ -497,8 +441,7 @@ fn process(
                                 fire = Some(make_alert(
                                     &inp.symbol, tf_label, gs.side, rvol, retrace,
                                     gs.move_bars.len(), gs.pullback_bars.len(),
-                                    inp.price, inp.volume_day, inp.change_day_pct,
-                                    inp.gap_pct, now,
+                                    inp.price, inp.volume_day, inp.change_day_pct, now,
                                 ));
                                 gs.cooldown_until =
                                     Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
@@ -521,41 +464,11 @@ fn process(
 
 // ─── Gate helpers ──────────────────────────────────────────────────────────────
 
-/// Gate 1 qualification at the colour flip: relative volume, dollar volume and the
-/// move's end price on the correct side of the 20-period MA and the session VWAP.
-/// `sma20` is the seeded 20-period MA computed by the caller (downloaded pre-open
-/// closes + live closes); None when not enough closes are available yet.
-fn move_qualifies(
-    gs:          &GateState,
-    sma20:       Option<f64>,
-    vwap:        Option<f64>,
-    avg_vol:     u64,
-    bucket_secs: i64,
-) -> bool {
-    let is_long = matches!(gs.side, Side::Long);
-
-    // Reference price = the move's last close (its peak/trough).
-    let Some(last) = gs.move_bars.last() else { return false };
-    let ref_close = last.close;
-
-    // Right side of the 20-period MA (seed-backed, available from the first live bar).
-    let Some(sma) = sma20 else { return false };
-    if is_long && ref_close <= sma {
-        return false;
-    }
-    if !is_long && ref_close >= sma {
-        return false;
-    }
-
-    // Right side of the session VWAP.
-    let Some(v) = vwap else { return false };
-    if is_long && ref_close <= v {
-        return false;
-    }
-    if !is_long && ref_close >= v {
-        return false;
-    }
-
+/// Gate 1 qualification at the colour flip: move strength only — relative volume
+/// and dollar volume of the whole move. Ticker selection (which names are worth
+/// watching at all) is handled upstream by the Market Attention Gate, so the old
+/// moving-average / VWAP location filters were removed.
+fn move_qualifies(gs: &GateState, avg_vol: u64, bucket_secs: i64) -> bool {
     // Dollar volume of the whole move.
     let move_vol: u64 = gs.move_bars.iter().map(|b| b.volume).sum();
     let dollar_volume: f64 = gs
@@ -634,15 +547,6 @@ fn move_rvol(move_vol: u64, n_bars: usize, bucket_secs: i64, avg_vol: u64) -> Op
     Some(move_vol as f64 / expected)
 }
 
-/// Simple moving average of the last `period` closes. None until enough exist.
-fn sma_last(closes: &[f64], period: usize) -> Option<f64> {
-    if period == 0 || closes.len() < period {
-        return None;
-    }
-    let sum: f64 = closes[closes.len() - period..].iter().sum();
-    Some(sum / period as f64)
-}
-
 /// Average true range (here high−low, wicks included) of the move candles.
 fn avg_true_range(bars: &[Bar]) -> f64 {
     if bars.is_empty() {
@@ -677,7 +581,7 @@ fn aggregate(m1: &[Bar], bucket_secs: i64, now: DateTime<Utc>) -> Vec<Bar> {
                 low:         b.low,
                 close:       b.close,
                 volume:      b.volume,
-                vwap:        None, // unused for detection (VWAP gate uses session VWAP)
+                vwap:        None, // unused for detection
                 trade_count: Some(b.trade_count.unwrap_or(0)),
             }),
         }
@@ -699,7 +603,6 @@ fn make_alert(
     price:          f64,
     volume_day:     u64,
     change_day_pct: Option<f64>,
-    gap_pct:        f64,
     now:            DateTime<Utc>,
 ) -> AlertSignal {
     let side_str = if matches!(side, Side::Long) { "Long" } else { "Short" };
@@ -724,7 +627,7 @@ fn make_alert(
         halted:        Some(false),
         latency_ui_ms: None,
         reason: format!(
-            "Perfect Pullback {side_str} {tf_label} — gap {gap_pct:+.1}%,{rvol_str} montée \
+            "Perfect Pullback {side_str} {tf_label} — Market Attention,{rvol_str} montée \
              {move_bars} barres, pullback {pullback_bars} barres (retracement {:.0}%) — ${:.2}",
             retrace * 100.0,
             price,
@@ -747,205 +650,12 @@ fn load_avg_volumes(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, u6
         .collect()
 }
 
-/// Build the day's premarket-gapper candidate map (symbol → gap %). The gap is
-/// `(today's 09:30 open − previous close) / previous close × 100`; only |gap| ≥
-/// MIN_GAP_PCT is kept. Called once per day and cached by the caller.
-///
-/// Sourcing the 09:30 open is the whole point: it is a fixed value set at the open,
-/// so we resolve it once. A normal (pre-open) launch finds the 09:30 minute bar in
-/// the live M1 ring; a launch *after* the open never saw that bar stream, so once
-/// past GAP_LATE_START_OFFSET_MIN we recover the open from Alpaca REST (today's first
-/// 1-minute bar). In mock mode the first available bar's open stands in for 09:30.
-///
-/// Returns `Some(map)` once the open is resolvable (the result may legitimately be
-/// empty — a non-trading day, or no qualifying gappers — in which case the caller
-/// commits an empty list and stops retrying). Returns `None` while the open is not
-/// yet available (still early, or a REST error), so the caller retries.
-async fn build_gaps(
-    market:      &Arc<RwLock<MarketState>>,
-    secrets:     &Arc<RwLock<Secrets>>,
-    avg_volumes: &HashMap<String, u64>,
-    now:         DateTime<Utc>,
-) -> Option<HashMap<String, f64>> {
-    // Candidate snapshot: same entry conditions as the engine's per-loop prefilter
-    // (known avg volume, price in band, a usable previous close), plus whatever 09:30
-    // open we can already read from the live ring.
-    struct Cand {
-        symbol:     String,
-        prev_close: f64,
-        ring_open:  Option<f64>,
-    }
-    let (mock, cands): (bool, Vec<Cand>) = {
-        let ms = market.read().unwrap();
-        let mock = ms.mock_running;
-        let cands = ms
-            .tickers
-            .values()
-            .filter_map(|t| {
-                let prev_close = t.previous_close.filter(|pc| *pc > 0.0)?;
-                let price = t.last_price?;
-                if !(PRICE_MIN..=PRICE_MAX).contains(&price) {
-                    return None;
-                }
-                avg_volumes.get(&t.symbol).filter(|&&v| v > 0)?;
-                let m1 = ms.closed_bars(&t.symbol, Timeframe::M1);
-                let ring_open = session_open(&m1, mock);
-                Some(Cand { symbol: t.symbol.clone(), prev_close, ring_open })
-            })
-            .collect::<Vec<_>>();
-        (mock, cands)
-    };
-    if cands.is_empty() {
-        return None;
-    }
-
-    // Opens resolved from the live ring.
-    let mut opens: HashMap<String, f64> = cands
-        .iter()
-        .filter_map(|c| c.ring_open.map(|o| (c.symbol.clone(), o)))
-        .collect();
-
-    // If nothing came from the ring, this is either too-early (wait) or a genuine
-    // late start (recover via REST once past the grace window). Mock never RESTs.
-    if opens.is_empty() && !mock {
-        if et_minutes(now) < SESSION_START_MIN + GAP_LATE_START_OFFSET_MIN {
-            return None; // still ramping up — let the live 09:30 bar arrive
-        }
-        let (key, sec) = {
-            let s = secrets.read().unwrap();
-            (s.alpaca_key.clone(), s.alpaca_secret.clone())
-        };
-        let (Some(k), Some(sc)) = (key, sec) else { return None };
-        if k.is_empty() || sc.is_empty() {
-            return None;
-        }
-        let syms: Vec<String> = cands.iter().map(|c| c.symbol.clone()).collect();
-        match crate::alpaca::bars::fetch_intraday_bars_today(&k, &sc, &syms).await {
-            // First bar (ascending) is today's 09:30 open. An Ok with no bars means a
-            // non-trading day → commit an empty gapper list and stop retrying.
-            Ok(bars_map) => {
-                for (sym, bars) in bars_map {
-                    if let Some(first) = bars.first() {
-                        opens.insert(sym, first.open);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[tagdash] perfect_pullback: intraday open fetch failed: {e}");
-                return None; // transient — retry next attempt
-            }
-        }
-    }
-
-    // Compute gaps and keep only the gappers (≥ ±MIN_GAP_PCT).
-    let gaps = cands
-        .iter()
-        .filter_map(|c| {
-            let open = *opens.get(&c.symbol)?;
-            let gap = (open - c.prev_close) / c.prev_close * 100.0;
-            (gap.abs() >= MIN_GAP_PCT).then_some((c.symbol.clone(), gap))
-        })
-        .collect();
-    Some(gaps)
-}
-
-/// Download the SMA-20 seed for the gapper candidates: per (symbol, enabled
-/// timeframe), the closes of the ~SMA_PERIOD timeframe bars ending just before today's
-/// 09:30 open. Concatenated ahead of the live closes by the caller so the 20-period MA
-/// gate is valid from the first live bar. Fetched concurrently (one Alpaca request per
-/// symbol per timeframe). On any error / missing creds the seed is simply absent and
-/// the gate falls back to waiting for 20 live bars.
-async fn fetch_sma_seeds(
-    secrets: &Arc<RwLock<Secrets>>,
-    symbols: &[String],
-    now:     DateTime<Utc>,
-) -> HashMap<(String, String), Vec<f64>> {
-    let mut out: HashMap<(String, String), Vec<f64>> = HashMap::new();
-    if symbols.is_empty() {
-        return out;
-    }
-    let (key, sec) = {
-        let s = secrets.read().unwrap();
-        (s.alpaca_key.clone(), s.alpaca_secret.clone())
-    };
-    let (Some(k), Some(sc)) = (key, sec) else { return out };
-    if k.is_empty() || sc.is_empty() {
-        return out;
-    }
-
-    // End the seed window at today's 09:30 ET regular-session open (DST-aware), so
-    // the seed is strictly the bars preceding today's open and never overlaps the
-    // live series.
-    let end = crate::time::et_session_open_utc(now)
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
-
-    // One fetch task per (symbol, enabled timeframe).
-    let mut tasks = Vec::new();
-    for &(tf_label, _bucket_secs, tf_enabled) in TIMEFRAMES {
-        if !tf_enabled {
-            continue;
-        }
-        let Some((fetch_tf, limit, agg_secs)) = seed_spec(tf_label) else { continue };
-        for sym in symbols {
-            let (k, sc, sym, end) = (k.clone(), sc.clone(), sym.clone(), end.clone());
-            tasks.push(async move {
-                let bars = crate::alpaca::bars::fetch_bars_before(
-                    &k, &sc, &sym, fetch_tf, &end, limit,
-                )
-                .await
-                .unwrap_or_default();
-                // 10m has no native Alpaca timeframe: aggregate the fetched 5m bars.
-                let bars = match agg_secs {
-                    Some(secs) => aggregate(&bars, secs, now),
-                    None => bars,
-                };
-                let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-                ((sym, tf_label.to_string()), closes)
-            });
-        }
-    }
-
-    for (key, closes) in futures_util::future::join_all(tasks).await {
-        if !closes.is_empty() {
-            out.insert(key, closes);
-        }
-    }
-    out
-}
-
-/// Alpaca fetch spec for a timeframe's SMA seed: (timeframe to request, bar count,
-/// optional aggregation-bucket seconds for frames Alpaca doesn't serve natively).
-fn seed_spec(tf_label: &str) -> Option<(Timeframe, u32, Option<i64>)> {
-    let limit = SMA_PERIOD as u32 + 2; // a small cushion over the SMA window
-    match tf_label {
-        "1m"  => Some((Timeframe::M1, limit, None)),
-        "2m"  => Some((Timeframe::M2, limit, None)),
-        "5m"  => Some((Timeframe::M5, limit, None)),
-        // No native 10-minute frame: pull twice as many 5m bars and aggregate ×2.
-        "10m" => Some((Timeframe::M5, limit * 2, Some(600))),
-        _ => None,
-    }
-}
-
-/// Today's regular-session open from a symbol's closed M1 ring: the open of the 09:30
-/// ET minute bar. In mock mode (no real 09:30 clock) the first available bar's open
-/// stands in. None when the opening bar isn't in RAM (e.g. a late start).
-fn session_open(m1: &[Bar], mock: bool) -> Option<f64> {
-    if mock {
-        return m1.first().map(|b| b.open);
-    }
-    m1.iter()
-        .find(|b| et_minutes(b.time) == SESSION_START_MIN)
-        .map(|b| b.open)
-}
-
 /// ET wall-clock minutes since midnight (DST-aware — see `crate::time`).
 fn et_minutes(now: DateTime<Utc>) -> u32 {
     crate::time::et_minutes(now)
 }
 
-/// ET calendar date (YYYY-MM-DD) — the key the gap map is built for.
+/// ET calendar date (YYYY-MM-DD) — the key the memorised candidate set is built for.
 fn et_date(now: DateTime<Utc>) -> String {
     crate::time::et_date(now)
 }

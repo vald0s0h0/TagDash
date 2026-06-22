@@ -18,6 +18,20 @@ export function useDailyBackground() {
   });
 }
 
+/** A fresh random mood pick (image + short/long phrase). Unlike the daily
+ *  background it re-randomises on every mount — the dashboard tab unmounts when
+ *  you leave it, so this yields a new pick on each open and on page refresh. The
+ *  ⟳ action in the dropdown invalidates ["mood"] for a manual reshuffle. */
+export function useMood() {
+  return useQuery({
+    queryKey: ["mood"],
+    queryFn: () => api.getMood(),
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+  });
+}
+
 /** Re-sync trades from TradeTally (source of truth) and refresh the cards. */
 export function useSyncTrades() {
   const qc = useQueryClient();

@@ -49,6 +49,15 @@ export default {
         md: "calc(var(--radius) - 2px)",
         sm: "calc(var(--radius) - 4px)",
       },
+      // Frosted / Brutal design system — dashboard only. Used via `font-display`,
+      // `font-body`, `font-spacemono` utility classes inside the dashboard cards.
+      // NB: `spacemono` (not `mono`) so we don't override Tailwind's default
+      // `font-mono`, which the rest of the app relies on.
+      fontFamily: {
+        display: ["Instrument Serif", "serif"],
+        body: ["Cantarell", "sans-serif"],
+        spacemono: ["Space Mono", "monospace"],
+      },
     },
   },
   plugins: [require("tailwindcss-animate")],

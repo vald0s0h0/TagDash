@@ -1,19 +1,38 @@
 import * as React from "react";
+import { Layers } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import {
   useDashboardStore,
   GRID_COLS,
   GRID_ROWS,
   type CardId,
+  type Surface,
 } from "@/stores/dashboardStore";
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-/** A single glass card placed on the 10×6 grid. When the dashboard is in edit
- *  mode, the header acts as a drag handle and a bottom-right grip resizes the
- *  card — both snap to whole grid cells. */
+const SURFACE_LABELS: Record<Surface, string> = {
+  glass: "Glass",
+  heavy: "Heavy",
+  invisible: "Transparent",
+};
+
+/** A single card placed on the 20×12 grid. Its frosted/brutal surface (glass /
+ *  heavy / transparent) is chosen per card and persisted. Cards render their own
+ *  internal labels, so there is no separate header. When the dashboard is in edit
+ *  mode the whole card becomes a drag handle, a bottom-right grip resizes it, and
+ *  a top-right button (or right-click) picks the surface — all snap to cells. */
 export function GridCard({
   id,
   title,
@@ -29,6 +48,9 @@ export function GridCard({
   const editing = useDashboardStore((s) => s.editing);
   const move = useDashboardStore((s) => s.move);
   const resize = useDashboardStore((s) => s.resize);
+  const setSurface = useDashboardStore((s) => s.setSurface);
+
+  const [menuOpen, setMenuOpen] = React.useState(false);
 
   function cellSize() {
     const rect = gridRef.current?.getBoundingClientRect();
@@ -84,36 +106,65 @@ export function GridCard({
   return (
     <div
       className={cn(
-        "glass-card relative flex min-h-0 flex-col overflow-hidden",
-        editing && "ring-1 ring-white/20"
+        `surface-${layout.surface}`,
+        "relative flex min-h-0 flex-col",
+        editing && "cursor-move select-none ring-1 ring-white/25"
       )}
       style={{
         gridColumn: `${layout.x + 1} / span ${layout.w}`,
         gridRow: `${layout.y + 1} / span ${layout.h}`,
       }}
+      onPointerDown={startDrag}
+      onContextMenu={
+        editing
+          ? (e) => {
+              e.preventDefault();
+              setMenuOpen(true);
+            }
+          : undefined
+      }
     >
-      <div
-        onPointerDown={startDrag}
-        className={cn(
-          "flex shrink-0 items-center justify-between px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-foreground/70",
-          editing && "cursor-move select-none"
-        )}
-      >
-        <span className="truncate">{title}</span>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-hidden px-3 pb-3">{children}</div>
+      <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
 
       {editing && (
-        <div
-          onPointerDown={startResize}
-          title="Redimensionner"
-          className="absolute bottom-0.5 right-0.5 h-4 w-4 cursor-se-resize text-foreground/40 hover:text-foreground"
-        >
-          <svg viewBox="0 0 10 10" className="h-full w-full">
-            <path d="M9 2 L9 9 L2 9" fill="none" stroke="currentColor" strokeWidth="1.2" />
-          </svg>
-        </div>
+        <>
+          {/* Surface picker — opened by the button or by right-clicking the card. */}
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                title={`Design : ${SURFACE_LABELS[layout.surface]}`}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="absolute right-1.5 top-1.5 z-[4] flex h-6 w-6 items-center justify-center rounded-md bg-black/30 text-white/70 backdrop-blur transition-colors hover:bg-black/50 hover:text-white"
+              >
+                <Layers className="h-3.5 w-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              <DropdownMenuLabel className="truncate">{title}</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuRadioGroup
+                value={layout.surface}
+                onValueChange={(v) => setSurface(id, v as Surface)}
+              >
+                <DropdownMenuRadioItem value="glass">Glass</DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="heavy">Heavy</DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="invisible">
+                  Transparent
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <div
+            onPointerDown={startResize}
+            title="Redimensionner"
+            className="absolute bottom-0.5 right-0.5 z-[4] h-4 w-4 cursor-se-resize text-white/50 hover:text-white"
+          >
+            <svg viewBox="0 0 10 10" className="h-full w-full">
+              <path d="M9 2 L9 9 L2 9" fill="none" stroke="currentColor" strokeWidth="1.2" />
+            </svg>
+          </div>
+        </>
       )}
     </div>
   );

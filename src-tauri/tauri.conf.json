@@ -33,6 +33,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,5 +41,13 @@
       "icons/icon.ico",
       "icons/icon.icns"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/vald0s0h0/TagDash/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdDRDQ5NjhGQkQyMTZBM0MKUldROGFpRzlqNWJVZkh5Z0J4SW1VMWxYQnM0NEV4MmxRNjd0aWsrRGhzQWlIakhXMmxkWjRrRFEK"
+    }
   }
 }

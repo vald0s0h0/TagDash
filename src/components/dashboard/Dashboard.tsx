@@ -1,5 +1,14 @@
 import { useEffect, useRef } from "react";
-import { FolderOpen, RefreshCw, RotateCcw, SlidersHorizontal } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  FileText,
+  FolderOpen,
+  Image as ImageIcon,
+  Quote,
+  RefreshCw,
+  Shuffle,
+  SlidersHorizontal,
+} from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -8,6 +17,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
 } from "@/components/ui/dropdown-menu";
 import { api } from "@/lib/tauri";
 import { GridCard } from "./GridCard";
@@ -21,6 +33,7 @@ import { useDailyBackground, useDashboardTrades, useSyncTrades } from "./useDash
 export function Dashboard() {
   const gridRef = useRef<HTMLDivElement>(null);
 
+  const qc = useQueryClient();
   const { data: bg } = useDailyBackground();
   const { data: trades = [] } = useDashboardTrades();
   const sync = useSyncTrades();
@@ -29,7 +42,6 @@ export function Dashboard() {
   const editing = useDashboardStore((s) => s.editing);
   const toggleEditing = useDashboardStore((s) => s.toggleEditing);
   const toggleVisible = useDashboardStore((s) => s.toggleVisible);
-  const resetLayout = useDashboardStore((s) => s.resetLayout);
 
   // Refresh from TradeTally on every open (the tab unmounts when you leave it).
   useEffect(() => {
@@ -85,10 +97,41 @@ export function Dashboard() {
             >
               Éditer la disposition
             </DropdownMenuCheckboxItem>
-            <DropdownMenuItem onClick={() => resetLayout()}>
-              <RotateCcw className="mr-2 h-4 w-4" />
-              Réinitialiser la disposition
-            </DropdownMenuItem>
+
+            <DropdownMenuSeparator />
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <ImageIcon className="mr-2 h-4 w-4" />
+                Mood (image & citations)
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-56">
+                <DropdownMenuItem
+                  onClick={() => api.openMoodTarget("images").catch(() => {})}
+                >
+                  <ImageIcon className="mr-2 h-4 w-4" />
+                  Dossier des images
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => api.openMoodTarget("short").catch(() => {})}
+                >
+                  <FileText className="mr-2 h-4 w-4" />
+                  Phrases courtes (short.txt)
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => api.openMoodTarget("long").catch(() => {})}
+                >
+                  <Quote className="mr-2 h-4 w-4" />
+                  Citations longues (long.txt)
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => qc.invalidateQueries({ queryKey: ["mood"] })}
+                >
+                  <Shuffle className="mr-2 h-4 w-4" />
+                  Nouvelle sélection
+                </DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
 
             <DropdownMenuSeparator />
             <DropdownMenuItem onClick={() => sync.mutate()}>

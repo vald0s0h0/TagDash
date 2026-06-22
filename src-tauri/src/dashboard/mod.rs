@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -45,6 +46,30 @@ pub struct DailyBackground {
     pub dir:       String,
     pub file_name: Option<String>,
     pub data_url:  Option<String>,
+}
+
+/// One random inspiration image, already encoded as a data-URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoodImage {
+    pub file_name: String,
+    pub data_url:  String,
+}
+
+/// A fresh, *random* mood pick (unlike `DailyBackground`, which is stable per day):
+/// one image + one short phrase + one long phrase, drawn anew on every call so the
+/// dashboard shows something different on each open / refresh. Each field is `None`
+/// when its folder / file is empty. The paths are returned so the UI can open them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mood {
+    pub images_dir:   String,
+    pub short_path:   String,
+    pub long_path:    String,
+    pub image:        Option<MoodImage>,
+    pub short_phrase: Option<String>,
+    /// A second short phrase, distinct from `short_phrase` when the file has ≥2
+    /// lines — used by the H1 card so it never echoes the Inspiration card.
+    pub heading_phrase: Option<String>,
+    pub long_phrase:  Option<String>,
 }
 
 // ─── TradeTally sync ─────────────────────────────────────────────────────────
@@ -225,6 +250,127 @@ pub fn open_folder(path: &Path) -> Result<(), String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let cmd = Command::new("xdg-open").arg(&path_str).spawn();
     cmd.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Open a file or folder with the OS default handler (folders → file manager,
+/// `.txt` → default editor). Works for both, unlike a bare `explorer <file>`.
+fn os_open(path: &Path) -> Result<(), String> {
+    let path_str = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    // `start` is a cmd builtin; the empty "" is the (mandatory) window title.
+    let cmd = Command::new("cmd").args(["/C", "start", "", &path_str]).spawn();
+    #[cfg(target_os = "macos")]
+    let cmd = Command::new("open").arg(&path_str).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = Command::new("xdg-open").arg(&path_str).spawn();
+    cmd.map(|_| ()).map_err(|e| e.to_string())
+}
+
+// ─── Mood (random image + short / long phrase) ─────────────────────────────────
+
+/// The mood drop targets, created on first access so the "open" actions always
+/// have something to open and the expected format is self-documenting. Returns
+/// `(images_dir, short_file, long_file)`.
+fn mood_paths(app_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = app_dir.join("mood");
+    let images = root.join("images");
+    let short = root.join("short.txt");
+    let long = root.join("long.txt");
+    let _ = std::fs::create_dir_all(&images);
+    // Seed the txt files with a commented hint so the one-phrase-per-line format is
+    // obvious. Lines starting with `#` are ignored when picking.
+    if !short.exists() {
+        let _ = std::fs::write(
+            &short,
+            "# Une phrase courte par ligne (ex : less is more)\n",
+        );
+    }
+    if !long.exists() {
+        let _ = std::fs::write(
+            &long,
+            "# Une citation longue par ligne (~50 mots)\n",
+        );
+    }
+    (images, short, long)
+}
+
+/// Pick a fresh, random image + short + long phrase from the user's `mood/` folder.
+/// Re-randomises on every call (each dashboard open / refresh).
+pub fn pick_mood(app_dir: &Path) -> Mood {
+    let (images_dir, short_path, long_path) = mood_paths(app_dir);
+
+    // Random image → data-URL.
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&images_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file() && is_image(p))
+                .collect()
+        })
+        .unwrap_or_default();
+    let image = files.choose(&mut rand::thread_rng()).and_then(|chosen| {
+        let file_name = chosen.file_name()?.to_string_lossy().to_string();
+        let bytes = std::fs::read(chosen).ok()?;
+        Some(MoodImage {
+            file_name,
+            data_url: format!("data:{};base64,{}", mime_for(chosen), base64_encode(&bytes)),
+        })
+    });
+
+    // Pick two distinct short phrases in one go so the Inspiration (03) and H1 (19)
+    // cards never show the same line.
+    let (short_phrase, heading_phrase) = pick_two_random_lines(&short_path);
+
+    Mood {
+        images_dir:   images_dir.to_string_lossy().to_string(),
+        short_path:   short_path.to_string_lossy().to_string(),
+        long_path:    long_path.to_string_lossy().to_string(),
+        image,
+        short_phrase,
+        heading_phrase,
+        long_phrase:  pick_random_line(&long_path),
+    }
+}
+
+/// Non-empty, non-comment lines from a text file (trimmed).
+fn clean_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One random clean line from a text file.
+fn pick_random_line(path: &Path) -> Option<String> {
+    clean_lines(path).choose(&mut rand::thread_rng()).cloned()
+}
+
+/// Two distinct random clean lines: `(first, second)`. The second is `None` when
+/// there is only one line; otherwise it is a different line from the first.
+fn pick_two_random_lines(path: &Path) -> (Option<String>, Option<String>) {
+    let mut rng = rand::thread_rng();
+    let lines = clean_lines(path);
+    let mut idxs: Vec<usize> = (0..lines.len()).collect();
+    idxs.shuffle(&mut rng);
+    let first = idxs.first().map(|&i| lines[i].clone());
+    let second = idxs.get(1).map(|&i| lines[i].clone());
+    (first, second)
+}
+
+/// Open one of the mood drop targets: the images folder, or a phrases `.txt` file.
+pub fn open_mood_target(app_dir: &Path, target: &str) -> Result<(), String> {
+    let (images_dir, short_path, long_path) = mood_paths(app_dir);
+    match target {
+        "images" => os_open(&images_dir),
+        "short" => os_open(&short_path),
+        "long" => os_open(&long_path),
+        _ => Err(format!("unknown mood target: {target}")),
+    }
 }
 
 // ─── Minimal base64 encoder (no crate dependency, matching `screenshot`'s

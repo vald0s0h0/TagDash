@@ -4,6 +4,7 @@ import type {
   AlertEnrichment,
   AlertSignal,
   AppConfig,
+  AttentionEntry,
   AppStatus,
   Bar,
   BugReport,
@@ -13,12 +14,15 @@ import type {
   DailyBackground,
   DashboardTrade,
   FeedDiagnostics,
+  FlatFileDay,
+  FlatFilesStatus,
   Fill,
   InternalOrder,
   JournalEntry,
   LatencyStatus,
   LocalLogEntry,
   MarketSnapshot,
+  Mood,
   NewsDiagnostics,
   Position,
   PrevDayLevels,
@@ -50,6 +54,14 @@ export const api = {
     invoke<void>("save_diary_entry", { title, content }),
   getDailyBackground:    () => invoke<DailyBackground>("get_daily_background"),
   openBackgroundsFolder: () => invoke<void>("open_backgrounds_folder"),
+  getMood:               () => invoke<Mood>("get_mood"),
+  openMoodTarget:        (target: "images" | "short" | "long") =>
+    invoke<void>("open_mood_target", { target }),
+
+  // Embedded TradeTally webview (native child webview positioned over its tab)
+  tradetallySetBounds: (x: number, y: number, width: number, height: number) =>
+    invoke<void>("tradetally_set_bounds", { x, y, width, height }),
+  tradetallyHide:      () => invoke<void>("tradetally_hide"),
 
   // Config
   getLocalConfig:    () => invoke<AppConfig>("get_local_config"),
@@ -161,6 +173,10 @@ export const api = {
   getActiveAlerts: () => invoke<AlertSignal[]>("get_active_alerts"),
   getAlertHistory: () => invoke<AlertSignal[]>("get_alert_history"),
   getScreenerMatches: () => invoke<ScreenerMatch[]>("get_screener_matches"),
+  // Market Attention top list (direction-agnostic, top 10, refreshed 1×/min
+  // 09:30–12:30 ET). Debug/inspection only — the primary consumer is the backend
+  // Perfect Pullback engine.
+  getMarketAttention: () => invoke<AttentionEntry[]>("get_market_attention"),
   // Pre-open screener dismissals, persisted per trading day.
   dismissScreener: (symbol: string) => invoke<void>("dismiss_screener", { symbol }),
   getScreenerDismissals: () => invoke<string[]>("get_screener_dismissals"),
@@ -226,4 +242,12 @@ export const api = {
   replayNextAlert: () => invoke<void>("replay_next_alert"),
   replayNextDay:   () => invoke<void>("replay_next_day"),
   getReplayStatus: () => invoke<ReplayStatus>("get_replay_status"),
+
+  // Flat files (offline market-data download for Market Replay)
+  flatFilesDownload: (start_day: string, end_day: string) =>
+    invoke<void>("flat_files_download", { start_day, end_day }),
+  flatFilesCancel:      () => invoke<void>("flat_files_cancel"),
+  getFlatFilesStatus:   () => invoke<FlatFilesStatus>("get_flat_files_status"),
+  getFlatFilesCalendar: () => invoke<FlatFileDay[]>("get_flat_files_calendar"),
+  openFlatFilesFolder:  () => invoke<void>("open_flat_files_folder"),
 };
