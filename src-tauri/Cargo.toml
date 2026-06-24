@@ -45,9 +45,34 @@ futures-util = "0.3"
 # Alpaca live market-data WebSocket. rustls (webpki roots) — no native TLS, matches reqwest.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
+# ── Speech-to-Text pipeline (offline dictée → notes/diary) ────────────────────
+# whisper.cpp via the whisper-rs bindings: fully local, offline French transcription
+# (no API). CPU by default everywhere; Metal is enabled on macOS below for a free
+# speed-up on Apple Silicon. CUDA / Vulkan stay opt-in (see the `stt-cuda` /
+# `stt-vulkan` features) because they pull heavy build-time SDKs.
+whisper-rs   = "0.16"
+# Native microphone capture (avoids WebView2's getUserMedia permission prompts and
+# webm/opus decoding — we feed whisper raw PCM directly).
+cpal         = "0.15"
+# CPU load sampling for the worker's "pause when the machine is busy" guard.
+sysinfo      = "0.32"
+# WAV read/write for the persisted STT job queue (each queued dictée is a small WAV).
+hound        = "3.5"
+# Light FFT for the live audio spectrum shown in the recording modal.
+rustfft      = "6"
+
+# Metal acceleration for whisper.cpp on macOS only (Apple Silicon). Features union
+# across the base + target entries, so non-macOS builds stay pure CPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Opt-in GPU backends for whisper.cpp (heavy build deps — enable with
+# `cargo build --features stt-cuda` on a box with the CUDA toolkit, etc.).
+stt-cuda   = ["whisper-rs/cuda"]
+stt-vulkan = ["whisper-rs/vulkan"]
 
 # Incremental compilation is disabled for the dev profile: the project lives on a
 # cloud-synced folder (SynologyDrive), which intermittently corrupts the

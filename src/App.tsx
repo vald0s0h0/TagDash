@@ -16,6 +16,7 @@ import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertNotifications } from "@/queries/useAlertNotifications";
 import { useHotkeys } from "@/hooks/useHotkeys";
 import { useGamepad } from "@/hooks/useGamepad";
+import { useSttEvents } from "@/hooks/useSttEvents";
 import { api } from "@/lib/tauri";
 
 export default function App() {
@@ -42,6 +43,10 @@ export default function App() {
   // session's chart: stick zoom/cursor, D-pad ticker nav, face-button orders, R2
   // armed sizing, TradeTally capture/tag, haptics. Configured in Settings → Hotkeys.
   useGamepad();
+
+  // Speech-to-Text events: refresh the queue mirror + apply finished diary dictées
+  // to the dashboard journal card (works even when that tab is unmounted).
+  useSttEvents();
 
   // Hydrate today's pre-open screener dismissals from the DB so cards the user
   // removed stay hidden across restarts (until the next trading day).

@@ -29,10 +29,13 @@ import type {
   PrevDayLevels,
   PriceAlarm,
   ReplayStatus,
+  MicTestResult,
   ScreenerMatch,
   SecretsStatus,
   SecretsUpdate,
   SplitMarker,
+  SttJobKind,
+  SttStatus,
   NewsMarker,
   StartupState,
   Strategy,
@@ -266,4 +269,16 @@ export const api = {
     invoke<FlatFileDay[]>("get_flat_files_calendar", { kind }),
   openFlatFilesFolder:  (kind: FlatFilesKind) =>
     invoke<void>("open_flat_files_folder", { kind }),
+
+  // Speech-to-Text dictée pipeline (offline whisper.cpp → trade notes / diary)
+  sttStatus:           () => invoke<SttStatus>("stt_status"),
+  sttDownloadModel:    () => invoke<void>("stt_download_model"),
+  sttStartRecording:   (kind: SttJobKind, trade_id?: string | null, symbol?: string | null) =>
+    invoke<void>("stt_start_recording", { kind, trade_id: trade_id ?? null, symbol: symbol ?? null }),
+  sttStopRecording:    () => invoke<string>("stt_stop_recording"),
+  sttCancelRecording:  () => invoke<void>("stt_cancel_recording"),
+  sttCancelJob:        (id: string) => invoke<void>("stt_cancel_job", { id }),
+  sttRetryJob:         (id: string) => invoke<void>("stt_retry_job", { id }),
+  sttListInputDevices: () => invoke<string[]>("stt_list_input_devices"),
+  sttTestMicrophone:   () => invoke<MicTestResult>("stt_test_microphone"),
 };

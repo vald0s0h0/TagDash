@@ -94,4 +94,7 @@ pub struct AppState {
     /// a cancel flag for the (single) background download task. See
     /// `crate::flat_files`.
     pub flat_files: Arc<crate::flat_files::FlatFilesShared>,
+    /// Speech-to-Text dictée pipeline: recorder + persisted job queue drained by the
+    /// single STT worker. See `crate::stt`.
+    pub stt: Arc<crate::stt::SttShared>,
 }

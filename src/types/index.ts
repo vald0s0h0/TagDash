@@ -400,6 +400,74 @@ export interface AppConfig {
   /** Where market data comes from: live Alpaca API or on-disk flat files. In
    *  flat-files mode there is no real-time feed — Market Replay only. */
   data_source: { mode: "api" | "flat_files" };
+  /** Offline Speech-to-Text dictée pipeline (whisper.cpp). */
+  stt: SttConfig;
+}
+
+// ─── Speech-to-Text (offline dictée → trade notes / diary) ───────────────────────
+
+export interface SttConfig {
+  enabled: boolean;
+  /** Whisper model size. */
+  model: "small" | "medium";
+  /** Forced transcription language (ISO). */
+  language: string;
+  /** Trading vocabulary fed to whisper as the initial prompt (bias detection). */
+  jargon: string[];
+  /** Pause the worker while global CPU usage is above this percentage. */
+  pause_cpu_pct: number;
+  /** Pause the worker during the first N minutes after the 09:30 ET cash open. */
+  pause_market_open_minutes: number;
+  /** Preferred input device name; null = system default. */
+  input_device: string | null;
+}
+
+export type SttJobKind = "trade" | "diary";
+export type SttJobState = "queued" | "running" | "done" | "error" | "cancelled";
+
+export interface SttJob {
+  id: string;
+  kind: SttJobKind;
+  trade_id: string | null;
+  symbol: string | null;
+  state: SttJobState;
+  attempts: number;
+  error: string | null;
+  text: string | null;
+  created_at: string;
+}
+
+export interface SttStatus {
+  enabled: boolean;
+  model: string;
+  model_present: boolean;
+  downloading: boolean;
+  download_progress: number;
+  recording: boolean;
+  recording_kind: SttJobKind | null;
+  worker_state: string;
+  paused_reason: string | null;
+  jobs: SttJob[];
+  error: string | null;
+}
+
+export interface MicTestResult {
+  ok: boolean;
+  level: number;
+  device: string | null;
+  error: string | null;
+}
+
+/** Payload of the `stt-spectrum` event emitted while recording. */
+export interface SttSpectrum {
+  bins: number[];
+  level: number;
+}
+
+/** Payload of the `stt-diary-result` event (worker → dashboard journal card). */
+export interface SttDiaryResult {
+  block: string;
+  title: string | null;
 }
 
 /** Which flat-files dataset: trades+quotes, minute bars, or daily bars. */

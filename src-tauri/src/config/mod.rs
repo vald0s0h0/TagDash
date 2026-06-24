@@ -31,6 +31,10 @@ pub struct AppConfig {
     /// `crate::flat_files`.
     #[serde(default)]
     pub data_source: DataSourceConfig,
+    /// Offline Speech-to-Text dictée pipeline (whisper.cpp) → trade notes / diary.
+    /// See `crate::stt`.
+    #[serde(default)]
+    pub stt: SttConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +215,70 @@ impl DataSourceConfig {
     }
 }
 
+/// Speech-to-Text settings. The whisper model is downloaded on first use into
+/// `<app_dir>/models/`; `jargon` biases recognition toward trading terms (fed to
+/// whisper as the `initial_prompt`), and the two `pause_*` thresholds let the
+/// single STT worker step aside when the machine is busy or the cash open is
+/// intense, so transcription never competes with the trading hot path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttConfig {
+    /// Master switch for the dictée pipeline.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whisper model size: "small" (default, ~466 MB) or "medium" (~1.5 GB).
+    #[serde(default = "default_stt_model")]
+    pub model: String,
+    /// Forced transcription language (ISO code). French by default; whisper still
+    /// passes through the occasional English term (tickers, jargon).
+    #[serde(default = "default_stt_language")]
+    pub language: String,
+    /// Trading vocabulary fed to whisper as the `initial_prompt` to bias detection
+    /// (e.g. "halt" not "hault", "ticker" not "tiqueur").
+    #[serde(default = "default_stt_jargon")]
+    pub jargon: Vec<String>,
+    /// Pause the worker while the global CPU usage is above this percentage.
+    #[serde(default = "default_stt_pause_cpu")]
+    pub pause_cpu_pct: f32,
+    /// Pause the worker during the first N minutes after the 09:30 ET cash open
+    /// (the most latency-sensitive window).
+    #[serde(default = "default_stt_pause_open_min")]
+    pub pause_market_open_minutes: u32,
+    /// Preferred input device name; `None` = system default.
+    #[serde(default)]
+    pub input_device: Option<String>,
+}
+
+fn default_stt_model() -> String { "small".into() }
+fn default_stt_language() -> String { "fr".into() }
+fn default_stt_pause_cpu() -> f32 { 85.0 }
+fn default_stt_pause_open_min() -> u32 { 30 }
+
+fn default_stt_jargon() -> Vec<String> {
+    [
+        "halt", "halted", "resume", "HOD", "LOD", "VWAP", "float", "low float",
+        "short", "squeeze", "bid", "ask", "spread", "ticker", "premarket",
+        "gap up", "breakout", "pullback", "dilution", "RVOL", "stop loss",
+        "take profit", "long", "short", "scalp", "runner", "catalyst",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: default_stt_model(),
+            language: default_stt_language(),
+            jargon: default_stt_jargon(),
+            pause_cpu_pct: default_stt_pause_cpu(),
+            pause_market_open_minutes: default_stt_pause_open_min(),
+            input_device: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeTallyConfig {
     pub api_base_url:  String,
@@ -270,6 +338,7 @@ impl Default for AppConfig {
             journal: JournalConfig::default(),
             company_intel: CompanyIntelConfig::default(),
             data_source: DataSourceConfig::default(),
+            stt: SttConfig::default(),
         }
     }
 }

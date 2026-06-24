@@ -15,6 +15,7 @@ import {
   Type,
 } from "lucide-react";
 import { JournalModal } from "./JournalModal";
+import { MicDictate } from "./MicDictate";
 import { DrawingContextMenu } from "./DrawingContextMenu";
 import { useQuery } from "@tanstack/react-query";
 import type { PaneSpec, StrategyCard, Timeframe, ZoneAssignment } from "@/types";
@@ -108,6 +109,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const [journalTarget, setJournalTarget] =
     useState<{ tradeId: string; symbol: string } | null>(null);
 
+  // Inline voice-dictation toggle, registered by the toolbar MicDictate button so
+  // the Xbox `journal_audio` button can start/stop the same recording.
+  const audioToggleRef = useRef<(() => void) | null>(null);
+
   // Capture status: idle | pending | success | error
   const [captureStatus, setCaptureStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
 
@@ -129,6 +134,12 @@ export function ChartZone({ zone }: ChartZoneProps) {
     const tradeId = context?.trade_id;
     if (tradeId && zone.symbol) setJournalTarget({ tradeId, symbol: zone.symbol });
   }, [context?.trade_id, zone.symbol]);
+
+  // Toggle the inline voice dictation for the current trade (gamepad path mirrors
+  // the toolbar mic button).
+  const toggleAudioNote = useCallback(() => {
+    audioToggleRef.current?.();
+  }, []);
 
   // ── Strategy identity card → panes + info-band fields ──────────────────────
   const { data: cards } = useStrategyCards();
@@ -892,13 +903,14 @@ export function ChartZone({ zone }: ChartZoneProps) {
       order:   (pct) => handleOrder(pct),
       close:   handleClose,
       capture: () => { if (captureStatus === "idle") handleCapture(); },
+      journalAudio: toggleAudioNote,
       release: handleRelease,
       hasTradeId: () => !!useChartStore.getState().getZone(zone.zone_id).context?.trade_id,
       tradeId:    () => useChartStore.getState().getZone(zone.zone_id).context?.trade_id ?? null,
       symbol:     () => zone.symbol,
     });
   }, [zone.zone_id, zone.symbol, cycleFocus, cursorPlace, removeOrders,
-      removeOrdersAndAlarms, handleOrder, handleClose, handleCapture, captureStatus, handleRelease]);
+      removeOrdersAndAlarms, handleOrder, handleClose, handleCapture, captureStatus, handleRelease, toggleAudioNote]);
 
   // ── Empty zone ─────────────────────────────────────────────────────────────
   if (!zone.symbol) {
@@ -1108,9 +1120,22 @@ export function ChartZone({ zone }: ChartZoneProps) {
     </TBtn>
   );
 
+  const tbAudioNote = (
+    <MicDictate
+      key="audio-note"
+      variant="toolbar"
+      mode="trade"
+      tradeId={context?.trade_id}
+      symbol={zone.symbol}
+      disabled={!hasTradeId}
+      title={hasTradeId ? "Dicter une note (micro)" : "TradeID requis (placer SL ou TP d'abord)"}
+      onRegisterToggle={(t) => { audioToggleRef.current = t; }}
+    />
+  );
+
   // Primary = always visible; secondary = in overflow when narrow
   const primaryButtons  = [tbRelease, tbSl, tbTp, tbAlarm, tbClock];
-  const secondaryButtons = [tbLine, tbText, tbEmoji, tbSize25, tbSize50, tbSize100, tbOrderMode, tbClose, tbCapture, tbJournal];
+  const secondaryButtons = [tbLine, tbText, tbEmoji, tbSize25, tbSize50, tbSize100, tbOrderMode, tbClose, tbCapture, tbJournal, tbAudioNote];
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -1423,6 +1448,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
           symbol={journalTarget.symbol}
         />
       )}
+
 
       {/* Right-click context menu for a drawing / price line */}
       {ctxMenu && (() => {

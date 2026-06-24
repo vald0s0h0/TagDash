@@ -1,6 +1,8 @@
 import { useEffect } from "react";
+import { ArrowRight } from "lucide-react";
 import { FrostLabel } from "./frosted";
 import { useSaveDiary } from "./useDashboard";
+import { MicDictate } from "@/components/MicDictate";
 import { useJournalStore, journalDayKey } from "@/stores/journalStore";
 
 // Same glass effect as the cards: near-transparent fill, 14.2px blur, 0.04 border.
@@ -68,13 +70,23 @@ export function JournalCard() {
           onChange={(e) => setContent(e.target.value)}
           className={`${fieldClass} h-full resize-none pb-11`}
         />
-        <button
-          onClick={onSend}
-          disabled={save.isPending || empty}
-          className="absolute bottom-2.5 right-2.5 rounded-[7px] border border-white/[0.22] bg-white/[0.18] px-[13px] py-[7px] font-spacemono text-[11px] uppercase tracking-[0.06em] text-white backdrop-blur transition-colors hover:bg-white/[0.26] disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          Envoyer →
-        </button>
+        {/* Two small icon buttons, bottom-left: dictate (record & send) + send manual edits. */}
+        <div className="absolute bottom-2.5 left-2.5 flex items-center gap-1.5">
+          <MicDictate
+            mode="diary"
+            variant="card"
+            title="Dicter une note de journal (enregistrer & envoyer)"
+            className="border border-white/[0.12] bg-white/[0.06] text-white/80 hover:bg-white/[0.16] hover:text-white"
+          />
+          <button
+            onClick={onSend}
+            disabled={save.isPending || empty}
+            title="Envoyer les modifications saisies au clavier"
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.12] bg-white/[0.06] text-white/80 backdrop-blur transition-colors hover:bg-white/[0.16] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <ArrowRight className="h-4 w-4" />
+          </button>
+        </div>
       </div>
     </div>
   );

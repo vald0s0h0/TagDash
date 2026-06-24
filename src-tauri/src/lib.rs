@@ -25,6 +25,7 @@ pub mod screenshot;
 pub mod sec_api;
 pub mod startup;
 pub mod state;
+pub mod stt;
 pub mod strategies;
 pub mod time;
 pub mod tradetally;
@@ -115,6 +116,10 @@ pub fn run() {
     // live feed tick-streams them on top of the broad surveillance tier.
     let (focus_symbols_tx, _) = tokio::sync::watch::channel::<Vec<String>>(Vec::new());
 
+    // Speech-to-Text shared handle (recorder + persisted job queue). Built before the
+    // struct so it can borrow `app_dir` before the field shorthand below moves it.
+    let stt_shared = Arc::new(stt::SttShared::new(app_dir.clone()));
+
     let app_state = AppState {
         app_dir,
         config:            Arc::new(RwLock::new(cfg)),
@@ -143,6 +148,7 @@ pub fn run() {
         focus_symbols_tx,
         replay:            Arc::new(replay::ReplayShared::default()),
         flat_files:        Arc::new(flat_files::FlatFilesShared::default()),
+        stt:               stt_shared,
     };
 
     // ── Start Tauri ───────────────────────────────────────────────────────
@@ -385,6 +391,19 @@ pub fn run() {
                 tauri::async_runtime::spawn(crate::company_intel::ondemand::run_worker(db, config, rx));
             }
 
+            // 6. Speech-to-Text worker: the single background task that drains the
+            //    persisted dictée queue (VAD → whisper → Deepseek → trade note /
+            //    diary). Pauses when the CPU is busy or the cash open is intense, so
+            //    transcription never competes with the trading hot path.
+            stt::worker::spawn(
+                state.stt.clone(),
+                app.handle().clone(),
+                state.db.clone(),
+                state.secrets.clone(),
+                state.config.clone(),
+                state.market.clone(),
+            );
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -516,6 +535,16 @@ pub fn run() {
             commands::get_flat_files_status,
             commands::get_flat_files_calendar,
             commands::open_flat_files_folder,
+            // Speech-to-Text dictée pipeline
+            commands::stt_status,
+            commands::stt_download_model,
+            commands::stt_start_recording,
+            commands::stt_stop_recording,
+            commands::stt_cancel_recording,
+            commands::stt_cancel_job,
+            commands::stt_retry_job,
+            commands::stt_list_input_devices,
+            commands::stt_test_microphone,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

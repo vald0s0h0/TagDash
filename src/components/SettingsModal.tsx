@@ -498,7 +498,7 @@ export function SettingsModal({ open, onClose }: Props) {
         <Tabs defaultValue="trading" className="mt-2">
           {/* Equal-width grid columns instead of inline-flex: the 8 tabs can never
               overflow the dialog regardless of the platform font width. */}
-          <TabsList className="grid w-full grid-cols-9">
+          <TabsList className="grid w-full grid-cols-10">
             <TabsTrigger value="trading" className="min-w-0 text-xs">Trading</TabsTrigger>
             <TabsTrigger value="strategies" className="min-w-0 text-xs">Stratégies</TabsTrigger>
             <TabsTrigger value="apparence" className="min-w-0 text-xs">Apparence</TabsTrigger>
@@ -506,6 +506,7 @@ export function SettingsModal({ open, onClose }: Props) {
             <TabsTrigger value="notifs" className="min-w-0 text-xs">Notifs</TabsTrigger>
             <TabsTrigger value="latency" className="min-w-0 text-xs">Latency</TabsTrigger>
             <TabsTrigger value="tags" className="min-w-0 text-xs">Tags</TabsTrigger>
+            <TabsTrigger value="dictee" className="min-w-0 text-xs">Dictée</TabsTrigger>
             <TabsTrigger value="tradetally" className="min-w-0 text-xs">TradeTally</TabsTrigger>
             <TabsTrigger value="secrets" className="min-w-0 text-xs">API Keys</TabsTrigger>
           </TabsList>
@@ -899,6 +900,75 @@ export function SettingsModal({ open, onClose }: Props) {
               </Button>
             </div>
           </TabsContent>
+
+          {/* ── Dictée vocale (Speech-to-Text) ── */}
+          {draft.stt && (
+            <TabsContent value="dictee" className="mt-4 space-y-3">
+              <label className="grid grid-cols-2 items-center gap-4">
+                <span className="text-right text-xs text-muted-foreground">Activer la dictée</span>
+                <input
+                  type="checkbox"
+                  checked={draft.stt.enabled}
+                  onChange={(e) => set("stt", "enabled", e.target.checked)}
+                  className="h-4 w-4 justify-self-start accent-blue-500"
+                />
+              </label>
+
+              <div className="grid grid-cols-2 items-center gap-4">
+                <Label className="text-right text-xs text-muted-foreground">Modèle</Label>
+                <select
+                  value={draft.stt.model}
+                  onChange={(e) => set("stt", "model", e.target.value)}
+                  className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground outline-none"
+                >
+                  <option value="small">small (~466 Mo · rapide)</option>
+                  <option value="medium">medium (~1,5 Go · précis)</option>
+                </select>
+              </div>
+
+              <Field
+                label="Langue (ISO)"
+                value={draft.stt.language}
+                onChange={(v) => set("stt", "language", v)}
+              />
+              <Field
+                label="Pause si CPU > (%)"
+                type="number"
+                value={draft.stt.pause_cpu_pct}
+                onChange={(v) => set("stt", "pause_cpu_pct", parseFloat(v) || 0)}
+              />
+              <Field
+                label="Pause après open (min)"
+                type="number"
+                value={draft.stt.pause_market_open_minutes}
+                onChange={(v) => set("stt", "pause_market_open_minutes", parseInt(v) || 0)}
+              />
+
+              <div className="grid grid-cols-2 gap-4">
+                <Label className="pt-1 text-right text-xs text-muted-foreground">
+                  Jargon (1 terme / ligne)
+                </Label>
+                <div className="space-y-1">
+                  <textarea
+                    value={draft.stt.jargon.join("\n")}
+                    onChange={(e) =>
+                      set(
+                        "stt",
+                        "jargon",
+                        e.target.value.split("\n").map((s) => s.trim()).filter(Boolean),
+                      )
+                    }
+                    rows={6}
+                    className="w-full resize-y rounded border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none"
+                  />
+                  <p className="text-[10px] text-muted-foreground/60">
+                    Force le français mais autorise ces termes (ex. halt, VWAP, ticker). Bias la
+                    reconnaissance vers le vocabulaire trading.
+                  </p>
+                </div>
+              </div>
+            </TabsContent>
+          )}
         </Tabs>
 
         <div className="mt-4 flex justify-end gap-2">

@@ -4,6 +4,7 @@ import {
   CircleDot,
   Database,
   History,
+  Mic,
   Moon,
   MoreVertical,
   Newspaper,
@@ -35,6 +36,7 @@ import { NewsDebugModal } from "@/components/NewsDebugModal";
 import { BugReportModal } from "@/components/BugReportModal";
 import { TickersTableModal } from "@/components/TickersTableModal";
 import { FlatFilesModal } from "@/components/FlatFilesModal";
+import { SttModal } from "@/components/SttModal";
 import type { Session } from "@/types";
 
 const TABS: { id: Session; label: string; icon: typeof Sun }[] = [
@@ -190,6 +192,10 @@ export function LeftRail() {
                 <ScrollText className="mr-2 h-4 w-4" />
                 Logs
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => showModal("stt")}>
+                <Mic className="mr-2 h-4 w-4" />
+                Dictée vocale (micro &amp; file)
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={() => showModal("sync-status")}>
                 <RefreshCw className="mr-2 h-4 w-4" />
@@ -231,6 +237,10 @@ export function LeftRail() {
       />
       <FlatFilesModal
         open={openModal === "flat-files"}
+        onClose={closeModal}
+      />
+      <SttModal
+        open={openModal === "stt"}
         onClose={closeModal}
       />
     </>

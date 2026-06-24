@@ -2357,3 +2357,94 @@ pub async fn tradetally_hide(app: tauri::AppHandle) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ─── Speech-to-Text (offline dictée → trade notes / diary) ────────────────────────
+
+/// Pipeline snapshot polled by the mic buttons + the STT modal (model presence,
+/// download progress, recording flag, worker state/pause reason, the job queue).
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_status(state: tauri::State<'_, AppState>) -> crate::stt::SttStatus {
+    let cfg = state.config.read().unwrap().stt.clone();
+    state.stt.status(&cfg)
+}
+
+/// Download the configured whisper model (small/medium) if absent. Idempotent;
+/// progress is surfaced through `stt_status`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn stt_download_model(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let model = state.config.read().unwrap().stt.model.clone();
+    let shared = state.stt.clone();
+    crate::stt::model::download_model(&shared, &model).await
+}
+
+/// Start capturing a dictée. `kind` is "trade" (with `trade_id`/`symbol`) or "diary".
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_start_recording(
+    kind:     String,
+    trade_id: Option<String>,
+    symbol:   Option<String>,
+    app:      tauri::AppHandle,
+    state:    tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let device = {
+        let c = state.config.read().unwrap();
+        if !c.stt.enabled {
+            return Err("dictée vocale désactivée".into());
+        }
+        c.stt.input_device.clone()
+    };
+    let kind = match kind.as_str() {
+        "trade" => crate::stt::JobKind::Trade,
+        "diary" => crate::stt::JobKind::Diary,
+        _ => return Err("kind invalide".into()),
+    };
+    crate::stt::start_recording(&state.stt, app, kind, trade_id, symbol, device)
+}
+
+/// Stop capturing, enqueue the dictée job, and return its id.
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_stop_recording(
+    app:   tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    crate::stt::stop_recording(&state.stt, app)
+}
+
+/// Discard the in-progress recording.
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_cancel_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::stt::cancel_recording(&state.stt, app);
+    Ok(())
+}
+
+/// Cancel a queued/running job.
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_cancel_job(id: String, app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::stt::cancel_job(&state.stt, &id, &app);
+    Ok(())
+}
+
+/// Re-queue a failed job for another attempt.
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_retry_job(id: String, app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::stt::retry_job(&state.stt, &id, &app);
+    Ok(())
+}
+
+/// Available input device names (for the mic-check UI).
+#[tauri::command(rename_all = "snake_case")]
+pub fn stt_list_input_devices() -> Vec<String> {
+    crate::stt::recorder::list_input_devices()
+}
+
+/// Short blocking probe of the (configured/default) mic: returns its peak level so
+/// the UI can confirm it's working.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn stt_test_microphone(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::stt::MicTestResult, String> {
+    let device = state.config.read().unwrap().stt.input_device.clone();
+    tokio::task::spawn_blocking(move || crate::stt::recorder::test_microphone(device))
+        .await
+        .map_err(|e| e.to_string())
+}

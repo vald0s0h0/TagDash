@@ -61,6 +61,20 @@ jobs:
         with:
           targets: ${{ matrix.rust_targets }}
 
+      # whisper-rs (offline STT) builds whisper.cpp via CMake and generates FFI
+      # bindings via bindgen (needs libclang). CMake is ensured on every platform;
+      # on Windows we also install LLVM and point bindgen at it. macOS gets libclang
+      # from the Xcode Command Line Tools already on the runner.
+      - name: Setup CMake (whisper.cpp build)
+        uses: lukka/get-cmake@latest
+
+      - name: Install LLVM / libclang (Windows — whisper-rs bindgen)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
       - name: Cache cargo build
         uses: swatinem/rust-cache@v2
         with:

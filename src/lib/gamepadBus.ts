@@ -51,6 +51,8 @@ export interface ZoneGamepad {
   close: () => void;
   /** TradeTally capture (View button). */
   capture: () => void;
+  /** Open the voice-dictation modal for the zone's current trade (Menu button). */
+  journalAudio: () => void;
   /** Release the zone (D-pad left, non-screener). */
   release: () => void;
   /** Whether the zone currently carries a live tradeID (gates capture / share). */

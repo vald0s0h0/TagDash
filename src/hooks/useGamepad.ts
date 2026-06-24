@@ -154,7 +154,7 @@ export function useGamepad(): void {
         case "close_position": zone?.close(); break;
         case "capture": if (zone?.hasTradeId()) zone.capture(); break;
         case "share_tag": shareTag(); break;
-        case "journal_audio": break; // reserved (deferred)
+        case "journal_audio": if (zone?.hasTradeId()) zone.journalAudio(); break;
         case "r2_modifier":   break; // handled as a held modifier, not an edge
       }
     };

@@ -73,7 +73,7 @@ export const GAMEPAD_ACTIONS: GamepadActionDef[] = [
   // Journal / TradeTally
   { id: "capture",       label: "Capture TradeTally",          group: "Journal / TradeTally", kind: "digital" },
   { id: "share_tag",     label: "Ajouter un tag (TradeTally)", group: "Journal / TradeTally", kind: "digital" },
-  { id: "journal_audio", label: "Note audio (bientôt)",        group: "Journal / TradeTally", kind: "digital", reserved: true },
+  { id: "journal_audio", label: "Note audio (dictée trade)",   group: "Journal / TradeTally", kind: "digital" },
 
   // Analog axes
   { id: "zoom_time",   label: "Zoom horizontal (temps)", group: "Axes (analogique)", kind: "analog" },
