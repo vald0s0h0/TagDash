@@ -4,6 +4,10 @@ dist
 dist-ssr
 *.local
 
+# TypeScript incremental build cache (machine-specific; a stale committed copy
+# referencing a non-existent project breaks `tsc -b` / `npm run build`).
+*.tsbuildinfo
+
 # IDE
 .vscode/*
 !.vscode/extensions.json

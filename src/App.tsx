@@ -8,11 +8,14 @@ import { ReplayToolbar } from "@/components/ReplayToolbar";
 import { TickerSpotlight } from "@/components/TickerSpotlight";
 import { Dashboard } from "@/components/dashboard/Dashboard";
 import { TradeTally } from "@/components/TradeTally";
+import { GamepadOverlays } from "@/components/GamepadOverlays";
 import { useUiStore } from "@/stores/uiStore";
 import { useUpdaterStore } from "@/stores/updaterStore";
+import { useDashboardStore } from "@/stores/dashboardStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertNotifications } from "@/queries/useAlertNotifications";
 import { useHotkeys } from "@/hooks/useHotkeys";
+import { useGamepad } from "@/hooks/useGamepad";
 import { api } from "@/lib/tauri";
 
 export default function App() {
@@ -35,6 +38,11 @@ export default function App() {
   // the cursor). User-configured in Settings → Hotkeys.
   useHotkeys();
 
+  // Xbox-controller layer (auto-active when a pad is connected). Drives the active
+  // session's chart: stick zoom/cursor, D-pad ticker nav, face-button orders, R2
+  // armed sizing, TradeTally capture/tag, haptics. Configured in Settings → Hotkeys.
+  useGamepad();
+
   // Hydrate today's pre-open screener dismissals from the DB so cards the user
   // removed stay hidden across restarts (until the next trading day).
   useEffect(() => {
@@ -48,6 +56,23 @@ export default function App() {
       .then((cfg) => {
         if (cfg?.data_source?.mode === "flat_files") {
           useUiStore.setState({ replayOpen: true });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Seed a brand-new user's dashboard with the bundled default layout (the
+  // maintainer's arrangement). A user who already saved a layout keeps theirs —
+  // the persisted key only exists once they've touched the board.
+  useEffect(() => {
+    if (localStorage.getItem("tagdash-dashboard") !== null) return;
+    api.getDefaultDashboard()
+      .then((json) => {
+        if (!json) return;
+        try {
+          useDashboardStore.getState().applyLayout(JSON.parse(json));
+        } catch {
+          /* malformed default → keep the built-in layout */
         }
       })
       .catch(() => {});
@@ -104,6 +129,8 @@ export default function App() {
         )}
         <TickerSpotlight />
       </div>
+      {/* Controller overlays: auto-tag picker, flash error, R2 armed-layer hint. */}
+      <GamepadOverlays />
     </div>
   );
 }

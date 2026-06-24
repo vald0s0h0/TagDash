@@ -5,6 +5,8 @@
   "windows": ["main", "flash"],
   "permissions": [
     "core:default",
+    "core:event:allow-listen",
+    "gamepad:default",
     "shell:allow-open",
     "notification:default",
     "updater:default",

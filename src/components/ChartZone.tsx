@@ -24,9 +24,11 @@ import {
   type ChartAnnotation, type CtxTarget, type LineStyleName,
 } from "@/stores/chartStore";
 import { useDrawingPrefs } from "@/stores/drawingPrefsStore";
+import { useChartTheme } from "@/stores/chartThemeStore";
 import {
   registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
+import { registerZoneGamepad, getChartControl } from "@/lib/gamepadBus";
 import { useStrategyCards } from "@/queries/useScanner";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
@@ -95,6 +97,9 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // the zone's other same-instrument panes.
   const crosshairSyncRef = useRef(createCrosshairSync());
   const [narrowToolbar, setNarrowToolbar] = useState(false);
+  // Split-day marker colour (the rest of the chart palette is read inside the
+  // chart itself); subscribing here re-renders when the palette is edited.
+  const chartTheme = useChartTheme();
 
   // Journal modal — pinned to the trade it was opened for. The mono-chart zone
   // can switch tickers underneath an open journal; capturing the target here
@@ -137,6 +142,15 @@ export function ChartZone({ zone }: ChartZoneProps) {
     : [{ timeframe, symbol: null, indicators: [], interactive: true }];
   // The pane that carries SL/TP/orders/drawing (the 5s pane for micro_pullback).
   const interactiveIdx = Math.max(0, panes.findIndex((p) => p.interactive));
+
+  // ── Controller chart focus (R1 cycles which pane the sticks drive) ──────────
+  // Default = the interactive pane; re-seeded when the pane layout (strategy) or
+  // ticker changes. A ref mirrors it so the gamepad registration reads it live
+  // without re-registering on every focus change.
+  const [focusPaneIdx, setFocusPaneIdx] = useState(interactiveIdx);
+  const focusPaneIdxRef = useRef(focusPaneIdx);
+  useEffect(() => { focusPaneIdxRef.current = focusPaneIdx; });
+  useEffect(() => { setFocusPaneIdx(interactiveIdx); }, [interactiveIdx, zone.symbol]);
 
   // Layout columns: panes sharing a `column` stack vertically (declaration
   // order); panes without one each get their own column. Legacy cards (no
@@ -764,6 +778,67 @@ export function ChartZone({ zone }: ChartZoneProps) {
     }
   }, [zone.zone_id, hasTradeId, context]);
 
+  // ── Controller (gamepad) zone handlers ─────────────────────────────────────
+  // R1 cycles the focused pane; the cursor-layer buttons (A/B/Y, R2 up) drop
+  // SL/TP/alarm at the horizontal cursor's price — read live from the focused
+  // pane's chart control, seeded at the current price if never moved. X clears the
+  // ticker's resting orders + planned SL/TP (double-tap also clears its alarms).
+  const cycleFocus = useCallback(() => {
+    setFocusPaneIdx((i) => {
+      if (panes.length <= 1) return i;
+      // Drop the cursor on the pane losing focus so only the focused pane shows it.
+      getChartControl(`${zone.zone_id}-${i}`)?.clearCursor();
+      return (i + 1) % panes.length;
+    });
+  }, [panes.length, zone.zone_id]);
+
+  const cursorPlace = useCallback(async (kind: "sl" | "tp" | "alarm") => {
+    const sym = zone.symbol;
+    if (!sym) return;
+    const ctl = getChartControl(`${zone.zone_id}-${focusPaneIdxRef.current}`);
+    if (!ctl) return;
+    let price = ctl.getCursorPrice();
+    if (price == null) { ctl.nudgeCursor(0); price = ctl.getCursorPrice(); } // seed at current price
+    if (price == null) return;
+    const strat = zone.strategy_id ?? "";
+    try {
+      if (kind === "sl") {
+        chartStore.setContext(zone.zone_id, await api.updateZoneSl(zone.zone_id, sym, strat, price));
+      } else if (kind === "tp") {
+        chartStore.setContext(zone.zone_id, await api.updateZoneTp(zone.zone_id, sym, strat, price));
+      } else {
+        const id = crypto?.randomUUID?.() ?? `alarm-${Date.now()}`;
+        const saved = await api.createAlarm(id, sym, strat || null, price);
+        chartStore.addAlarm(zone.zone_id, { id: saved.id, price: saved.price });
+      }
+    } catch (e) { console.error(`cursor ${kind} failed:`, e); }
+  }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
+
+  const removeOrders = useCallback(async () => {
+    const sym = zone.symbol;
+    if (!sym) return;
+    const strat = zone.strategy_id ?? "";
+    try {
+      const orders = await api.getInternalOrders();
+      await Promise.all(
+        orders.filter((o) => o.symbol === sym).map((o) => api.cancelInternalOrder(o.order_id)),
+      );
+      await api.updateZoneSl(zone.zone_id, sym, strat, null);
+      chartStore.setContext(zone.zone_id, await api.updateZoneTp(zone.zone_id, sym, strat, null));
+    } catch (e) { console.error("remove orders failed:", e); }
+  }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
+
+  const removeOrdersAndAlarms = useCallback(async () => {
+    await removeOrders();
+    const sym = zone.symbol;
+    if (!sym) return;
+    try {
+      const al = await api.getAlarmsForSymbol(sym);
+      await Promise.all(al.map((a) => api.deleteAlarm(a.id)));
+      chartStore.setAlarms(zone.zone_id, []);
+    } catch (e) { console.error("remove alarms failed:", e); }
+  }, [removeOrders, zone.zone_id, zone.symbol, chartStore]);
+
   // ── Hotkeys: run a bindable action on this zone ────────────────────────────
   // Mirrors the toolbar buttons / timeframe dropdown / IA button. The global
   // listener (useHotkeys) routes a chord to the hovered zone's runner; timeframe
@@ -799,6 +874,31 @@ export function ChartZone({ zone }: ChartZoneProps) {
       handleOrder, handleClose, card]);
 
   useEffect(() => registerZoneHotkeys(zone.zone_id, runAction), [zone.zone_id, runAction]);
+
+  // ── Gamepad: register this zone's controller handlers ──────────────────────
+  // The global gamepad loop (useGamepad) routes button presses + stick input to
+  // the active session's zone through this registry. Registered only while the
+  // zone shows a ticker. tradeID / symbol are read live from the store on demand.
+  useEffect(() => {
+    if (!zone.symbol) return;
+    return registerZoneGamepad(zone.zone_id, {
+      getFocusedPaneId: () => `${zone.zone_id}-${focusPaneIdxRef.current}`,
+      cycleFocus,
+      placeSl:    () => cursorPlace("sl"),
+      placeTp:    () => cursorPlace("tp"),
+      placeAlarm: () => cursorPlace("alarm"),
+      removeOrders,
+      removeOrdersAndAlarms,
+      order:   (pct) => handleOrder(pct),
+      close:   handleClose,
+      capture: () => { if (captureStatus === "idle") handleCapture(); },
+      release: handleRelease,
+      hasTradeId: () => !!useChartStore.getState().getZone(zone.zone_id).context?.trade_id,
+      tradeId:    () => useChartStore.getState().getZone(zone.zone_id).context?.trade_id ?? null,
+      symbol:     () => zone.symbol,
+    });
+  }, [zone.zone_id, zone.symbol, cycleFocus, cursorPlace, removeOrders,
+      removeOrdersAndAlarms, handleOrder, handleClose, handleCapture, captureStatus, handleRelease]);
 
   // ── Empty zone ─────────────────────────────────────────────────────────────
   if (!zone.symbol) {
@@ -1231,13 +1331,18 @@ export function ChartZone({ zone }: ChartZoneProps) {
               // markers come from the enrichment payload.
               const splitMarkers =
                 isDaily && enrichment?.split_markers?.length
-                  ? enrichment.split_markers.map((m) => ({ time: m.time, color: "#ef4444", text: m.label }))
+                  ? enrichment.split_markers.map((m) => ({ time: m.time, color: chartTheme.markers.split, text: m.label }))
                   : undefined;
               const hasOverlay = overlayPaneIdx === i;
               return (
                 <div
                   key={i}
-                  className={cn("relative min-h-0 min-w-0 flex-1", ri > 0 && "border-t border-border/40 pt-1")}
+                  className={cn(
+                    "relative min-h-0 min-w-0 flex-1",
+                    ri > 0 && "border-t border-border/40 pt-1",
+                    // Controller focus ring (only meaningful when there's a choice).
+                    panes.length > 1 && i === focusPaneIdx && "rounded-sm ring-1 ring-sky-500/50",
+                  )}
                 >
                   {!isInteractive && (
                     <span className={cn(

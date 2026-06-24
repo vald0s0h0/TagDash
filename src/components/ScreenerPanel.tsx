@@ -23,8 +23,9 @@ function fmtVol(v: number): string {
 }
 
 /** Build a synthetic AlertSignal so the pre-open zone uses the strategy's card
- *  (panes / indicators / info band) exactly like a real alert placement. */
-function matchToAlert(m: ScreenerMatch): AlertSignal {
+ *  (panes / indicators / info band) exactly like a real alert placement. Exported
+ *  so the controller's ticker-navigation opens screener matches the same way. */
+export function matchToAlert(m: ScreenerMatch): AlertSignal {
   return {
     alert_id:       `screener-${m.symbol}-${m.strategy_id}`,
     timestamp:      new Date().toISOString(),

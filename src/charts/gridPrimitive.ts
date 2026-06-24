@@ -17,6 +17,8 @@ import type {
   SeriesType,
   Time,
 } from "lightweight-charts";
+import { getChartTheme } from "@/stores/chartThemeStore";
+import { hexToRgba } from "@/charts/drawingsPrimitive";
 
 // Minimal shape of the bitmap rendering scope (avoids a fancy-canvas import).
 interface BitmapScope {
@@ -30,8 +32,7 @@ interface RenderTarget {
   useBitmapCoordinateSpace(cb: (scope: BitmapScope) => void): void;
 }
 
-// Half opacity #111 — matches the previous native horizontal grid colour.
-const LINE_COLOR = "rgba(17, 17, 17, 0.5)";
+// Grid line colour/opacity are user-tunable (see chartThemeStore), read at draw.
 // Target pixel spacing between lines (drives the chosen step → same density feel
 // as the native grid).
 const TARGET_SPACING_PX = 50;
@@ -76,7 +77,8 @@ class GridRenderer implements ISeriesPrimitivePaneRenderer {
 
       const step = niceStep((range / h) * TARGET_SPACING_PX);
       const thickness = Math.max(1, Math.round(vr));
-      ctx.fillStyle = LINE_COLOR;
+      const grid = getChartTheme().grid;
+      ctx.fillStyle = hexToRgba(grid.color, grid.opacity);
 
       // Index-based stepping keeps prices exact multiples of `step` (no float
       // drift), so lines stay pinned to $X.00 / $X.50.
@@ -101,6 +103,7 @@ export class GridPrimitive implements ISeriesPrimitive<Time> {
   chart?:  IChartApi;
   series?: ISeriesApi<SeriesType>;
   private readonly views: GridPaneView[];
+  private requestUpdate?: () => void;
 
   constructor() {
     this.views = [new GridPaneView(this)];
@@ -109,11 +112,16 @@ export class GridPrimitive implements ISeriesPrimitive<Time> {
   attached(param: SeriesAttachedParameter<Time>): void {
     this.chart  = param.chart;
     this.series = param.series;
+    this.requestUpdate = param.requestUpdate;
   }
   detached(): void {
     this.chart = undefined;
     this.series = undefined;
+    this.requestUpdate = undefined;
   }
   updateAllViews(): void { /* reads the live price scale each draw */ }
   paneViews(): readonly ISeriesPrimitivePaneView[] { return this.views; }
+
+  /** Force a redraw (e.g. after a theme edit — colour is read at draw time). */
+  redraw(): void { this.requestUpdate?.(); }
 }

@@ -200,6 +200,172 @@ pub(crate) async fn fetch_bars_window(
     Ok(out)
 }
 
+// ─── Raw trades + quotes (loader-private, unclamped) ───────────────────────────
+// Only used by the TRADE flat files: real tick data fetched on the small
+// [alert−1min, alert+10min] windows the pre-scan flags, so Micro Pullback can replay
+// on genuine prints instead of synthetic slices.
+
+#[derive(Debug, Deserialize)]
+struct TradesResponse {
+    #[serde(default)]
+    trades: HashMap<String, Vec<RawTrade>>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawTrade {
+    pub(crate) t: String,
+    pub(crate) p: f64,
+    #[serde(default)]
+    pub(crate) s: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotesResponse {
+    #[serde(default)]
+    quotes: HashMap<String, Vec<RawQuote>>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawQuote {
+    pub(crate) t: String,
+    #[serde(default)]
+    pub(crate) bp: f64,
+    #[serde(default)]
+    pub(crate) ap: f64,
+    #[serde(default)]
+    pub(crate) bs: i64,
+    #[serde(rename = "as", default)]
+    pub(crate) as_size: i64,
+}
+
+/// Every trade for `symbols` in [start, end] (RFC3339). One paginated query; intended
+/// for short windows so the result stays bounded.
+pub(crate) async fn fetch_trades_window(
+    key: &str,
+    secret: &str,
+    symbols: &[String],
+    start: &str,
+    end: &str,
+) -> Result<HashMap<String, Vec<RawTrade>>, String> {
+    let client = reqwest::Client::new();
+    let mut out: HashMap<String, Vec<RawTrade>> = HashMap::new();
+    let mut syms: Vec<String> = symbols.iter().filter(|s| is_rest_symbol(s)).cloned().collect();
+    let mut page_token: Option<String> = None;
+    loop {
+        if syms.is_empty() {
+            break;
+        }
+        let sym_str = syms.join(",");
+        let mut url = format!(
+            "https://data.alpaca.markets/v2/stocks/trades?symbols={sym_str}\
+             &start={start}&end={end}&limit=10000"
+        );
+        if let Some(tok) = &page_token {
+            url.push_str(&format!("&page_token={tok}"));
+        }
+        let resp = client
+            .get(&url)
+            .header("APCA-API-KEY-ID", key)
+            .header("APCA-API-SECRET-KEY", secret)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400 {
+                if let Some(bad) = invalid_symbol_of(&body) {
+                    let before = syms.len();
+                    syms.retain(|s| s != &bad);
+                    if syms.len() < before {
+                        page_token = None;
+                        continue;
+                    }
+                }
+            }
+            return Err(format!("Alpaca trades HTTP {status}: {body}"));
+        }
+        let raw: TradesResponse = resp.json().await.map_err(|e| e.to_string())?;
+        for (sym, trades) in raw.trades {
+            out.entry(sym).or_default().extend(trades);
+        }
+        match raw.next_page_token {
+            Some(tok) if !tok.is_empty() => page_token = Some(tok),
+            _ => break,
+        }
+    }
+    for v in out.values_mut() {
+        v.sort_by(|a, b| a.t.cmp(&b.t));
+    }
+    Ok(out)
+}
+
+/// Every quote (NBBO) for `symbols` in [start, end] (RFC3339). Same shape as
+/// `fetch_trades_window`.
+pub(crate) async fn fetch_quotes_window(
+    key: &str,
+    secret: &str,
+    symbols: &[String],
+    start: &str,
+    end: &str,
+) -> Result<HashMap<String, Vec<RawQuote>>, String> {
+    let client = reqwest::Client::new();
+    let mut out: HashMap<String, Vec<RawQuote>> = HashMap::new();
+    let mut syms: Vec<String> = symbols.iter().filter(|s| is_rest_symbol(s)).cloned().collect();
+    let mut page_token: Option<String> = None;
+    loop {
+        if syms.is_empty() {
+            break;
+        }
+        let sym_str = syms.join(",");
+        let mut url = format!(
+            "https://data.alpaca.markets/v2/stocks/quotes?symbols={sym_str}\
+             &start={start}&end={end}&limit=10000"
+        );
+        if let Some(tok) = &page_token {
+            url.push_str(&format!("&page_token={tok}"));
+        }
+        let resp = client
+            .get(&url)
+            .header("APCA-API-KEY-ID", key)
+            .header("APCA-API-SECRET-KEY", secret)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400 {
+                if let Some(bad) = invalid_symbol_of(&body) {
+                    let before = syms.len();
+                    syms.retain(|s| s != &bad);
+                    if syms.len() < before {
+                        page_token = None;
+                        continue;
+                    }
+                }
+            }
+            return Err(format!("Alpaca quotes HTTP {status}: {body}"));
+        }
+        let raw: QuotesResponse = resp.json().await.map_err(|e| e.to_string())?;
+        for (sym, quotes) in raw.quotes {
+            out.entry(sym).or_default().extend(quotes);
+        }
+        match raw.next_page_token {
+            Some(tok) if !tok.is_empty() => page_token = Some(tok),
+            _ => break,
+        }
+    }
+    for v in out.values_mut() {
+        v.sort_by(|a, b| a.t.cmp(&b.t));
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Deserialize)]
 struct NewsResponse {
     #[serde(default)]

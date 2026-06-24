@@ -15,6 +15,7 @@ import type {
   DashboardTrade,
   FeedDiagnostics,
   FlatFileDay,
+  FlatFilesKind,
   FlatFilesStatus,
   Fill,
   InternalOrder,
@@ -30,7 +31,9 @@ import type {
   ReplayStatus,
   ScreenerMatch,
   SecretsStatus,
+  SecretsUpdate,
   SplitMarker,
+  NewsMarker,
   StartupState,
   Strategy,
   StrategyCard,
@@ -57,6 +60,11 @@ export const api = {
   getMood:               () => invoke<Mood>("get_mood"),
   openMoodTarget:        (target: "images" | "short" | "long") =>
     invoke<void>("open_mood_target", { target }),
+  // Bundled default dashboard layout (seeds a fresh user's board).
+  getDefaultDashboard:   () => invoke<string | null>("get_default_dashboard"),
+  // Maintainer: save the current layout to disk so it can be bundled as the default.
+  exportDashboardDefault: (layout_json: string) =>
+    invoke<string>("export_dashboard_default", { layout_json }),
 
   // Embedded TradeTally webview (native child webview positioned over its tab)
   tradetallySetBounds: (x: number, y: number, width: number, height: number) =>
@@ -68,8 +76,10 @@ export const api = {
   updateLocalConfig: (config: AppConfig) =>
     invoke<void>("update_local_config", { config }),
 
-  // Secrets (status only)
+  // Secrets — status (booleans) + write-only update (values never read back)
   getSecretsStatus: () => invoke<SecretsStatus>("get_secrets_status"),
+  updateSecrets: (updates: SecretsUpdate) =>
+    invoke<SecretsStatus>("update_secrets", { updates }),
 
   // Journal tags (user-defined) + TradeTally queue, retry
   getJournalTags:          () => invoke<string[]>("get_journal_tags"),
@@ -139,6 +149,10 @@ export const api = {
   // daily chart — red dots on the split ex-dates.
   getSplitMarkers: (symbol: string) =>
     invoke<SplitMarker[]>("get_split_markers", { symbol }),
+  // Single-ticker news timestamps over a wide window — a small pastille per bar
+  // with news (intraday + daily). The frontend snaps each to the nearest bar.
+  getNewsMarkers: (symbol: string) =>
+    invoke<NewsMarker[]>("get_news_markers", { symbol }),
   // Previous trading day's reference levels (PDC/PDH/PDL) relative to today.
   getPreviousDayLevels: (symbol: string) =>
     invoke<PrevDayLevels | null>("get_previous_day_levels", { symbol }),
@@ -244,10 +258,12 @@ export const api = {
   getReplayStatus: () => invoke<ReplayStatus>("get_replay_status"),
 
   // Flat files (offline market-data download for Market Replay)
-  flatFilesDownload: (start_day: string, end_day: string) =>
-    invoke<void>("flat_files_download", { start_day, end_day }),
+  flatFilesDownload: (kind: FlatFilesKind, start_day: string, end_day: string) =>
+    invoke<void>("flat_files_download", { kind, start_day, end_day }),
   flatFilesCancel:      () => invoke<void>("flat_files_cancel"),
   getFlatFilesStatus:   () => invoke<FlatFilesStatus>("get_flat_files_status"),
-  getFlatFilesCalendar: () => invoke<FlatFileDay[]>("get_flat_files_calendar"),
-  openFlatFilesFolder:  () => invoke<void>("open_flat_files_folder"),
+  getFlatFilesCalendar: (kind: FlatFilesKind) =>
+    invoke<FlatFileDay[]>("get_flat_files_calendar", { kind }),
+  openFlatFilesFolder:  (kind: FlatFilesKind) =>
+    invoke<void>("open_flat_files_folder", { kind }),
 };

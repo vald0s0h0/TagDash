@@ -12,6 +12,17 @@ mettent à jour **toutes seules** au prochain lancement.
 
 ## Partie 1 — Configuration unique (à faire **une seule fois**)
 
+### 1.0 — Le dépôt doit être **public** ⚠️
+
+La mise à jour auto interroge `…/releases/latest/download/latest.json` **sans
+authentification**. Sur un dépôt **privé**, GitHub renvoie **404** → l'app affiche
+« *Could not fetch a valid release JSON* ». Le dépôt **doit donc être public**
+(les installeurs sont publics, mais ton code aussi). Tes secrets restent protégés :
+clé privée de signature *gitignorée*, clés API hors du repo, secrets dans *GitHub
+Secrets*.
+→ GitHub → **Settings → General** → tout en bas **Danger Zone** → **Change
+visibility → Make public**.
+
 ### 1.A — Ajouter les 2 secrets sur GitHub (dans le navigateur)
 
 Sans ça, le build échoue au moment de signer la mise à jour.

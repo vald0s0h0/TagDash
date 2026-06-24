@@ -5,17 +5,11 @@
 import type { Bar, PaneIndicator } from "@/types";
 import { nyDateKey } from "@/lib/nyTime";
 
-export const INDICATOR_COLORS = {
-  vwap: "#3b82f6", // blue
-  ema:  "#60a5fa", // light blue
-  sma:  "#9ca3af", // grey
-} as const;
+// Indicator colours (VWAP / EMA / SMA) and the Bollinger fill colour/opacity are
+// user-tunable — see `chartThemeStore` (read by `useIndicators`).
 
 /** Bollinger period multiplier (classic 2σ). */
 export const BOLLINGER_K = 2;
-/** Bollinger is drawn as a single translucent violet band (no upper/basis/lower
- *  lines) — a faint 10 % fill between ±2σ. */
-export const BOLLINGER_FILL = "rgba(167,139,250,0.10)"; // violet, 10 % opacity
 
 /** Stable id for an indicator so series can be created/updated/removed in place. */
 export function indicatorId(ind: PaneIndicator): string {

@@ -78,6 +78,21 @@ pub fn get_secrets_status(state: tauri::State<'_, AppState>) -> SecretsStatus {
     state.secrets.read().unwrap().status()
 }
 
+/// Set/replace API secrets from Settings → API Keys and persist them to
+/// `tagdash.secrets.toml`. Only non-empty fields are applied (blank inputs leave
+/// the existing value), so the user types just what they want to change. Returns
+/// the refreshed status (booleans only — secret values never leave Rust).
+#[tauri::command(rename_all = "snake_case")]
+pub fn update_secrets(
+    updates: crate::config::secrets::SecretsUpdate,
+    state: tauri::State<'_, AppState>,
+) -> Result<SecretsStatus, String> {
+    let mut guard = state.secrets.write().unwrap();
+    guard.apply_update(updates);
+    config::secrets::save(&state.app_dir, &guard)?;
+    Ok(guard.status())
+}
+
 // ─── Journal tags (user-defined, stored in tagdash.toml) ──────────────────────
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1256,6 +1271,48 @@ pub async fn get_ticker_news(
     Ok(out)
 }
 
+/// One news pastille for the chart overlay: the publish time (unix seconds) and
+/// headline. Plotted as a small dot at the bottom of the pane (over the volume),
+/// snapped client-side to the bar that was forming when it published.
+#[derive(Debug, Serialize)]
+pub struct NewsMarker {
+    pub time:     i64,
+    pub headline: String,
+}
+
+/// Single-ticker news timestamps for `symbol` over a wide window (Alpaca news REST),
+/// so the chart can drop a small pastille on each bar that had news — on intraday
+/// AND daily panes (the frontend snaps each timestamp to the nearest loaded bar, so
+/// markers outside the loaded range simply don't render). One query serves every
+/// timeframe. Headlines lumping several tickers are dropped. Empty on missing
+/// credentials / fetch error so the chart degrades gracefully.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_news_markers(
+    symbol: String,
+    state:  tauri::State<'_, AppState>,
+) -> Result<Vec<NewsMarker>, String> {
+    let (key, secret) = {
+        let s = state.secrets.read().unwrap();
+        (s.alpaca_key.clone(), s.alpaca_secret.clone())
+    };
+    let (Some(key), Some(secret)) = (key, secret) else {
+        return Ok(vec![]); // no credentials (e.g. mock mode)
+    };
+    if key.is_empty() || secret.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let raw = crate::alpaca::news::fetch_recent_headlines(&key, &secret, &symbol, 365, 200)
+        .await
+        .unwrap_or_default();
+    let out: Vec<NewsMarker> = raw
+        .into_iter()
+        .filter(|n| n.symbols.len() <= 1) // drop headlines lumping several tickers
+        .map(|n| NewsMarker { time: n.created_at.timestamp(), headline: n.headline })
+        .collect();
+    Ok(out)
+}
+
 /// Force an immediate rebuild of the Panic Mean Reversion watchlist (ignores the
 /// 09:00 ET / once-per-day gate) — for testing. Runs off the async runtime (it
 /// fetches premarket minute bars + reads daily history) so the command returns at
@@ -1980,20 +2037,27 @@ pub fn get_replay_status(state: tauri::State<'_, AppState>) -> crate::replay::Re
 
 // ─── Flat files (offline market-data download for Market Replay) ────────────────
 
-/// Download 1-minute bars (premarket + regular + after-hours) of the liquid US
-/// universe for every weekday in [start_day, end_day], persisting one SQLite file
-/// per day under `<app_dir>/flat_files/`. Runs in the background — poll
-/// `get_flat_files_status`. Errors if a download is already running or the Alpaca
-/// keys are missing.
+/// Download flat files of `kind` ("trade" | "minute" | "daily") over [start_day,
+/// end_day], persisting them under `<app_dir>/flat_files/<kind>/`. Runs in the
+/// background — poll `get_flat_files_status`. Errors if a download is already running
+/// or the Alpaca keys are missing. (Daily ignores the day granularity and writes the
+/// cumulative `daily.db`; for it, start/end is just the bar range.)
 #[tauri::command(rename_all = "snake_case")]
 pub fn flat_files_download(
+    kind:      String,
     start_day: String,
     end_day:   String,
     state:     tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (key, secret) = {
+    let kind = crate::flat_files::Kind::from_str(&kind)
+        .ok_or_else(|| format!("type de flat file inconnu: {kind}"))?;
+    let (key, secret, massive_key) = {
         let s = state.secrets.read().unwrap();
-        (s.alpaca_key.clone().unwrap_or_default(), s.alpaca_secret.clone().unwrap_or_default())
+        (
+            s.alpaca_key.clone().unwrap_or_default(),
+            s.alpaca_secret.clone().unwrap_or_default(),
+            s.massive_api_key.clone().unwrap_or_default(),
+        )
     };
     crate::flat_files::start_download(
         state.flat_files.clone(),
@@ -2001,6 +2065,8 @@ pub fn flat_files_download(
         state.db.clone(),
         key,
         secret,
+        massive_key,
+        kind,
         start_day,
         end_day,
     )
@@ -2019,19 +2085,30 @@ pub fn get_flat_files_status(
     state.flat_files.status.read().unwrap().clone()
 }
 
-/// Every day present on disk (downloaded or imported from another user), for the
-/// calendar. Picks up dropped-in `flat-*.db` files on the next call.
+/// Every day present on disk for `kind` (downloaded or imported from another user),
+/// for the calendar. Picks up dropped-in files on the next call.
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_flat_files_calendar(
+    kind:  String,
     state: tauri::State<'_, AppState>,
 ) -> Vec<crate::flat_files::FlatFileDay> {
-    crate::flat_files::calendar(&state.app_dir)
+    let Some(kind) = crate::flat_files::Kind::from_str(&kind) else { return Vec::new() };
+    crate::flat_files::calendar(&state.app_dir, kind)
 }
 
-/// Open the flat-files folder in the OS file manager (to copy/share the files).
+/// Open a flat-files folder in the OS file manager (to copy/share the files). `kind`
+/// opens that subfolder; an unknown kind opens the root `flat_files/`.
 #[tauri::command(rename_all = "snake_case")]
-pub fn open_flat_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    crate::dashboard::open_folder(&crate::flat_files::flat_dir(&state.app_dir))
+pub fn open_flat_files_folder(
+    kind:  String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let dir = match crate::flat_files::Kind::from_str(&kind) {
+        Some(k) => crate::flat_files::kind_dir(&state.app_dir, k),
+        None => crate::flat_files::flat_dir(&state.app_dir),
+    };
+    crate::flat_files::ensure_layout(&state.app_dir);
+    crate::dashboard::open_folder(&dir)
 }
 
 // ─── Company intelligence (read-only; collection happens in the background) ────
@@ -2183,6 +2260,30 @@ pub fn open_mood_target(
     target: String,
 ) -> Result<(), String> {
     crate::dashboard::open_mood_target(&state.app_dir, &target)
+}
+
+/// The bundled default dashboard layout JSON (shipped with the app). The frontend
+/// uses it to seed a brand-new user's board; users with a saved layout ignore it.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_default_dashboard(app: tauri::AppHandle) -> Option<String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .resolve("resources/defaults", tauri::path::BaseDirectory::Resource)
+        .ok()?;
+    crate::dashboard::read_default_dashboard(&dir)
+}
+
+/// Save the current dashboard layout to `<app_dir>/dashboard-default.json`, so the
+/// maintainer can capture their arrangement and bundle it as the new shipped
+/// default. Returns the written file path. (Maintainer affordance.)
+#[tauri::command(rename_all = "snake_case")]
+pub fn export_dashboard_default(
+    layout_json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    crate::dashboard::write_dashboard_export(&state.app_dir, &layout_json)?;
+    Ok(state.app_dir.join("dashboard-default.json").to_string_lossy().to_string())
 }
 
 // ─── Embedded TradeTally webview ──────────────────────────────────────────────

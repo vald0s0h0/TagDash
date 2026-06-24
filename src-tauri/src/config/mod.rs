@@ -90,10 +90,21 @@ pub struct UiConfig {
     /// alert. Same scale as `flash_alerts`.
     #[serde(default = "default_attention_mode")]
     pub foreground_alerts: String,
+    /// When to play a notification sound on a new scanner alert. Same scale as
+    /// `flash_alerts`. The sound itself is synthesized & played in the frontend.
+    #[serde(default = "default_attention_mode")]
+    pub alert_sound_mode: String,
+    /// Which notification sound to play (id from the frontend sound catalog).
+    #[serde(default = "default_alert_sound")]
+    pub alert_sound: String,
 }
 
 fn default_attention_mode() -> String {
     "off".into()
+}
+
+fn default_alert_sound() -> String {
+    "soft_chime".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +254,8 @@ impl Default for AppConfig {
                 desktop_alerts: false,
                 flash_alerts: default_attention_mode(),
                 foreground_alerts: default_attention_mode(),
+                alert_sound_mode: default_attention_mode(),
+                alert_sound: default_alert_sound(),
             },
             latency: LatencyConfig {
                 warn_ms: 1_000,

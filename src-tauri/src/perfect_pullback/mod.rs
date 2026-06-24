@@ -1,38 +1,40 @@
-// Perfect Pullback — stateful, multi-timeframe pullback-continuation engine.
+// Perfect Pullback — stateful 5-minute pullback-continuation engine.
 //
-// Goal: catch a clean trend-continuation entry. First a ticker makes a strong,
-// high-relative-volume directional move (gate 1); then it pulls back in a healthy,
-// low-volume, shallow way (gate 2); we fire on the close of the 2nd pullback candle
-// so a continuation can be traded in the direction of the move. There is a long and
-// a short side (up move → long bias, down move → short bias). The engine can run in
-// parallel on the 1, 2, 5 and 10-minute timeframes, each toggled by an ENABLE_* flag
-// below; for now only the 5-minute timeframe is active.
+// Once a ticker is WATCHED (selected by the Market Attention Gate — see
+// `crate::market_attention` — and memorised for the session), this engine runs a
+// four-gate pipeline on its 5-minute aggregates to fire a clean pullback-continuation
+// signal. The gates are evaluated every loop (≤ once per 1-minute close in practice),
+// but every structural decision is built on CLOSED 5-minute bars:
 //
-// Ticker SELECTION is NOT done here: it comes from the Market Attention Gate
-// (`crate::market_attention`), which publishes, once a minute between 09:30 and
-// 12:30 ET, the top-10 most-watched/traded tickers (direction-agnostic). This engine
-// reads that list and MEMORISES the symbols for the whole session: during a pullback
-// a ticker's volume falls and it can drop off the attention list, yet it stays worth
-// trading — so once a symbol has been on the list it remains watched until the end of
-// the session (16:00) regardless of whether it is still on the list. Gate 1 here is
-// purely a move-strength check (consecutive bars + relative volume + dollar volume);
-// the moving-average / VWAP location filters were removed (selection is Market
-// Attention's job now).
+//   Gate 1 — Direction : a clean directional regime (price vs session VWAP, EMA9 vs
+//            EMA20, EMA20 slope, Kaufman efficiency, few VWAP crosses, low chop). Picks
+//            the side (long/short); choppy names are rejected here.
+//   Gate 2 — Impulse   : a real impulse leg exists — last swing pivot → extreme move
+//            ≥ 1.5 × ATR, impulse volume above the recent average, HH/HL intact.
+//   Gate 3 — Pullback  : a healthy breather — retracement 20–55 % (vertical) or a very
+//            compressed shallow drift (time-based), volume below the impulse, ranges
+//            compressing, price holding above EMA20/VWAP, the higher low unbroken, no
+//            violent counter bar (> 1 ATR).
+//   Gate 4 — Trigger   : fire when the pullback has just closed its 3rd counter-trend
+//            5-minute bar AND that bar is small (true range ≤ 0.6 × ATR).
 //
-// Why an engine and not a `ScanStrategy::should_alert`: the gates form a per-(symbol,
-// timeframe) state machine spanning many bars (count the consecutive move bars,
-// detect the colour flip, count the pullback bars, measure retracement/volume/ATR).
-// That can't fit the stateless per-tick contract, so this engine runs in its own
-// tokio task and pushes AlertSignals straight into the active-alert list via
-// `scanner::push_alert` (the same escape hatch the price-alarm watcher uses). The
-// registry still carries a metadata `PerfectPullback` strategy (card, toggle,
-// name, priority) — see `strategies::perfect_pullback`.
+// Anti-spam: after a trigger a 10-minute cooldown applies, lifted early only by a new
+// significant extreme (a fresh impulse beyond the last one by ≥ 1 ATR) or a side flip
+// (structure reset). Each 5-minute bar can trigger at most once.
+//
+// Scope: 5-minute timeframe only for now (other timeframes will be added later).
+//
+// Why an engine and not a `ScanStrategy::should_alert`: the gates need the recent
+// 5-minute structure (pivots, impulse leg, multi-bar pullback) plus per-symbol
+// anti-spam state, which can't fit the stateless per-tick contract. So this engine
+// runs in its own tokio task and pushes AlertSignals straight into the active-alert
+// list via `scanner::push_alert`. The registry still carries a metadata
+// `PerfectPullback` strategy (card, toggle, name, priority) — see
+// `strategies::perfect_pullback`.
 //
 // Bars: during the regular session Alpaca streams 1-minute bars for the whole
-// universe (MarketState::on_bar → M1 ring), while trade ticks only flow for the
-// displayed (focus) symbols. So we read the M1 closed bars and aggregate the
-// 2/5/10-minute timeframes from them ourselves rather than relying
-// on the per-symbol trade-built aggregators (which are empty for non-focus names).
+// universe (MarketState::on_bar → M1 ring); we read those closed M1 bars and build the
+// 5-minute series (and reconstruct the cumulative session VWAP per bar) ourselves.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -51,51 +53,78 @@ use crate::strategies::perfect_pullback::ID as STRATEGY_ID;
 use crate::types::{AlertSignal, AttentionEntry, Session, Side};
 
 // ─── Tunable parameters (recompile to apply) ──────────────────────────────────
-/// Per-(symbol, timeframe) re-arm cooldown after a fire (a fresh move→pullback can
-/// re-trigger once it elapses).
-pub const COOLDOWN_SECS: u64 = 180;
-/// How often the engine evaluates the gates (seconds).
+/// Anti-spam cooldown after a trigger (seconds): no second alert for the same symbol
+/// for 10 minutes unless a new significant extreme / side flip re-arms it.
+pub const COOLDOWN_SECS: u64 = 600;
+/// How often the engine evaluates the gates (seconds). The structural decisions only
+/// change on a new closed 5-minute bar, so a short loop just keeps it responsive.
 const LOOP_INTERVAL_SECS: u64 = 2;
 /// How often the per-symbol average-daily-volume map is reloaded from the universe
-/// table (seconds).
+/// table (seconds). Only feeds the DISPLAYED relative volume.
 const AVG_VOL_REFRESH_SECS: u64 = 300;
 
 /// Tradeable price band (USD). Keeps the engine off sub-penny noise and ultra-highs.
 const PRICE_MIN: f64 = 1.0;
 const PRICE_MAX: f64 = 1000.0;
+/// Minimum closed M1 bars a watched ticker needs before we bother building 5m bars.
+const MIN_M1_BARS: usize = 5;
 
-// ── Timeframe on/off switches ───────────────────────────────────────────────
-// Flip a flag to true/false to watch / ignore that timeframe. When a timeframe is
-// off the engine neither aggregates nor evaluates its bars (no gate machines are
-// created for it). For now only the 5-minute timeframe is active: bars are only
-// aggregated, watched and fired on the 5m.
-const ENABLE_1M:  bool = false;
-const ENABLE_2M:  bool = false;
-const ENABLE_5M:  bool = true;
-const ENABLE_10M: bool = false;
+/// 5-minute bucket (the only timeframe for now) and its display label.
+const BUCKET_SECS: i64 = 300;
+const TF_LABEL: &str = "5m";
 
-// ── Gate 1 — strong directional move ──────────────────────────────────────────
-/// Minimum consecutive same-direction candles to establish the move.
-const MIN_MOVE_BARS: usize = 2;
-/// Relative volume of the move vs the ticker's own daily norm. The move's total
-/// volume must be at least RVOL_MIN × the volume it would normally trade over the
-/// same number of minutes (avg daily volume spread over a 390-min session).
-const RVOL_MIN: f64 = 2.0;
-/// Minimum dollar volume traded during the whole move, to avoid thin-name noise.
-const MIN_MOVE_DOLLAR_VOLUME: f64 = 250_000.0;
-/// Regular-session length in minutes, used to pro-rate the daily average volume
-/// down to a per-bar expectation for the relative-volume calc.
-const REGULAR_MINUTES_PER_DAY: f64 = 390.0;
+// ── Indicators ────────────────────────────────────────────────────────────────
+/// Minimum closed 5m bars before any gate is evaluated.
+const MIN_BARS_5M: usize = 6;
+const EMA_FAST: usize = 9;
+const EMA_SLOW: usize = 20;
+const ATR_PERIOD: usize = 14;
+/// EMA20 slope is measured as the last value minus this many bars back.
+const SLOPE_LOOKBACK: usize = 1;
+/// Hard floor: ignore ultra-quiet names whose 5m ATR is below this (dollars).
+const MIN_ATR: f64 = 0.10;
 
-// ── Gate 2 — healthy pullback ──────────────────────────────────────────────────
-/// Minimum pullback candles before the alert can fire (fires at the close of the
-/// 2nd one at the earliest).
-const MIN_PULLBACK_BARS: usize = 2;
-/// Maximum retracement of the move allowed for a still-healthy pullback (0.60 = 60%).
-const MAX_RETRACE: f64 = 0.60;
-/// The last closed (pullback) candle's true range must be below this multiple of the
-/// average true range of the move candles — rejects a violent reversal bar.
-const ATR_MAX_MULT: f64 = 2.0;
+// ── Gate 1 — Direction ─────────────────────────────────────────────────────────
+/// Kaufman efficiency-ratio window (bars, ≈ 15 min) and its minimum value. Measured
+/// over the last 3 bars — responsive enough to confirm direction without needing a
+/// long clean run.
+const ER_WINDOW: usize = 3;
+const MIN_EFFICIENCY: f64 = 0.35;
+/// Max VWAP crossings allowed in the recent window (too many = chop).
+const VWAP_CROSS_WINDOW: usize = 6;
+const MAX_VWAP_CROSSES: usize = 2;
+/// Max candle-colour alternations in the recent window (too many = chop).
+const CHOP_WINDOW: usize = 6;
+const MAX_ALTERNATIONS: usize = 3;
+
+// ── Gate 2 — Impulse ──────────────────────────────────────────────────────────
+/// Impulse leg (pivot → extreme) must move at least this multiple of ATR.
+const IMPULSE_ATR_MULT: f64 = 1.5;
+/// Swing-pivot fractal span (bars on each side). 1 = a 3-bar fractal.
+const PIVOT_SPAN: usize = 1;
+/// Window for the "recent average volume" the impulse must beat.
+const RECENT_VOL_WINDOW: usize = 12;
+
+// ── Gate 3 — Pullback ─────────────────────────────────────────────────────────
+/// Vertical pullback retracement band (fraction of the impulse).
+const MIN_RETRACE: f64 = 0.20;
+const MAX_RETRACE: f64 = 0.55;
+/// Time-based (shallow) pullback only qualifies if its bars are this compressed
+/// relative to the impulse's bars.
+const COMPRESSION_MULT: f64 = 0.70;
+/// A counter-trend pullback bar wider than this multiple of ATR is "violent" → reject.
+const VIOLENT_ATR_MULT: f64 = 1.0;
+
+// ── Gate 4 — Trigger ──────────────────────────────────────────────────────────
+/// Number of counter-trend pullback bars required before the trigger can fire.
+const TRIGGER_PB_BARS: usize = 3;
+/// The triggering (3rd+) bar must be "small": its true range ≤ this multiple of ATR.
+const TRIGGER_SMALL_ATR_MULT: f64 = 0.6;
+
+// ── Anti-spam ─────────────────────────────────────────────────────────────────
+/// During cooldown, a re-trigger is allowed if a NEW impulse extreme forms beyond the
+/// last trigger's extreme by at least this multiple of ATR (or the side flips).
+const NEW_EXTREME_ATR_MULT: f64 = 1.0;
 
 /// Regular cash session in ET wall-clock minutes since midnight: 09:30–16:00. Perfect
 /// Pullback watches and fires across the whole session; Market Attention only feeds
@@ -104,24 +133,14 @@ const ATR_MAX_MULT: f64 = 2.0;
 const SESSION_START_MIN: u32 = 9 * 60 + 30; // 570
 const SESSION_END_MIN:   u32 = 16 * 60;     // 960
 
-/// Drop a gate machine that hasn't seen a new bar in this many seconds (memory
-/// bound — keeps the map to genuinely active names).
-const GATE_STALE_SECS: i64 = 30 * 60;
+/// Drop a per-symbol state that hasn't seen a new bar in this many seconds.
+const STATE_STALE_SECS: i64 = 30 * 60;
 
-/// The four timeframes, as (label, bucket seconds, enabled). Only the ones whose
-/// flag is true are aggregated, watched and fired on.
-const TIMEFRAMES: &[(&str, i64, bool)] = &[
-    ("1m",  60,  ENABLE_1M),
-    ("2m",  120, ENABLE_2M),
-    ("5m",  300, ENABLE_5M),
-    ("10m", 600, ENABLE_10M),
-];
-
-/// Per-symbol snapshot read from MarketState once per loop, then fed to every
-/// timeframe's gate machine (so we hold the read lock only briefly).
+/// Per-symbol snapshot read from MarketState once per loop, then evaluated outside the
+/// read lock.
 struct TickerInput {
     symbol:         String,
-    /// Closed 1-minute bars (oldest → newest); higher timeframes are aggregated.
+    /// Closed 1-minute bars (oldest → newest); the 5-minute series is built from these.
     m1:             Vec<Bar>,
     price:          f64,
     volume_day:     u64,
@@ -129,57 +148,26 @@ struct TickerInput {
     avg_vol:        u64,
 }
 
-// ─── Per-(symbol, timeframe) gate state ───────────────────────────────────────
+// ─── Per-symbol anti-spam state ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// No move under way — waiting for the first directional candle.
-    Idle,
-    /// Inside a directional run (gate 1), counting consecutive same-colour bars.
-    Move,
-    /// A colour flip happened — counting pullback candles (gate 2).
-    Pullback,
+#[derive(Debug, Clone, Default)]
+struct SymbolState {
+    cooldown_until:   Option<DateTime<Utc>>,
+    /// The 5m bar that last triggered — so a given bar fires at most once.
+    last_trigger_bar: Option<DateTime<Utc>>,
+    /// The impulse extreme at the last trigger (re-arm reference).
+    armed_extreme:    Option<f64>,
+    armed_side:       Option<Side>,
+    /// Last 5m bar seen for this symbol (memory-prune key).
+    last_seen:        Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
-struct GateState {
-    phase:          Phase,
-    /// Direction of the current move (Long = up, Short = down). Discovered when the
-    /// run starts; meaningless in Idle.
-    side:           Side,
-    last_bar_time:  Option<DateTime<Utc>>,
-    /// Consecutive same-direction candles forming the move (gate 1).
-    move_bars:      Vec<Bar>,
-    /// Counter-direction candles forming the pullback (gate 2).
-    pullback_bars:  Vec<Bar>,
-    cooldown_until: Option<DateTime<Utc>>,
-}
-
-impl GateState {
-    fn new() -> Self {
-        Self {
-            phase:          Phase::Idle,
-            side:           Side::Long,
-            last_bar_time:  None,
-            move_bars:      Vec::new(),
-            pullback_bars:  Vec::new(),
-            cooldown_until: None,
-        }
-    }
-
-    fn reset_idle(&mut self) {
-        self.phase = Phase::Idle;
-        self.move_bars.clear();
-        self.pullback_bars.clear();
-    }
-
-    /// Begin a fresh move from `b` in the given direction.
-    fn start_move(&mut self, b: &Bar, side: Side) {
-        self.side = side;
-        self.move_bars = vec![b.clone()];
-        self.pullback_bars.clear();
-        self.phase = Phase::Move;
-    }
+/// A qualified impulse leg: the swing pivot and the impulse extreme it ran to.
+struct Impulse {
+    pivot_idx: usize,
+    ext_idx:   usize,
+    pivot_px:  f64, // pivot low (long) / pivot high (short)
+    ext_px:    f64, // impulse high (long) / impulse low (short)
 }
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
@@ -201,22 +189,20 @@ impl PerfectPullbackEngine {
         // Use the Tauri-managed runtime so this can be launched from the sync
         // `setup` hook (a bare `tokio::spawn` there panics: no reactor running).
         tauri::async_runtime::spawn(async move {
-            // Per-(symbol, timeframe) gate machines.
-            let mut gates: HashMap<(String, String), GateState> = HashMap::new();
-            // Per-symbol average daily volume (relative-volume base), refreshed
-            // periodically from the universe table.
+            // Per-symbol anti-spam state.
+            let mut states: HashMap<String, SymbolState> = HashMap::new();
+            // Per-symbol average daily volume (feeds the displayed relative volume),
+            // refreshed periodically from the universe table.
             let mut avg_volumes = load_avg_volumes(&db);
             let mut avg_vol_loaded = std::time::Instant::now();
             // Memorised candidate set: every symbol Market Attention has selected
             // today (symbol → first time seen). A ticker stays here for the whole
             // session even after it leaves the attention list, so a pullback whose
             // falling volume drops it off the list never loses the candidate.
-            // `watched_day` is the ET date the set is built for (cleared at a new day).
             let mut watched: HashMap<String, DateTime<Utc>> = HashMap::new();
             let mut watched_day: Option<String> = None;
             // Market Replay reset watch: replay start / backward seek / new day →
-            // drop gate machines and the memorised candidate set so the replayed
-            // session is rebuilt from the simulated clock.
+            // drop per-symbol state and the memorised candidate set.
             let mut replay_gen = crate::replay::clock::generation();
 
             while running.load(Ordering::Relaxed) {
@@ -224,7 +210,7 @@ impl PerfectPullbackEngine {
                     let g = crate::replay::clock::generation();
                     if g != replay_gen {
                         replay_gen = g;
-                        gates.clear();
+                        states.clear();
                         watched.clear();
                         watched_day = None;
                     }
@@ -275,11 +261,9 @@ impl PerfectPullbackEngine {
                     }
                 }
 
-                // Snapshot the per-symbol inputs (M1 closed bars + live price) under a
-                // brief read lock; all gate logic runs outside the lock. Pre-filter to
-                // active names: a known avg volume (so rvol is meaningful), a price in
-                // band, at least a couple of M1 bars, and — the candidate gate — a
-                // symbol Market Attention has selected (and we've memorised) today.
+                // Snapshot the per-symbol inputs under a brief read lock; all gate
+                // logic runs outside the lock. Pre-filter to active candidates: price
+                // in band, some M1 history, and a Market-Attention-memorised symbol.
                 let inputs: Vec<TickerInput> = {
                     let ms = market.read().unwrap();
                     ms.tickers
@@ -289,15 +273,15 @@ impl PerfectPullbackEngine {
                             if !(PRICE_MIN..=PRICE_MAX).contains(&price) {
                                 return None;
                             }
-                            let avg_vol = *avg_volumes.get(&t.symbol).filter(|&&v| v > 0)?;
-                            let m1 = ms.closed_bars(&t.symbol, Timeframe::M1);
-                            if m1.len() < MIN_MOVE_BARS + 1 {
-                                return None;
-                            }
-                            // Candidate gate: only Market-Attention-selected tickers.
                             if !watched.contains_key(&t.symbol) {
                                 return None;
                             }
+                            let m1 = ms.closed_bars(&t.symbol, Timeframe::M1);
+                            if m1.len() < MIN_M1_BARS {
+                                return None;
+                            }
+                            // 0 = unknown → no rvol shown; not a filter.
+                            let avg_vol = avg_volumes.get(&t.symbol).copied().unwrap_or(0);
                             Some(TickerInput {
                                 symbol: t.symbol.clone(),
                                 m1,
@@ -310,30 +294,27 @@ impl PerfectPullbackEngine {
                         .collect()
                 };
 
+                // Today's 09:30 ET cash open (UTC): bounds the detector to the current
+                // regular session, so a freshly-watched ticker is seeded from this
+                // morning's bars (the impulse is replayed and a fast pullback is caught)
+                // while no prior day / premarket bar ever feeds a signal.
+                let session_open = crate::time::et_session_open_utc(now);
+
                 let mut fires: Vec<AlertSignal> = Vec::new();
                 for inp in inputs {
-                    for &(tf_label, bucket_secs, tf_enabled) in TIMEFRAMES {
-                        if !tf_enabled {
-                            continue;
-                        }
-                        let bars = aggregate(&inp.m1, bucket_secs, now);
-                        if bars.len() < MIN_MOVE_BARS + 1 {
-                            continue;
-                        }
-                        let key = (inp.symbol.clone(), tf_label.to_string());
-                        let gs = gates.entry(key).or_insert_with(GateState::new);
-                        if let Some(fire) =
-                            process(gs, &inp, tf_label, bucket_secs, &bars, now)
-                        {
-                            fires.push(fire);
-                        }
+                    let m1: Vec<Bar> =
+                        inp.m1.iter().filter(|b| b.time >= session_open).cloned().collect();
+                    let (bars, vwaps) = session_5m(&m1, now);
+                    let st = states.entry(inp.symbol.clone()).or_default();
+                    if let Some(fire) = evaluate(st, &inp, &bars, &vwaps, now) {
+                        fires.push(fire);
                     }
                 }
 
-                // Prune stale gate machines (symbol gone quiet) to bound memory.
-                gates.retain(|_, g| {
-                    g.last_bar_time
-                        .map(|t| (now - t).num_seconds() <= GATE_STALE_SECS)
+                // Prune stale per-symbol state to bound memory.
+                states.retain(|_, s| {
+                    s.last_seen
+                        .map(|t| (now - t).num_seconds() <= STATE_STALE_SECS)
                         .unwrap_or(false)
                 });
 
@@ -347,268 +328,490 @@ impl PerfectPullbackEngine {
     }
 }
 
-/// Drive one (symbol, timeframe) gate machine over any newly-closed bars. Returns a
-/// fire signal when a healthy pullback completes.
-fn process(
-    gs:          &mut GateState,
-    inp:         &TickerInput,
-    tf_label:    &str,
-    bucket_secs: i64,
-    bars:        &[Bar],
-    now:         DateTime<Utc>,
+/// Run the four-gate pipeline for one symbol on its closed 5m series. Returns a fire
+/// signal when a fresh pullback trigger passes every gate (and anti-spam allows it).
+fn evaluate(
+    st:    &mut SymbolState,
+    inp:   &TickerInput,
+    bars:  &[Bar],
+    vwaps: &[f64],
+    now:   DateTime<Utc>,
 ) -> Option<AlertSignal> {
-    // Cooldown: skip until it elapses, then resume watching fresh.
-    if let Some(until) = gs.cooldown_until {
+    st.last_seen = bars.last().map(|b| b.time);
+    if bars.len() < MIN_BARS_5M {
+        return None;
+    }
+    let atr = atr(bars, ATR_PERIOD);
+    if atr < MIN_ATR {
+        return None;
+    }
+    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let ema9 = ema_series(&closes, EMA_FAST);
+    let ema20 = ema_series(&closes, EMA_SLOW);
+    let vwap_now = *vwaps.last().unwrap_or(&inp.price);
+    let price = inp.price;
+
+    // Gate 1 — Direction (also picks the side; rejects chop).
+    let side = direction_side(bars, &ema9, &ema20, vwaps, price, vwap_now)?;
+    // Gate 2 — Impulse.
+    let imp = impulse_gate(side, bars, atr)?;
+    // Gate 3 — Pullback (returns the retracement fraction).
+    let retrace = pullback_gate(side, bars, *ema20.last().unwrap(), vwap_now, price, &imp, atr)?;
+    // Gate 4 — Trigger.
+    if !trigger_ready(side, bars, &imp, atr) {
+        return None;
+    }
+
+    // One fire per 5m bar.
+    let trigger_bar_time = bars.last().unwrap().time;
+    if st.last_trigger_bar == Some(trigger_bar_time) {
+        return None;
+    }
+
+    // Anti-spam: during cooldown, only a new significant extreme or a side flip
+    // (structure reset) re-arms the trigger.
+    if let Some(until) = st.cooldown_until {
         if now < until {
-            return None;
-        }
-        gs.cooldown_until = None;
-        gs.reset_idle();
-    }
-
-    // Only process bars closed after the last one we handled, in order.
-    let new_bars: Vec<&Bar> = match gs.last_bar_time {
-        Some(t) => bars.iter().filter(|b| b.time > t).collect(),
-        None => bars.iter().collect(),
-    };
-    let mut fire: Option<AlertSignal> = None;
-
-    for b in new_bars {
-        gs.last_bar_time = Some(b.time);
-        let up = b.close > b.open;
-        let down = b.close < b.open;
-
-        match gs.phase {
-            // ── Idle — wait for the first directional candle to seed a move. ──────
-            Phase::Idle => {
-                if up {
-                    gs.start_move(b, Side::Long);
-                } else if down {
-                    gs.start_move(b, Side::Short);
-                }
-            }
-
-            // ── Gate 1 — build the directional run; the colour flip hands off. ────
-            Phase::Move => {
-                let continues = match gs.side {
-                    Side::Long => up,
-                    Side::Short => down,
-                };
-                if continues {
-                    gs.move_bars.push(b.clone());
-                } else {
-                    // Opposite (or doji) candle = potential pullback start. Only
-                    // hand off to gate 2 if the move is long enough AND qualified
-                    // (relative volume + dollar volume — move strength only).
-                    let qualified = gs.move_bars.len() >= MIN_MOVE_BARS
-                        && move_qualifies(gs, inp.avg_vol, bucket_secs);
-                    if qualified {
-                        gs.pullback_bars = vec![b.clone()];
-                        gs.phase = Phase::Pullback;
-                    } else {
-                        // Move fizzled — restart detection from this candle.
-                        if up {
-                            gs.start_move(b, Side::Long);
-                        } else if down {
-                            gs.start_move(b, Side::Short);
-                        } else {
-                            gs.reset_idle();
-                        }
-                    }
-                }
-            }
-
-            // ── Gate 2 — count the pullback, then fire when it's healthy. ─────────
-            Phase::Pullback => {
-                let resumes = match gs.side {
-                    Side::Long => up,
-                    Side::Short => down,
-                };
-                if resumes {
-                    // Trend resumed before a tradeable pullback formed — treat this
-                    // candle as the start of a fresh move (continuation).
-                    gs.start_move(b, gs.side);
-                } else {
-                    gs.pullback_bars.push(b.clone());
-                    if gs.pullback_bars.len() >= MIN_PULLBACK_BARS {
-                        match evaluate_pullback(gs, b) {
-                            PullbackVerdict::Fire { retrace } => {
-                                let move_vol: u64 =
-                                    gs.move_bars.iter().map(|bar| bar.volume).sum();
-                                let rvol = move_rvol(
-                                    move_vol, gs.move_bars.len(), bucket_secs, inp.avg_vol,
-                                );
-                                fire = Some(make_alert(
-                                    &inp.symbol, tf_label, gs.side, rvol, retrace,
-                                    gs.move_bars.len(), gs.pullback_bars.len(),
-                                    inp.price, inp.volume_day, inp.change_day_pct, now,
-                                ));
-                                gs.cooldown_until =
-                                    Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
-                                gs.reset_idle();
-                            }
-                            // Too deep / volume not lost → the setup is dead.
-                            PullbackVerdict::Abort => gs.reset_idle(),
-                            // Calm enough setup but this candle isn't a trigger yet
-                            // (e.g. an oversized bar) — keep waiting on the next one.
-                            PullbackVerdict::Wait => {}
-                        }
-                    }
-                }
+            let new_extreme = match (side, st.armed_extreme) {
+                (Side::Long, Some(e))  => imp.ext_px > e + NEW_EXTREME_ATR_MULT * atr,
+                (Side::Short, Some(e)) => imp.ext_px < e - NEW_EXTREME_ATR_MULT * atr,
+                _ => true,
+            };
+            let flip = st.armed_side.map_or(true, |s| s != side);
+            if !(new_extreme || flip) {
+                return None;
             }
         }
     }
 
-    fire
+    st.cooldown_until   = Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
+    st.last_trigger_bar = Some(trigger_bar_time);
+    st.armed_extreme    = Some(imp.ext_px);
+    st.armed_side       = Some(side);
+
+    let rvol = (inp.avg_vol > 0).then(|| inp.volume_day as f64 / inp.avg_vol as f64);
+    let move_dollar = (imp.ext_px - imp.pivot_px).abs();
+    Some(make_alert(
+        &inp.symbol, side, retrace, move_dollar, atr, price,
+        inp.volume_day, inp.change_day_pct, rvol, now,
+    ))
 }
 
-// ─── Gate helpers ──────────────────────────────────────────────────────────────
+// ─── Gate 1 — Direction ─────────────────────────────────────────────────────────
 
-/// Gate 1 qualification at the colour flip: move strength only — relative volume
-/// and dollar volume of the whole move. Ticker selection (which names are worth
-/// watching at all) is handled upstream by the Market Attention Gate, so the old
-/// moving-average / VWAP location filters were removed.
-fn move_qualifies(gs: &GateState, avg_vol: u64, bucket_secs: i64) -> bool {
-    // Dollar volume of the whole move.
-    let move_vol: u64 = gs.move_bars.iter().map(|b| b.volume).sum();
-    let dollar_volume: f64 = gs
-        .move_bars
-        .iter()
-        .map(|b| b.volume as f64 * b.close)
-        .sum();
-    if dollar_volume < MIN_MOVE_DOLLAR_VOLUME {
+/// A clean directional regime → the side to trade, or None (no direction / choppy).
+fn direction_side(
+    bars:     &[Bar],
+    ema9:     &[f64],
+    ema20:    &[f64],
+    vwaps:    &[f64],
+    price:    f64,
+    vwap_now: f64,
+) -> Option<Side> {
+    let n = bars.len();
+    if n < MIN_BARS_5M || n < SLOPE_LOOKBACK + 1 {
+        return None;
+    }
+    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+
+    // Reject choppy regimes (net move weak vs path, VWAP whipsaws, colour churn).
+    if efficiency_ratio(&closes, ER_WINDOW) < MIN_EFFICIENCY {
+        return None;
+    }
+    if vwap_crosses(&closes, vwaps, VWAP_CROSS_WINDOW) > MAX_VWAP_CROSSES {
+        return None;
+    }
+    if color_alternations(bars, CHOP_WINDOW) > MAX_ALTERNATIONS {
+        return None;
+    }
+
+    let e9 = *ema9.last().unwrap();
+    let e20 = *ema20.last().unwrap();
+    let slope = e20 - ema20[n - 1 - SLOPE_LOOKBACK];
+
+    if price > vwap_now && e9 > e20 && slope > 0.0 {
+        return Some(Side::Long);
+    }
+    if price < vwap_now && e9 < e20 && slope < 0.0 {
+        return Some(Side::Short);
+    }
+    None
+}
+
+// ─── Gate 2 — Impulse ──────────────────────────────────────────────────────────
+
+/// A real impulse leg in the trend direction: last swing pivot → extreme move ≥
+/// 1.5 ATR, impulse volume above the recent average, higher-low (long) / lower-high
+/// (short) structure intact.
+fn impulse_gate(side: Side, bars: &[Bar], atr: f64) -> Option<Impulse> {
+    match side {
+        Side::Long => {
+            let pivot_idx = last_swing_low(bars, PIVOT_SPAN)?;
+            let pivot_px = bars[pivot_idx].low;
+            // Impulse extreme = highest high from the pivot onward.
+            let (ext_idx, ext_px) = bars[pivot_idx..]
+                .iter()
+                .enumerate()
+                .fold((pivot_idx, f64::MIN), |acc, (i, b)| {
+                    if b.high > acc.1 { (pivot_idx + i, b.high) } else { acc }
+                });
+            if ext_idx <= pivot_idx || (ext_px - pivot_px) < IMPULSE_ATR_MULT * atr {
+                return None;
+            }
+            // Volume of the impulse leg must beat the recent average.
+            if mean_vol(&bars[pivot_idx..=ext_idx]) <= recent_mean_vol(bars, RECENT_VOL_WINDOW) {
+                return None;
+            }
+            // Higher-low structure: this pivot ≥ the prior swing low.
+            if let Some(prev) = last_swing_low(&bars[..pivot_idx], PIVOT_SPAN) {
+                if bars[pivot_idx].low < bars[prev].low {
+                    return None;
+                }
+            }
+            Some(Impulse { pivot_idx, ext_idx, pivot_px, ext_px })
+        }
+        Side::Short => {
+            let pivot_idx = last_swing_high(bars, PIVOT_SPAN)?;
+            let pivot_px = bars[pivot_idx].high;
+            // Impulse extreme = lowest low from the pivot onward.
+            let (ext_idx, ext_px) = bars[pivot_idx..]
+                .iter()
+                .enumerate()
+                .fold((pivot_idx, f64::MAX), |acc, (i, b)| {
+                    if b.low < acc.1 { (pivot_idx + i, b.low) } else { acc }
+                });
+            if ext_idx <= pivot_idx || (pivot_px - ext_px) < IMPULSE_ATR_MULT * atr {
+                return None;
+            }
+            if mean_vol(&bars[pivot_idx..=ext_idx]) <= recent_mean_vol(bars, RECENT_VOL_WINDOW) {
+                return None;
+            }
+            // Lower-high structure: this pivot ≤ the prior swing high.
+            if let Some(prev) = last_swing_high(&bars[..pivot_idx], PIVOT_SPAN) {
+                if bars[pivot_idx].high > bars[prev].high {
+                    return None;
+                }
+            }
+            Some(Impulse { pivot_idx, ext_idx, pivot_px, ext_px })
+        }
+    }
+}
+
+// ─── Gate 3 — Pullback ─────────────────────────────────────────────────────────
+
+/// A healthy breather after the impulse. Returns the retracement fraction when the
+/// pullback qualifies (vertical 20–55 % OR a very compressed shallow time-based
+/// drift), with falling volume, compressing ranges, the higher low unbroken, price
+/// holding above EMA20/VWAP and no violent counter bar.
+fn pullback_gate(
+    side:     Side,
+    bars:     &[Bar],
+    ema_slow: f64,
+    vwap_now: f64,
+    price:    f64,
+    imp:      &Impulse,
+    atr:      f64,
+) -> Option<f64> {
+    let n = bars.len();
+    if imp.ext_idx + 1 >= n {
+        return None; // no pullback bar yet (the extreme is the last bar)
+    }
+    let pb = &bars[imp.ext_idx + 1..];
+    let imp_leg = &bars[imp.pivot_idx..=imp.ext_idx];
+    let amplitude = (imp.ext_px - imp.pivot_px).abs();
+    if amplitude <= 0.0 {
+        return None;
+    }
+
+    // Retracement from the impulse extreme.
+    let retrace = match side {
+        Side::Long => {
+            let pb_low = pb.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+            (imp.ext_px - pb_low) / amplitude
+        }
+        Side::Short => {
+            let pb_high = pb.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+            (pb_high - imp.ext_px) / amplitude
+        }
+    };
+    if retrace > MAX_RETRACE {
+        return None; // too deep — not a continuation breather
+    }
+
+    // Volume must fall vs the impulse.
+    if mean_vol(pb) >= mean_vol(imp_leg) {
+        return None;
+    }
+    // No violent counter bar.
+    if pb.iter().any(|b| (b.high - b.low) > VIOLENT_ATR_MULT * atr) {
+        return None;
+    }
+    // Higher-low / lower-high not broken on a close.
+    match side {
+        Side::Long  => if pb.iter().any(|b| b.close < imp.pivot_px) { return None; },
+        Side::Short => if pb.iter().any(|b| b.close > imp.pivot_px) { return None; },
+    }
+    // Price still holding above EMA20 or VWAP (long) / below (short).
+    match side {
+        Side::Long  => if !(price > ema_slow || price > vwap_now) { return None; },
+        Side::Short => if !(price < ema_slow || price < vwap_now) { return None; },
+    }
+    // Ranges compressing / slowing.
+    let imp_range = mean_range(imp_leg);
+    let pb_range = mean_range(pb);
+    if pb_range >= imp_range {
+        return None;
+    }
+    // Breathing type: vertical retracement in band, OR a shallow time-based drift
+    // that is strongly compressed (price stalling near the high).
+    let vertical = (MIN_RETRACE..=MAX_RETRACE).contains(&retrace);
+    let time_based = retrace < MIN_RETRACE && pb_range <= COMPRESSION_MULT * imp_range;
+    if !(vertical || time_based) {
+        return None;
+    }
+    Some(retrace)
+}
+
+// ─── Gate 4 — Trigger ──────────────────────────────────────────────────────────
+
+/// The pullback has just closed its 3rd (or later) counter-trend bar and that bar is
+/// small (true range ≤ TRIGGER_SMALL_ATR_MULT × ATR).
+fn trigger_ready(side: Side, bars: &[Bar], imp: &Impulse, atr: f64) -> bool {
+    let n = bars.len();
+    if imp.ext_idx + 1 >= n {
         return false;
     }
-
-    // Relative volume vs the ticker's own daily norm pro-rated to the move duration.
-    move_rvol(move_vol, gs.move_bars.len(), bucket_secs, avg_vol).map_or(false, |r| r >= RVOL_MIN)
-}
-
-enum PullbackVerdict {
-    Fire { retrace: f64 },
-    Abort,
-    Wait,
-}
-
-/// Gate 2 evaluation at the close of a pullback candle (≥ MIN_PULLBACK_BARS).
-fn evaluate_pullback(gs: &GateState, last_bar: &Bar) -> PullbackVerdict {
-    let is_long = matches!(gs.side, Side::Long);
-
-    // Move envelope.
-    let move_high = gs.move_bars.iter().map(|b| b.high).fold(f64::MIN, f64::max);
-    let move_low = gs.move_bars.iter().map(|b| b.low).fold(f64::MAX, f64::min);
-    let amplitude = move_high - move_low;
-    if amplitude <= 0.0 {
-        return PullbackVerdict::Abort;
-    }
-
-    // Retracement of the pullback into the move (from the move's far extreme).
-    let depth = if is_long {
-        let pb_low = gs.pullback_bars.iter().map(|b| b.low).fold(f64::MAX, f64::min);
-        move_high - pb_low
-    } else {
-        let pb_high = gs.pullback_bars.iter().map(|b| b.high).fold(f64::MIN, f64::max);
-        pb_high - move_low
+    let pb = &bars[imp.ext_idx + 1..];
+    let counter = |b: &Bar| match side {
+        Side::Long => b.close <= b.open,
+        Side::Short => b.close >= b.open,
     };
-    let retrace = depth / amplitude;
-    if retrace > MAX_RETRACE {
-        return PullbackVerdict::Abort;
+    if pb.iter().filter(|b| counter(b)).count() < TRIGGER_PB_BARS {
+        return false;
     }
-
-    // Volume must be lost vs the move: total pullback volume ≤ total move volume.
-    let move_vol: u64 = gs.move_bars.iter().map(|b| b.volume).sum();
-    let pullback_vol: u64 = gs.pullback_bars.iter().map(|b| b.volume).sum();
-    if pullback_vol > move_vol {
-        return PullbackVerdict::Abort;
+    let last = bars.last().unwrap();
+    if !counter(last) {
+        return false;
     }
-
-    // The just-closed pullback candle must not be a violent bar: its true range
-    // below ATR_MAX_MULT × the average true range of the move candles.
-    let avg_move_tr = avg_true_range(&gs.move_bars);
-    let last_tr = last_bar.high - last_bar.low;
-    if avg_move_tr > 0.0 && last_tr >= ATR_MAX_MULT * avg_move_tr {
-        return PullbackVerdict::Wait;
-    }
-
-    PullbackVerdict::Fire { retrace }
+    (last.high - last.low) <= TRIGGER_SMALL_ATR_MULT * atr
 }
 
-/// Relative volume of the move vs the daily norm pro-rated to the move's minutes.
-/// None when the average is unknown / the move has no duration.
-fn move_rvol(move_vol: u64, n_bars: usize, bucket_secs: i64, avg_vol: u64) -> Option<f64> {
-    if avg_vol == 0 || n_bars == 0 {
-        return None;
+// ─── Indicator helpers (pure) ──────────────────────────────────────────────────
+
+/// EMA series (one value per input) using 2/(period+1) smoothing, seeded with the
+/// first value. Empty when inputs are empty.
+fn ema_series(values: &[f64], period: usize) -> Vec<f64> {
+    if values.is_empty() || period == 0 {
+        return Vec::new();
     }
-    let minutes = n_bars as f64 * (bucket_secs as f64 / 60.0);
-    let expected = avg_vol as f64 * (minutes / REGULAR_MINUTES_PER_DAY);
-    if expected <= 0.0 {
-        return None;
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut out = Vec::with_capacity(values.len());
+    let mut e = values[0];
+    out.push(e);
+    for &v in &values[1..] {
+        e = v * k + e * (1.0 - k);
+        out.push(e);
     }
-    Some(move_vol as f64 / expected)
+    out
 }
 
-/// Average true range (here high−low, wicks included) of the move candles.
-fn avg_true_range(bars: &[Bar]) -> f64 {
+/// Average true range over the last `period` bars (Wilder true range; first bar uses
+/// high−low). 0 when empty.
+fn atr(bars: &[Bar], period: usize) -> f64 {
+    if bars.is_empty() {
+        return 0.0;
+    }
+    let mut trs = Vec::with_capacity(bars.len());
+    for i in 0..bars.len() {
+        let tr = if i == 0 {
+            bars[i].high - bars[i].low
+        } else {
+            let pc = bars[i - 1].close;
+            (bars[i].high - bars[i].low)
+                .max((bars[i].high - pc).abs())
+                .max((bars[i].low - pc).abs())
+        };
+        trs.push(tr);
+    }
+    let take = period.min(trs.len());
+    if take == 0 {
+        return 0.0;
+    }
+    trs[trs.len() - take..].iter().sum::<f64>() / take as f64
+}
+
+/// Kaufman efficiency ratio over the last `window` steps: |net change| / Σ|step|.
+/// 1.0 = perfectly directional, ~0 = choppy. 0 when flat / too little data.
+fn efficiency_ratio(closes: &[f64], window: usize) -> f64 {
+    let n = closes.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let w = window.min(n - 1);
+    let slice = &closes[n - w - 1..];
+    let net = (slice[slice.len() - 1] - slice[0]).abs();
+    let path: f64 = slice.windows(2).map(|p| (p[1] - p[0]).abs()).sum();
+    if path <= 0.0 { 0.0 } else { net / path }
+}
+
+/// Number of times the close crossed its (cumulative session) VWAP in the last
+/// `window` steps.
+fn vwap_crosses(closes: &[f64], vwaps: &[f64], window: usize) -> usize {
+    let n = closes.len().min(vwaps.len());
+    if n < 2 {
+        return 0;
+    }
+    let start = n.saturating_sub(window + 1);
+    let mut crosses = 0;
+    let mut prev = closes[start] - vwaps[start];
+    for i in start + 1..n {
+        let d = closes[i] - vwaps[i];
+        if d != 0.0 {
+            if prev != 0.0 && (d > 0.0) != (prev > 0.0) {
+                crosses += 1;
+            }
+            prev = d;
+        }
+    }
+    crosses
+}
+
+/// Number of candle-colour changes (green↔red) over the last `window` bars.
+fn color_alternations(bars: &[Bar], window: usize) -> usize {
+    let n = bars.len();
+    if n < 2 {
+        return 0;
+    }
+    let start = n.saturating_sub(window);
+    let green = |b: &Bar| b.close >= b.open;
+    let mut alt = 0;
+    for i in start + 1..n {
+        if green(&bars[i]) != green(&bars[i - 1]) {
+            alt += 1;
+        }
+    }
+    alt
+}
+
+/// Index of the most recent confirmed swing low (low ≤ the lows of `span` bars on
+/// each side). None when none is confirmed.
+fn last_swing_low(bars: &[Bar], span: usize) -> Option<usize> {
+    if bars.len() < 2 * span + 1 {
+        return None;
+    }
+    for i in (span..bars.len() - span).rev() {
+        let lo = bars[i].low;
+        if (1..=span).all(|d| bars[i - d].low >= lo && bars[i + d].low >= lo) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Index of the most recent confirmed swing high. None when none is confirmed.
+fn last_swing_high(bars: &[Bar], span: usize) -> Option<usize> {
+    if bars.len() < 2 * span + 1 {
+        return None;
+    }
+    for i in (span..bars.len() - span).rev() {
+        let hi = bars[i].high;
+        if (1..=span).all(|d| bars[i - d].high <= hi && bars[i + d].high <= hi) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn mean_vol(bars: &[Bar]) -> f64 {
+    if bars.is_empty() {
+        return 0.0;
+    }
+    bars.iter().map(|b| b.volume as f64).sum::<f64>() / bars.len() as f64
+}
+
+fn recent_mean_vol(bars: &[Bar], window: usize) -> f64 {
+    let start = bars.len().saturating_sub(window);
+    mean_vol(&bars[start..])
+}
+
+fn mean_range(bars: &[Bar]) -> f64 {
     if bars.is_empty() {
         return 0.0;
     }
     bars.iter().map(|b| b.high - b.low).sum::<f64>() / bars.len() as f64
 }
 
-/// Aggregate closed 1-min bars into closed `bucket_secs` bars (clock-aligned; 09:30
-/// ET aligns since 13:30:00 UTC is divisible by 60/120/300/600). A bucket is
-/// "closed" only once `now` is past its end. For the 1-minute timeframe the M1 bars
-/// are already aligned closed candles, so they're returned as-is.
-fn aggregate(m1: &[Bar], bucket_secs: i64, now: DateTime<Utc>) -> Vec<Bar> {
-    if bucket_secs <= 60 {
-        return m1.to_vec();
-    }
-    let mut out: Vec<Bar> = Vec::new();
+/// Aggregate session M1 bars (ascending, already bounded to ≥ session open) into
+/// closed 5-minute bars, plus the cumulative session VWAP at each 5m bar's close.
+/// The VWAP is reconstructed by accumulating every M1 bar's (vwap × volume) — Alpaca's
+/// per-minute `vw` — across the session, matching the broker's session VWAP. Only
+/// 5-minute buckets whose end is at/before `now` are returned (closed bars).
+fn session_5m(m1: &[Bar], now: DateTime<Utc>) -> (Vec<Bar>, Vec<f64>) {
+    let mut bars: Vec<Bar> = Vec::new();
+    let mut vwaps: Vec<f64> = Vec::new();
+    let mut pv = 0.0_f64; // Σ price × volume over the session so far
+    let mut vol = 0.0_f64;
     for b in m1 {
-        let bucket = (b.time.timestamp() / bucket_secs) * bucket_secs;
-        match out.last_mut() {
+        let price = b.vwap.unwrap_or((b.high + b.low + b.close) / 3.0);
+        pv += price * b.volume as f64;
+        vol += b.volume as f64;
+        let cum_vwap = if vol > 0.0 { pv / vol } else { price };
+        let bucket = (b.time.timestamp() / BUCKET_SECS) * BUCKET_SECS;
+        match bars.last_mut() {
             Some(last) if last.time.timestamp() == bucket => {
                 last.high = last.high.max(b.high);
                 last.low = last.low.min(b.low);
                 last.close = b.close;
                 last.volume += b.volume;
                 last.trade_count = Some(last.trade_count.unwrap_or(0) + b.trade_count.unwrap_or(0));
+                *vwaps.last_mut().unwrap() = cum_vwap;
             }
-            _ => out.push(Bar {
-                time:        Utc.timestamp_opt(bucket, 0).single().unwrap_or(b.time),
-                open:        b.open,
-                high:        b.high,
-                low:         b.low,
-                close:       b.close,
-                volume:      b.volume,
-                vwap:        None, // unused for detection
-                trade_count: Some(b.trade_count.unwrap_or(0)),
-            }),
+            _ => {
+                bars.push(Bar {
+                    time:        Utc.timestamp_opt(bucket, 0).single().unwrap_or(b.time),
+                    open:        b.open,
+                    high:        b.high,
+                    low:         b.low,
+                    close:       b.close,
+                    volume:      b.volume,
+                    vwap:        None,
+                    trade_count: Some(b.trade_count.unwrap_or(0)),
+                });
+                vwaps.push(cum_vwap);
+            }
         }
     }
-    out.retain(|bar| now.timestamp() >= bar.time.timestamp() + bucket_secs);
-    out
+    // Drop the last bucket while it is still forming (end past `now`).
+    while let Some(last) = bars.last() {
+        if now.timestamp() < last.time.timestamp() + BUCKET_SECS {
+            bars.pop();
+            vwaps.pop();
+        } else {
+            break;
+        }
+    }
+    (bars, vwaps)
 }
 
-/// Build the fire signal for a completed move→pullback.
+/// Build the fire signal for a completed pullback trigger.
 #[allow(clippy::too_many_arguments)]
 fn make_alert(
     symbol:         &str,
-    tf_label:       &str,
     side:           Side,
-    rvol:           Option<f64>,
     retrace:        f64,
-    move_bars:      usize,
-    pullback_bars:  usize,
+    move_dollar:    f64,
+    atr:            f64,
     price:          f64,
     volume_day:     u64,
     change_day_pct: Option<f64>,
+    rvol:           Option<f64>,
     now:            DateTime<Utc>,
 ) -> AlertSignal {
     let side_str = if matches!(side, Side::Long) { "Long" } else { "Short" };
+    let mult = if atr > 0.0 { move_dollar / atr } else { 0.0 };
     let rvol_str = rvol.map(|r| format!(" RVOL ×{r:.1},")).unwrap_or_default();
     AlertSignal {
-        alert_id:      format!("pp-{}-{}-{}", now.timestamp_millis(), symbol, tf_label),
+        alert_id:      format!("pp-{}-{}-{}", now.timestamp_millis(), symbol, TF_LABEL),
         timestamp:     now,
         symbol:        symbol.to_string(),
         strategy_id:   STRATEGY_ID.to_string(),
@@ -627,12 +830,11 @@ fn make_alert(
         halted:        Some(false),
         latency_ui_ms: None,
         reason: format!(
-            "Perfect Pullback {side_str} {tf_label} — Market Attention,{rvol_str} montée \
-             {move_bars} barres, pullback {pullback_bars} barres (retracement {:.0}%) — ${:.2}",
+            "Perfect Pullback {side_str} {TF_LABEL} — impulsion {move_dollar:.2}$ \
+             ({mult:.1}×ATR),{rvol_str} pullback {:.0}% (3e bougie compacte) — ${price:.2}",
             retrace * 100.0,
-            price,
         ),
-        display_timeframe: Some(tf_label.to_string()),
+        display_timeframe: Some(TF_LABEL.to_string()),
         side:          Some(side),
     }
 }
@@ -658,4 +860,106 @@ fn et_minutes(now: DateTime<Utc>) -> u32 {
 /// ET calendar date (YYYY-MM-DD) — the key the memorised candidate set is built for.
 fn et_date(now: DateTime<Utc>) -> String {
     crate::time::et_date(now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(i: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + i * BUCKET_SECS, 0).single().unwrap()
+    }
+
+    fn bar(i: i64, o: f64, h: f64, l: f64, c: f64, vol: u64) -> Bar {
+        Bar { time: t(i), open: o, high: h, low: l, close: c, volume: vol, vwap: Some(c), trade_count: Some(10) }
+    }
+
+    #[test]
+    fn ema_tracks_and_fast_leads_in_uptrend() {
+        let v: Vec<f64> = (0..30).map(|i| 100.0 + i as f64).collect();
+        let f = ema_series(&v, 9);
+        let s = ema_series(&v, 20);
+        assert_eq!(f.len(), v.len());
+        // In a steady uptrend the faster EMA sits above the slower one.
+        assert!(*f.last().unwrap() > *s.last().unwrap());
+    }
+
+    #[test]
+    fn efficiency_ratio_directional_vs_choppy() {
+        let trend = vec![10.0, 11.0, 12.0, 13.0, 14.0];
+        assert!((efficiency_ratio(&trend, 4) - 1.0).abs() < 1e-9);
+        let chop = vec![10.0, 11.0, 10.0, 11.0, 10.0];
+        assert!(efficiency_ratio(&chop, 4) < 0.35);
+    }
+
+    #[test]
+    fn swing_pivots_found() {
+        // lows: 100, 99.5(min), 99.6, 100.9 → swing low at index 1.
+        let lows = vec![
+            bar(0, 100.0, 100.2, 99.9, 100.0, 1000),
+            bar(1, 100.0, 100.0, 99.5, 99.8, 1000),
+            bar(2, 99.6, 101.0, 99.6, 100.9, 3000),
+            bar(3, 101.0, 102.5, 100.9, 102.4, 3500),
+        ];
+        assert_eq!(last_swing_low(&lows, 1), Some(1));
+        // highs: 100.5, 101.5(peak), 100.8 → swing high at index 1.
+        let highs = vec![
+            bar(0, 100.0, 100.5, 99.8, 100.2, 1000),
+            bar(1, 100.2, 101.5, 100.1, 101.3, 2000),
+            bar(2, 100.4, 100.8, 100.0, 100.4, 1500),
+        ];
+        assert_eq!(last_swing_high(&highs, 1), Some(1));
+    }
+
+    #[test]
+    fn vwap_crosses_counts_sign_changes() {
+        let closes = vec![10.0, 9.0, 11.0, 9.0];
+        let vwaps  = vec![10.0, 10.0, 10.0, 10.0];
+        // below, above, below → 2 crossings over the window.
+        assert_eq!(vwap_crosses(&closes, &vwaps, 6), 2);
+    }
+
+    /// A clean long impulse + a 3-bar compact red pullback fires a Long.
+    #[test]
+    fn clean_long_setup_triggers() {
+        let bars = vec![
+            bar(0, 100.0, 100.2, 99.9, 100.0, 1000),
+            bar(1, 100.0, 100.0, 99.5, 99.8, 1000),  // swing low pivot
+            bar(2, 99.6, 101.0, 99.6, 100.9, 3000),  // impulse up
+            bar(3, 101.0, 102.5, 100.9, 102.4, 3500),// impulse high
+            bar(4, 102.4, 102.4, 102.0, 102.1, 1500),// pullback 1 (red, small)
+            bar(5, 102.1, 102.2, 101.8, 101.9, 1200),// pullback 2 (red, small)
+            bar(6, 101.9, 102.0, 101.7, 101.8, 1000),// pullback 3 (red, small) → trigger
+        ];
+        let vwaps = vec![99.0; bars.len()]; // price well above VWAP throughout
+        let inp = TickerInput {
+            symbol: "AAA".into(), m1: vec![], price: 101.8,
+            volume_day: 0, change_day_pct: None, avg_vol: 0,
+        };
+        let mut st = SymbolState::default();
+        let fire = evaluate(&mut st, &inp, &bars, &vwaps, t(7));
+        let a = fire.expect("clean long setup should trigger");
+        assert_eq!(a.side, Some(Side::Long));
+        // Cooldown armed; the same bar can't fire twice.
+        assert!(st.cooldown_until.is_some());
+        assert!(evaluate(&mut st, &inp, &bars, &vwaps, t(7)).is_none());
+    }
+
+    /// A choppy series produces no direction → no signal.
+    #[test]
+    fn choppy_series_does_not_trigger() {
+        let mut bars = Vec::new();
+        for i in 0..8 {
+            let up = i % 2 == 0;
+            let (o, c): (f64, f64) = if up { (100.0, 101.0) } else { (101.0, 100.0) };
+            bars.push(bar(i, o.min(c), 101.2, 99.8, c, 1500));
+        }
+        let vwaps = vec![100.5; bars.len()];
+        let inp = TickerInput {
+            symbol: "BBB".into(), m1: vec![], price: 100.0,
+            volume_day: 0, change_day_pct: None, avg_vol: 0,
+        };
+        let mut st = SymbolState::default();
+        assert!(evaluate(&mut st, &inp, &bars, &vwaps, t(9)).is_none());
+    }
 }

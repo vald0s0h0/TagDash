@@ -21,6 +21,8 @@ import type {
   Time,
 } from "lightweight-charts";
 import type { TradeExecutions } from "@/types";
+import { getChartTheme } from "@/stores/chartThemeStore";
+import { hexToRgba } from "@/charts/drawingsPrimitive";
 
 // Minimal shape of the bitmap rendering scope (avoids a fancy-canvas import).
 interface BitmapScope {
@@ -35,14 +37,9 @@ interface RenderTarget {
 const TRI_W = 7; // triangle horizontal size (CSS px)
 const TRI_H = 8; // triangle height (CSS px)
 
-const COLOR_BUY  = "#22c55e"; // green
-const COLOR_SELL = "#ef4444"; // red
-const LINE_PROFIT = "rgba(34,197,94,0.75)";
-const LINE_LOSS   = "rgba(239,68,68,0.75)";
-const LINE_OPEN   = "rgba(150,150,150,0.45)";
-// Original (launch-time) stop loss — a thin, discreet dashed segment spanning the
-// trade's duration.
-const SL0_COLOR   = "rgba(239,68,68,0.4)";
+// The open-trade connecting line stays a fixed neutral grey (it carries no P&L
+// sign yet, so it isn't user-themed).
+const LINE_OPEN = "rgba(150,150,150,0.45)";
 
 function toSecNum(iso: string): number {
   return Math.floor(new Date(iso).getTime() / 1000);
@@ -73,6 +70,14 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
     const series = this.src.series;
     if (!chart || !series) return;
     const ts = chart.timeScale();
+
+    // User-tunable execution colours (read live each draw).
+    const t = getChartTheme().executions;
+    const colorBuy   = t.buy;
+    const colorSell  = t.sell;
+    const lineProfit = hexToRgba(t.profit, 0.75);
+    const lineLoss   = hexToRgba(t.loss, 0.75);
+    const sl0Color   = hexToRgba(t.loss, 0.4); // launch-time SL: discreet dashed
 
     target.useBitmapCoordinateSpace((scope) => {
       const ctx = scope.context;
@@ -108,7 +113,7 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
             const x2 = ts.timeToCoordinate(endSec as Time);
             if (x1 != null && x2 != null) {
               ctx.save();
-              ctx.strokeStyle = SL0_COLOR;
+              ctx.strokeStyle = sl0Color;
               ctx.lineWidth = Math.max(1, Math.floor(vr));
               ctx.setLineDash([4 * hr, 4 * hr]);
               ctx.beginPath();
@@ -128,7 +133,7 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
           ctx.moveTo(pts[0].x, pts[0].y);
           for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
           ctx.strokeStyle = trade.closed
-            ? (trade.pnl >= 0 ? LINE_PROFIT : LINE_LOSS)
+            ? (trade.pnl >= 0 ? lineProfit : lineLoss)
             : LINE_OPEN;
           ctx.lineWidth = Math.max(1, Math.floor(vr));
           ctx.stroke();
@@ -137,7 +142,7 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
         // Triangles — tip (apex) at the fill price/bar; body on the opposite
         // side of where it points. Colour is per-fill: green buy / red sell.
         for (const p of pts) {
-          ctx.fillStyle = p.buy ? COLOR_BUY : COLOR_SELL;
+          ctx.fillStyle = p.buy ? colorBuy : colorSell;
           ctx.beginPath();
           ctx.moveTo(p.x, p.y); // apex at price
           if (p.increase) {
@@ -195,4 +200,7 @@ export class ExecutionsPrimitive implements ISeriesPrimitive<Time> {
     this.barTimes = barTimes;
     this.requestUpdate?.();
   }
+
+  /** Force a redraw (e.g. after a theme edit — colours are read at draw time). */
+  redraw(): void { this.requestUpdate?.(); }
 }

@@ -149,6 +149,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        // Native Gamepad-API polyfill (WebView2/WKWebView don't expose it). Makes
+        // the Xbox controller visible to navigator.getGamepads() in the frontend.
+        .plugin(tauri_plugin_gamepad::init())
         // `relaunch()` after an auto-update is installed.
         .plugin(tauri_plugin_process::init())
         .manage(app_state)
@@ -168,6 +171,26 @@ pub fn run() {
             let db      = state.db.clone();
             let config  = state.config.clone();
             let secrets = state.secrets.clone();
+
+            // Seed bundled default mood images / phrases / backgrounds into the
+            // user's app-data ONCE (first launch). Never overwrites the user's own
+            // files, and a one-time marker means later edits/deletions stick.
+            {
+                let seeded = {
+                    let g = db.lock().unwrap();
+                    local_db::cache_repository::get_app_meta(&g, "default_assets_seeded").as_deref()
+                        == Some("1")
+                };
+                if !seeded {
+                    if let Ok(res) =
+                        app.path().resolve("resources/defaults", tauri::path::BaseDirectory::Resource)
+                    {
+                        dashboard::seed_default_assets(&res, &state.app_dir);
+                    }
+                    let g = db.lock().unwrap();
+                    let _ = local_db::cache_repository::set_app_meta(&g, "default_assets_seeded", "1");
+                }
+            }
 
             // 0. Desktop attention cues for new alerts (flash overlay + foreground).
             //    Build the full-screen white flash overlay: always-on-top, transparent,
@@ -372,6 +395,7 @@ pub fn run() {
             commands::update_local_config,
             // Secrets
             commands::get_secrets_status,
+            commands::update_secrets,
             // Journal tags (user-defined) + TradeTally queue
             commands::get_journal_tags,
             commands::get_sync_queue_status,
@@ -437,6 +461,7 @@ pub fn run() {
             commands::force_recompute_scores,
             commands::get_card_info,
             commands::get_ticker_news,
+            commands::get_news_markers,
             // Company intelligence (read-only cache + background refresh trigger)
             commands::get_company_intel_catalog,
             commands::get_company_intel,
@@ -450,6 +475,8 @@ pub fn run() {
             commands::open_backgrounds_folder,
             commands::get_mood,
             commands::open_mood_target,
+            commands::get_default_dashboard,
+            commands::export_dashboard_default,
             // Embedded TradeTally webview (native child webview over the tab)
             commands::tradetally_set_bounds,
             commands::tradetally_hide,

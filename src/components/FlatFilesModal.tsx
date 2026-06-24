@@ -1,18 +1,21 @@
 // Gestion Flat Files — download, browse and share offline market-data days.
 //
-// Downloads 1-minute bars (premarket + regular + after-hours) of the liquid US
-// universe per trading day into `<app_dir>/flat_files/flat-YYYY-MM-DD.db`, so the
-// platform can run entirely offline through Market Replay (useful if the Alpaca
-// API becomes unavailable, and to share a day with another TagDash user — just
-// copy the `.db` file into their folder). A month calendar colour-codes which days
-// are available on disk. The data-source toggle (API ↔ Flat files) is duplicated
-// here and in Settings → API Keys; the choice is persisted in tagdash.toml.
+// Three datasets live side by side, each with its own download logic + calendar:
+//   • Trade  — real trades + quotes inside the [alert−1min, +10min] windows where a
+//     minute pre-scan says Micro Pullback would ignite (historical float aware).
+//   • Minute — 1-minute bars of the day's 2000 most-traded symbols (04:00→20:00 ET),
+//     plus the 5 previous trading days for intraday chart history.
+//   • Daily  — daily bars of the whole US universe, appended into a cumulative
+//     daily.db whose table is identical to the local database.
+// The data-source toggle (API ↔ Flat files) is duplicated here and in Settings →
+// API Keys; the choice is persisted in tagdash.toml.
 
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   ChevronLeft,
   ChevronRight,
+  Clock,
   Database,
   Download,
   FolderOpen,
@@ -30,7 +33,7 @@ import { Button } from "@/components/ui/button";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
-import type { FlatFileDay, FlatFilesStatus } from "@/types";
+import type { FlatFileDay, FlatFilesKind, FlatFilesStatus } from "@/types";
 
 interface Props {
   open: boolean;
@@ -42,6 +45,38 @@ const MONTH_LABELS = [
   "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
   "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
 ];
+
+const KIND_META: Record<
+  FlatFilesKind,
+  { label: string; blurb: string; unitSymbols: string; unitBars: string }
+> = {
+  trade: {
+    label: "Trade",
+    blurb:
+      "Trades + quotes réels autour des fenêtres où Micro Pullback se déclencherait " +
+      "(pré-scan minute), de −1 min à +10 min. Le float historique du jour est pris en " +
+      "compte. Un fichier SQLite par jour.",
+    unitSymbols: "tickers",
+    unitBars: "trades",
+  },
+  minute: {
+    label: "Minute",
+    blurb:
+      "Barres 1 minute (pré-marché + séance + post-marché) des 2000 actions les plus " +
+      "échangées du jour, plus les 5 jours précédents pour l'historique intraday. " +
+      "Un fichier par jour.",
+    unitSymbols: "symboles",
+    unitBars: "barres",
+  },
+  daily: {
+    label: "Daily",
+    blurb:
+      "Barres journalières (daily) de tout l'univers US, ajoutées dans une base " +
+      "cumulative daily.db au format identique à la base de données.",
+    unitSymbols: "symboles",
+    unitBars: "barres",
+  },
+};
 
 /** Local YYYY-MM-DD (no timezone shift). */
 function ymd(d: Date): string {
@@ -61,6 +96,9 @@ export function FlatFilesModal({ open, onClose }: Props) {
   const { data: config } = useLocalConfig();
   const update = useUpdateLocalConfig();
   const mode = config?.data_source?.mode ?? "api";
+
+  // Active sub-tab (dataset).
+  const [tab, setTab] = useState<FlatFilesKind>("minute");
 
   // Download range (defaults: last 30 days → yesterday).
   const today = useMemo(() => new Date(), []);
@@ -93,17 +131,17 @@ export function FlatFilesModal({ open, onClose }: Props) {
     };
   }, [open]);
 
-  // Days available on disk → calendar colouring. Refetched as days complete.
+  // Days available on disk for the active tab → calendar colouring.
   const calendar = useQuery({
-    queryKey: ["flat-files-calendar"],
-    queryFn: api.getFlatFilesCalendar,
+    queryKey: ["flat-files-calendar", tab],
+    queryFn: () => api.getFlatFilesCalendar(tab),
     enabled: open,
   });
   useEffect(() => {
     if (open) calendar.refetch();
-    // Refetch whenever a new day finishes downloading.
+    // Refetch whenever a new day finishes downloading or the tab changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status?.last_done, open]);
+  }, [status?.last_done, tab, open]);
 
   const byDay = useMemo(() => {
     const m = new Map<string, FlatFileDay>();
@@ -112,6 +150,7 @@ export function FlatFilesModal({ open, onClose }: Props) {
   }, [calendar.data]);
 
   const running = status?.running ?? false;
+  const meta = KIND_META[tab];
 
   const setMode = (next: "api" | "flat_files") => {
     if (!config || next === mode) return;
@@ -121,7 +160,7 @@ export function FlatFilesModal({ open, onClose }: Props) {
   const startDownload = async () => {
     setStartErr(null);
     try {
-      await api.flatFilesDownload(start, end);
+      await api.flatFilesDownload(tab, start, end);
     } catch (e) {
       setStartErr(String(e));
     }
@@ -141,8 +180,14 @@ export function FlatFilesModal({ open, onClose }: Props) {
   }, [month]);
 
   const todayKey = ymd(today);
-
   const availableCount = (calendar.data ?? []).filter((d) => d.complete).length;
+
+  // Daily coverage (first/last date present in the cumulative file).
+  const coverage = useMemo(() => {
+    const days = (calendar.data ?? []).map((d) => d.day).sort();
+    if (days.length === 0) return null;
+    return { from: days[0], to: days[days.length - 1], count: days.length };
+  }, [calendar.data]);
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
@@ -187,14 +232,31 @@ export function FlatFilesModal({ open, onClose }: Props) {
             </div>
           </div>
 
+          {/* ── Sub-tabs: Trade / Minute / Daily ── */}
+          <div className="flex overflow-hidden rounded-md border border-border">
+            {(Object.keys(KIND_META) as FlatFilesKind[]).map((k) => (
+              <button
+                key={k}
+                onClick={() => setTab(k)}
+                className={cn(
+                  "flex-1 px-3 py-2 text-xs font-medium transition-colors",
+                  tab === k ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
+                )}
+              >
+                {KIND_META[k].label}
+                {running && status?.kind === k && (
+                  <Loader2 className="ml-1.5 inline h-3 w-3 animate-spin" />
+                )}
+              </button>
+            ))}
+          </div>
+
           {/* ── Download a date range ── */}
           <div className="rounded-md border border-border p-3">
-            <div className="mb-2 text-sm font-medium">Télécharger des journées</div>
-            <p className="mb-3 text-xs text-muted-foreground">
-              Barres 1 minute (pré-marché + séance + post-marché) du sous-ensemble liquide
-              de l'univers US, un fichier SQLite par jour. Les week-ends et jours déjà
-              téléchargés sont ignorés.
-            </p>
+            <div className="mb-2 text-sm font-medium">
+              {tab === "daily" ? "Télécharger une plage daily" : "Télécharger des journées"}
+            </div>
+            <p className="mb-3 text-xs text-muted-foreground">{meta.blurb}</p>
             <div className="flex flex-wrap items-end gap-3">
               <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
                 Du
@@ -228,7 +290,7 @@ export function FlatFilesModal({ open, onClose }: Props) {
                 </Button>
               )}
 
-              <Button size="sm" variant="outline" onClick={() => api.openFlatFilesFolder().catch(() => {})}>
+              <Button size="sm" variant="outline" onClick={() => api.openFlatFilesFolder(tab).catch(() => {})}>
                 <FolderOpen className="mr-1.5 h-3.5 w-3.5" /> Ouvrir le dossier
               </Button>
             </div>
@@ -238,7 +300,8 @@ export function FlatFilesModal({ open, onClose }: Props) {
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
                   <span className="flex items-center gap-1.5">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    {status?.current_day ?? "…"} · jour {status?.day_index ?? 0}/{status?.day_total ?? 0}
+                    {status?.kind ? `[${status.kind}] ` : ""}
+                    {status?.current_day ?? "…"} · {status?.day_index ?? 0}/{status?.day_total ?? 0}
                   </span>
                   <span className="tabular-nums">{Math.round((status?.progress ?? 0) * 100)} %</span>
                 </div>
@@ -257,6 +320,11 @@ export function FlatFilesModal({ open, onClose }: Props) {
               </div>
             )}
             {startErr && <p className="mt-2 text-xs text-red-400">{startErr}</p>}
+            {!running && status?.state === "error" && status?.error && (
+              <p className="mt-2 text-xs text-red-400" title={status.error}>
+                Échec : {status.error}
+              </p>
+            )}
             {!running && status?.state === "done" && status?.error && (
               <p className="mt-2 text-xs text-amber-400" title={status.error}>
                 Terminé avec des jours ignorés (jours fériés / sans données).
@@ -264,8 +332,8 @@ export function FlatFilesModal({ open, onClose }: Props) {
             )}
             <p className="mt-2 text-[11px] text-muted-foreground">
               Pour <strong>importer</strong> les flat files d'un autre utilisateur TagDash&nbsp;:
-              ouvrez le dossier et déposez-y ses fichiers <code className="rounded bg-muted px-1">flat-*.db</code> —
-              ils apparaissent en vert dans le calendrier et deviennent rejouables.
+              ouvrez le dossier et déposez-y ses fichiers — ils apparaissent en vert dans le
+              calendrier et deviennent rejouables.
             </p>
           </div>
 
@@ -297,6 +365,13 @@ export function FlatFilesModal({ open, onClose }: Props) {
               </div>
             </div>
 
+            {tab === "daily" && coverage && (
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <Clock className="h-3 w-3" />
+                Couverture daily.db : {coverage.from} → {coverage.to} ({coverage.count} jours)
+              </div>
+            )}
+
             <div className="grid grid-cols-7 gap-1">
               {WEEKDAY_LABELS.map((w) => (
                 <div key={w} className="py-1 text-center text-[10px] uppercase text-muted-foreground/60">
@@ -320,7 +395,7 @@ export function FlatFilesModal({ open, onClose }: Props) {
                       ? "bg-transparent text-muted-foreground/30 border-transparent"
                       : "bg-muted/40 text-muted-foreground border-border/40";
                 const title = entry
-                  ? `${key} — ${entry.complete ? "disponible" : "partiel"} · ${entry.symbol_count} symboles · ${entry.bar_count.toLocaleString()} barres · ${formatBytes(entry.bytes)}`
+                  ? `${key} — ${entry.complete ? "disponible" : "partiel"} · ${entry.symbol_count} ${meta.unitSymbols} · ${entry.bar_count.toLocaleString()} ${meta.unitBars}${entry.bytes > 0 ? ` · ${formatBytes(entry.bytes)}` : ""}`
                   : weekend
                     ? `${key} — week-end`
                     : future

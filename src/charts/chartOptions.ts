@@ -3,6 +3,8 @@
 
 import { LineStyle, type UTCTimestamp } from "lightweight-charts";
 import type { Timeframe } from "@/types";
+import { getChartTheme } from "@/stores/chartThemeStore";
+import { hexToRgba } from "@/charts/drawingsPrimitive";
 
 export function toUTC(isoString: string): UTCTimestamp {
   return Math.floor(new Date(isoString).getTime() / 1000) as UTCTimestamp;
@@ -30,8 +32,9 @@ export const BACKFILL_BATCH = 300;
 // (rendered in the component, tracked to the line) replaces the native axis tag,
 // so the delete button is part of the label instead of a separate overlay.
 export function slOpts(order: boolean, title = "SL") {
+  const c = getChartTheme().levels.sl;
   return {
-    color:            order ? "rgba(239,68,68,0.55)" : "#ef4444",
+    color:            order ? hexToRgba(c, 0.55) : c,
     lineWidth:        1 as const,
     lineStyle:        order ? LineStyle.Dotted : LineStyle.Solid,
     axisLabelVisible: false,
@@ -39,8 +42,9 @@ export function slOpts(order: boolean, title = "SL") {
   };
 }
 export function tpOpts(order: boolean, title = "TP") {
+  const c = getChartTheme().levels.tp;
   return {
-    color:            order ? "rgba(34,197,94,0.55)" : "#22c55e",
+    color:            order ? hexToRgba(c, 0.55) : c,
     lineWidth:        1 as const,
     lineStyle:        order ? LineStyle.Dotted : LineStyle.Solid,
     axisLabelVisible: false,
@@ -63,13 +67,28 @@ export const BID_ASK_OPTIONS = {
   axisLabelVisible: true,
 };
 
-export const ALARM_OPTIONS = {
-  color:            "#f59e0b", // amber
+/** Price-alarm line style — amber by default, colour from the theme. A function
+ *  (not a constant) so the colour is read live at create-time. */
+export function alarmOpts() {
+  return {
+    color:            getChartTheme().levels.alarm,
+    lineWidth:        1 as const,
+    lineStyle:        LineStyle.Dashed,
+    // Native axis tag off — the right-edge "price + ✕" label pill stands in for it.
+    axisLabelVisible: false,
+    title:            "⏰",
+  };
+}
+
+// Controller horizontal cursor (right stick). A distinct sky-blue dashed line the
+// pad nudges up/down; A/B/Y drop an SL/alarm/TP at its price. The axis tag stays
+// on (so the exact price is readable while aiming) since it isn't a persisted level.
+export const CURSOR_OPTIONS = {
+  color:            "#38bdf8", // sky
   lineWidth:        1 as const,
   lineStyle:        LineStyle.Dashed,
-  // Native axis tag off — the right-edge "price + ✕" label pill stands in for it.
-  axisLabelVisible: false,
-  title:            "⏰",
+  axisLabelVisible: true,
+  title:            "⊹",
 };
 
 // Previous-day reference levels (close = key, high/low = secondary). Drawn as

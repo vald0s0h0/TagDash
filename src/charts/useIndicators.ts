@@ -3,10 +3,12 @@ import type { IChartApi, ISeriesApi, LineData } from "lightweight-charts";
 import type { Bar, PaneIndicator } from "@/types";
 import {
   indicatorId, computeEma, computeSma, computeBollinger, computeDailyVwap,
-  INDICATOR_COLORS, BOLLINGER_K, BOLLINGER_FILL,
+  BOLLINGER_K,
 } from "@/charts/indicators";
 import type { BollingerPrimitive, BollingerBand } from "@/charts/bollingerPrimitive";
 import { toUTC } from "@/charts/chartOptions";
+import { hexToRgba } from "@/charts/drawingsPrimitive";
+import type { ChartTheme } from "@/stores/chartThemeStore";
 
 /** Strategy-card-driven indicator series (VWAP / EMA / SMA / Bollinger), drawn on
  *  this pane. Reconciles the requested series against what's currently drawn, then
@@ -22,6 +24,7 @@ export function useIndicators(
   bollingerPrimRef: MutableRefObject<BollingerPrimitive | null>,
   bars: Bar[] | undefined,
   indicators: PaneIndicator[],
+  theme: ChartTheme,
 ) {
   const indicatorsKey = indicators.map(indicatorId).join(",");
   useEffect(() => {
@@ -61,11 +64,12 @@ export function useIndicators(
 
     // Bollinger → translucent fill band(s) via the primitive (one per requested
     // bollinger indicator). No data ⇒ cleared above; here we (re)compute.
+    const bollingerFill = hexToRgba(theme.indicators.bollinger, theme.indicators.bollingerOpacity);
     const bands: BollingerBand[] = [];
     for (const ind of indicators) {
       if (ind.kind !== "bollinger_bands") continue;
       const { upper, lower } = computeBollinger(closes, ind.period ?? 20, BOLLINGER_K);
-      bands.push({ times, upper, lower, fill: BOLLINGER_FILL });
+      bands.push({ times, upper, lower, fill: bollingerFill });
     }
     bollingerPrimRef.current?.setData(bands);
 
@@ -84,16 +88,23 @@ export function useIndicators(
 
       // Line indicators: vwap / ema / sma
       const id = indicatorId(ind);
+      const color =
+        ind.kind === "vwap" ? theme.indicators.vwap
+        : ind.kind === "ema" ? theme.indicators.ema
+        : ind.kind === "sma" ? theme.indicators.sma
+        : "#888";
       let series = indicatorSeriesMap.current.get(id) as ISeriesApi<"Line"> | undefined;
       if (!series) {
         series = chart.addLineSeries({
-          color:                  INDICATOR_COLORS[ind.kind as keyof typeof INDICATOR_COLORS] ?? "#888",
+          color,
           lineWidth:              1,
           priceLineVisible:       false,
           lastValueVisible:       false,
           crosshairMarkerVisible: false,
         });
         indicatorSeriesMap.current.set(id, series);
+      } else {
+        series.applyOptions({ color }); // recolour live on a theme edit
       }
 
       let values: (number | null)[];
@@ -106,5 +117,5 @@ export function useIndicators(
       values.forEach((v, i) => { if (v != null) data.push({ time: times[i], value: v }); });
       try { series.setData(data); } catch { /* duplicate-time guard */ }
     }
-  }, [bars, indicatorsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bars, indicatorsKey, theme]); // eslint-disable-line react-hooks/exhaustive-deps
 }

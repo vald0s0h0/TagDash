@@ -388,6 +388,10 @@ export interface AppConfig {
     flash_alerts: AttentionMode;
     /** When to force the TagDash window back to the foreground on a new alert. */
     foreground_alerts: AttentionMode;
+    /** When to play a sound on a new scanner alert, by trading session. */
+    alert_sound_mode: AttentionMode;
+    /** Which notification sound to play (see notifSounds.ts for the catalog). */
+    alert_sound: string;
   };
   latency: { warn_ms: number; critical_ms: number };
   tradetally: { api_base_url: string };
@@ -398,25 +402,33 @@ export interface AppConfig {
   data_source: { mode: "api" | "flat_files" };
 }
 
+/** Which flat-files dataset: trades+quotes, minute bars, or daily bars. */
+export type FlatFilesKind = "trade" | "minute" | "daily";
+
 /** Background flat-files download progress (polled while running). */
 export interface FlatFilesStatus {
   running:     boolean;
+  /** Which dataset is downloading: trade | minute | daily. */
+  kind:        string;
   /** idle | running | done | cancelled | error */
   state:       string;
   current_day: string | null;
   day_index:   number;
   day_total:   number;
-  /** 0..1 within the current day. */
+  /** 0..1 within the current day (or whole-range chunk for daily). */
   progress:    number;
   error:       string | null;
   last_done:   string | null;
 }
 
-/** One day present on disk (downloaded or imported), shown in the calendar. */
+/** One day present on disk (downloaded or imported), shown in the calendar. For
+ *  daily, rows are the distinct dates covered by the cumulative file. */
 export interface FlatFileDay {
   day:          string;
   bytes:        number;
+  /** symbols stored (minute) / with windows (trade) / on the date (daily). */
   symbol_count: number;
+  /** bars (minute/daily) or trades (trade) stored. */
   bar_count:    number;
   /** false for a partial/interrupted download. */
   complete:     boolean;
@@ -439,7 +451,15 @@ export interface SecretsStatus {
   claude_api_key: boolean;
   deepseek_api_key: boolean;
   tradetally_token: boolean;
+  tradetally_email: boolean;
+  tradetally_password: boolean;
 }
+
+/** Which secret keys can be set from the UI. */
+export type SecretKey = keyof SecretsStatus;
+
+/** Partial secrets update — only the keys the user typed (non-empty) are sent. */
+export type SecretsUpdate = Partial<Record<SecretKey, string>>;
 
 // ─── Sync queue ──────────────────────────────────────────────────────────────
 
@@ -675,6 +695,12 @@ export type Classification = "pump_dump" | "momo_former";
 export interface SplitMarker {
   time: number;   // unix seconds (UTC midnight of the split day)
   label: string;  // e.g. "x20"
+}
+
+/** One news pastille for the chart overlay (Alpaca news REST). */
+export interface NewsMarker {
+  time: number;     // unix seconds (publish time)
+  headline: string;
 }
 
 export interface AlertEnrichment {

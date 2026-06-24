@@ -1,15 +1,15 @@
 // Perfect Pullback — metadata-only ScanStrategy entry.
 //
-// The real detection logic is NOT here: it is a stateful, multi-timeframe gate
-// engine that lives in `crate::perfect_pullback` and runs in its own tokio task
-// during the regular session. Ticker SELECTION comes from the Market Attention Gate
-// (`crate::market_attention`) — the engine watches the most-watched/traded tickers
-// it publishes (and memorises them for the session) on its enabled timeframes (the
-// 5m by default; 1m/2m/10m toggleable via ENABLE_* flags in the engine) for a strong
-// directional move with high relative volume (gate 1), then fires on the first
-// healthy pullback into it (gate 2). That can't fit the stateless per-ticker
-// `should_alert(ctx)` contract, so the engine pushes its AlertSignals straight into
-// the active-alert list (the same escape hatch the price-alarm watcher uses).
+// The real detection logic is NOT here: it is a stateful 5-minute gate engine that
+// lives in `crate::perfect_pullback` and runs in its own tokio task during the regular
+// session. Ticker SELECTION comes from the Market Attention Gate
+// (`crate::market_attention`) — the engine watches the tickers it publishes (and
+// memorises them for the session), then runs a four-gate pipeline on their 5-minute
+// bars: Direction (clean trend, picks the side) → Impulse (real ≥1.5×ATR leg) →
+// Pullback (healthy breather) → Trigger (3rd compact counter-trend bar). That can't
+// fit the stateless per-ticker `should_alert(ctx)` contract, so the engine pushes its
+// AlertSignals straight into the active-alert list (the same escape hatch the
+// price-alarm watcher uses).
 //
 // This file exists so the strategy still has a proper identity in the registry: a
 // Settings on/off toggle, a name + priority, and the identity card the UI uses to
@@ -102,12 +102,15 @@ impl ScanStrategy for PerfectPullback {
                     column:      None,
                 },
             ],
-            // Live-sourced info band (no enrichment/LLM for this strategy).
+            // Live-sourced info band (no enrichment/LLM for this strategy). Float
+            // comes from the universe DB via get_card_info (resolved as an extra);
+            // Alert source so an unknown float shows "—" rather than a spinner.
             info_fields: vec![
-                InfoField { key: "change_day_pct".into(), label: "Gap".into(),  source: InfoSource::Alert },
-                InfoField { key: "rvol".into(),           label: "RVOL".into(), source: InfoSource::Alert },
-                InfoField { key: "vwap".into(),           label: "VWAP".into(), source: InfoSource::Alert },
-                InfoField { key: "volume".into(),         label: "Vol".into(),  source: InfoSource::Alert },
+                InfoField { key: "change_day_pct".into(), label: "Gap".into(),   source: InfoSource::Alert },
+                InfoField { key: "float_shares".into(),   label: "Float".into(), source: InfoSource::Alert },
+                InfoField { key: "rvol".into(),           label: "RVOL".into(),  source: InfoSource::Alert },
+                InfoField { key: "vwap".into(),           label: "VWAP".into(),  source: InfoSource::Alert },
+                InfoField { key: "volume".into(),         label: "Vol".into(),   source: InfoSource::Alert },
             ],
             llm:         None,
             enrichments: vec![],

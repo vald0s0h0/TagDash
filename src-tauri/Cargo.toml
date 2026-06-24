@@ -26,6 +26,11 @@ tauri-plugin-notification = "2"
 # plugin. Desktop-only; gated behind `#[cfg(desktop)]` at registration.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# WebView2 (Windows) and WKWebView (macOS) don't reliably expose the W3C Gamepad
+# API, so the Xbox controller is invisible to navigator.getGamepads() even though
+# it works in a normal browser. This plugin polyfills the Gamepad API natively
+# (gilrs) so the standard frontend code sees the pad. Note: no vibration support.
+tauri-plugin-gamepad = "0.0.6"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

@@ -145,6 +145,79 @@ pub async fn fetch_float(api_key: &str, ticker: &str) -> Result<Option<MassiveFl
     Ok(parsed.results.into_iter().filter_map(RawFloat::into_float).next())
 }
 
+/// One symbol's float as it stood on (or just before) a requested past date.
+#[derive(Debug, Clone)]
+pub struct AsOfFloat {
+    pub float_shares: f64,
+    /// The `effective_date` of the value Massive returned (YYYY-MM-DD), if any.
+    pub effective_date: Option<String>,
+    /// true when the value is actually effective on/before the requested day; false
+    /// when no dated history was available and we fell back to the latest float.
+    pub historical: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AsOfResponse {
+    #[serde(default)]
+    results: Vec<RawAsOf>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RawAsOf {
+    free_float: Option<f64>,
+    #[serde(default)]
+    effective_date: Option<String>,
+}
+
+/// Fetch the float for `ticker` AS OF `day` (YYYY-MM-DD). The float is a Micro Pullback
+/// filtering condition and drifts over time, so for a historical TRADE download we want
+/// the value effective back then, not today's. Massive carries an `effective_date`; we
+/// ask with a `date` filter and pick the most recent row whose `effective_date ≤ day`.
+/// If no dated history comes back we fall back to the latest float (flagged
+/// `historical = false`). Returns None when the ticker has no usable float.
+pub async fn fetch_float_asof(
+    api_key: &str,
+    ticker: &str,
+    day: &str,
+) -> Result<Option<AsOfFloat>, String> {
+    let client = reqwest::Client::new();
+    let url = with_key(
+        &format!("{BASE_URL}/stocks/vX/float?ticker={ticker}&date={day}&limit=50"),
+        api_key,
+    );
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Massive HTTP {}", resp.status()));
+    }
+    let parsed: AsOfResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(pick_asof(parsed.results, day))
+}
+
+/// Choose the float row effective on/before `day` (most recent such), else the latest
+/// row available (flagged non-historical). Pure so it is unit-testable.
+fn pick_asof(rows: Vec<RawAsOf>, day: &str) -> Option<AsOfFloat> {
+    let rows: Vec<RawAsOf> = rows.into_iter().filter(|r| r.free_float.is_some()).collect();
+    // Historical candidates: effective_date present and ≤ day. Lexicographic compare is
+    // valid for zero-padded YYYY-MM-DD.
+    let best_hist = rows
+        .iter()
+        .filter(|r| r.effective_date.as_deref().map(|e| e <= day).unwrap_or(false))
+        .max_by(|a, b| a.effective_date.cmp(&b.effective_date));
+    if let Some(r) = best_hist {
+        return Some(AsOfFloat {
+            float_shares: r.free_float.unwrap(),
+            effective_date: r.effective_date.clone(),
+            historical: true,
+        });
+    }
+    // Fallback: the latest row Massive returned.
+    rows.into_iter().max_by(|a, b| a.effective_date.cmp(&b.effective_date)).map(|r| AsOfFloat {
+        float_shares: r.free_float.unwrap(),
+        effective_date: r.effective_date,
+        historical: false,
+    })
+}
+
 /// Mock float data — mirrors the FMP mock set so dev/mock mode behaves the same
 /// whichever provider is wired in.
 pub fn mock_float_all() -> Vec<MassiveFloat> {
@@ -198,6 +271,29 @@ mod tests {
         let floats: Vec<MassiveFloat> =
             parsed.results.into_iter().filter_map(RawFloat::into_float).collect();
         assert!(floats.is_empty());
+    }
+
+    #[test]
+    fn asof_picks_most_recent_on_or_before_day() {
+        let body = r#"{"results":[
+            {"free_float":1000000,"effective_date":"2026-01-10"},
+            {"free_float":2000000,"effective_date":"2026-03-01"},
+            {"free_float":3000000,"effective_date":"2026-06-20"}
+        ]}"#;
+        let parsed: AsOfResponse = serde_json::from_str(body).unwrap();
+        let got = pick_asof(parsed.results, "2026-04-01").unwrap();
+        assert_eq!(got.float_shares, 2_000_000.0);
+        assert!(got.historical);
+        assert_eq!(got.effective_date.as_deref(), Some("2026-03-01"));
+    }
+
+    #[test]
+    fn asof_falls_back_to_latest_when_no_history_before_day() {
+        let body = r#"{"results":[{"free_float":3000000,"effective_date":"2026-06-20"}]}"#;
+        let parsed: AsOfResponse = serde_json::from_str(body).unwrap();
+        let got = pick_asof(parsed.results, "2026-01-01").unwrap();
+        assert_eq!(got.float_shares, 3_000_000.0);
+        assert!(!got.historical);
     }
 
     #[test]

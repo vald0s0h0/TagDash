@@ -1,0 +1,9 @@
+{
+  "kpis":        { "x": 0,  "y": 0, "w": 8,  "h": 4, "visible": true,  "surface": "glass" },
+  "inspiration": { "x": 0,  "y": 4, "w": 8,  "h": 4, "visible": true,  "surface": "glass" },
+  "quote":       { "x": 0,  "y": 8, "w": 8,  "h": 4, "visible": true,  "surface": "glass" },
+  "pnl-curve":   { "x": 8,  "y": 0, "w": 12, "h": 6, "visible": true,  "surface": "glass" },
+  "rolling-pf":  { "x": 8,  "y": 6, "w": 6,  "h": 6, "visible": true,  "surface": "glass" },
+  "journal":     { "x": 14, "y": 6, "w": 6,  "h": 6, "visible": true,  "surface": "glass" },
+  "heading":     { "x": 0,  "y": 0, "w": 8,  "h": 2, "visible": false, "surface": "glass" }
+}

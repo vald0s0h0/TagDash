@@ -32,6 +32,10 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
+      # Sequential builds: each platform's job merges its entry into the SAME
+      # release `latest.json`. Running them in parallel can race and leave the
+      # manifest with only one platform (the auto-update then 404s for the other).
+      max-parallel: 1
       matrix:
         include:
           # Windows → .msi / .exe (NSIS) installers.

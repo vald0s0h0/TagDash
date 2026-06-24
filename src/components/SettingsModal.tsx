@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { CheckCircle2, XCircle, X } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { CheckCircle2, XCircle, X, Play } from "lucide-react";
+import { NOTIF_SOUNDS, playNotifSound } from "@/lib/notifSounds";
 import {
   Dialog,
   DialogContent,
@@ -14,14 +15,16 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
-import { useSecretsStatus } from "@/queries/useSecretsStatus";
+import { useSecretsStatus, useUpdateSecrets } from "@/queries/useSecretsStatus";
 import { useStrategies, useSetStrategyEnabled, useSetStrategyRisk } from "@/queries/useScanner";
 import {
   useHotkeyStore, HOTKEY_ACTIONS, HOTKEY_GROUPS, bindingLabel, bindingFromEvent,
   setRecordingActive, type Binding, type HotkeyActionDef, type HotkeyGroup,
 } from "@/stores/hotkeyStore";
+import { GamepadSettings } from "@/components/GamepadSettings";
+import { useChartThemeStore, type ChartTheme, type ChartThemeSection } from "@/stores/chartThemeStore";
 import { cn } from "@/lib/utils";
-import type { AppConfig, AttentionMode, Session } from "@/types";
+import type { AppConfig, AttentionMode, SecretKey, SecretsUpdate, Session } from "@/types";
 
 const SESSION_LABELS: Record<Session, string> = {
   premarket:  "Premarket",
@@ -65,19 +68,55 @@ interface Props {
   onClose: () => void;
 }
 
-function SecretRow({ label, configured }: { label: string; configured: boolean }) {
+/** Editable API-key fields shown in Settings → API Keys (order = display order). */
+const SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
+  { key: "alpaca_key",          label: "Alpaca key" },
+  { key: "alpaca_secret",       label: "Alpaca secret" },
+  { key: "massive_api_key",     label: "Massive API key (float)" },
+  { key: "sec_api_key",         label: "sec-api.io key (pays · industrie)" },
+  { key: "fmp_api_key",         label: "FMP API key (fallback)" },
+  { key: "claude_api_key",      label: "Claude API key" },
+  { key: "deepseek_api_key",    label: "Deepseek API key (news / dilution)" },
+  { key: "tradetally_token",    label: "TradeTally token (tt_live_…)" },
+  { key: "tradetally_email",    label: "TradeTally email (screenshots)", type: "email" },
+  { key: "tradetally_password", label: "TradeTally password (screenshots)" },
+];
+
+/** One editable secret: configured indicator + a masked input. Existing values are
+ *  never sent to the UI, so the input starts empty and a blank submit keeps the
+ *  stored key (the placeholder makes that explicit). */
+function SecretField({
+  label,
+  configured,
+  value,
+  onChange,
+  type = "password",
+}: {
+  label: string;
+  configured: boolean;
+  value: string;
+  onChange: (v: string) => void;
+  type?: string;
+}) {
   return (
-    <div className="flex items-center justify-between py-1.5">
-      <span className="text-sm">{label}</span>
-      {configured ? (
-        <span className="flex items-center gap-1.5 text-xs text-emerald-400">
-          <CheckCircle2 className="h-3.5 w-3.5" /> configured
-        </span>
-      ) : (
-        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <XCircle className="h-3.5 w-3.5" /> not set
-        </span>
-      )}
+    <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,15rem)] items-center gap-3 py-1">
+      <div className="flex min-w-0 items-center gap-1.5">
+        {configured ? (
+          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+        ) : (
+          <XCircle className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50" />
+        )}
+        <span className="truncate text-sm" title={label}>{label}</span>
+      </div>
+      <Input
+        type={type}
+        value={value}
+        autoComplete="off"
+        spellCheck={false}
+        placeholder={configured ? "•••••• (laisser vide pour garder)" : "non défini"}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-7 text-xs"
+      />
     </div>
   );
 }
@@ -221,6 +260,171 @@ function HotkeyRow({ action }: { action: HotkeyActionDef }) {
   );
 }
 
+/** One labelled swatch: a native colour picker + its hex, editable. */
+function ColorRow({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-1">
+      <span className="truncate text-xs">{label}</span>
+      <div className="flex shrink-0 items-center gap-2">
+        <span className="font-mono text-[10px] uppercase text-muted-foreground tabular-nums">{value}</span>
+        <input
+          type="color"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="h-6 w-9 cursor-pointer rounded border border-border bg-transparent p-0.5"
+        />
+      </div>
+    </div>
+  );
+}
+
+/** One labelled opacity slider (0–100 %). */
+function OpacityRow({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-1">
+      <span className="truncate text-xs">{label}</span>
+      <div className="flex shrink-0 items-center gap-2">
+        <span className="w-9 text-right font-mono text-[10px] text-muted-foreground tabular-nums">
+          {Math.round(value * 100)}%
+        </span>
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.01}
+          value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value))}
+          className="h-1.5 w-28 cursor-pointer accent-blue-500"
+        />
+      </div>
+    </div>
+  );
+}
+
+/** A titled group of appearance rows. */
+function ThemeGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div>
+      <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+        {title}
+      </div>
+      <div className="rounded-md border border-border px-3 py-1.5">{children}</div>
+    </div>
+  );
+}
+
+/** Settings → Apparence: live chart-palette editor backed by `chartThemeStore`.
+ *  Edits apply immediately to every open pane; values persist locally. The
+ *  shipped defaults live in `DEFAULT_CHART_THEME` (see the store header). */
+function AppearanceTab() {
+  const theme = useChartThemeStore((s) => s.theme);
+  const setField = useChartThemeStore((s) => s.set);
+  const reset = useChartThemeStore((s) => s.reset);
+  const [copied, setCopied] = useState(false);
+
+  // Typed thin wrappers so each row stays a one-liner.
+  function color<S extends ChartThemeSection>(section: S, key: keyof ChartTheme[S]) {
+    return {
+      value: theme[section][key] as unknown as string,
+      onChange: (v: string) => setField(section, key, v as ChartTheme[S][keyof ChartTheme[S]]),
+    };
+  }
+  function opacity<S extends ChartThemeSection>(section: S, key: keyof ChartTheme[S]) {
+    return {
+      value: theme[section][key] as unknown as number,
+      onChange: (v: number) => setField(section, key, v as ChartTheme[S][keyof ChartTheme[S]]),
+    };
+  }
+
+  function copyJson() {
+    void navigator.clipboard.writeText(JSON.stringify(theme, null, 2)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Couleurs et opacités des graphiques. Les changements s'appliquent
+        immédiatement à tous les panes ouverts et sont conservés au relancement.
+      </p>
+      <div className="max-h-[26rem] space-y-3 overflow-y-auto pr-1">
+        <ThemeGroup title="Bougies">
+          <ColorRow label="Hausse" {...color("candle", "up")} />
+          <ColorRow label="Baisse" {...color("candle", "down")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Volume (couleur des bougies)">
+          <OpacityRow label="Opacité hausse" {...opacity("volume", "upOpacity")} />
+          <OpacityRow label="Opacité baisse" {...opacity("volume", "downOpacity")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Fond pré / post-market">
+          <ColorRow label="Teinte" {...color("session", "color")} />
+          <OpacityRow label="Opacité" {...opacity("session", "opacity")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Grille">
+          <ColorRow label="Couleur" {...color("grid", "color")} />
+          <OpacityRow label="Opacité" {...opacity("grid", "opacity")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Indicateurs">
+          <ColorRow label="VWAP" {...color("indicators", "vwap")} />
+          <ColorRow label="EMA" {...color("indicators", "ema")} />
+          <ColorRow label="SMA" {...color("indicators", "sma")} />
+          <ColorRow label="Bollinger" {...color("indicators", "bollinger")} />
+          <OpacityRow label="Bollinger (opacité)" {...opacity("indicators", "bollingerOpacity")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Exécutions (marqueurs)">
+          <ColorRow label="Achat ▶" {...color("executions", "buy")} />
+          <ColorRow label="Vente ◀" {...color("executions", "sell")} />
+          <ColorRow label="Ligne gain" {...color("executions", "profit")} />
+          <ColorRow label="Ligne perte" {...color("executions", "loss")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Marqueurs">
+          <ColorRow label="Splits" {...color("markers", "split")} />
+          <ColorRow label="News (pastille)" {...color("markers", "news")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Niveaux">
+          <ColorRow label="Stop Loss" {...color("levels", "sl")} />
+          <ColorRow label="Take Profit" {...color("levels", "tp")} />
+          <ColorRow label="Alarme" {...color("levels", "alarm")} />
+        </ThemeGroup>
+      </div>
+
+      <div className="flex items-center justify-between gap-2">
+        <Button variant="ghost" size="sm" onClick={reset}>
+          Réinitialiser
+        </Button>
+        <Button variant="outline" size="sm" onClick={copyJson}>
+          {copied ? "Copié ✓" : "Copier le thème (JSON)"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsModal({ open, onClose }: Props) {
   const { data: config } = useLocalConfig();
   const { data: secrets } = useSecretsStatus();
@@ -228,9 +432,24 @@ export function SettingsModal({ open, onClose }: Props) {
   const setStrategyEnabled = useSetStrategyEnabled();
   const setStrategyRisk = useSetStrategyRisk();
   const update = useUpdateLocalConfig();
+  const updateSecrets = useUpdateSecrets();
 
   const [draft, setDraft] = useState<AppConfig | null>(null);
   const [tagInput, setTagInput] = useState("");
+  // Secret inputs are local + write-only: we only ever send the keys the user
+  // typed (non-empty), and clear them after a successful save.
+  const [secretInputs, setSecretInputs] = useState<SecretsUpdate>({});
+  const hasSecretEdits = Object.values(secretInputs).some((v) => v.trim() !== "");
+
+  function saveSecrets() {
+    const updates: SecretsUpdate = {};
+    for (const { key } of SECRET_FIELDS) {
+      const v = secretInputs[key]?.trim();
+      if (v) updates[key] = v;
+    }
+    if (Object.keys(updates).length === 0) return;
+    updateSecrets.mutate(updates, { onSuccess: () => setSecretInputs({}) });
+  }
 
   useEffect(() => {
     if (config) setDraft(structuredClone(config));
@@ -268,21 +487,27 @@ export function SettingsModal({ open, onClose }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-xl">
+      {/* `overflow-hidden` keeps any child (notably the 8-tab strip, which is
+          wider with the macOS system font) from spilling past the rounded right
+          border. */}
+      <DialogContent className="max-w-3xl overflow-hidden">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
         </DialogHeader>
 
         <Tabs defaultValue="trading" className="mt-2">
-          <TabsList className="w-full">
-            <TabsTrigger value="trading" className="flex-1 text-xs">Trading</TabsTrigger>
-            <TabsTrigger value="strategies" className="flex-1 text-xs">Stratégies</TabsTrigger>
-            <TabsTrigger value="hotkeys" className="flex-1 text-xs">Hotkeys</TabsTrigger>
-            <TabsTrigger value="notifs" className="flex-1 text-xs">Notifs</TabsTrigger>
-            <TabsTrigger value="latency" className="flex-1 text-xs">Latency</TabsTrigger>
-            <TabsTrigger value="tags" className="flex-1 text-xs">Tags</TabsTrigger>
-            <TabsTrigger value="tradetally" className="flex-1 text-xs">TradeTally</TabsTrigger>
-            <TabsTrigger value="secrets" className="flex-1 text-xs">API Keys</TabsTrigger>
+          {/* Equal-width grid columns instead of inline-flex: the 8 tabs can never
+              overflow the dialog regardless of the platform font width. */}
+          <TabsList className="grid w-full grid-cols-9">
+            <TabsTrigger value="trading" className="min-w-0 text-xs">Trading</TabsTrigger>
+            <TabsTrigger value="strategies" className="min-w-0 text-xs">Stratégies</TabsTrigger>
+            <TabsTrigger value="apparence" className="min-w-0 text-xs">Apparence</TabsTrigger>
+            <TabsTrigger value="hotkeys" className="min-w-0 text-xs">Hotkeys</TabsTrigger>
+            <TabsTrigger value="notifs" className="min-w-0 text-xs">Notifs</TabsTrigger>
+            <TabsTrigger value="latency" className="min-w-0 text-xs">Latency</TabsTrigger>
+            <TabsTrigger value="tags" className="min-w-0 text-xs">Tags</TabsTrigger>
+            <TabsTrigger value="tradetally" className="min-w-0 text-xs">TradeTally</TabsTrigger>
+            <TabsTrigger value="secrets" className="min-w-0 text-xs">API Keys</TabsTrigger>
           </TabsList>
 
           {/* ── Trading ── */}
@@ -369,31 +594,51 @@ export function SettingsModal({ open, onClose }: Props) {
             </div>
           </TabsContent>
 
-          {/* ── Hotkeys (keyboard chords / extra mouse buttons → hovered zone) ── */}
-          <TabsContent value="hotkeys" className="mt-4 space-y-3">
-            <p className="text-xs text-muted-foreground">
-              Assigne une touche, une combinaison clavier ou un bouton de souris
-              (boutons latéraux d'une souris multi-boutons) à chaque commande.
-              Clique sur le champ puis appuie sur la touche/bouton voulu&nbsp;;
-              <kbd className="mx-1 rounded bg-muted px-1 text-[10px]">Échap</kbd>
-              annule. Le raccourci agit sur la zone <strong>survolée par la
-              souris</strong> (son pane de gauche), sinon sur la zone active. Clic
-              gauche/droit réservés.
-            </p>
-            <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
-              {HOTKEY_GROUPS.map((group) => (
-                <div key={group}>
-                  <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
-                    {HOTKEY_GROUP_LABELS[group]}
-                  </div>
-                  <div className="rounded-md border border-border px-3 py-1.5">
-                    {HOTKEY_ACTIONS.filter((a) => a.group === group).map((a) => (
-                      <HotkeyRow key={a.id} action={a} />
-                    ))}
-                  </div>
+          {/* ── Apparence (chart palette: colours + opacities, live) ── */}
+          <TabsContent value="apparence" className="mt-4">
+            <AppearanceTab />
+          </TabsContent>
+
+          {/* ── Hotkeys → Clavier / Manette Xbox sub-tabs ── */}
+          <TabsContent value="hotkeys" className="mt-4">
+            <Tabs defaultValue="clavier">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="clavier" className="text-xs">Clavier / Souris</TabsTrigger>
+                <TabsTrigger value="xbox" className="text-xs">Manette Xbox</TabsTrigger>
+              </TabsList>
+
+              {/* Clavier / souris — existing chord recorder. */}
+              <TabsContent value="clavier" className="mt-3 space-y-3">
+                <p className="text-xs text-muted-foreground">
+                  Assigne une touche, une combinaison clavier ou un bouton de souris
+                  (boutons latéraux d'une souris multi-boutons) à chaque commande.
+                  Clique sur le champ puis appuie sur la touche/bouton voulu&nbsp;;
+                  <kbd className="mx-1 rounded bg-muted px-1 text-[10px]">Échap</kbd>
+                  annule. Le raccourci agit sur la zone <strong>survolée par la
+                  souris</strong> (son pane de gauche), sinon sur la zone active. Clic
+                  gauche/droit réservés.
+                </p>
+                <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+                  {HOTKEY_GROUPS.map((group) => (
+                    <div key={group}>
+                      <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                        {HOTKEY_GROUP_LABELS[group]}
+                      </div>
+                      <div className="rounded-md border border-border px-3 py-1.5">
+                        {HOTKEY_ACTIONS.filter((a) => a.group === group).map((a) => (
+                          <HotkeyRow key={a.id} action={a} />
+                        ))}
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              </TabsContent>
+
+              {/* Manette Xbox — bindings, sensibilité, test en direct. */}
+              <TabsContent value="xbox" className="mt-3">
+                <GamepadSettings />
+              </TabsContent>
+            </Tabs>
           </TabsContent>
 
           {/* ── Notifications (native OS desktop alerts) ── */}
@@ -438,6 +683,57 @@ export function SettingsModal({ open, onClose }: Props) {
                 value={draft.ui.foreground_alerts}
                 onChange={(v) => set("ui", "foreground_alerts", v)}
               />
+            </div>
+
+            {/* Sound cue: when (by session) + which sound, each previewable. */}
+            <div className="rounded-md border border-border px-3 py-2.5">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">Son de notification</div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    Joue un son léger et discret à chaque alerte du scanner. Choisis
+                    le moment de la session et le son ci-dessous (▶ pour l'écouter).
+                  </p>
+                </div>
+                <AttentionSelect
+                  value={draft.ui.alert_sound_mode}
+                  onChange={(v) => set("ui", "alert_sound_mode", v)}
+                />
+              </div>
+              <div className="mt-2 space-y-1">
+                {NOTIF_SOUNDS.map((s) => {
+                  const selected = draft.ui.alert_sound === s.id;
+                  return (
+                    <div
+                      key={s.id}
+                      className={cn(
+                        "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5",
+                        selected ? "border-blue-500/70 bg-blue-900/20" : "border-border/60",
+                      )}
+                    >
+                      <button
+                        onClick={() => set("ui", "alert_sound", s.id)}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      >
+                        <span
+                          className={cn(
+                            "h-2.5 w-2.5 shrink-0 rounded-full border",
+                            selected ? "border-blue-400 bg-blue-400" : "border-muted-foreground/40",
+                          )}
+                        />
+                        <span className="truncate text-xs">{s.label}</span>
+                      </button>
+                      <button
+                        onClick={() => playNotifSound(s.id)}
+                        title="Écouter"
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
+                        <Play className="h-3 w-3" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
 
             <p className="text-[11px] leading-relaxed text-muted-foreground">
@@ -570,45 +866,38 @@ export function SettingsModal({ open, onClose }: Props) {
             </div>
             <Separator className="mb-3" />
             <p className="mb-3 text-xs text-muted-foreground">
-              Keys are stored in{" "}
+              Saisis tes clés ci-dessous puis <strong>Enregistrer les clés</strong> —
+              elles sont écrites dans{" "}
               <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
                 tagdash.secrets.toml
-              </code>{" "}
-              in your app config directory. Edit that file to set them.
+              </code>
+              . Un champ laissé vide conserve la clé existante. Les valeurs ne sont
+              jamais relues par l'interface (seul l'état configuré/non est affiché).
             </p>
-            <Separator className="mb-3" />
-            <SecretRow
-              label="Alpaca key"
-              configured={secrets?.alpaca_key ?? false}
-            />
-            <SecretRow
-              label="Alpaca secret"
-              configured={secrets?.alpaca_secret ?? false}
-            />
-            <SecretRow
-              label="Massive API key (float)"
-              configured={secrets?.massive_api_key ?? false}
-            />
-            <SecretRow
-              label="sec-api.io key (country · industry)"
-              configured={secrets?.sec_api_key ?? false}
-            />
-            <SecretRow
-              label="FMP API key (legacy/fallback)"
-              configured={secrets?.fmp_api_key ?? false}
-            />
-            <SecretRow
-              label="Claude API key"
-              configured={secrets?.claude_api_key ?? false}
-            />
-            <SecretRow
-              label="Deepseek API key (micro_pullback news/dilution)"
-              configured={secrets?.deepseek_api_key ?? false}
-            />
-            <SecretRow
-              label="TradeTally token"
-              configured={secrets?.tradetally_token ?? false}
-            />
+            <div className="max-h-72 space-y-0.5 overflow-y-auto pr-1">
+              {SECRET_FIELDS.map((f) => (
+                <SecretField
+                  key={f.key}
+                  label={f.label}
+                  type={f.type}
+                  configured={secrets?.[f.key] ?? false}
+                  value={secretInputs[f.key] ?? ""}
+                  onChange={(v) => setSecretInputs((s) => ({ ...s, [f.key]: v }))}
+                />
+              ))}
+            </div>
+            <div className="mt-3 flex items-center justify-end gap-2">
+              {updateSecrets.isSuccess && !hasSecretEdits && (
+                <span className="text-xs text-emerald-400">Clés enregistrées ✓</span>
+              )}
+              <Button
+                size="sm"
+                onClick={saveSecrets}
+                disabled={updateSecrets.isPending || !hasSecretEdits}
+              >
+                {updateSecrets.isPending ? "Enregistrement…" : "Enregistrer les clés"}
+              </Button>
+            </div>
           </TabsContent>
         </Tabs>
 

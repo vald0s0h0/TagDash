@@ -146,3 +146,10 @@
   box-shadow: none;
 }
 
+/* Controller auto-tag picker — 2 s "no further press → confirm" progress bar.
+   Restarted on each Share press via a changing React key. */
+@keyframes gamepadTagFill {
+  from { width: 0%; }
+  to   { width: 100%; }
+}
+

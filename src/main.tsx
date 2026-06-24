@@ -2,6 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+// NOTE: the tauri-plugin-gamepad polyfill (gilrs) detects the pad but never
+// delivers button/axis events on Windows here, so we use the webview's NATIVE
+// Gamepad API instead — it works once WebView2's renderer-throttling is disabled
+// (see additionalBrowserArgs in tauri.conf.json). The native API needs a button
+// pressed while the window is focused to start exposing the pad.
 import App from "./App";
 import { FlashOverlay } from "./FlashOverlay";
 import "./index.css";

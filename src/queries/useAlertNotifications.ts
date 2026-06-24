@@ -6,7 +6,19 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { useActiveAlerts } from "@/queries/useScanner";
 import { useLocalConfig } from "@/queries/useLocalConfig";
-import type { AlertSignal } from "@/types";
+import { playNotifSound } from "@/lib/notifSounds";
+import type { AlertSignal, AttentionMode, Session } from "@/types";
+
+/** True when a sound/attention mode is active for the alert's session. Mirrors
+ *  the Rust `mode_matches` gate (notify.rs): pre-open / afterhours never fire. */
+function modeMatches(mode: AttentionMode, session: Session): boolean {
+  switch (mode) {
+    case "premarket": return session === "premarket";
+    case "open":      return session === "open";
+    case "both":      return session === "premarket" || session === "open";
+    default:          return false; // "off"
+  }
+}
 
 /** One-line body for a notification: reason + price when known. */
 function notifBody(a: AlertSignal): string {
@@ -29,6 +41,8 @@ export function useAlertNotifications() {
   const { data: config } = useLocalConfig();
   const { data: alerts } = useActiveAlerts();
   const enabled = config?.ui?.desktop_alerts ?? false;
+  const soundMode = (config?.ui?.alert_sound_mode ?? "off") as AttentionMode;
+  const soundId   = config?.ui?.alert_sound ?? "soft_chime";
 
   // Alert ids seen on the previous poll — anything new this poll is a fresh alert.
   const prevIds     = useRef<Set<string>>(new Set());
@@ -65,7 +79,14 @@ export function useAlertNotifications() {
     const fresh = alerts.filter((a) => !prevIds.current.has(a.alert_id));
     prevIds.current = new Set(currentIds);
 
-    if (!enabled || !granted.current || fresh.length === 0) return;
+    if (fresh.length === 0) return;
+
+    // Sound cue — independent of the desktop toast, gated by its own session mode.
+    if (soundMode !== "off" && fresh.some((a) => modeMatches(soundMode, a.session))) {
+      playNotifSound(soundId);
+    }
+
+    if (!enabled || !granted.current) return;
 
     // `alerts` is newest-first; notify oldest-first so the most recent ends up on top.
     for (const a of [...fresh].reverse()) {
@@ -76,5 +97,5 @@ export function useAlertNotifications() {
         });
       } catch { /* notification backend unavailable — ignore */ }
     }
-  }, [alerts, enabled]);
+  }, [alerts, enabled, soundMode, soundId]);
 }

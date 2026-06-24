@@ -226,7 +226,7 @@ pub fn pick_daily_background(app_dir: &Path) -> DailyBackground {
 fn is_image(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "png" | "webp" | "gif")
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "avif")
     )
 }
 
@@ -235,6 +235,7 @@ fn mime_for(p: &Path) -> &'static str {
         Some("png")  => "image/png",
         Some("webp") => "image/webp",
         Some("gif")  => "image/gif",
+        Some("avif") => "image/avif",
         _            => "image/jpeg",
     }
 }
@@ -371,6 +372,63 @@ pub fn open_mood_target(app_dir: &Path, target: &str) -> Result<(), String> {
         "long" => os_open(&long_path),
         _ => Err(format!("unknown mood target: {target}")),
     }
+}
+
+// ─── Bundled default assets (shipped with the app, seeded once on first run) ───
+
+/// Copy the bundled default mood images / phrase files / backgrounds into the
+/// user's app-data, WITHOUT overwriting anything they already have. New users get
+/// the maintainer's curated set out of the box; existing users keep their own
+/// files (and any later edit/deletion sticks — this is gated by a one-time marker
+/// in the caller). `resources` is the resolved `resources/defaults` directory.
+pub fn seed_default_assets(resources: &Path, app_dir: &Path) {
+    copy_dir_if_absent(
+        &resources.join("mood").join("images"),
+        &app_dir.join("mood").join("images"),
+    );
+    copy_dir_if_absent(&resources.join("backgrounds"), &app_dir.join("backgrounds"));
+    for name in ["short.txt", "long.txt"] {
+        copy_file_if_absent(
+            &resources.join("mood").join(name),
+            &app_dir.join("mood").join(name),
+        );
+    }
+}
+
+fn copy_dir_if_absent(src: &Path, dst: &Path) {
+    let Ok(entries) = std::fs::read_dir(src) else { return };
+    let _ = std::fs::create_dir_all(dst);
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_file() {
+            if let Some(name) = p.file_name() {
+                copy_file_if_absent(&p, &dst.join(name));
+            }
+        }
+    }
+}
+
+fn copy_file_if_absent(src: &Path, dst: &Path) {
+    if dst.exists() || !src.exists() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(src, dst);
+}
+
+/// The bundled default dashboard layout JSON (shipped resource), or None if absent.
+/// Used by the frontend to seed a brand-new user's board with the maintainer's
+/// arrangement; users with a saved layout keep theirs.
+pub fn read_default_dashboard(resources: &Path) -> Option<String> {
+    std::fs::read_to_string(resources.join("dashboard.json")).ok()
+}
+
+/// Persist the current dashboard layout to `<app_dir>/dashboard-default.json` so the
+/// maintainer can capture it and bundle it as the new shipped default.
+pub fn write_dashboard_export(app_dir: &Path, json: &str) -> Result<(), String> {
+    std::fs::write(app_dir.join("dashboard-default.json"), json).map_err(|e| e.to_string())
 }
 
 // ─── Minimal base64 encoder (no crate dependency, matching `screenshot`'s

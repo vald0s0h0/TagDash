@@ -59,6 +59,9 @@ interface DashboardState {
   toggleVisible: (id: CardId) => void;
   setSurface: (id: CardId, surface: Surface) => void;
   resetLayout: () => void;
+  /** Replace the whole layout (used to seed a fresh user with the bundled default).
+   *  Missing cards fall back to their built-in slot so the board is always complete. */
+  applyLayout: (layout: Partial<Record<CardId, CardLayout>>) => void;
 }
 
 export const useDashboardStore = create<DashboardState>()(
@@ -78,6 +81,7 @@ export const useDashboardStore = create<DashboardState>()(
       setSurface: (id, surface) =>
         set((s) => ({ layout: { ...s.layout, [id]: { ...s.layout[id], surface } } })),
       resetLayout: () => set({ layout: cloneDefault() }),
+      applyLayout: (layout) => set({ layout: { ...cloneDefault(), ...layout } }),
     }),
     {
       name: "tagdash-dashboard",

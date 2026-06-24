@@ -21,11 +21,14 @@ import { nyTime, nyDateTime, nyDayMonth, nyMonth, nyYear } from "@/lib/nyTime";
 import { ExecutionsPrimitive } from "@/charts/executionsPrimitive";
 import { BollingerPrimitive } from "@/charts/bollingerPrimitive";
 import { GridPrimitive } from "@/charts/gridPrimitive";
+import { NewsPrimitive } from "@/charts/newsPrimitive";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
+import { useChartTheme, getChartTheme } from "@/stores/chartThemeStore";
 import {
   BACKFILL_THRESHOLD,
-  slOpts, tpOpts, ALARM_OPTIONS,
+  slOpts, tpOpts, alarmOpts, CURSOR_OPTIONS,
 } from "@/charts/chartOptions";
+import { registerChartControl } from "@/lib/gamepadBus";
 import { useVolumeSeries } from "@/charts/useVolumeSeries";
 import { useReferenceLines } from "@/charts/useReferenceLines";
 import { usePrevDayLines } from "@/charts/usePrevDayLines";
@@ -34,6 +37,7 @@ import { useSessionShading } from "@/charts/useSessionShading";
 import { useCandleMarkers } from "@/charts/useCandleMarkers";
 import { useSlTpLines } from "@/charts/useSlTpLines";
 import { useExecutionMarkers } from "@/charts/useExecutionMarkers";
+import { useNewsMarkers } from "@/charts/useNewsMarkers";
 import { useCrosshairRegister } from "@/charts/useCrosshairRegister";
 import { useDeleteButtons } from "@/charts/useDeleteButtons";
 import { useBarSeries } from "@/charts/useBarSeries";
@@ -193,6 +197,9 @@ export function LightweightChart({
   const entryLineRef  = useRef<IPriceLine | null>(null);
   const bidLineRef    = useRef<IPriceLine | null>(null);
   const askLineRef    = useRef<IPriceLine | null>(null);
+  // Controller horizontal cursor (right stick) — a movable price line + its price.
+  const cursorLineRef  = useRef<IPriceLine | null>(null);
+  const cursorPriceRef = useRef<number | null>(null);
   // User-placed price alarms (amber dashed lines), keyed by alarm id.
   const alarmLineMap  = useRef<Map<string, IPriceLine>>(new Map());
   // Previous-day reference levels (PDC/PDH/PDL), keyed by indicator kind.
@@ -203,6 +210,8 @@ export function LightweightChart({
   const sessionBgRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
   const execPrimRef     = useRef<ExecutionsPrimitive | null>(null);
   const bollingerPrimRef = useRef<BollingerPrimitive | null>(null);
+  const gridPrimRef      = useRef<GridPrimitive | null>(null);
+  const newsPrimRef      = useRef<NewsPrimitive | null>(null);
   // User trend lines + selection handles (custom primitive).
   const drawingsPrimRef = useRef<DrawingsPrimitive | null>(null);
   // Right-edge "price + ✕" label pills for user price lines (SL/TP/alarms).
@@ -260,6 +269,10 @@ export function LightweightChart({
   >(null);
   const dragging = useRef<DragTarget>(null);
 
+  // User-tunable chart appearance (Settings → Apparence). Subscribing here re-runs
+  // the styling hooks/effects below when the palette is edited, for a live update.
+  const theme = useChartTheme();
+
   // ── Bar-loading pipeline (history refresh + RAM poll + lazy back-fill) — hook ─
   const { bars, loadOlderBars } = useChartBars(
     symbol, timeframe, symbolRef, timeframeRef,
@@ -287,13 +300,16 @@ export function LightweightChart({
   });
   const allMarkers = useMemo(() => {
     const byTime = new Map<number, { time: number; color: string; text?: string }>();
-    if (isDailyTf) for (const m of splitMarkers ?? []) byTime.set(m.time, { time: m.time, color: "#ef4444", text: m.label });
+    if (isDailyTf) for (const m of splitMarkers ?? []) byTime.set(m.time, { time: m.time, color: theme.markers.split, text: m.label });
     for (const m of markers) byTime.set(m.time, m);
     return [...byTime.values()];
-  }, [markers, splitMarkers, isDailyTf]);
+  }, [markers, splitMarkers, isDailyTf, theme.markers.split]);
 
   // ── Trade executions (triangles + P&L line) — extracted hook ───────────────
   useExecutionMarkers(execPrimRef, symbol, bars);
+
+  // ── News pastilles (bottom-of-pane dots) — extracted hook ──────────────────
+  useNewsMarkers(newsPrimRef, symbol, bars);
 
   // ── Coordinate helpers (read live each call from the chart) ────────────────
   const timeToX = useCallback((t: number): number | null => {
@@ -309,6 +325,93 @@ export function LightweightChart({
     const t = chartRef.current?.timeScale().coordinateToTime(x);
     return t == null ? null : Number(t);
   }, []);
+
+  // ── Imperative chart controls (wheel + gamepad sticks) ─────────────────────
+  // Shared by the mouse `onWheel` handler and the controller's analog sticks (via
+  // the gamepad chart-control registry). Defined at component scope (reading refs)
+  // so both call sites and the cleanup can reach them.
+
+  // Price-axis zoom: step>0 loosens (zoom out), step<0 tightens (zoom in), by
+  // nudging the price-scale margins symmetrically (smaller margins = taller candles).
+  const zoomPriceAxis = useCallback((step: number) => {
+    const candle = candleRef.current;
+    if (!candle) return;
+    const scale = candle.priceScale();
+    const m = scale.options().scaleMargins ?? { top: 0.08, bottom: 0.08 };
+    const clamp = (v: number) => Math.max(0, Math.min(0.45, v));
+    scale.applyOptions({ scaleMargins: { top: clamp(m.top + step), bottom: clamp(m.bottom + step) } });
+  }, []);
+
+  // Time-axis zoom. factor>1 = zoom in. Default view (pinned to realtime) keeps the
+  // current bar fixed; once panned into history it scales the visible range around
+  // `anchorX` (px from the container's left), matching the mouse-wheel behaviour.
+  const zoomTimeAxis = useCallback((factor: number, anchorX?: number) => {
+    const chart = chartRef.current;
+    const container = containerRef.current;
+    if (!chart || !container) return;
+    const ts = chart.timeScale();
+    const logical = ts.getVisibleLogicalRange();
+    if (!logical) return;
+    const n = barsRef.current?.length ?? 0;
+    const lastIdx = n - 1;
+    if (n === 0 || logical.to >= lastIdx) {
+      const opts = ts.options();
+      const pxOffset = opts.rightOffset * opts.barSpacing;
+      const next = Math.max(opts.minBarSpacing, Math.min(opts.barSpacing * factor, 80));
+      ts.applyOptions({ barSpacing: next, rightOffset: pxOffset / next });
+      return;
+    }
+    const anchor = (anchorX != null ? ts.coordinateToLogical(anchorX) : null) ?? (logical.from + logical.to) / 2;
+    const inv  = 1 / factor;
+    const from = anchor - (anchor - logical.from) * inv;
+    const to   = anchor + (logical.to - anchor) * inv;
+    if (factor > 1 && to - from < container.clientWidth / 80) return;
+    ts.setVisibleLogicalRange({ from, to });
+  }, []);
+
+  const clearCursorLine = useCallback(() => {
+    const candle = candleRef.current;
+    if (candle && cursorLineRef.current) candle.removePriceLine(cursorLineRef.current);
+    cursorLineRef.current  = null;
+    cursorPriceRef.current = null;
+  }, []);
+
+  // Move the horizontal cursor by a fraction of the visible price span. Seeds at
+  // the current price (last bar close) on the first nudge for a fresh symbol.
+  const nudgeCursor = useCallback((deltaFrac: number) => {
+    const candle = candleRef.current;
+    const container = containerRef.current;
+    if (!candle || !container) return;
+    let price = cursorPriceRef.current;
+    if (price == null) {
+      const seed = lastBarRef.current?.close;
+      if (seed == null) return;
+      price = Number(seed);
+    }
+    const top = candle.coordinateToPrice(0);
+    const bot = candle.coordinateToPrice(container.clientHeight);
+    const span = top != null && bot != null ? Math.abs(Number(top) - Number(bot)) : price * 0.04;
+    const next = price + deltaFrac * span;
+    cursorPriceRef.current = next;
+    if (cursorLineRef.current) cursorLineRef.current.applyOptions({ price: next });
+    else cursorLineRef.current = candle.createPriceLine({ price: next, ...CURSOR_OPTIONS });
+  }, []);
+
+  // Register this pane's controls for the gamepad loop; cursor clears on unmount.
+  useEffect(() => {
+    if (!paneId) return;
+    const un = registerChartControl(paneId, {
+      zoomTime: zoomTimeAxis,
+      zoomPrice: zoomPriceAxis,
+      nudgeCursor,
+      getCursorPrice: () => cursorPriceRef.current,
+      clearCursor: clearCursorLine,
+    });
+    return () => { un(); clearCursorLine(); };
+  }, [paneId, zoomTimeAxis, zoomPriceAxis, nudgeCursor, clearCursorLine]);
+
+  // Drop the cursor when the symbol changes so it re-seeds at the new price.
+  useEffect(() => { clearCursorLine(); }, [symbol, clearCursorLine]);
 
   // ── Create chart once ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -374,13 +477,16 @@ export function LightweightChart({
     sessionBg.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 } });
     sessionBgRef.current = sessionBg;
 
+    // Seed candle colours from the live theme; a dedicated effect re-applies them
+    // when the user edits the palette (this setup effect runs once).
+    const { up, down } = getChartTheme().candle;
     const candle = chart.addCandlestickSeries({
-      upColor:          "#26a69a",
-      downColor:        "#ef5350",
-      borderUpColor:    "#26a69a",
-      borderDownColor:  "#ef5350",
-      wickUpColor:      "#26a69a",
-      wickDownColor:    "#ef5350",
+      upColor:          up,
+      downColor:        down,
+      borderUpColor:    up,
+      borderDownColor:  down,
+      wickUpColor:      up,
+      wickDownColor:    down,
       priceLineVisible: false,
     });
 
@@ -389,11 +495,18 @@ export function LightweightChart({
 
     // Horizontal grid (round/half-dollar levels). Attached first so it sits
     // behind the other bottom-z primitives (Bollinger fill) and the candles.
-    candle.attachPrimitive(new GridPrimitive());
+    const gridPrim = new GridPrimitive();
+    candle.attachPrimitive(gridPrim);
+    gridPrimRef.current = gridPrim;
 
     const execPrim = new ExecutionsPrimitive();
     candle.attachPrimitive(execPrim);
     execPrimRef.current = execPrim;
+
+    // News pastilles — small dots pinned to the pane bottom (over the volume).
+    const newsPrim = new NewsPrimitive();
+    candle.attachPrimitive(newsPrim);
+    newsPrimRef.current = newsPrim;
 
     const bollingerPrim = new BollingerPrimitive();
     candle.attachPrimitive(bollingerPrim);
@@ -473,52 +586,19 @@ export function LightweightChart({
     });
 
     const onWheel = (e: WheelEvent) => {
-      // ── Horizontal wheel (Logitech 2nd wheel / tilt) → vertical price-axis zoom ─
-      // Squash / expand the candles vertically by adjusting the price-scale margins
-      // symmetrically (smaller margins = taller candles = zoom in).
+      // Horizontal wheel (Logitech 2nd wheel / tilt) → vertical price-axis zoom.
       if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
         e.preventDefault();
-        const scale = candle.priceScale();
-        const m = scale.options().scaleMargins ?? { top: 0.08, bottom: 0.08 };
-        const step = e.deltaX < 0 ? -0.02 : 0.02; // one way zooms in, the other out
-        const clamp = (v: number) => Math.max(0, Math.min(0.45, v));
-        scale.applyOptions({ scaleMargins: { top: clamp(m.top + step), bottom: clamp(m.bottom + step) } });
+        zoomPriceAxis(e.deltaX < 0 ? -0.02 : 0.02); // one way zooms in, the other out
         return;
       }
-
-      // ── Main wheel → time-axis zoom ─────────────────────────────────────────
+      // Main wheel → time-axis zoom, anchored on the cursor once panned.
       if (e.deltaY === 0) return;
       e.preventDefault();
-      const ts      = chart.timeScale();
-      const logical = ts.getVisibleLogicalRange();
-      if (!logical) return;
-      const n       = barsRef.current?.length ?? 0;
-      const lastIdx = n - 1;
-      const factor  = e.deltaY < 0 ? 1.1 : 1 / 1.1; // wheel up = zoom in
-
-      // Default view (the latest bar is still the rightmost thing on screen, nothing
-      // newer scrolled past) → keep the CURRENT bar fixed: hold the last-bar →
-      // right-edge pixel gap constant while changing bar spacing. This also keeps the
-      // chart pinned to realtime, so new bars still scroll in.
-      if (n === 0 || logical.to >= lastIdx) {
-        const opts     = ts.options();
-        const pxOffset = opts.rightOffset * opts.barSpacing;
-        const next     = Math.max(opts.minBarSpacing, Math.min(opts.barSpacing * factor, 80));
-        ts.applyOptions({ barSpacing: next, rightOffset: pxOffset / next });
-        return;
-      }
-
-      // Panned into history → zoom focused on the bar under the cursor: scale the
-      // visible logical range around the cursor's bar (the chart stays where it is,
-      // no snap-back to the latest bar).
-      const anchor = ts.coordinateToLogical(e.clientX - container.getBoundingClientRect().left)
-        ?? (logical.from + logical.to) / 2;
-      const inv  = 1 / factor; // the visible range scales inversely to bar spacing
-      const from = anchor - (anchor - logical.from) * inv;
-      const to   = anchor + (logical.to - anchor) * inv;
-      // Cap zoom-in at ~80px/bar (matches the bar-spacing ceiling above).
-      if (factor > 1 && to - from < container.clientWidth / 80) return;
-      ts.setVisibleLogicalRange({ from, to });
+      zoomTimeAxis(
+        e.deltaY < 0 ? 1.1 : 1 / 1.1, // wheel up = zoom in
+        e.clientX - container.getBoundingClientRect().left,
+      );
     };
     container.addEventListener("wheel", onWheel, { passive: false });
 
@@ -542,11 +622,15 @@ export function LightweightChart({
       entryLineRef.current = null;
       bidLineRef.current   = null;
       askLineRef.current   = null;
+      cursorLineRef.current  = null;
+      cursorPriceRef.current = null;
       indicatorSeriesMap.current.clear();
       volumeSeriesRef.current = null;
       sessionBgRef.current = null;
       execPrimRef.current = null;
       bollingerPrimRef.current = null;
+      gridPrimRef.current = null;
+      newsPrimRef.current = null;
       drawingsPrimRef.current = null;
       alarmLineMap.current.clear();
       prevDayLineMap.current.clear();
@@ -563,16 +647,16 @@ export function LightweightChart({
   useLiveTicks(candleRef, lastBarRef, symbol, timeframe);
 
   // ── Indicators (strategy-card driven: VWAP/EMA/SMA/Bollinger) — extracted hook ─
-  useIndicators(chartRef, indicatorSeriesMap, bollingerPrimRef, bars, indicators);
+  useIndicators(chartRef, indicatorSeriesMap, bollingerPrimRef, bars, indicators, theme);
 
   // ── Volume histogram — always on, every pane (extracted hook) ──────────────
-  useVolumeSeries(chartRef, volumeSeriesRef, bars);
+  useVolumeSeries(chartRef, volumeSeriesRef, bars, theme);
 
   // ── Press-and-hold tooltip (bar volume + body % above the bar) — extracted hook ─
   useBarTooltip(chartRef, candleRef, volumeSeriesRef, containerRef);
 
   // ── Pre/post-market background shading (extracted hook) ────────────────────
-  useSessionShading(sessionBgRef, bars, timeframe);
+  useSessionShading(sessionBgRef, bars, timeframe, theme);
 
   // ── Candle markers (e.g. red dots on split days) — extracted hook ──────────
   useCandleMarkers(candleRef, allMarkers, bars);
@@ -609,7 +693,7 @@ export function LightweightChart({
     for (const a of alarms) {
       const existing = alarmLineMap.current.get(a.id);
       if (existing) existing.applyOptions({ price: a.price });
-      else alarmLineMap.current.set(a.id, series.createPriceLine({ price: a.price, ...ALARM_OPTIONS }));
+      else alarmLineMap.current.set(a.id, series.createPriceLine({ price: a.price, ...alarmOpts() }));
     }
   }, [alarmsKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -618,6 +702,26 @@ export function LightweightChart({
 
   // ── Previous-day reference lines (PDC/PDH/PDL) — extracted hook ────────────
   usePrevDayLines(candleRef, prevDayLineMap, indicators, prevDay);
+
+  // ── Live theme apply ───────────────────────────────────────────────────────
+  // Re-style the once-created candle series + reconciled price lines, and poke the
+  // theme-reading primitives (grid / executions) to redraw, whenever the palette
+  // is edited. The data hooks above (volume / session / indicators / Bollinger /
+  // split markers) re-run on `theme` themselves, so they're not handled here.
+  useEffect(() => {
+    const { up, down } = theme.candle;
+    candleRef.current?.applyOptions({
+      upColor: up, downColor: down,
+      borderUpColor: up, borderDownColor: down,
+      wickUpColor: up, wickDownColor: down,
+    });
+    slLineRef.current?.applyOptions({ color: slOpts(ordersActiveRef.current).color });
+    tpLineRef.current?.applyOptions({ color: tpOpts(ordersActiveRef.current).color });
+    for (const line of alarmLineMap.current.values()) line.applyOptions({ color: theme.levels.alarm });
+    gridPrimRef.current?.redraw();
+    execPrimRef.current?.redraw();
+    newsPrimRef.current?.redraw();
+  }, [theme]);
 
   // ── Freeze / restore the chart's pan+zoom around an in-chart drag ──────────
   const freezePan = useCallback((freeze: boolean) => {
