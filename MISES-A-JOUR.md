@@ -125,11 +125,16 @@ release :
 1. Va sur **https://github.com/vald0s0h0/TagDash** → onglet **Code**.
 2. Encart **Releases** à droite → clique sur la version (ex. `v0.1.1`).
 3. Déplie **Assets** : tu y trouves les fichiers à envoyer aux testeurs —
-   - **macOS** : `TagDash_x.y.z_universal.dmg` ← *le fichier pour les Mac (Intel + Apple Silicon)*
+   - **macOS Apple Silicon** (Mac M1/M2/M3…) : `TagDash_x.y.z_aarch64.dmg`
+   - **macOS Intel** (anciens Mac) : `TagDash_x.y.z_x64.dmg`
    - **Windows** : `TagDash_x.y.z_x64-setup.exe` et/ou `TagDash_x.y.z_x64_en-US.msi`
    - *(les fichiers `.sig`, `.app.tar.gz` et `latest.json` servent à la mise à jour
      automatique — pas besoin de les envoyer.)*
-4. Clique sur le `.dmg` pour le télécharger, puis envoie-le à tes testeurs (mail,
+
+   > Depuis v0.1.3 le `.dmg` **universel** unique est remplacé par **deux** `.dmg`
+   > (un par puce). En cas de doute, sur le Mac : menu  → *À propos de ce Mac* →
+   > si « Puce Apple », prends `aarch64` ; si « Processeur Intel », prends `x64`.
+4. Clique sur le bon `.dmg` pour le télécharger, puis envoie-le à tes testeurs (mail,
    lien, WeTransfer…).
 
 ### Côté testeur macOS — ouvrir une app non signée Apple

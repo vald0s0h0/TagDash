@@ -34,18 +34,29 @@ jobs:
       fail-fast: false
       # Sequential builds: each platform's job merges its entry into the SAME
       # release `latest.json`. Running them in parallel can race and leave the
-      # manifest with only one platform (the auto-update then 404s for the other).
+      # manifest with only one platform (the auto-update then 404s for the others).
       max-parallel: 1
       matrix:
         include:
-          # Windows → .msi / .exe (NSIS) installers.
+          # Windows → .msi / .exe (NSIS) installers → windows-x86_64 updater key.
           - platform: windows-latest
             args: ""
             rust_targets: ""
-          # macOS → universal .dmg (runs on both Apple Silicon and Intel Macs).
-          - platform: macos-latest
-            args: "--target universal-apple-darwin"
-            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          # macOS Apple Silicon → NATIVE arm64 build → darwin-aarch64 updater key.
+          # We deliberately do NOT cross-build a universal binary anymore: the
+          # offline-STT native deps (whisper.cpp + Metal, coreaudio-sys/bindgen)
+          # fail to cross-compile the x86_64 slice on an arm64 runner, which broke
+          # the whole macOS job in v0.1.2 and left latest.json with no darwin keys
+          # (Apple-Silicon apps then can't auto-update). Building each arch on its
+          # own native runner is the robust Tauri pattern and, with fail-fast:false,
+          # an Intel failure no longer takes Apple Silicon down with it.
+          - platform: macos-14
+            args: ""
+            rust_targets: ""
+          # macOS Intel → NATIVE x86_64 build → darwin-x86_64 updater key.
+          - platform: macos-13
+            args: ""
+            rust_targets: ""
           # To also ship Linux, add: { platform: ubuntu-22.04, args: "", rust_targets: "" }
     runs-on: ${{ matrix.platform }}
     steps:

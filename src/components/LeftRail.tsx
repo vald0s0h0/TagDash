@@ -3,6 +3,7 @@ import {
   Bug,
   CircleDot,
   Database,
+  DownloadCloud,
   History,
   Mic,
   Moon,
@@ -37,6 +38,7 @@ import { BugReportModal } from "@/components/BugReportModal";
 import { TickersTableModal } from "@/components/TickersTableModal";
 import { FlatFilesModal } from "@/components/FlatFilesModal";
 import { SttModal } from "@/components/SttModal";
+import { UpdateModal } from "@/components/UpdateModal";
 import type { Session } from "@/types";
 
 const TABS: { id: Session; label: string; icon: typeof Sun }[] = [
@@ -201,6 +203,11 @@ export function LeftRail() {
                 <RefreshCw className="mr-2 h-4 w-4" />
                 Sync TradeTally Status
               </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => showModal("update")}>
+                <DownloadCloud className="mr-2 h-4 w-4" />
+                Mise à jour
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -241,6 +248,10 @@ export function LeftRail() {
       />
       <SttModal
         open={openModal === "stt"}
+        onClose={closeModal}
+      />
+      <UpdateModal
+        open={openModal === "update"}
         onClose={closeModal}
       />
     </>
