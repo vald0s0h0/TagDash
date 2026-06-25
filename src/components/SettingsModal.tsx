@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
+import { RestartRequiredDialog } from "@/components/RestartRequiredDialog";
 import { useSecretsStatus, useUpdateSecrets } from "@/queries/useSecretsStatus";
 import { useStrategies, useSetStrategyEnabled, useSetStrategyRisk } from "@/queries/useScanner";
 import {
@@ -436,6 +437,8 @@ export function SettingsModal({ open, onClose }: Props) {
 
   const [draft, setDraft] = useState<AppConfig | null>(null);
   const [tagInput, setTagInput] = useState("");
+  // Changing the data source switches the startup pipeline → prompt for a restart.
+  const [showRestart, setShowRestart] = useState(false);
   // Secret inputs are local + write-only: we only ever send the keys the user
   // typed (non-empty), and clear them after a successful save.
   const [secretInputs, setSecretInputs] = useState<SecretsUpdate>({});
@@ -482,10 +485,17 @@ export function SettingsModal({ open, onClose }: Props) {
 
   function save() {
     if (!draft) return;
-    update.mutate(draft, { onSuccess: onClose });
+    // A data-source mode change needs a restart (different startup pipeline): keep
+    // the modal flow but raise the restart prompt instead of just closing.
+    const modeChanged =
+      (draft.data_source?.mode ?? "api") !== (config?.data_source?.mode ?? "api");
+    update.mutate(draft, {
+      onSuccess: () => (modeChanged ? setShowRestart(true) : onClose()),
+    });
   }
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
       {/* `overflow-hidden` keeps any child (notably the 8-tab strip, which is
           wider with the macOS system font) from spilling past the rounded right
@@ -985,5 +995,13 @@ export function SettingsModal({ open, onClose }: Props) {
         </div>
       </DialogContent>
     </Dialog>
+    <RestartRequiredDialog
+      open={showRestart}
+      onClose={() => {
+        setShowRestart(false);
+        onClose();
+      }}
+    />
+    </>
   );
 }

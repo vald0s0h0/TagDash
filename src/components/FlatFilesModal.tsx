@@ -30,6 +30,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { RestartRequiredDialog } from "@/components/RestartRequiredDialog";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
@@ -97,6 +98,9 @@ export function FlatFilesModal({ open, onClose }: Props) {
   const update = useUpdateLocalConfig();
   const mode = config?.data_source?.mode ?? "api";
 
+  // Switching data source changes the startup pipeline → prompt for a restart.
+  const [showRestart, setShowRestart] = useState(false);
+
   // Active sub-tab (dataset).
   const [tab, setTab] = useState<FlatFilesKind>("minute");
 
@@ -154,7 +158,10 @@ export function FlatFilesModal({ open, onClose }: Props) {
 
   const setMode = (next: "api" | "flat_files") => {
     if (!config || next === mode) return;
-    update.mutate({ ...config, data_source: { mode: next } });
+    update.mutate(
+      { ...config, data_source: { mode: next } },
+      { onSuccess: () => setShowRestart(true) },
+    );
   };
 
   const startDownload = async () => {
@@ -190,6 +197,7 @@ export function FlatFilesModal({ open, onClose }: Props) {
   }, [calendar.data]);
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
@@ -438,5 +446,7 @@ export function FlatFilesModal({ open, onClose }: Props) {
         </div>
       </DialogContent>
     </Dialog>
+    <RestartRequiredDialog open={showRestart} onClose={() => setShowRestart(false)} />
+    </>
   );
 }

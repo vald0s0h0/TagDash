@@ -120,12 +120,17 @@ pub fn run() {
     // struct so it can borrow `app_dir` before the field shorthand below moves it.
     let stt_shared = Arc::new(stt::SttShared::new(app_dir.clone()));
 
+    // Initial startup state carries the step list for the active data-source mode
+    // (the flat-files pipeline shows different steps). Computed before the struct so
+    // it reads `cfg.data_source` before `cfg` is moved into the `config` field.
+    let startup_state = startup::StartupState::for_mode(&cfg.data_source);
+
     let app_state = AppState {
         app_dir,
         config:            Arc::new(RwLock::new(cfg)),
         secrets:           Arc::new(RwLock::new(secrets)),
         db:                Arc::new(Mutex::new(db)),
-        startup:           Arc::new(RwLock::new(startup::StartupState::default())),
+        startup:           Arc::new(RwLock::new(startup_state)),
         market:            Arc::new(RwLock::new(market_state::MarketState::new())),
         mock_feed_running: Arc::new(AtomicBool::new(false)),
         live_feed_running: Arc::new(AtomicBool::new(false)),
@@ -260,6 +265,13 @@ pub fn run() {
                 let focus_rx          = state.focus_symbols_tx.subscribe();
                 let app_handle        = app.handle().clone();
                 let news_feed_running = state.news_feed_running.clone();
+                // Extra handles for the flat-files Market Replay auto-start (the
+                // latest downloaded day is parked, paused, after that pipeline).
+                let app_dir          = state.app_dir.clone();
+                let replay_shared    = state.replay.clone();
+                let active_alerts    = state.active_alerts.clone();
+                let alert_history    = state.alert_history.clone();
+                let focus_rx_restart = state.focus_symbols_tx.subscribe();
                 // Dedicated handles for the company-intel collection job (kept as
                 // its own clones so it can run after the pipeline without fighting
                 // the moves above).
@@ -267,14 +279,45 @@ pub fn run() {
                 let ci_config  = config.clone();
                 let ci_secrets = secrets.clone();
                 tauri::async_runtime::spawn(async move {
-                    startup::run_pipeline(db.clone(), config.clone(), secrets.clone(), startup).await;
-                    // In flat-files mode there is no real-time feed: the platform
-                    // runs off the downloaded days via Market Replay, so neither the
-                    // live data feed nor the premarket news feed are started (the
-                    // Alpaca API may be unavailable entirely).
-                    if config.read().unwrap().data_source.is_flat_files() {
-                        eprintln!("[tagdash] mode flat files actif: flux live + news non démarrés (replay hors-ligne)");
+                    let is_flat = config.read().unwrap().data_source.is_flat_files();
+                    if is_flat {
+                        // Flat-files boot: dedicated pipeline (no Alpaca — universe +
+                        // daily history from disk, FMP/Massive/SEC for gaps), then the
+                        // latest downloaded day is parked in Market Replay, PAUSED at
+                        // 04:00 ET. Charts populate from disk; pressing Play runs the
+                        // engines so the strategies emit signals. No live / news feed.
+                        startup::run_pipeline_flat_files(
+                            db.clone(), config.clone(), secrets.clone(), startup, app_dir.clone(),
+                        )
+                        .await;
+                        match crate::flat_files::minute::latest_complete_day(&app_dir) {
+                            Some(day) => {
+                                let deps = crate::replay::ReplayDeps {
+                                    app_dir: app_dir.clone(),
+                                    market: market.clone(),
+                                    db: db.clone(),
+                                    config: config.clone(),
+                                    secrets: secrets.clone(),
+                                    live_feed_running,
+                                    news_feed_running,
+                                    focus_rx,
+                                    focus_rx_restart,
+                                    active_alerts,
+                                    alert_history,
+                                    app: app_handle,
+                                };
+                                // 240 = 04:00 ET start (includes the premarket window).
+                                match crate::replay::start(replay_shared, deps, day.clone(), 240) {
+                                    Ok(_)  => eprintln!("[tagdash] flat files: jour {day} chargé dans Market Replay (en pause)"),
+                                    Err(e) => eprintln!("[tagdash] flat files: replay non démarré: {e}"),
+                                }
+                            }
+                            None => eprintln!("[tagdash] flat files: aucun jour minute téléchargé — replay non démarré"),
+                        }
                     } else {
+                        // API boot: Alpaca-centric pipeline, then connect the live
+                        // WebSocket + premarket news feed so real-time data flows.
+                        startup::run_pipeline(db.clone(), config.clone(), secrets.clone(), startup).await;
                         match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, live_feed_running, focus_rx, app_handle) {
                             Ok(n)  => eprintln!("[tagdash] live feed: {n} US-stock universe ready"),
                             Err(e) => eprintln!("[tagdash] live feed not started: {e}"),

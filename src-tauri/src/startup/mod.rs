@@ -6,10 +6,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, secrets::Secrets};
+use crate::config::{AppConfig, DataSourceConfig, secrets::Secrets};
 use crate::local_db::{
     cache_repository, company_meta_repository, insert_log, universe_repository, UniverseAsset,
 };
+
+/// Once-per-ET-day freshness markers (app_meta). Stamped ONLY on a successful real
+/// fetch — never on the mock / cached fallbacks — so a missing provider key never
+/// masks a later real fetch the same day (see `step_floats` / `step_sec`).
+const FLOATS_DATE_KEY: &str = "floats_fetch_date";
+const SEC_DATE_KEY: &str = "sec_fetch_date";
 
 // ─── Public types (cross the Tauri bridge) ───────────────────────────────────
 
@@ -72,6 +78,18 @@ impl Default for StartupState {
     }
 }
 
+impl StartupState {
+    /// Initial state with the step list for the active data-source mode. The
+    /// flat-files pipeline shows a different set of steps (no Alpaca) — see
+    /// `default_steps_flat_files`.
+    pub fn for_mode(ds: &DataSourceConfig) -> Self {
+        Self {
+            steps: if ds.is_flat_files() { default_steps_flat_files() } else { default_steps() },
+            ..Self::default()
+        }
+    }
+}
+
 /// A symbol retained in the final streamable universe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamableSymbol {
@@ -105,6 +123,28 @@ fn default_steps() -> Vec<StartupStep> {
         StartupStep::new("compute_risk_scores", "Score dilution capacity · need · short interest"),
         StartupStep::new("build_universe",   "Finalize universe (all US stocks)"),
         StartupStep::new("ready",            "Ready for WebSocket"),
+    ]
+}
+
+/// Steps shown in flat-files mode. Alpaca is gone (no assets / live daily / live
+/// splits); the universe + daily history come from disk, and FMP/Massive/SEC are
+/// still used (online) to fill float / metadata gaps. Ends by parking the latest
+/// downloaded day in Market Replay (see `lib.rs`).
+fn default_steps_flat_files() -> Vec<StartupStep> {
+    vec![
+        StartupStep::new("load_config",      "Load local config"),
+        StartupStep::new("load_strategies",  "Load compiled strategies"),
+        StartupStep::new("load_cache",       "Load universe from cache"),
+        StartupStep::new("load_flat_daily",  "Load daily history from flat files"),
+        StartupStep::new("fetch_massive",    "Float data (flat-files gap-fill)"),
+        StartupStep::new("fetch_sec",        "SEC company data (country · industry)"),
+        StartupStep::new("compute_metrics",  "Compute ATR · prev close · Pump&Dump score"),
+        StartupStep::new("fetch_short_interest", "Fetch short interest (Massive bulk)"),
+        StartupStep::new("fetch_dilution",   "Fetch dilution + financials (SEC XBRL) · scores"),
+        StartupStep::new("compute_universe", "Persist float & average volume"),
+        StartupStep::new("compute_risk_scores", "Score dilution capacity · need · short interest"),
+        StartupStep::new("load_replay_day",  "Load latest flat-files day into Market Replay"),
+        StartupStep::new("ready",            "Ready (offline replay)"),
     ]
 }
 
@@ -227,147 +267,34 @@ pub async fn run_pipeline(
     }
     let _ = log(&db, "info", &format!("startup: {} Alpaca tradable assets", alpaca_active.len()));
 
-    // ── Step 5: fetch_massive (floats, at most once per calendar day) ─────────
-    // Massive is the active float provider; FMP is kept as a legacy fallback.
-    // Free tier (~1 req/13 s) makes this expensive, so we reuse today's cache.
-    //
-    // Freshness is tracked by a dedicated `floats_fetch_date` marker, NOT by the
-    // fundamentals_cache timestamp: the old FMP path stamped that table too, so
-    // a tiny FMP dump from earlier today would otherwise mask the full Massive
-    // fetch (it once silently kept the float count at ~160).
-    set_step(&state, "fetch_massive", StepStatus::Running, None);
-    // ET date (DST-aware) for the once-per-day markers, so "a new day" flips at
-    // Eastern midnight — consistent with the screener dismissals + the engines.
+    // ── Step 5: fetch_massive (floats) ────────────────────────────────────────
+    // Shared with the flat-files pipeline (see `step_floats`): cache-first, real
+    // fetch when stale OR empty, marker stamped only on a real success so a missing
+    // provider key never masks a later fetch the same day. ET date (DST-aware) for
+    // the once-per-day markers, so "a new day" flips at Eastern midnight.
     let today = crate::time::et_date(Utc::now());
-    const FLOATS_DATE_KEY: &str = "floats_fetch_date";
-    let floats_fresh_today = {
-        let db_guard = db.lock().unwrap();
-        cache_repository::get_app_meta(&db_guard, FLOATS_DATE_KEY).as_deref() == Some(today.as_str())
-    };
-    let mut float_fetch_ok = false;
-    let cached_floats = || -> Vec<crate::massive::MassiveFloat> {
-        let db_guard = db.lock().unwrap();
-        cache_repository::all_fundamentals(&db_guard)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|f| {
-                Some(crate::massive::MassiveFloat {
-                    symbol: f.symbol,
-                    float_shares: f.float_shares? as f64,
-                    outstanding_shares: f.outstanding_shares.unwrap_or(0) as f64,
-                    free_float: f.free_float.unwrap_or(0.0),
-                })
-            })
-            .collect()
-    };
-    let floats: Vec<crate::massive::MassiveFloat> = if floats_fresh_today {
-        let cached = cached_floats();
-        set_step(&state, "fetch_massive", StepStatus::Success, Some(&format!("{} float records (cached today)", cached.len())));
-        cached
-    } else if mock_float {
-        push_warning(&state, "No float provider key (Massive/FMP) — using mock float data");
-        crate::massive::mock_float_all()
-    } else if has_massive {
-        let key = sec.massive_api_key.as_deref().unwrap_or_default();
-        set_step(&state, "fetch_massive", StepStatus::Running, Some("fetching bulk float (rate-limited ~1 req/13s)…"));
-        match crate::massive::fetch_float_all(key).await {
-            Ok(data) => { float_fetch_ok = true; data }
-            Err(e) => {
-                push_warning(&state, &format!("Massive unavailable: {e} — using cached floats"));
-                set_step(&state, "fetch_massive", StepStatus::Warning, Some(&format!("fetch error: {e}")));
-                cached_floats()
-            }
-        }
-    } else {
-        // FMP legacy fallback.
-        let key = sec.fmp_api_key.as_deref().unwrap_or_default();
-        match crate::fmp::fetch_shares_float_all(key).await {
-            Ok(data) => {
-                float_fetch_ok = true;
-                data.into_iter()
-                    .map(|f| crate::massive::MassiveFloat {
-                        symbol: f.symbol,
-                        float_shares: f.float_shares,
-                        outstanding_shares: f.outstanding_shares,
-                        free_float: f.free_float,
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                push_warning(&state, &format!("FMP unavailable: {e} — using cached floats"));
-                set_step(&state, "fetch_massive", StepStatus::Warning, Some(&format!("fetch error: {e}")));
-                cached_floats()
-            }
-        }
-    };
-    // Build float lookup map.
+    let floats = step_floats(&db, &state, &sec, &today, mock_float, has_massive).await;
     let float_map: std::collections::HashMap<String, &crate::massive::MassiveFloat> =
         floats.iter().map(|f| (f.symbol.clone(), f)).collect();
     let with_float = alpaca_active.iter().filter(|a| float_map.contains_key(&a.symbol)).count();
     {
         state.write().unwrap().stats.with_float = with_float;
     }
-    // Persist floats to fundamentals_cache (skip when reusing today's cache).
-    // Only stamp the once-per-day marker on a *successful* fetch, so a failed
-    // fetch that fell back to cache will retry on the next launch.
-    if !floats_fresh_today {
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let db_guard = db.lock().unwrap();
-        for f in &floats {
-            let fund = cache_repository::FundamentalCache {
-                symbol: f.symbol.clone(),
-                float_shares: Some(f.float_shares as i64),
-                outstanding_shares: Some(f.outstanding_shares as i64),
-                free_float: Some(f.free_float),
-                prev_close: None,
-                avg_volume: None,
-                atr: None,
-                updated_at: now.clone(),
-            };
-            let _ = cache_repository::upsert_fundamental(&db_guard, &fund);
-        }
-        if float_fetch_ok {
-            let _ = cache_repository::set_app_meta(&db_guard, FLOATS_DATE_KEY, &today);
-        }
-    }
-    if matches!(state.read().unwrap().steps.iter().find(|s| s.id == "fetch_massive").map(|s| &s.status), Some(StepStatus::Running)) {
-        set_step(&state, "fetch_massive", StepStatus::Success, Some(&format!("{} float records ({with_float} in universe)", floats.len())));
+    // Append the in-universe count, but only when the step succeeded — don't clobber
+    // a Warning from a failed fetch that fell back to cache.
+    if matches!(
+        state.read().unwrap().steps.iter().find(|s| s.id == "fetch_massive").map(|s| &s.status),
+        Some(StepStatus::Success)
+    ) {
+        set_step(&state, "fetch_massive", StepStatus::Success,
+            Some(&format!("{} float records ({with_float} in universe)", floats.len())));
     }
     let _ = log(&db, "info", &format!("startup: {} float records (Massive/FMP)", floats.len()));
 
-    // ── Step 6: fetch_sec (country of origin + SIC industry, once per day) ────
-    set_step(&state, "fetch_sec", StepStatus::Running, None);
-    let sec_fresh_today = {
-        let db_guard = db.lock().unwrap();
-        company_meta_repository::last_date(&db_guard)
-            .map(|d| d.starts_with(&today))
-            .unwrap_or(false)
-    };
-    if sec_fresh_today {
-        let n = { let db_guard = db.lock().unwrap(); company_meta_repository::count(&db_guard).unwrap_or(0) };
-        set_step(&state, "fetch_sec", StepStatus::Success, Some(&format!("{n} companies (cached today)")));
-    } else if mock_sec {
-        push_warning(&state, "sec-api key not configured — using mock company data");
-        let companies = crate::sec_api::mock_companies();
-        persist_company_meta(&db, companies.values());
-        set_step(&state, "fetch_sec", StepStatus::Success, Some(&format!("{} companies (mock)", companies.len())));
-    } else {
-        let token = sec.sec_api_key.as_deref().unwrap_or_default();
-        match crate::sec_api::fetch_all(token).await {
-            Ok(companies) => {
-                let with_country = companies.values().filter(|c| c.country.is_some()).count();
-                persist_company_meta(&db, companies.values());
-                set_step(&state, "fetch_sec", StepStatus::Success,
-                    Some(&format!("{} companies · {with_country} with country", companies.len())));
-                let _ = log(&db, "info", &format!("startup: {} SEC company records", companies.len()));
-            }
-            Err(e) => {
-                let n = { let db_guard = db.lock().unwrap(); company_meta_repository::count(&db_guard).unwrap_or(0) };
-                push_warning(&state, &format!("sec-api unavailable: {e} — using cached company data"));
-                set_step(&state, "fetch_sec", StepStatus::Warning, Some(&format!("fetch error — {n} cached")));
-            }
-        }
-    }
+    // ── Step 6: fetch_sec (country of origin + SIC industry) ──────────────────
+    // Shared with the flat-files pipeline (see `step_sec`): dedicated freshness
+    // marker, forced fetch when company_meta is empty, mock never poisons it.
+    step_sec(&db, &state, &sec, &today, mock_sec).await;
 
     // ── Step 7: load_daily (incremental: 250d first run, missing days after) ──
     set_step(&state, "load_daily", StepStatus::Running, None);
@@ -754,6 +681,250 @@ pub async fn run_pipeline(
     }
 }
 
+// ─── Flat-files pipeline ───────────────────────────────────────────────────────
+
+/// Startup pipeline for flat-files mode. No Alpaca: the universe + daily history
+/// come from the on-disk flat files (`flat_files/daily/daily.db`), and FMP / Massive
+/// / SEC are still used (online, when reachable) to fill float / company-metadata
+/// gaps — so the app works fully offline once those were loaded once. Ends by
+/// reporting the latest downloaded minute day; `lib.rs` then parks it in Market
+/// Replay (paused) so charts populate and the engines run on Play.
+pub async fn run_pipeline_flat_files(
+    db: Arc<Mutex<rusqlite::Connection>>,
+    config: Arc<RwLock<AppConfig>>,
+    secrets: Arc<RwLock<Secrets>>,
+    state: Arc<RwLock<StartupState>>,
+    app_dir: std::path::PathBuf,
+) {
+    let sec = secrets.read().unwrap().clone();
+    let key_set = |o: &Option<String>| o.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let has_massive = key_set(&sec.massive_api_key);
+    let has_fmp = key_set(&sec.fmp_api_key);
+    let mock_float = !(has_massive || has_fmp);
+    let has_sec = key_set(&sec.sec_api_key);
+    let mock_sec = !has_sec;
+    {
+        state.write().unwrap().mock_mode = mock_float || mock_sec;
+    }
+    let today = crate::time::et_date(Utc::now());
+
+    // ── load_config ───────────────────────────────────────────────────────────
+    set_step(&state, "load_config", StepStatus::Running, None);
+    set_step(&state, "load_config", StepStatus::Success, Some("config loaded (flat-files mode)"));
+    let _ = log(&db, "info", "startup: flat-files mode — config loaded");
+
+    // ── load_strategies ───────────────────────────────────────────────────────
+    set_step(&state, "load_strategies", StepStatus::Running, None);
+    let n_strategies = crate::strategies::registry::all_strategies().len();
+    set_step(&state, "load_strategies", StepStatus::Success,
+        Some(&format!("{n_strategies} compiled strategies")));
+
+    // ── load_cache ────────────────────────────────────────────────────────────
+    set_step(&state, "load_cache", StepStatus::Running, None);
+    let cache_count = { let g = db.lock().unwrap(); universe_repository::count(&g).unwrap_or(0) };
+    { state.write().unwrap().stats.cache_symbols = cache_count as usize; }
+    set_step(&state, "load_cache", StepStatus::Success, Some(&format!("{cache_count} symbols in cache")));
+
+    // ── load_flat_daily: copy flat daily.db → daily_cache + seed the universe ──
+    set_step(&state, "load_flat_daily", StepStatus::Running, None);
+    let flat_symbols = crate::flat_files::daily::symbols(&app_dir);
+    let copied = {
+        let g = db.lock().unwrap();
+        crate::flat_files::daily::load_into_cache(&app_dir, &g)
+    };
+    // Seed `universe_assets` with any symbol present in the flat daily file but not
+    // yet known (offline boot with an empty universe). Minimal rows — float / volume
+    // are filled by compute_universe below.
+    if !flat_symbols.is_empty() {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let g = db.lock().unwrap();
+        let existing: std::collections::HashSet<String> = universe_repository::get_all(&g)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.symbol)
+            .collect();
+        let _ = g.execute_batch("BEGIN");
+        for sym in &flat_symbols {
+            if !existing.contains(sym) {
+                let asset = UniverseAsset {
+                    symbol: sym.clone(),
+                    name: Some(sym.clone()),
+                    exchange: None,
+                    tradable: true,
+                    shortable: false,
+                    float_shares: None,
+                    market_cap: None,
+                    avg_volume: None,
+                    updated_at: now.clone(),
+                };
+                let _ = universe_repository::upsert(&g, &asset);
+            }
+        }
+        let _ = g.execute_batch("COMMIT");
+    }
+    match copied {
+        Ok(n) => {
+            set_step(&state, "load_flat_daily", StepStatus::Success,
+                Some(&format!("{n} daily bars · {} symbols from flat files", flat_symbols.len())));
+            let _ = log(&db, "info",
+                &format!("startup: flat daily loaded — {n} bars, {} symbols", flat_symbols.len()));
+        }
+        Err(e) => {
+            push_warning(&state, &format!("flat daily load failed: {e}"));
+            set_step(&state, "load_flat_daily", StepStatus::Warning, Some(&format!("error: {e}")));
+        }
+    }
+
+    // Active set = all universe symbols (what the strategies / scanner stream).
+    let active_symbols: Vec<String> = {
+        let g = db.lock().unwrap();
+        universe_repository::get_active_symbols(&g).unwrap_or_default()
+    };
+
+    // ── fetch_massive (floats; gap-fill, online optional) ─────────────────────
+    let floats = step_floats(&db, &state, &sec, &today, mock_float, has_massive).await;
+    let float_map: std::collections::HashMap<String, &crate::massive::MassiveFloat> =
+        floats.iter().map(|f| (f.symbol.clone(), f)).collect();
+    let active_set: std::collections::HashSet<&String> = active_symbols.iter().collect();
+    let with_float = float_map.keys().filter(|s| active_set.contains(s)).count();
+    { state.write().unwrap().stats.with_float = with_float; }
+    if matches!(
+        state.read().unwrap().steps.iter().find(|s| s.id == "fetch_massive").map(|s| &s.status),
+        Some(StepStatus::Success)
+    ) {
+        set_step(&state, "fetch_massive", StepStatus::Success,
+            Some(&format!("{} float records ({with_float} in universe)", floats.len())));
+    }
+
+    // ── fetch_sec (country / industry; online optional) ───────────────────────
+    step_sec(&db, &state, &sec, &today, mock_sec).await;
+
+    // ── compute_metrics (CPU-only over the now-populated daily_cache) ─────────
+    {
+        let g = db.lock().unwrap();
+        let _ = cache_repository::recompute_multiday_changes(&g);
+    }
+    set_step(&state, "compute_metrics", StepStatus::Running, None);
+    {
+        let (pc, pd) = {
+            let g = db.lock().unwrap();
+            (
+                cache_repository::recompute_atr_prev_close(&g).unwrap_or(0),
+                cache_repository::recompute_pump_dump_scores(&g).unwrap_or(0),
+            )
+        };
+        set_step(&state, "compute_metrics", StepStatus::Success,
+            Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
+    }
+
+    // ── fetch_short_interest (Massive bulk, once/day, online optional) ────────
+    set_step(&state, "fetch_short_interest", StepStatus::Running, None);
+    let si_fresh = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, "short_interest_fetch_date").as_deref() == Some(today.as_str())
+    };
+    if si_fresh {
+        set_step(&state, "fetch_short_interest", StepStatus::Success, Some("cached today"));
+    } else if !has_massive {
+        set_step(&state, "fetch_short_interest", StepStatus::Warning, Some("no Massive key (offline / not configured)"));
+    } else {
+        match crate::company_intel::collect_short_interest_bulk(db.clone(), secrets.clone()).await {
+            Ok(n) => {
+                { let g = db.lock().unwrap(); let _ = cache_repository::set_app_meta(&g, "short_interest_fetch_date", &today); }
+                set_step(&state, "fetch_short_interest", StepStatus::Success, Some(&format!("{n} tickers")));
+            }
+            Err(e) => {
+                push_warning(&state, &format!("short interest fetch failed: {e}"));
+                set_step(&state, "fetch_short_interest", StepStatus::Warning, Some(&format!("error: {e}")));
+            }
+        }
+    }
+
+    // ── fetch_dilution (SEC XBRL, once/day, online optional) + scores ─────────
+    set_step(&state, "fetch_dilution", StepStatus::Running, None);
+    let dil_fresh = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, "dilution_fetch_date").as_deref() == Some(today.as_str())
+    };
+    if !dil_fresh && has_sec {
+        match crate::company_intel::collect_sec_bulk(db.clone(), config.clone()).await {
+            Ok((snaps, fins)) => {
+                { let g = db.lock().unwrap(); let _ = cache_repository::set_app_meta(&g, "dilution_fetch_date", &today); }
+                let _ = log(&db, "info", &format!("startup: SEC bulk — {snaps} snapshots, {fins} financials"));
+            }
+            Err(e) => push_warning(&state, &format!("SEC bulk fetch failed: {e}")),
+        }
+    }
+    {
+        let n = { let g = db.lock().unwrap(); cache_repository::recompute_dilution_scores(&g, &today).unwrap_or(0) };
+        set_step(&state, "fetch_dilution", StepStatus::Success, Some(&format!("{n} scored")));
+    }
+
+    // ── compute_universe: persist float / market cap / avg volume ─────────────
+    set_step(&state, "compute_universe", StepStatus::Running, None);
+    let (prev_close_map, volume_map): (std::collections::HashMap<String, f64>, std::collections::HashMap<String, i64>) = {
+        let g = db.lock().unwrap();
+        (
+            cache_repository::latest_closes(&g).unwrap_or_default().into_iter().collect(),
+            cache_repository::avg_volumes(&g, 20).unwrap_or_default().into_iter().collect(),
+        )
+    };
+    let universe_rows = { let g = db.lock().unwrap(); universe_repository::get_all(&g).unwrap_or_default() };
+    {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let g = db.lock().unwrap();
+        let _ = g.execute_batch("BEGIN");
+        for a in &universe_rows {
+            let fmpf = float_map.get(&a.symbol);
+            let float_shares = fmpf.map(|f| f.float_shares as i64);
+            let prev_close = prev_close_map.get(&a.symbol).copied();
+            let market_cap = fmpf
+                .filter(|f| f.outstanding_shares > 0.0)
+                .and_then(|f| prev_close.map(|pc| (f.outstanding_shares * pc) as i64));
+            let asset = UniverseAsset {
+                symbol: a.symbol.clone(),
+                name: a.name.clone(),
+                exchange: a.exchange.clone(),
+                tradable: a.tradable,
+                shortable: a.shortable,
+                float_shares,
+                market_cap,
+                avg_volume: volume_map.get(&a.symbol).copied(),
+                updated_at: now.clone(),
+            };
+            let _ = universe_repository::upsert(&g, &asset);
+        }
+        let _ = g.execute_batch("COMMIT");
+    }
+    let n_universe = universe_rows.len();
+    { state.write().unwrap().stats.final_universe = n_universe; }
+    set_step(&state, "compute_universe", StepStatus::Success,
+        Some(&format!("{n_universe} symbols · {with_float} with float")));
+
+    // ── compute_risk_scores ───────────────────────────────────────────────────
+    set_step(&state, "compute_risk_scores", StepStatus::Running, None);
+    {
+        let n = { let g = db.lock().unwrap(); cache_repository::recompute_risk_scores(&g, &today).unwrap_or(0) };
+        set_step(&state, "compute_risk_scores", StepStatus::Success, Some(&format!("{n} tickers scored")));
+    }
+
+    // ── load_replay_day: report the latest downloaded minute day (lib.rs starts it) ──
+    set_step(&state, "load_replay_day", StepStatus::Running, None);
+    match crate::flat_files::minute::latest_complete_day(&app_dir) {
+        Some(day) => set_step(&state, "load_replay_day", StepStatus::Success,
+            Some(&format!("dernier jour disponible : {day}"))),
+        None => {
+            push_warning(&state, "aucun jour minute téléchargé — ouvrez « Gestion Flat Files »");
+            set_step(&state, "load_replay_day", StepStatus::Warning, Some("aucun jour téléchargé"));
+        }
+    }
+
+    // ── ready ─────────────────────────────────────────────────────────────────
+    set_step(&state, "ready", StepStatus::Success, Some("univers prêt — mode flat files (replay hors-ligne)"));
+    let _ = log(&db, "info", "startup: flat-files pipeline complete");
+    { state.write().unwrap().completed = true; }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn log(db: &Arc<Mutex<rusqlite::Connection>>, level: &str, msg: &str) -> rusqlite::Result<()> {
@@ -778,5 +949,180 @@ fn persist_company_meta<'a>(
             updated_at: now.clone(),
         };
         let _ = company_meta_repository::upsert(&db_guard, &row);
+    }
+}
+
+// ─── Shared provider steps (used by BOTH pipelines) ────────────────────────────
+
+/// Float provider step (`fetch_massive`). Reuses today's cache when fresh AND
+/// non-empty; otherwise fetches from Massive (FMP fallback) and persists into
+/// `fundamentals_cache`. The once-per-day marker is stamped ONLY on a real
+/// successful fetch, and a fetch is FORCED whenever the float cache is empty — so a
+/// fresh deploy (or a day that first ran in mock) always loads real floats once a
+/// key is present. Returns the floats in effect this run; the caller derives the
+/// in-universe count + map.
+async fn step_floats(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    state: &Arc<RwLock<StartupState>>,
+    sec: &Secrets,
+    today: &str,
+    mock_float: bool,
+    has_massive: bool,
+) -> Vec<crate::massive::MassiveFloat> {
+    set_step(state, "fetch_massive", StepStatus::Running, None);
+    let floats_fresh_today = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, FLOATS_DATE_KEY).as_deref() == Some(today)
+    };
+    let cached: Vec<crate::massive::MassiveFloat> = {
+        let g = db.lock().unwrap();
+        cache_repository::all_fundamentals(&g)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|f| {
+                Some(crate::massive::MassiveFloat {
+                    symbol: f.symbol,
+                    float_shares: f.float_shares? as f64,
+                    outstanding_shares: f.outstanding_shares.unwrap_or(0) as f64,
+                    free_float: f.free_float.unwrap_or(0.0),
+                })
+            })
+            .collect()
+    };
+    let have_floats = !cached.is_empty();
+
+    let mut float_fetch_ok = false;
+    let floats: Vec<crate::massive::MassiveFloat> = if floats_fresh_today && have_floats {
+        set_step(state, "fetch_massive", StepStatus::Success,
+            Some(&format!("{} float records (cached today)", cached.len())));
+        return cached;
+    } else if mock_float {
+        // No provider key. Keep real cached floats if we have them; only fall back to
+        // mock when the cache is empty. NEVER stamp the marker (so a key added later
+        // still triggers a real fetch the same day).
+        if have_floats {
+            push_warning(state, "No float provider key (Massive/FMP) — keeping cached floats");
+            set_step(state, "fetch_massive", StepStatus::Warning,
+                Some(&format!("{} cached float records (no provider key)", cached.len())));
+            return cached;
+        }
+        push_warning(state, "No float provider key (Massive/FMP) — using mock float data");
+        crate::massive::mock_float_all()
+    } else if has_massive {
+        let key = sec.massive_api_key.as_deref().unwrap_or_default();
+        set_step(state, "fetch_massive", StepStatus::Running,
+            Some("fetching bulk float (rate-limited ~1 req/13s)…"));
+        match crate::massive::fetch_float_all(key).await {
+            Ok(data) => { float_fetch_ok = true; data }
+            Err(e) => {
+                push_warning(state, &format!("Massive unavailable: {e} — using cached floats"));
+                set_step(state, "fetch_massive", StepStatus::Warning, Some(&format!("fetch error: {e}")));
+                return cached;
+            }
+        }
+    } else {
+        let key = sec.fmp_api_key.as_deref().unwrap_or_default();
+        match crate::fmp::fetch_shares_float_all(key).await {
+            Ok(data) => {
+                float_fetch_ok = true;
+                data.into_iter()
+                    .map(|f| crate::massive::MassiveFloat {
+                        symbol: f.symbol,
+                        float_shares: f.float_shares,
+                        outstanding_shares: f.outstanding_shares,
+                        free_float: f.free_float,
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                push_warning(state, &format!("FMP unavailable: {e} — using cached floats"));
+                set_step(state, "fetch_massive", StepStatus::Warning, Some(&format!("fetch error: {e}")));
+                return cached;
+            }
+        }
+    };
+
+    // Persist freshly fetched / mock floats, stamping the marker only on a real fetch.
+    {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let g = db.lock().unwrap();
+        for f in &floats {
+            let fund = cache_repository::FundamentalCache {
+                symbol: f.symbol.clone(),
+                float_shares: Some(f.float_shares as i64),
+                outstanding_shares: Some(f.outstanding_shares as i64),
+                free_float: Some(f.free_float),
+                prev_close: None,
+                avg_volume: None,
+                atr: None,
+                updated_at: now.clone(),
+            };
+            let _ = cache_repository::upsert_fundamental(&g, &fund);
+        }
+        if float_fetch_ok {
+            let _ = cache_repository::set_app_meta(&g, FLOATS_DATE_KEY, today);
+        }
+    }
+    set_step(state, "fetch_massive", StepStatus::Success,
+        Some(&format!("{} float records", floats.len())));
+    floats
+}
+
+/// SEC company-metadata step (`fetch_sec`: country of origin + SIC industry).
+/// Uses a DEDICATED `sec_fetch_date` marker stamped ONLY on a real successful
+/// fetch — never via the mock path, which previously poisoned the company_meta
+/// timestamp and made the daily skip fire even when the data was mock. A fetch is
+/// FORCED whenever `company_meta` is empty, so a fresh deploy with a key always
+/// loads real country/industry.
+async fn step_sec(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    state: &Arc<RwLock<StartupState>>,
+    sec: &Secrets,
+    today: &str,
+    mock_sec: bool,
+) {
+    set_step(state, "fetch_sec", StepStatus::Running, None);
+    let (count, fresh) = {
+        let g = db.lock().unwrap();
+        (
+            company_meta_repository::count(&g).unwrap_or(0),
+            cache_repository::get_app_meta(&g, SEC_DATE_KEY).as_deref() == Some(today),
+        )
+    };
+    if count > 0 && fresh {
+        set_step(state, "fetch_sec", StepStatus::Success, Some(&format!("{count} companies (cached today)")));
+        return;
+    }
+    if mock_sec {
+        // Only seed mock data when there is nothing at all (never clobber real rows),
+        // and never stamp the marker — a real key added later still fetches today.
+        if count == 0 {
+            let companies = crate::sec_api::mock_companies();
+            persist_company_meta(db, companies.values());
+            set_step(state, "fetch_sec", StepStatus::Warning,
+                Some(&format!("{} companies (mock — no sec-api key)", companies.len())));
+        } else {
+            set_step(state, "fetch_sec", StepStatus::Warning, Some(&format!("{count} cached (no sec-api key)")));
+        }
+        push_warning(state, "sec-api key not configured — country/industry from cache or mock");
+        return;
+    }
+    let token = sec.sec_api_key.as_deref().unwrap_or_default();
+    match crate::sec_api::fetch_all(token).await {
+        Ok(companies) => {
+            let with_country = companies.values().filter(|c| c.country.is_some()).count();
+            persist_company_meta(db, companies.values());
+            {
+                let g = db.lock().unwrap();
+                let _ = cache_repository::set_app_meta(&g, SEC_DATE_KEY, today);
+            }
+            set_step(state, "fetch_sec", StepStatus::Success,
+                Some(&format!("{} companies · {with_country} with country", companies.len())));
+            let _ = log(db, "info", &format!("startup: {} SEC company records", companies.len()));
+        }
+        Err(e) => {
+            push_warning(state, &format!("sec-api unavailable: {e} — using cached company data"));
+            set_step(state, "fetch_sec", StepStatus::Warning, Some(&format!("fetch error — {count} cached")));
+        }
     }
 }

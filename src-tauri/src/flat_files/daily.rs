@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use rusqlite::Connection;
 
 use super::{daily_path, FlatFileDay, FlatFilesShared};
@@ -137,4 +137,87 @@ pub async fn run(
         st.last_done = Some(format!("{n_dates} jours"));
     }
     Ok(())
+}
+
+// ─── Reading back into the app DB (offline daily source) ───────────────────────
+
+/// Copy every daily bar from the cumulative flat file into the app's `daily_cache`
+/// (idempotent upsert by symbol+date). This is the offline daily source: once
+/// loaded, every `daily_cache` consumer — mean-reversion scoring, PDC/PDH levels,
+/// the daily chart pane — works with no network. Returns the number of bars
+/// copied; a no-op `Ok(0)` when the flat file is absent.
+///
+/// `main` is an already-locked handle to the app database (the startup pipeline
+/// locks the guard once and calls in), so the whole copy runs under a single
+/// transaction without re-locking.
+pub fn load_into_cache(app_dir: &Path, main: &Connection) -> Result<usize, String> {
+    let path = daily_path(app_dir);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let src = open_db(&path).map_err(|e| e.to_string())?;
+    let mut stmt = src
+        .prepare("SELECT symbol,date,open,high,low,close,volume FROM daily_cache")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut n = 0usize;
+    // RAII transaction on a shared `&Connection` (the guard derefs to one): rolls
+    // back automatically if any read/insert fails partway, so we never leave the
+    // app DB inside a dangling transaction.
+    let tx = main.unchecked_transaction().map_err(|e| e.to_string())?;
+    {
+        let mut ins = tx
+            .prepare(
+                "INSERT INTO daily_cache (symbol,date,open,high,low,close,volume,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(symbol,date) DO UPDATE SET
+                     open=excluded.open, high=excluded.high, low=excluded.low,
+                     close=excluded.close, volume=excluded.volume,
+                     updated_at=excluded.updated_at",
+            )
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (sym, date, o, h, l, c, v) = row.map_err(|e| e.to_string())?;
+            ins.execute(rusqlite::params![sym, date, o, h, l, c, v, now])
+                .map_err(|e| e.to_string())?;
+            n += 1;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+/// Distinct symbols present in the cumulative daily flat file. Used to seed
+/// `universe_assets` when the app boots offline with no Alpaca-built universe.
+/// Empty when the file is absent.
+pub fn symbols(app_dir: &Path) -> Vec<String> {
+    let path = daily_path(app_dir);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(conn) = open_db(&path) else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    let Ok(mut stmt) = conn.prepare("SELECT DISTINCT symbol FROM daily_cache") else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+        for s in rows.flatten() {
+            out.push(s);
+        }
+    }
+    out
 }

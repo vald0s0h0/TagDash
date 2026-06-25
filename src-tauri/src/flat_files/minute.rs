@@ -21,6 +21,7 @@ use super::{
     day_of_file, get_meta, kind_dir, minute_path, set_meta, tmp_path, writer_pragmas, FlatFileDay,
     FlatFilesShared, Kind, SCHEMA_VERSION,
 };
+use crate::market_state::aggregators::{Bar, Timeframe};
 use crate::replay::data;
 use crate::types::NewsHeadline;
 
@@ -40,6 +41,12 @@ pub fn has_day(app_dir: &Path, day: &str) -> bool {
         .and_then(|c| get_meta(&c, "complete"))
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// The most recent COMPLETE minute day on disk (YYYY-MM-DD), or None when none has
+/// been downloaded. Used to pick the day to park in Market Replay on a flat-files boot.
+pub fn latest_complete_day(app_dir: &Path) -> Option<String> {
+    calendar(app_dir).into_iter().filter(|d| d.complete).map(|d| d.day).max()
 }
 
 pub fn calendar(app_dir: &Path) -> Vec<FlatFileDay> {
@@ -410,4 +417,143 @@ pub fn read_day(
 
     events.sort_by_key(|e| e.ts_ms);
     Ok(data::DayData { events, prev_closes, source, symbols: symbols.len() })
+}
+
+// ─── Reader (offline chart source: per-symbol OHLC bars) ───────────────────────
+
+/// Read `symbol`'s intraday OHLC bars from the minute flat files, aggregated to
+/// `tf` (M1/M2/M5/M15), oldest→newest. This is the offline chart source: it serves
+/// `load_chart_bars` / `load_older_bars` straight from disk when there is no live
+/// feed. Returns at most `limit` bars; with `before_ms` set, only bars strictly
+/// before that instant (lazy back-fill of older history). Days / symbols absent
+/// from the files simply don't contribute — the chart renders the gap.
+///
+/// Daily and sub-minute (5s/10s) timeframes are NOT handled here: daily comes from
+/// `daily_cache`, and sub-minute bars can't be rebuilt from 1-minute data.
+pub fn read_symbol_bars(
+    app_dir: &Path,
+    symbol: &str,
+    tf: Timeframe,
+    limit: usize,
+    before_ms: Option<i64>,
+) -> Vec<Bar> {
+    let tf_minutes = (tf.seconds() / 60).max(1) as usize;
+    if limit == 0 {
+        return Vec::new();
+    }
+    // Raw 1-minute bars needed to build `limit` aggregated bars (+ one tf of slack
+    // for partial buckets / gaps). Bounds how many day files we open.
+    let need_minutes = limit.saturating_mul(tf_minutes).saturating_add(tf_minutes);
+    const MAX_FILES: usize = 40;
+
+    // ET date upper bound when back-filling older history: skip whole day files we
+    // know are entirely at/after the cursor before even opening them.
+    let before_date: Option<String> = before_ms.and_then(|ms| {
+        chrono::TimeZone::timestamp_millis_opt(&Utc, ms)
+            .single()
+            .map(crate::time::et_date)
+    });
+
+    // Complete day files, newest first.
+    let mut days: Vec<String> =
+        calendar(app_dir).into_iter().filter(|d| d.complete).map(|d| d.day).collect();
+    days.sort();
+    days.reverse();
+
+    type RawMin = (i64, f64, f64, f64, f64, i64, i64, Option<f64>);
+    let mut raw: Vec<RawMin> = Vec::new();
+    let mut files_read = 0usize;
+    for day in days {
+        if let Some(bd) = &before_date {
+            if day.as_str() > bd.as_str() {
+                continue; // day entirely after the back-fill cursor
+            }
+        }
+        let path = minute_path(app_dir, &day);
+        let Ok(conn) = Connection::open(&path) else { continue };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT t_ms,o,h,l,c,v,n,vw FROM minute_bars WHERE symbol=?1")
+        else {
+            continue;
+        };
+        let rows = stmt.query_map([symbol], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<f64>>(7)?,
+            ))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                if let Some(b) = before_ms {
+                    if row.0 >= b {
+                        continue;
+                    }
+                }
+                raw.push(row);
+            }
+        }
+        files_read += 1;
+        if raw.len() >= need_minutes || files_read >= MAX_FILES {
+            break;
+        }
+    }
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.sort_by_key(|b| b.0);
+
+    // Aggregate 1-minute bars into `tf` buckets (clock-aligned via epoch floor).
+    let bucket_ms = tf.seconds() * 1000;
+    let mut out: Vec<Bar> = Vec::new();
+    let mut vwnum: Vec<f64> = Vec::new(); // volume-weighted price numerator per bar
+    for (t_ms, o, h, l, c, v, n, vw) in raw {
+        let bucket = (t_ms / bucket_ms) * bucket_ms;
+        let vol = v.max(0) as u64;
+        let contrib = vw.map(|x| x * vol as f64).unwrap_or(0.0);
+        match out.last_mut() {
+            Some(last) if last.time.timestamp_millis() == bucket => {
+                last.high = last.high.max(h);
+                last.low = last.low.min(l);
+                last.close = c;
+                last.volume += vol;
+                last.trade_count = Some(last.trade_count.unwrap_or(0) + n.max(0) as u64);
+                if let Some(num) = vwnum.last_mut() {
+                    *num += contrib;
+                }
+            }
+            _ => {
+                let Some(time) = chrono::TimeZone::timestamp_millis_opt(&Utc, bucket).single()
+                else {
+                    continue;
+                };
+                out.push(Bar {
+                    time,
+                    open: o,
+                    high: h,
+                    low: l,
+                    close: c,
+                    volume: vol,
+                    vwap: None,
+                    trade_count: Some(n.max(0) as u64),
+                });
+                vwnum.push(contrib);
+            }
+        }
+    }
+    for (b, num) in out.iter_mut().zip(vwnum) {
+        if b.volume > 0 && num > 0.0 {
+            b.vwap = Some(num / b.volume as f64);
+        }
+    }
+
+    if out.len() > limit {
+        out.drain(0..out.len() - limit);
+    }
+    out
 }

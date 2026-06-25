@@ -662,6 +662,20 @@ pub fn replace_ticker_splits(conn: &Connection, rows: &[SplitRow]) -> Result<usi
     Ok(rows.len())
 }
 
+/// Stored split events for one symbol since `since_date` (YYYY-MM-DD), ex_date
+/// DESC: `(ex_date, label)`. Offline source for the daily chart's split markers in
+/// flat-files mode (the live path hits Alpaca corporate-actions).
+pub fn splits_for_symbol(conn: &Connection, symbol: &str, since_date: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ex_date, label FROM ticker_splits
+         WHERE symbol = ?1 AND ex_date >= ?2 ORDER BY ex_date DESC",
+    )?;
+    let rows = stmt.query_map(params![symbol, since_date], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    rows.collect()
+}
+
 /// Roll up `ticker_splits` into the `fundamentals_cache` display columns:
 /// `last_split_date`, `last_split_label`, `split_count_1y` (splits in the last 365
 /// days). Resets all rows first so an aged-out split doesn't linger.

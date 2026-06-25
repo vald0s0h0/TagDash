@@ -360,18 +360,26 @@ pub async fn run_startup_pipeline(state: tauri::State<'_, AppState>) -> Result<(
     if crate::replay::clock::is_active() {
         return Err("Market Replay actif — termine le replay avant de relancer le pipeline".into());
     }
+    // Reset the step list to the active mode's set and run the matching pipeline.
+    let ds = state.config.read().unwrap().data_source.clone();
+    let is_flat = ds.is_flat_files();
     {
         let mut s = state.startup.write().unwrap();
-        *s = StartupState::default();
+        *s = StartupState::for_mode(&ds);
     }
 
     let db      = state.db.clone();
     let config  = state.config.clone();
     let secrets = state.secrets.clone();
     let startup = state.startup.clone();
+    let app_dir = state.app_dir.clone();
 
     tokio::spawn(async move {
-        crate::startup::run_pipeline(db, config, secrets, startup).await;
+        if is_flat {
+            crate::startup::run_pipeline_flat_files(db, config, secrets, startup, app_dir).await;
+        } else {
+            crate::startup::run_pipeline(db, config, secrets, startup).await;
+        }
     });
 
     Ok(())
@@ -521,6 +529,13 @@ pub fn spawn_live_feed(
         return Err("Market Replay actif — flux live indisponible".into());
     }
 
+    // Flat-files mode never uses the live Alpaca feed (the API may be unavailable
+    // entirely): the platform runs off the downloaded days via Market Replay. This
+    // guard also keeps the replay-stop cleanup from resurrecting the feed here.
+    if config.read().unwrap().data_source.is_flat_files() {
+        return Err("mode flat files — flux live désactivé".into());
+    }
+
     let (key, secret) = {
         let s = secrets.read().unwrap();
         match (s.alpaca_key.clone(), s.alpaca_secret.clone()) {
@@ -666,6 +681,25 @@ pub fn get_ticker_bars(
     state.market.read().unwrap().get_bars(&symbol, tf)
 }
 
+/// Convert a cached daily bar (the offline daily source loaded from the flat files
+/// at startup) into a chart `Bar`, anchored at 00:00:00 UTC of its date. `None`
+/// when the OHLC is incomplete (a NULL-padded cache row).
+fn daily_cache_to_bar(d: cache_repository::DailyBar) -> Option<Bar> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+    let nd = NaiveDate::parse_from_str(d.date.get(..10)?, "%Y-%m-%d").ok()?;
+    let time = Utc.from_utc_datetime(&nd.and_hms_opt(0, 0, 0)?);
+    Some(Bar {
+        time,
+        open: d.open?,
+        high: d.high?,
+        low: d.low?,
+        close: d.close?,
+        volume: d.volume.unwrap_or(0).max(0) as u64,
+        vwap: None,
+        trade_count: None,
+    })
+}
+
 /// Single, unified entry point for loading a chart's bars — used by every pane,
 /// every strategy, every timeframe. On each call it refreshes the (symbol,
 /// timeframe) history straight from Alpaca: this fills any gaps and pulls the
@@ -691,6 +725,36 @@ pub async fn load_chart_bars(
     // series (built from trade ticks) without hitting the network.
     if crate::alpaca::bars::alpaca_timeframe(tf).is_none() {
         return Ok(state.market.read().unwrap().get_bars(&symbol, tf));
+    }
+
+    // Flat-files mode: no live API — serve straight from disk, tolerating missing
+    // days/symbols (the chart renders the gap).
+    if state.config.read().unwrap().data_source.is_flat_files() {
+        let limit = if tf == Timeframe::Daily { 600 } else { 400 };
+        if tf == Timeframe::Daily {
+            // Daily history from the cache, clamped to strictly before the current
+            // (simulated, during replay) day so an active replay never reveals the
+            // future — same bound as get_previous_day_levels. The forming day shows
+            // on the intraday panes.
+            let clamp = crate::time::et_date(crate::time::now());
+            let conn = state.db.lock().unwrap();
+            let mut v: Vec<Bar> = cache_repository::get_daily_bars_before(&conn, &symbol, &clamp, limit)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(daily_cache_to_bar)
+                .collect();
+            v.reverse(); // DESC → ascending for the chart
+            return Ok(v);
+        }
+        // Intraday: while a replay drives the sim clock, return the RAM series it is
+        // feeding (already bounded to the sim instant — no look-ahead); otherwise read
+        // the static minute files for offline browsing.
+        if crate::replay::clock::is_active() {
+            return Ok(state.market.read().unwrap().get_bars(&symbol, tf));
+        }
+        return Ok(crate::flat_files::minute::read_symbol_bars(
+            &state.app_dir, &symbol, tf, limit as usize, None,
+        ));
     }
 
     let (key, secret) = {
@@ -758,6 +822,27 @@ pub async fn load_older_bars(
         return Ok(vec![]);
     }
 
+    // Flat-files mode: back-fill older history straight from disk (daily from the
+    // daily_cache; intraday from the minute files), bounded to before `before`.
+    if state.config.read().unwrap().data_source.is_flat_files() {
+        let limit = limit.clamp(1, 1000);
+        if tf == Timeframe::Daily {
+            let before_date = before.get(..10).unwrap_or("").to_string();
+            let conn = state.db.lock().unwrap();
+            let mut v: Vec<Bar> = cache_repository::get_daily_bars_before(&conn, &symbol, &before_date, limit)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(daily_cache_to_bar)
+                .collect();
+            v.reverse(); // DESC → ascending
+            return Ok(v);
+        }
+        let before_ms = chrono::DateTime::parse_from_rfc3339(&before).ok().map(|d| d.timestamp_millis());
+        return Ok(crate::flat_files::minute::read_symbol_bars(
+            &state.app_dir, &symbol, tf, limit as usize, before_ms,
+        ));
+    }
+
     let (key, secret) = {
         let s = state.secrets.read().unwrap();
         (s.alpaca_key.clone(), s.alpaca_secret.clone())
@@ -788,6 +873,22 @@ pub async fn get_split_markers(
     state:  tauri::State<'_, AppState>,
 ) -> Result<Vec<crate::types::SplitMarker>, String> {
     use chrono::{NaiveDate, TimeZone, Utc};
+
+    // Flat-files mode: read the stored split events (ticker_splits) instead of the
+    // Alpaca corporate-actions API, so markers still show offline.
+    if state.config.read().unwrap().data_source.is_flat_files() {
+        let since = (Utc::now() - chrono::Duration::days(365 * 2)).format("%Y-%m-%d").to_string();
+        let conn = state.db.lock().unwrap();
+        let rows = cache_repository::splits_for_symbol(&conn, &symbol, &since).unwrap_or_default();
+        return Ok(rows
+            .into_iter()
+            .filter_map(|(ex_date, label)| {
+                let d = NaiveDate::parse_from_str(&ex_date, "%Y-%m-%d").ok()?;
+                let time = Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?).timestamp();
+                Some(crate::types::SplitMarker { time, label })
+            })
+            .collect());
+    }
 
     let (key, secret) = {
         let s = state.secrets.read().unwrap();
