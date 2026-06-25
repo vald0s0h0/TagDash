@@ -86,6 +86,16 @@ jobs:
           choco install llvm -y --no-progress
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
+      # whisper.cpp's ggml uses C++17 std::filesystem (fs::u8path), which clang
+      # marks "unavailable" below macOS 10.15. Tauri's default deployment target is
+      # 10.13, so the C++ compile fails with:
+      #   error: '~path' is unavailable: introduced in macOS 10.15
+      # Pin the deployment target to 10.15 (matches bundle.macOS.minimumSystemVersion
+      # in tauri.conf.json) so std::filesystem is available. macOS only.
+      - name: Pin macOS deployment target (whisper.cpp std::filesystem ≥ 10.15)
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+
       - name: Cache cargo build
         uses: swatinem/rust-cache@v2
         with:
