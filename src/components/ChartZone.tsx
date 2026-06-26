@@ -124,7 +124,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   const chartStore   = useChartStore();
   const zoneState    = useChartStore((s) => s.getZone(zone.zone_id));
-  const { timeframe, drawMode, orderMode, lines, annotations, alarms, linePoint1, pendingEmoji, context } = zoneState;
+  const { timeframe, drawMode, orderMode, lines, annotations, alarms, linePoint1, pendingEmoji, pendingLimitPercent, context } = zoneState;
 
   // Right-click context menu (one per zone).
   const [ctxMenu, setCtxMenu] = useState<{ target: CtxTarget; x: number; y: number } | null>(null);
@@ -733,12 +733,26 @@ export function ChartZone({ zone }: ChartZoneProps) {
       if (orderMode === "market") {
         await api.createInternalMarketOrderPercent(zone.zone_id, percent);
       } else {
-        await api.createInternalOrderPercent(zone.zone_id, percent);
+        // Limit mode: arm the chart click to place the limit price (toggle off if same %).
+        const current = useChartStore.getState().getZone(zone.zone_id).pendingLimitPercent;
+        chartStore.setPendingLimitPercent(zone.zone_id, current === percent ? null : percent);
       }
     } catch (e) {
       console.error("order failed:", e);
     }
-  }, [zone.zone_id, hasSl, orderMode]);
+  }, [zone.zone_id, hasSl, orderMode, chartStore]);
+
+  // ── Chart click finalises a pending limit order ──────────────────────────
+  const handleLimitOrderClick = useCallback(async (price: number) => {
+    const pct = useChartStore.getState().getZone(zone.zone_id).pendingLimitPercent;
+    if (!pct) return;
+    chartStore.setPendingLimitPercent(zone.zone_id, null);
+    try {
+      await api.createInternalLimitOrderPercent(zone.zone_id, pct, price);
+    } catch (e) {
+      console.error("limit order failed:", e);
+    }
+  }, [zone.zone_id, chartStore]);
 
   // ── Close open position ────────────────────────────────────────────────────
   const handleClose = useCallback(async () => {
@@ -1143,6 +1157,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     <TBtn key="25"
       title={hasSl ? `25 % — mode ${orderMode === "market" ? "Mkt" : "Lmt"}` : "SL requis"}
       disabled={!hasSl}
+      active={pendingLimitPercent === 25}
       onClick={() => handleOrder(25)}
     >
       <span>25</span>
@@ -1152,6 +1167,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     <TBtn key="50"
       title={hasSl ? `50 % — mode ${orderMode === "market" ? "Mkt" : "Lmt"}` : "SL requis"}
       disabled={!hasSl}
+      active={pendingLimitPercent === 50}
       onClick={() => handleOrder(50)}
     >
       <span>50</span>
@@ -1161,6 +1177,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     <TBtn key="100"
       title={hasSl ? `100 % — mode ${orderMode === "market" ? "Mkt" : "Lmt"}` : "SL requis"}
       disabled={!hasSl}
+      active={pendingLimitPercent === 100}
       onClick={() => handleOrder(100)}
     >
       <span>100</span>
@@ -1545,6 +1562,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     drawMode={drawMode}
                     paneScope={paneScope}
                     pendingEmoji={pendingEmoji}
+                    pendingLimitPercent={pendingLimitPercent}
+                    onLimitOrderClick={handleLimitOrderClick}
                     slPrice={context?.stop_loss ?? null}
                     tpPrice={context?.take_profit ?? null}
                     entryPrice={openPosition?.avg_entry_price ?? null}

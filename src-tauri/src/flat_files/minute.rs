@@ -192,7 +192,7 @@ async fn write_one_day(
 
     // 4. News of the day (published 00:00 ET → 20:00 ET).
     let news_start = crate::time::et_clock_utc(noon, 0, 0).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let news = data::fetch_news_window(key, secret, &news_start, &min_end).await.unwrap_or_else(|e| {
+    let news = data::fetch_news_window(key, secret, &news_start, &min_end, &[]).await.unwrap_or_else(|e| {
         eprintln!("[tagdash] flat_files minute: {day} news ignorées ({e})");
         Vec::new()
     });

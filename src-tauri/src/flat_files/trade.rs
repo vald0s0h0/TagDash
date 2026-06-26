@@ -121,6 +121,9 @@ fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
          );
          CREATE TABLE IF NOT EXISTS windows (
              symbol TEXT NOT NULL, alert_ts INTEGER, start_ts INTEGER, end_ts INTEGER, reason TEXT
+         );
+         CREATE TABLE IF NOT EXISTS news (
+             id INTEGER, headline TEXT NOT NULL, created_ms INTEGER NOT NULL, symbols_json TEXT
          );",
     )?;
     Ok(conn)
@@ -141,6 +144,7 @@ pub async fn write_day(
     let noon = data::noon_utc(nd);
     let pm_start = crate::time::et_clock_utc(noon, 4, 0); // 04:00 ET
     let cash_open = crate::time::et_clock_utc(noon, 9, 30); // 09:30 ET (Micro Pullback is premarket-only)
+    let day_end = crate::time::et_clock_utc(noon, 20, 0); // 20:00 ET
 
     // 1. Candidate universe: known float ≤ generous ceiling (price filtered later via bars).
     let prefilter_max = cfg.float_max.saturating_mul(PREFILTER_FLOAT_MULT);
@@ -242,22 +246,46 @@ pub async fn write_day(
             let (Some(s), Some(e)) = (ms_to_rfc3339(w.start_ms), ms_to_rfc3339(w.end_ms)) else {
                 continue;
             };
-            if let Ok(map) = data::fetch_trades_window(key, secret, &one, &s, &e).await {
-                for t in map.get(sym).into_iter().flatten() {
-                    if let Some(ms) = rfc3339_to_ms(&t.t) {
-                        all_trades.push((sym.clone(), ms, t.p, t.s));
+            match data::fetch_trades_window(key, secret, &one, &s, &e).await {
+                Ok(map) => {
+                    for t in map.get(sym).into_iter().flatten() {
+                        if let Some(ms) = rfc3339_to_ms(&t.t) {
+                            all_trades.push((sym.clone(), ms, t.p, t.s));
+                        }
                     }
                 }
+                Err(e) => eprintln!("[tagdash] flat_files trade: fetch trades {sym}: {e}"),
             }
-            if let Ok(map) = data::fetch_quotes_window(key, secret, &one, &s, &e).await {
-                for q in map.get(sym).into_iter().flatten() {
-                    if let Some(ms) = rfc3339_to_ms(&q.t) {
-                        all_quotes.push((sym.clone(), ms, q.bp, q.ap, q.bs, q.as_size));
+            match data::fetch_quotes_window(key, secret, &one, &s, &e).await {
+                Ok(map) => {
+                    for q in map.get(sym).into_iter().flatten() {
+                        if let Some(ms) = rfc3339_to_ms(&q.t) {
+                            all_quotes.push((sym.clone(), ms, q.bp, q.ap, q.bs, q.as_size));
+                        }
                     }
                 }
+                Err(e) => eprintln!("[tagdash] flat_files trade: fetch quotes {sym}: {e}"),
             }
         }
     }
+    shared.set_progress(0.93);
+
+    // 5b. Fetch news for kept symbols (48h before premarket → end of day).
+    let kept_syms: Vec<String> = kept.iter().map(|(s, _)| s.clone()).collect();
+    let all_news = if !kept_syms.is_empty() {
+        let news_start = (pm_start - chrono::Duration::hours(48))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let news_end = day_end.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        data::fetch_news_window(key, secret, &news_start, &news_end, &kept_syms)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("[tagdash] flat_files trade: {day} news ignorées ({e})");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     shared.set_progress(0.98);
 
     // 6. Write atomically (even when empty — a complete file marks the day done).
@@ -299,6 +327,15 @@ pub async fn write_day(
                         .map_err(|e| e.to_string())?;
                 }
             }
+            let mut ins_n = tx
+                .prepare("INSERT INTO news (id, headline, created_ms, symbols_json) VALUES (?1,?2,?3,?4)")
+                .map_err(|e| e.to_string())?;
+            for h in &all_news {
+                let syms_json = serde_json::to_string(&h.symbols).unwrap_or_else(|_| "[]".into());
+                ins_n
+                    .execute(rusqlite::params![h.id, h.headline, h.created_at.timestamp_millis(), syms_json])
+                    .map_err(|e| e.to_string())?;
+            }
         }
         set_meta(&tx, "schema_version", SCHEMA_VERSION).map_err(|e| e.to_string())?;
         set_meta(&tx, "kind", "trade").map_err(|e| e.to_string())?;
@@ -309,6 +346,7 @@ pub async fn write_day(
         set_meta(&tx, "symbol_count", &kept.len().to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "trade_count", &trade_count.to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "quote_count", &all_quotes.len().to_string()).map_err(|e| e.to_string())?;
+        set_meta(&tx, "news_count", &all_news.len().to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "complete", "1").map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         drop(conn);
@@ -442,13 +480,53 @@ pub fn read_overlay(app_dir: &Path, day: &str) -> Option<TradeOverlay> {
         }
     }
 
+    // News (may be absent in older trade files).
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT id, headline, created_ms, symbols_json FROM news")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (id, headline, created_ms, symbols_json) = row;
+                let Some(created) =
+                    chrono::TimeZone::timestamp_millis_opt(&Utc, created_ms).single()
+                else {
+                    continue;
+                };
+                let syms: Vec<String> =
+                    symbols_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+                events.push(data::TimedEvent {
+                    ts_ms: created_ms,
+                    ev: data::Event::News(crate::types::NewsHeadline {
+                        id: id.unwrap_or(0),
+                        headline,
+                        summary: None,
+                        url: None,
+                        source: None,
+                        symbols: syms,
+                        created_at: created,
+                        received_at: created,
+                    }),
+                });
+            }
+        }
+    }
+
     Some(TradeOverlay { windows, events })
 }
 
 // ─── Time helpers ───────────────────────────────────────────────────────────────
 
 fn ms_to_rfc3339(ms: i64) -> Option<String> {
-    chrono::TimeZone::timestamp_millis_opt(&Utc, ms).single().map(|d| d.to_rfc3339())
+    chrono::TimeZone::timestamp_millis_opt(&Utc, ms)
+        .single()
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 fn rfc3339_to_ms(s: &str) -> Option<i64> {

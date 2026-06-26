@@ -610,6 +610,7 @@ export function HodDriveInfoOverlay({ overlay }: { overlay: HodDriveOverlay | nu
   const ratio = overlay?.pullback_vol_ratio ?? null;    // 1.0 = equal
   const power = overlay?.power_score ?? null;            // 0..1
   const eff   = overlay?.directional_efficiency ?? null; // 0..1
+  const rgAtr = overlay?.range_vs_green_atr ?? null;    // 1.0 = 100%
   const pct = (x: number) => `${Math.round(x * 100)}%`;
 
   return (
@@ -662,6 +663,13 @@ export function HodDriveInfoOverlay({ overlay }: { overlay: HodDriveOverlay | nu
         fill={eff != null ? clamp01(eff) : null}
         value={eff != null ? pct(eff) : null}
         tone="blue"
+      />
+      {/* Today's HOD/LOD range vs average range of green daily candles. */}
+      <MetricBar
+        label="Rg/ATR vert"
+        fill={rgAtr != null ? clamp01(rgAtr / 2) : null}
+        value={rgAtr != null ? pct(rgAtr) : null}
+        tone={rgAtr != null && rgAtr >= 1 ? "red" : "blue"}
       />
     </div>
   );

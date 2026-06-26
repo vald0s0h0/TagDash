@@ -53,11 +53,19 @@ export function useChartBars(
   }, [backfilled, symbol, timeframe, queryClient]);
 
   // ── Poll live bars from RAM (cheap, fast).
+  // `gcTime: 0` drops this query's cache the moment the symbol/timeframe changes
+  // (the observer goes inactive). Without it, returning to a previously-viewed
+  // ticker would synchronously deliver that visit's STALE snapshot, which the
+  // accumulator merges with the now-current RAM ring — and if enough time elapsed
+  // that the two no longer overlap (the 5s/10s ring only spans the last few
+  // minutes), the union is non-contiguous → the intermittent "holes" on switch.
+  // Starting each visit from a fresh RAM fetch keeps the series contiguous.
   const { data: fetchedBars } = useQuery({
     queryKey: ["bars", symbol, timeframe],
     queryFn:  () => api.getTickerBars(symbol, timeframe),
     refetchInterval: timeframe === "5s" || timeframe === "10s" ? 500 : 1000,
     enabled:  !!symbol,
+    gcTime:   0,
   });
 
   useEffect(() => { barsRef.current = bars; }, [bars]); // eslint-disable-line react-hooks/exhaustive-deps

@@ -386,12 +386,14 @@ struct RawNews {
     created_at: Option<String>,
 }
 
-/// Every Alpaca headline published in [start, end] (all symbols), ascending.
+/// Every Alpaca headline published in [start, end], ascending.
+/// When `symbols` is non-empty, only headlines mentioning at least one of them.
 pub(crate) async fn fetch_news_window(
     key: &str,
     secret: &str,
     start: &str,
     end: &str,
+    symbols: &[String],
 ) -> Result<Vec<NewsHeadline>, String> {
     let client = reqwest::Client::new();
     let mut out: Vec<NewsHeadline> = Vec::new();
@@ -401,6 +403,9 @@ pub(crate) async fn fetch_news_window(
             "https://data.alpaca.markets/v1beta1/news?start={start}&end={end}\
              &limit=50&sort=asc&include_content=false"
         );
+        if !symbols.is_empty() {
+            url.push_str(&format!("&symbols={}", symbols.join(",")));
+        }
         if let Some(tok) = &page_token {
             url.push_str(&format!("&page_token={tok}"));
         }
@@ -622,7 +627,7 @@ pub async fn load_day(
 
     // 6. News of the day (published 00:00 ET → 20:00 ET), emitted at created_at.
     let news_start = crate::time::et_clock_utc(noon, 0, 0).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    match fetch_news_window(key, secret, &news_start, &min_end).await {
+    match fetch_news_window(key, secret, &news_start, &min_end, &[]).await {
         Ok(list) => {
             for h in list {
                 events.push(TimedEvent { ts_ms: h.created_at.timestamp_millis(), ev: Event::News(h) });

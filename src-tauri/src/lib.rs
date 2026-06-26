@@ -571,6 +571,7 @@ pub fn run() {
             commands::clear_zone_context,
             // Internal trading engine
             commands::create_internal_order_percent,
+            commands::create_internal_limit_order_percent,
             commands::create_internal_market_order_percent,
             commands::cancel_internal_order,
             commands::close_internal_position,

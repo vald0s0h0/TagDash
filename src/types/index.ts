@@ -153,6 +153,8 @@ export interface HodDriveOverlay {
   series_bar_times:       number[];
   /** True when Gates 1-3 currently pass. */
   gates_pass:             boolean;
+  /** (HOD−LOD) / avg range of green daily candles. 1.0 = identical, 0.5 = half. */
+  range_vs_green_atr:     number | null;
 }
 
 /** One headline for the Micro Pullback overlay (mirrors CardNews in

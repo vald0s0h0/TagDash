@@ -110,6 +110,10 @@ interface Props {
   /** Timeframe class of THIS pane: drawings are created/filtered against it. */
   paneScope:   DrawScope;
   pendingEmoji: string | null;
+  /** When set, next chart click places a limit order at that price (% size). */
+  pendingLimitPercent?: 25 | 50 | 100 | null;
+  /** Called when the user clicks on the chart to finalise a pending limit order. */
+  onLimitOrderClick?: (price: number) => void;
   slPrice:     number | null;
   tpPrice:     number | null;
   entryPrice:  number | null;
@@ -166,6 +170,8 @@ export function LightweightChart({
   drawMode,
   paneScope,
   pendingEmoji,
+  pendingLimitPercent,
+  onLimitOrderClick,
   slPrice,
   tpPrice,
   entryPrice,
@@ -233,6 +239,8 @@ export function LightweightChart({
   const drawModeRef     = useRef<DrawMode>(drawMode);
   const paneScopeRef    = useRef<DrawScope>(paneScope);
   const pendingEmojiRef = useRef<string | null>(pendingEmoji);
+  const pendingLimitRef = useRef<25 | 50 | 100 | null>(pendingLimitPercent ?? null);
+  const onLimitOrderClickRef = useRef(onLimitOrderClick);
   const slPriceRef      = useRef<number | null>(slPrice);
   const tpPriceRef      = useRef<number | null>(tpPrice);
   const ordersActiveRef = useRef<boolean>(ordersActive);
@@ -253,6 +261,8 @@ export function LightweightChart({
   useEffect(() => { drawModeRef.current     = drawMode; });
   useEffect(() => { paneScopeRef.current    = paneScope; });
   useEffect(() => { pendingEmojiRef.current = pendingEmoji; });
+  useEffect(() => { pendingLimitRef.current = pendingLimitPercent ?? null; });
+  useEffect(() => { onLimitOrderClickRef.current = onLimitOrderClick; });
   useEffect(() => { slPriceRef.current      = slPrice; });
   useEffect(() => { tpPriceRef.current      = tpPrice; });
   useEffect(() => { ordersActiveRef.current = ordersActive; });
@@ -331,7 +341,7 @@ export function LightweightChart({
   useExecutionMarkers(execPrimRef, symbol, bars);
 
   // ── News pastilles (bottom-of-pane dots) — extracted hook ──────────────────
-  useNewsMarkers(newsPrimRef, symbol, bars);
+  useNewsMarkers(newsPrimRef, symbol, bars, timeframe);
 
   // ── Coordinate helpers (read live each call from the chart) ────────────────
   const timeToX = useCallback((t: number): number | null => {
@@ -540,6 +550,15 @@ export function LightweightChart({
 
     // ── Single click: place the active tool ─────────────────────────────────
     chart.subscribeClick((param) => {
+      // Pending limit order: intercept before draw mode so the click places the order.
+      if (pendingLimitRef.current != null) {
+        if (!param.point) return;
+        const price = candle.coordinateToPrice(param.point.y);
+        if (price == null || price <= 0) return;
+        onLimitOrderClickRef.current?.(price);
+        return;
+      }
+
       const mode = drawModeRef.current;
       if (mode === "none") return;          // selection handled in onMouseDown
       if (!param.point) return;
@@ -914,7 +933,7 @@ export function LightweightChart({
   }, [freezePan]);
 
   // ── Cursor ─────────────────────────────────────────────────────────────────
-  const cursor = drawMode === "none" ? "default" : "crosshair";
+  const cursor = pendingLimitPercent ? "crosshair" : drawMode === "none" ? "default" : "crosshair";
 
   // ── Deletable user price lines → right-edge "price + ✕" label pills ─────────
   const fmtPrice = (p: number) => (p >= 1 ? p.toFixed(2) : p.toFixed(4));

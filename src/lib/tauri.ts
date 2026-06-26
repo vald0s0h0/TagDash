@@ -220,6 +220,8 @@ export const api = {
   // Internal trading engine
   createInternalOrderPercent: (zone_id: string, percent: number) =>
     invoke<InternalOrder>("create_internal_order_percent", { zone_id, percent }),
+  createInternalLimitOrderPercent: (zone_id: string, percent: number, limit_price: number) =>
+    invoke<InternalOrder>("create_internal_limit_order_percent", { zone_id, percent, limit_price }),
   createInternalMarketOrderPercent: (zone_id: string, percent: number) =>
     invoke<Fill>("create_internal_market_order_percent", { zone_id, percent }),
   cancelInternalOrder: (order_id: string) =>

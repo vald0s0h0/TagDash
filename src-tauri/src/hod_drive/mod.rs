@@ -247,7 +247,7 @@ pub fn evaluate(
     // ── Gate 2 — Risk Ratio (last closed bar) ──
     let retracement = (hod - last.low) / open_range;
     let risk = last.high - last.low;
-    let reward = hod - last.low;
+    let reward = hod - last.high;
     let risk_ratio = if risk > 0.0 { reward / risk } else { 0.0 };
     let g2 = retracement <= cfg.max_retracement && risk_ratio >= cfg.min_risk_ratio;
 

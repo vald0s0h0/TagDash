@@ -1357,6 +1357,8 @@ pub struct HodDriveOverlay {
     pub series_bar_times:       Vec<i64>,
     /// True when Gates 1-3 currently pass (overlay can badge the live structure).
     pub gates_pass:             bool,
+    /// (HOD−LOD) / avg range of green daily candles. 1.0 = identical, 0.5 = half.
+    pub range_vs_green_atr:     Option<f64>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1391,6 +1393,29 @@ pub fn get_hod_drive_overlay(
         return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() };
     };
 
+    let range_vs_green_atr = {
+        let open_range = eval.hod - eval.lod;
+        if open_range > 0.0 {
+            let today = Utc::now().format("%Y-%m-%d").to_string();
+            let db = state.db.lock().unwrap();
+            let daily = cache_repository::ohlcv_ascending(&db, &symbol, 60, &today)
+                .unwrap_or_default();
+            let green_ranges: Vec<f64> = daily
+                .iter()
+                .filter(|(o, _h, _l, c, _v)| *c > *o)
+                .map(|(_o, h, l, _c, _v)| h - l)
+                .collect();
+            if !green_ranges.is_empty() {
+                let avg: f64 = green_ranges.iter().sum::<f64>() / green_ranges.len() as f64;
+                if avg > 0.0 { Some(open_range / avg) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     HodDriveOverlay {
         timeframe:              cfg.label.into(),
         series_share:           Some(eval.series_share),
@@ -1408,6 +1433,7 @@ pub fn get_hod_drive_overlay(
             .filter_map(|&i| bars.get(i).map(|b| b.time.timestamp()))
             .collect(),
         gates_pass:             eval.gates_pass,
+        range_vs_green_atr,
     }
 }
 
@@ -1731,6 +1757,51 @@ pub fn create_internal_order_percent(
     );
     // A resting entry order is part of the day's state — persist so it survives a
     // restart and the trading loop can still fill it on a price cross.
+    persist_book(&state.internal_book, &state.db);
+    Ok(order)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn create_internal_limit_order_percent(
+    zone_id: String,
+    percent: u8,
+    limit_price: f64,
+    state: tauri::State<'_, AppState>,
+) -> Result<InternalOrder, String> {
+    let ctx = state.chart.read().unwrap()
+        .get_context_for_zone(&zone_id)
+        .ok_or_else(|| "zone has no trade context".to_string())?;
+
+    let sl = ctx.stop_loss.ok_or_else(|| "SL is required".to_string())?;
+    if limit_price < 1e-6 { return Err("limit price is invalid".into()); }
+
+    let max_risk = strategy_max_risk(&state, &ctx.strategy_id);
+    let cfg = state.config.read().unwrap();
+    let sizing = InternalBook::compute_risk_sizing(
+        limit_price, sl, max_risk,
+        cfg.trading.min_position_size,
+        cfg.trading.max_position_size,
+    );
+    drop(cfg);
+
+    let qty = match percent {
+        25  => sizing.size_25,
+        50  => sizing.size_50,
+        _   => sizing.size_100,
+    };
+    if qty == 0 { return Err("position size is 0 — check SL distance".into()); }
+
+    let order = state.internal_book.write().unwrap().create_limit_order(
+        ctx.trade_id.clone(),
+        zone_id,
+        ctx.symbol.clone(),
+        ctx.strategy_id.clone(),
+        sizing.side,
+        qty,
+        limit_price,
+        ctx.stop_loss,
+        ctx.take_profit,
+    );
     persist_book(&state.internal_book, &state.db);
     Ok(order)
 }

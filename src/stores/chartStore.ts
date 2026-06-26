@@ -58,6 +58,8 @@ export interface ZoneChartState {
   linePoint1:   { time: number; price: number } | null;
   /** Glyph chosen in the emoji toolbar, placed on the next click (drawMode="emoji"). */
   pendingEmoji: string | null;
+  /** When set, next chart click places a limit order at that price for this % size. */
+  pendingLimitPercent: 25 | 50 | 100 | null;
   context:      ZoneTradeContext | null;
 }
 
@@ -70,6 +72,7 @@ const DEFAULT_ZONE: ZoneChartState = {
   alarms:      [],
   linePoint1:  null,
   pendingEmoji: null,
+  pendingLimitPercent: null,
   context:     null,
 };
 
@@ -82,6 +85,7 @@ interface ChartStoreState {
   setTimeframe:    (zoneId: string, tf: Timeframe) => void;
   setDrawMode:     (zoneId: string, mode: DrawMode) => void;
   setOrderMode:    (zoneId: string, mode: OrderMode) => void;
+  setPendingLimitPercent: (zoneId: string, pct: 25 | 50 | 100 | null) => void;
   setLinePoint1:   (zoneId: string, p: { time: number; price: number } | null) => void;
   setPendingEmoji: (zoneId: string, glyph: string | null) => void;
   setLines:        (zoneId: string, lines: ChartLine[]) => void;
@@ -124,7 +128,10 @@ export const useChartStore = create<ChartStoreState>((set, get) => ({
     set((s) => ({ zones: patch(s.zones, zoneId, { drawMode: mode, linePoint1: null }) })),
 
   setOrderMode: (zoneId, mode) =>
-    set((s) => ({ zones: patch(s.zones, zoneId, { orderMode: mode }) })),
+    set((s) => ({ zones: patch(s.zones, zoneId, { orderMode: mode, pendingLimitPercent: null }) })),
+
+  setPendingLimitPercent: (zoneId, pct) =>
+    set((s) => ({ zones: patch(s.zones, zoneId, { pendingLimitPercent: pct }) })),
 
   setLinePoint1: (zoneId, p) =>
     set((s) => ({ zones: patch(s.zones, zoneId, { linePoint1: p }) })),
