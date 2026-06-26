@@ -147,6 +147,7 @@ jobs:
           sudo softwareupdate --install-rosetta --agree-to-license || true
           # x86_64 Rust toolchain — its real cargo/rustc are x86_64 → native (not cross).
           rustup toolchain install stable-x86_64-apple-darwin --force-non-host
+          rustup target add x86_64-apple-darwin
           echo "$HOME/.rustup/toolchains/stable-x86_64-apple-darwin/bin" >> "$GITHUB_PATH"
           # x86_64 Node — the whole build runs under Rosetta, so node must be x64 too.
           # Match the exact version actions/setup-node installed.
