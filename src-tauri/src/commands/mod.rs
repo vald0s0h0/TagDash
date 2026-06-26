@@ -1333,6 +1333,84 @@ pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardI
     }
 }
 
+/// The HOD Drive on-chart overlay payload for one symbol: the five KPIs plus the
+/// HOD/LOD levels (+ their bar times) and the green-series bar times, so the chart can
+/// draw the HOD/LOD points and a small cross under each series bar. Recomputed live
+/// from the session 5-minute structure (the engine's own pure pipeline). All values
+/// are `None`/empty when the symbol doesn't have enough structure yet.
+#[derive(Debug, Serialize, Default)]
+pub struct HodDriveOverlay {
+    pub timeframe:              String,
+    /// series_range / (HOD−LOD), 0..1.
+    pub series_share:           Option<f64>,
+    pub pullback_volume:        Option<f64>,
+    /// pullback_volume / series_volume (1.0 = equal, 0.5 = half, 2.0 = double).
+    pub pullback_vol_ratio:     Option<f64>,
+    pub power_score:            Option<f64>,
+    pub directional_efficiency: Option<f64>,
+    pub hod:                    Option<f64>,
+    pub lod:                    Option<f64>,
+    /// Unix seconds of the HOD / LOD bars (for the chart points).
+    pub hod_time:               Option<i64>,
+    pub lod_time:               Option<i64>,
+    /// Unix seconds of every bar in the green series (a cross is drawn under each).
+    pub series_bar_times:       Vec<i64>,
+    /// True when Gates 1-3 currently pass (overlay can badge the live structure).
+    pub gates_pass:             bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_hod_drive_overlay(
+    symbol: String,
+    state:  tauri::State<'_, AppState>,
+) -> HodDriveOverlay {
+    let cfg = &crate::hod_drive::CFG_5M;
+    let now = crate::time::now();
+    let session_open = crate::time::et_session_open_utc(now);
+
+    let (m1, price) = {
+        let market = state.market.read().unwrap();
+        let m1 = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
+        let price = market.last_price(&symbol);
+        (m1, price)
+    };
+    let Some(price) = price else { return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() } };
+
+    // Session-bounded M1 → closed 5-minute bars (the engine's aggregation).
+    let m1_session: Vec<_> = m1.into_iter().filter(|b| b.time >= session_open).collect();
+    let bars = crate::hod_drive::session_bars(cfg, &m1_session, now);
+    let volume_since_open: u64 = bars.iter().map(|b| b.volume).sum();
+    let dollar_volume_since_open: f64 = bars
+        .iter()
+        .map(|b| ((b.high + b.low + b.close) / 3.0) * b.volume as f64)
+        .sum();
+
+    let Some(eval) =
+        crate::hod_drive::evaluate(cfg, &bars, price, volume_since_open, dollar_volume_since_open)
+    else {
+        return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() };
+    };
+
+    HodDriveOverlay {
+        timeframe:              cfg.label.into(),
+        series_share:           Some(eval.series_share),
+        pullback_volume:        Some(eval.pullback_volume as f64),
+        pullback_vol_ratio:     Some(eval.pullback_vol_ratio),
+        power_score:            Some(eval.power_score),
+        directional_efficiency: Some(eval.directional_efficiency),
+        hod:                    Some(eval.hod),
+        lod:                    Some(eval.lod),
+        hod_time:               bars.get(eval.hod_bar_idx).map(|b| b.time.timestamp()),
+        lod_time:               bars.get(eval.lod_bar_idx).map(|b| b.time.timestamp()),
+        series_bar_times:       eval
+            .series_bar_idxs
+            .iter()
+            .filter_map(|&i| bars.get(i).map(|b| b.time.timestamp()))
+            .collect(),
+        gates_pass:             eval.gates_pass,
+    }
+}
+
 /// The most recent single-ticker headlines for `symbol` (Alpaca news REST), for the
 /// Micro Pullback overlay's news list. Fetched per displayed ticker, headlines only
 /// (no article body). Headlines that reference several tickers are dropped — we only

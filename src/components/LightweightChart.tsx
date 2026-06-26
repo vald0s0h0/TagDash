@@ -24,6 +24,7 @@ import { GridPrimitive } from "@/charts/gridPrimitive";
 import { NewsPrimitive } from "@/charts/newsPrimitive";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
 import { useChartTheme, getChartTheme } from "@/stores/chartThemeStore";
+import { useChartInput } from "@/stores/chartInputStore";
 import {
   BACKFILL_THRESHOLD,
   slOpts, tpOpts, alarmOpts, CURSOR_OPTIONS,
@@ -121,8 +122,13 @@ interface Props {
   linePoint1:  { time: number; price: number } | null;
   /** Strategy-card indicators overlaid on this pane (VWAP / EMA / SMA). */
   indicators?: PaneIndicator[];
-  /** Candle markers (e.g. red dots on split days), unix-seconds keyed. */
-  markers?: { time: number; color: string; text?: string }[];
+  /** Candle markers (e.g. red dots on split days, HOD/LOD points, series crosses),
+   *  unix-seconds keyed. `position`/`shape` default to belowBar/circle. */
+  markers?: {
+    time: number; color: string; text?: string;
+    position?: "aboveBar" | "belowBar" | "inBar";
+    shape?: "circle" | "square" | "arrowUp" | "arrowDown";
+  }[];
   /** Shared cross-pane crosshair sync group (same instrument). */
   crosshairSync?: CrosshairSync;
   /** Stable id of this pane within its zone, for the crosshair sync registry. */
@@ -273,6 +279,15 @@ export function LightweightChart({
   // the styling hooks/effects below when the palette is edited, for a live update.
   const theme = useChartTheme();
 
+  // Trackpad / wheel X-zoom tuning (Settings → Apparence). Mirrored into refs so the
+  // once-bound `onWheel` handler reads the live values without re-binding.
+  const zoomSensitivity = useChartInput((s) => s.zoomSensitivity);
+  const zoomInvert      = useChartInput((s) => s.zoomInvert);
+  const zoomSensRef     = useRef(zoomSensitivity);
+  const zoomInvertRef   = useRef(zoomInvert);
+  useEffect(() => { zoomSensRef.current = zoomSensitivity; }, [zoomSensitivity]);
+  useEffect(() => { zoomInvertRef.current = zoomInvert; }, [zoomInvert]);
+
   // ── Bar-loading pipeline (history refresh + RAM poll + lazy back-fill) — hook ─
   const { bars, loadOlderBars } = useChartBars(
     symbol, timeframe, symbolRef, timeframeRef,
@@ -299,10 +314,17 @@ export function LightweightChart({
     staleTime: 6 * 60 * 60 * 1000,
   });
   const allMarkers = useMemo(() => {
-    const byTime = new Map<number, { time: number; color: string; text?: string }>();
-    if (isDailyTf) for (const m of splitMarkers ?? []) byTime.set(m.time, { time: m.time, color: theme.markers.split, text: m.label });
-    for (const m of markers) byTime.set(m.time, m);
-    return [...byTime.values()];
+    // Keyed by time + position + shape so several markers can share a bar (e.g. a
+    // HOD point above and a green-series cross below the same candle).
+    type M = NonNullable<typeof markers>[number];
+    const byKey = new Map<string, M>();
+    const key = (m: M) => `${m.time}:${m.position ?? "belowBar"}:${m.shape ?? "circle"}`;
+    if (isDailyTf) for (const m of splitMarkers ?? []) {
+      const sm: M = { time: m.time, color: theme.markers.split, text: m.label };
+      byKey.set(key(sm), sm);
+    }
+    for (const m of markers) byKey.set(key(m), m);
+    return [...byKey.values()];
   }, [markers, splitMarkers, isDailyTf, theme.markers.split]);
 
   // ── Trade executions (triangles + P&L line) — extracted hook ───────────────
@@ -592,13 +614,18 @@ export function LightweightChart({
         zoomPriceAxis(e.deltaX < 0 ? -0.02 : 0.02); // one way zooms in, the other out
         return;
       }
-      // Main wheel → time-axis zoom, anchored on the cursor once panned.
+      // Main wheel / 2-finger trackpad scroll → time-axis (X) zoom, current bar
+      // pinned at the default view. The step is proportional to the wheel delta and
+      // scaled by the user's sensitivity, so a trackpad's many small events stay
+      // smooth while a mouse notch (~100) keeps the classic ~1.1× at sensitivity 1.
+      // The invert toggle flips zoom-in/zoom-out (e.g. macOS "natural" scrolling).
       if (e.deltaY === 0) return;
       e.preventDefault();
-      zoomTimeAxis(
-        e.deltaY < 0 ? 1.1 : 1 / 1.1, // wheel up = zoom in
-        e.clientX - container.getBoundingClientRect().left,
-      );
+      const mag = Math.min(Math.abs(e.deltaY) * 0.001 * zoomSensRef.current, 0.5);
+      let zoomIn = e.deltaY < 0; // up = zoom in by default
+      if (zoomInvertRef.current) zoomIn = !zoomIn;
+      const factor = zoomIn ? 1 + mag : 1 / (1 + mag);
+      zoomTimeAxis(factor, e.clientX - container.getBoundingClientRect().left);
     };
     container.addEventListener("wheel", onWheel, { passive: false });
 

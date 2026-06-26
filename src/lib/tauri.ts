@@ -10,6 +10,7 @@ import type {
   BugReport,
   CardInfo,
   CardNews,
+  HodDriveOverlay,
   ChartDrawing,
   DailyBackground,
   DashboardTrade,
@@ -161,6 +162,10 @@ export const api = {
     invoke<PrevDayLevels | null>("get_previous_day_levels", { symbol }),
   getCardInfo: (symbol: string) =>
     invoke<CardInfo>("get_card_info", { symbol }),
+  // HOD Drive on-chart overlay: the five KPIs + HOD/LOD levels + green-series bar
+  // times for the chart points/crosses. Recomputed live for the displayed ticker.
+  getHodDriveOverlay: (symbol: string) =>
+    invoke<HodDriveOverlay>("get_hod_drive_overlay", { symbol }),
   // Most recent single-ticker headlines for a displayed ticker (Alpaca news REST,
   // headlines only, multi-ticker news dropped). Up to 4, newest first.
   getTickerNews: (symbol: string) =>

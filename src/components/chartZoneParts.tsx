@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import { LoaderCircle, Sparkles } from "lucide-react";
 import type {
-  AlertEnrichment, CardInfo, CardNews, InfoField, StrategyCard,
+  AlertEnrichment, CardInfo, CardNews, HodDriveOverlay, InfoField, StrategyCard,
   TickerLiveState, Timeframe, ZoneAssignment,
 } from "@/types";
 import { cn } from "@/lib/utils";
@@ -133,6 +133,7 @@ const STRATEGY_BADGE: Record<string, string> = {
   micro_pullback:       "bg-amber-900/60 text-amber-300",
   panic_mean_reversion: "bg-red-900/60 text-red-300",
   perfect_pullback:     "bg-emerald-900/60 text-emerald-300",
+  hod_drive:            "bg-teal-900/60 text-teal-300",
   backside_parabolic:   "bg-sky-900/60 text-sky-300",
   premarket_gapper:     "bg-violet-900/60 text-violet-300",
   premarket_frd_runner: "bg-violet-900/60 text-violet-300",
@@ -592,6 +593,76 @@ export function MicroInfoOverlay({
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── HOD Drive info overlay (5 KPIs, top-left of the right/timeframe pane) ────
+
+/** The HOD Drive overlay: the five key numbers of a clean post-open drive + its
+ *  pullback toward the HOD, drawn as aligned bars (same look as MicroInfoOverlay).
+ *  All from the live `get_hod_drive_overlay` recompute; greys a row when its value
+ *  isn't available yet. The HOD/LOD points + green-series crosses are drawn on the
+ *  candles themselves (chart markers), not here. */
+export function HodDriveInfoOverlay({ overlay }: { overlay: HodDriveOverlay | null }) {
+  const share = overlay?.series_share ?? null;          // 0..1
+  const pbVol = overlay?.pullback_volume ?? null;       // shares
+  const ratio = overlay?.pullback_vol_ratio ?? null;    // 1.0 = equal
+  const power = overlay?.power_score ?? null;            // 0..1
+  const eff   = overlay?.directional_efficiency ?? null; // 0..1
+  const pct = (x: number) => `${Math.round(x * 100)}%`;
+
+  return (
+    <div
+      data-capture-overlay
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[228px] max-w-[78%] flex-col gap-1.5 rounded bg-black/40 px-2 py-1.5 backdrop-blur-[1px]"
+    >
+      <div data-capture-cell className="flex items-center justify-between leading-none">
+        <span data-cap-label className="text-[9px] uppercase tracking-wide text-muted-foreground/60">
+          HOD Drive {overlay?.timeframe ?? ""}
+        </span>
+        {overlay?.gates_pass && (
+          <span data-cap-value className="rounded bg-emerald-900/70 px-1 py-0.5 text-[8px] font-semibold text-emerald-300">
+            OK
+          </span>
+        )}
+      </div>
+      <div className="h-px w-full bg-white/10" />
+
+      {/* Green series range as a share of the open range (HOD−LOD). */}
+      <MetricBar
+        label="Série/range"
+        fill={share != null ? clamp01(share) : null}
+        value={share != null ? pct(share) : null}
+        tone="blue"
+      />
+      {/* Pullback bars' volume (absolute) + its size vs the green series' volume. */}
+      <MetricBar
+        label="Vol pullbk"
+        fill={pbVol != null ? volumeFill(pbVol) : null}
+        value={pbVol != null ? fmtCompact(pbVol) : null}
+        tone="blue"
+      />
+      <MetricBar
+        label="Vol PB/sér"
+        fill={ratio != null ? clamp01(ratio / 2) : null}
+        value={ratio != null ? pct(ratio) : null}
+        tone={ratio != null && ratio > 1 ? "red" : "blue"}
+      />
+      {/* Body-dominance of the series (quality of the move). */}
+      <MetricBar
+        label="Power"
+        fill={power != null ? clamp01(power) : null}
+        value={power != null ? pct(power) : null}
+        tone="blue"
+      />
+      {/* Directional efficiency: ~1 clean, ~0 choppy. */}
+      <MetricBar
+        label="Efficience"
+        fill={eff != null ? clamp01(eff) : null}
+        value={eff != null ? pct(eff) : null}
+        tone="blue"
+      />
     </div>
   );
 }

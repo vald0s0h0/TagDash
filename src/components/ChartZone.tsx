@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, Fragment } from "react";
 import {
   AlarmClockPlus,
   Bird,
@@ -26,6 +26,7 @@ import {
 } from "@/stores/chartStore";
 import { useDrawingPrefs } from "@/stores/drawingPrefsStore";
 import { useChartTheme } from "@/stores/chartThemeStore";
+import { usePaneSizeStore } from "@/stores/paneSizeStore";
 import {
   registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
@@ -45,12 +46,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   PRIORITY_STYLES, TIMEFRAMES,
-  ChartInfoBar, StrategyInfoOverlay, MicroInfoOverlay, TBtn, Sep, EmptyZone,
+  ChartInfoBar, StrategyInfoOverlay, MicroInfoOverlay, HodDriveInfoOverlay, TBtn, Sep, EmptyZone,
 } from "./chartZoneParts";
 
 // Micro Pullback gets the rich on-chart risk overlay (on its sub-minute pane);
 // every other strategy uses the generic field overlay (on its left pane).
 const MICRO_PULLBACK_ID = "micro_pullback";
+// HOD Drive gets its own KPI overlay + HOD/LOD points + green-series crosses on its
+// timeframe (right/interactive) pane.
+const HOD_DRIVE_ID = "hod_drive";
 
 // Mood emojis offered by the toolbar (euphoric / angry / panicked / in the clouds).
 const EMOJIS: { glyph: string; title: string }[] = [
@@ -181,7 +185,100 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // risk overlay on the sub-minute (interactive) pane; other strategies keep the
   // generic field overlay on the left-most pane.
   const isMicro = zone.strategy_id === MICRO_PULLBACK_ID;
-  const overlayPaneIdx = isMicro ? interactiveIdx : 0;
+  const isHod   = zone.strategy_id === HOD_DRIVE_ID;
+  // Micro Pullback + HOD Drive draw their overlay on the interactive (right) pane;
+  // every other strategy keeps the generic field overlay on the left-most pane.
+  const overlayPaneIdx = isMicro || isHod ? interactiveIdx : 0;
+
+  // ── Resizable panes (drag the gutters BETWEEN panes / columns) ─────────────
+  // Sizes are flex-grow ratios persisted per layout shape (see paneSizeStore), so a
+  // split survives zone reassignments and is shared by charts of the same strategy.
+  // Only internal gutters resize — never the zone's outer edges.
+  const layoutKey = `${zone.strategy_id ?? "manual"}|${columns.map((c) => c.length).join("-")}`;
+  const paneSizes = usePaneSizeStore((s) => s.byLayout[layoutKey]);
+  const setColSizes = usePaneSizeStore((s) => s.setCols);
+  const setRowSizes = usePaneSizeStore((s) => s.setRows);
+  const colGrow = (ci: number) => paneSizes?.cols?.[ci] ?? 1;
+  const rowGrow = (ci: number, ri: number) => paneSizes?.rows?.[ci]?.[ri] ?? 1;
+
+  // Active gutter drag (window-level move/up while set). A full snapshot of the
+  // adjacent grows is captured at mousedown so the move handler never depends on the
+  // live store (no listener re-bind per move). axis x = between columns (ci = left
+  // index); y = between panes of column ci (ri = top index).
+  const gutterDrag = useRef<
+    | {
+        axis: "x" | "y";
+        ci: number;
+        ri: number;
+        start: number;
+        size0: number;
+        size1: number;
+        sumGrow: number;
+        cols: number[];
+        rows: number[];
+      }
+    | null
+  >(null);
+  const [gutterActive, setGutterActive] = useState(false);
+
+  const onGutterDown = useCallback(
+    (e: React.MouseEvent, axis: "x" | "y", ci: number, ri: number) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const g = e.currentTarget as HTMLElement;
+      const prev = g.previousElementSibling as HTMLElement | null;
+      const next = g.nextElementSibling as HTMLElement | null;
+      if (!prev || !next) return;
+      const r0 = prev.getBoundingClientRect();
+      const r1 = next.getBoundingClientRect();
+      const size0 = axis === "x" ? r0.width : r0.height;
+      const size1 = axis === "x" ? r1.width : r1.height;
+      const g0 = axis === "x" ? colGrow(ci) : rowGrow(ci, ri);
+      const g1 = axis === "x" ? colGrow(ci + 1) : rowGrow(ci, ri + 1);
+      gutterDrag.current = {
+        axis, ci, ri,
+        start: axis === "x" ? e.clientX : e.clientY,
+        size0, size1, sumGrow: g0 + g1,
+        cols: columns.map((_, c) => colGrow(c)),
+        rows: columns[ci].map((_, r) => rowGrow(ci, r)),
+      };
+      setGutterActive(true);
+    },
+    // colGrow/rowGrow close over paneSizes; columns over the card.
+    [paneSizes, columns], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  useEffect(() => {
+    if (!gutterActive) return;
+    const MIN = 48; // px — never collapse a pane to nothing
+    const onMove = (e: MouseEvent) => {
+      const d = gutterDrag.current;
+      if (!d) return;
+      const pos = d.axis === "x" ? e.clientX : e.clientY;
+      const total = d.size0 + d.size1;
+      const newSize0 = Math.max(MIN, Math.min(total - MIN, d.size0 + (pos - d.start)));
+      const ratio = total > 0 ? newSize0 / total : 0.5;
+      const ng0 = ratio * d.sumGrow;
+      const ng1 = (1 - ratio) * d.sumGrow;
+      if (d.axis === "x") {
+        const cols = d.cols.slice();
+        cols[d.ci] = ng0; cols[d.ci + 1] = ng1;
+        setColSizes(layoutKey, cols);
+      } else {
+        const rows = d.rows.slice();
+        rows[d.ri] = ng0; rows[d.ri + 1] = ng1;
+        setRowSizes(layoutKey, d.ci, rows);
+      }
+    };
+    const onUp = () => { gutterDrag.current = null; setGutterActive(false); };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [gutterActive, layoutKey, setColSizes, setRowSizes]);
 
   // ── Progressive alert enrichment (info band + daily pane data) ─────────────
   // Kicked off when an alert lands; only runs for strategies whose card declares
@@ -226,6 +323,15 @@ export function ChartZone({ zone }: ChartZoneProps) {
     queryKey: ["card_info", zone.symbol],
     queryFn:  () => api.getCardInfo(zone.symbol!),
     enabled:  !!zone.symbol,
+    refetchInterval: 3000,
+  });
+
+  // ── HOD Drive overlay (5 KPIs + HOD/LOD levels + green-series bar times) ─────
+  // Recomputed live for the displayed ticker; only fetched for a HOD Drive zone.
+  const { data: hodOverlay } = useQuery({
+    queryKey: ["hod_drive_overlay", zone.symbol],
+    queryFn:  () => api.getHodDriveOverlay(zone.symbol!),
+    enabled:  !!zone.symbol && zone.strategy_id === HOD_DRIVE_ID,
     refetchInterval: 3000,
   });
 
@@ -1331,15 +1437,23 @@ export function ChartZone({ zone }: ChartZoneProps) {
           card timeframe). A "daily" pane is fed from the enrichment payload
           (history + red split markers) when available, else the cached daily
           history, else the live daily aggregate. */}
-      <div ref={chartAreaRef} className="relative mx-1 mb-1 mt-0.5 flex min-h-0 flex-1 gap-1 overflow-hidden rounded">
+      <div ref={chartAreaRef} className="relative mx-1 mb-1 mt-0.5 flex min-h-0 flex-1 overflow-hidden rounded">
         {columns.map((paneIdxs, ci) => (
-          <div
-            key={ci}
-            className={cn(
-              "flex min-h-0 min-w-0 flex-1 flex-col gap-1",
-              ci > 0 && "border-l border-border/40 pl-1",
+          <Fragment key={ci}>
+            {/* Vertical gutter between columns — drag to resize their widths. */}
+            {ci > 0 && (
+              <div
+                onMouseDown={(e) => onGutterDown(e, "x", ci - 1, 0)}
+                title="Glisser pour redimensionner les colonnes"
+                className="group relative z-10 flex w-1.5 shrink-0 cursor-col-resize items-stretch"
+              >
+                <div className="mx-auto w-px bg-border/40 transition-colors group-hover:bg-sky-500/70" />
+              </div>
             )}
-          >
+            <div
+              className="flex min-h-0 min-w-0 flex-col"
+              style={{ flexGrow: colGrow(ci), flexBasis: 0 }}
+            >
             {paneIdxs.map((i, ri) => {
               const pane          = panes[i];
               const isInteractive = i === interactiveIdx;
@@ -1358,16 +1472,43 @@ export function ChartZone({ zone }: ChartZoneProps) {
                 isDaily && enrichment?.split_markers?.length
                   ? enrichment.split_markers.map((m) => ({ time: m.time, color: chartTheme.markers.split, text: m.label }))
                   : undefined;
+              // HOD Drive: a HOD point (above) + LOD point (below) + a small mark
+              // under every bar of the green series. Drawn on the interactive
+              // (timeframe) pane only; the levels/times come from the live overlay.
+              const hodMarkers =
+                isHod && isInteractive && hodOverlay
+                  ? [
+                      ...(hodOverlay.hod_time != null
+                        ? [{ time: hodOverlay.hod_time, color: "#f59e0b", position: "aboveBar" as const, shape: "circle" as const, text: "HOD" }]
+                        : []),
+                      ...(hodOverlay.lod_time != null
+                        ? [{ time: hodOverlay.lod_time, color: "#38bdf8", position: "belowBar" as const, shape: "circle" as const, text: "LOD" }]
+                        : []),
+                      ...hodOverlay.series_bar_times.map((t) => ({
+                        time: t, color: "#22c55e", position: "belowBar" as const, shape: "arrowUp" as const,
+                      })),
+                    ]
+                  : undefined;
               const hasOverlay = overlayPaneIdx === i;
               return (
+                <Fragment key={i}>
+                  {/* Horizontal gutter between stacked panes — drag to resize heights. */}
+                  {ri > 0 && (
+                    <div
+                      onMouseDown={(e) => onGutterDown(e, "y", ci, ri - 1)}
+                      title="Glisser pour redimensionner les panneaux"
+                      className="group relative z-10 flex h-1.5 shrink-0 cursor-row-resize flex-col justify-center"
+                    >
+                      <div className="my-auto h-px bg-border/40 transition-colors group-hover:bg-sky-500/70" />
+                    </div>
+                  )}
                 <div
-                  key={i}
                   className={cn(
-                    "relative min-h-0 min-w-0 flex-1",
-                    ri > 0 && "border-t border-border/40 pt-1",
+                    "relative min-h-0 min-w-0",
                     // Controller focus ring (only meaningful when there's a choice).
                     panes.length > 1 && i === focusPaneIdx && "rounded-sm ring-1 ring-sky-500/50",
                   )}
+                  style={{ flexGrow: rowGrow(ci, ri), flexBasis: 0 }}
                 >
                   {!isInteractive && (
                     <span className={cn(
@@ -1387,6 +1528,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
                         enrichment={enrichment ?? null}
                         news={tickerNews ?? []}
                       />
+                    ) : isHod ? (
+                      <HodDriveInfoOverlay overlay={hodOverlay ?? null} />
                     ) : (
                       <StrategyInfoOverlay
                         card={card}
@@ -1413,7 +1556,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     alarms={alarms}
                     linePoint1={linePoint1}
                     indicators={pane.indicators}
-                    markers={splitMarkers}
+                    markers={hodMarkers ?? splitMarkers}
                     crosshairSync={crosshairSyncRef.current}
                     paneId={`${zone.zone_id}-${i}`}
                     onPriceClick={handlePriceClick}
@@ -1432,9 +1575,11 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     onCancelTool={() => chartStore.setDrawMode(zone.zone_id, "none")}
                   />
                 </div>
+                </Fragment>
               );
             })}
-          </div>
+            </div>
+          </Fragment>
         ))}
       </div>
 

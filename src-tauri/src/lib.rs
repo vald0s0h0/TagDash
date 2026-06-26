@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod enrichment;
 pub mod flat_files;
 pub mod fmp;
+pub mod hod_drive;
 pub mod internal_trading;
 pub mod llm;
 pub mod local_db;
@@ -137,6 +138,7 @@ pub fn run() {
         news_feed_running: Arc::new(AtomicBool::new(false)),
         scanner_running:   Arc::new(AtomicBool::new(false)),
         perfect_pullback_running: Arc::new(AtomicBool::new(false)),
+        hod_drive_running: Arc::new(AtomicBool::new(false)),
         market_attention_running: Arc::new(AtomicBool::new(false)),
         micro_pullback_running: Arc::new(AtomicBool::new(false)),
         panic_watchlist_running: Arc::new(AtomicBool::new(false)),
@@ -381,6 +383,24 @@ pub fn run() {
                 );
             }
 
+            // 3a-bis. HOD Drive engine (stateful, multi-timeframe): scans the whole
+            //     universe for a clean post-open drive then a high-R/R pullback toward
+            //     the HOD (Universe → Risk Ratio → Clear Pattern → live 5s liquidity).
+            //     V1 ships the 5-minute timeframe. Auto-started; idles outside the
+            //     regular session / each timeframe's active window and honours the
+            //     Settings toggle.
+            {
+                let hd_running       = state.hod_drive_running.clone();
+                let market           = state.market.clone();
+                let active_alerts    = state.active_alerts.clone();
+                let alert_history    = state.alert_history.clone();
+                let strategy_enabled = state.strategy_enabled.clone();
+                hd_running.store(true, std::sync::atomic::Ordering::Relaxed);
+                hod_drive::HodDriveEngine::start(
+                    hd_running, market, active_alerts, alert_history, strategy_enabled,
+                );
+            }
+
             // 3b. Micro Pullback engine (stateful, per-ticker): watches every dormant
             //    low-float small cap in the premarket window for the first state change
             //    of the session (silence → 10s ignition → 30s confirmation) and fires
@@ -522,6 +542,7 @@ pub fn run() {
             commands::get_mean_reversion_scores,
             commands::force_recompute_scores,
             commands::get_card_info,
+            commands::get_hod_drive_overlay,
             commands::get_ticker_news,
             commands::get_news_markers,
             // Company intelligence (read-only cache + background refresh trigger)

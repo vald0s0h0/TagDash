@@ -130,6 +130,31 @@ export interface CardInfo {
   live_volume:             number | null;
 }
 
+/** HOD Drive on-chart overlay payload (mirrors HodDriveOverlay in
+ *  commands/mod.rs). The five KPIs shown top-right plus the HOD/LOD levels (+ bar
+ *  times) and the green-series bar times used to draw the chart points/crosses.
+ *  All KPI fields are null until the symbol has enough session structure. Ratios
+ *  are 0..1 fractions except `pullback_vol_ratio` (1.0 = equal, 2.0 = double). */
+export interface HodDriveOverlay {
+  timeframe:              string;
+  /** series_range / (HOD−LOD), 0..1. */
+  series_share:           number | null;
+  pullback_volume:        number | null;
+  /** pullback_volume / series_volume (1.0 = equal, 0.5 = half, 2.0 = double). */
+  pullback_vol_ratio:     number | null;
+  power_score:            number | null;
+  directional_efficiency: number | null;
+  hod:                    number | null;
+  lod:                    number | null;
+  /** Unix seconds of the HOD / LOD bars. */
+  hod_time:               number | null;
+  lod_time:               number | null;
+  /** Unix seconds of every bar in the green series. */
+  series_bar_times:       number[];
+  /** True when Gates 1-3 currently pass. */
+  gates_pass:             boolean;
+}
+
 /** One headline for the Micro Pullback overlay (mirrors CardNews in
  *  commands/mod.rs), fetched per displayed ticker via Alpaca REST. `created_at`
  *  is the publish time (RFC 3339). */

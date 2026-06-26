@@ -31,12 +31,18 @@ function nearestBarTime(barTimes: number[], t: number): number | null {
 /** Candle markers (e.g. red dots on split days) on the candle series, snapped to
  *  the nearest loaded bar so they actually render, and reconciled by a content key
  *  so `setMarkers` only runs when the marker set OR the loaded bar range changes. */
+type ChartMarker = {
+  time: number; color: string; text?: string;
+  position?: "aboveBar" | "belowBar" | "inBar";
+  shape?: "circle" | "square" | "arrowUp" | "arrowDown";
+};
+
 export function useCandleMarkers(
   candleRef: MutableRefObject<ISeriesApi<"Candlestick"> | null>,
-  markers: { time: number; color: string; text?: string }[],
+  markers: ChartMarker[],
   bars: Bar[] | undefined,
 ) {
-  const markersKey = markers.map((m) => `${m.time}:${m.color}`).join(",");
+  const markersKey = markers.map((m) => `${m.time}:${m.color}:${m.position ?? ""}:${m.shape ?? ""}:${m.text ?? ""}`).join(",");
   // Re-snap when the loaded window grows/shifts (back-fill), keyed by first/last bar.
   const barsKey = bars?.length ? `${toUTC(bars[0].time)}-${toUTC(bars[bars.length - 1].time)}-${bars.length}` : "";
   useEffect(() => {
@@ -49,9 +55,9 @@ export function useCandleMarkers(
       if (snapped == null) continue; // off the loaded range → appears once back-filled
       data.push({
         time:     snapped as UTCTimestamp,
-        position: "belowBar",
+        position: m.position ?? "belowBar",
         color:    m.color,
-        shape:    "circle",
+        shape:    m.shape ?? "circle",
         text:     m.text,
       });
     }

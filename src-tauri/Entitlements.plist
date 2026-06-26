@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS code-signing entitlements (referenced from tauri.conf.json ▸
+  bundle.macOS.entitlements). The audio-input entitlement is what grants
+  microphone access once the app runs under the hardened runtime (required if you
+  ever notarize with a Developer ID). On an ad-hoc-signed build it is inert and
+  harmless — there the NSMicrophoneUsageDescription in Info.plist is what unlocks
+  the mic. The app is NOT sandboxed, so no app-sandbox entitlement is declared.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

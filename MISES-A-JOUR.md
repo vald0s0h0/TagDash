@@ -134,6 +134,12 @@ release :
    > Depuis v0.1.3 le `.dmg` **universel** unique est remplacé par **deux** `.dmg`
    > (un par puce). En cas de doute, sur le Mac : menu  → *À propos de ce Mac* →
    > si « Puce Apple », prends `aarch64` ; si « Processeur Intel », prends `x64`.
+
+   > ⚠️ **Depuis 2026, GitHub ne construit plus le `.dmg` Intel `x64`** (les runners
+   > Intel ont été retirés). La release GitHub ne contient donc **que** Windows +
+   > **macOS Apple Silicon** (`aarch64`). Le `.dmg` **Intel** (`x64`) se fabrique
+   > **à la main sur un Mac Apple Silicon** → voir la **Partie 4** ci-dessous. Tant
+   > que tu ne le fais pas, il n'y a simplement pas de version Intel pour ce tag.
 4. Clique sur le bon `.dmg` pour le télécharger, puis envoie-le à tes testeurs (mail,
    lien, WeTransfer…).
 
@@ -153,6 +159,115 @@ payant). Au 1er lancement, macOS la bloque. À dire aux testeurs **une fois** :
 
 ---
 
+## Partie 4 — Fabriquer le `.dmg` macOS **Intel** (sur ton Mac Apple Silicon)
+
+> ✨ **Le workflow GitHub tente désormais de fabriquer l'Intel automatiquement**
+> (job « Intel », **expérimental** : il construit le x86_64 via Rosetta directement
+> sur le runner Apple Silicon, avec le **même** script que ci-dessous).
+> → Va dans **Actions** : si le job **Intel** est **vert ✅** et que le fichier
+> `TagDash_x.y.z_x64.dmg` apparaît dans la release, **tu n'as rien à faire**.
+> → S'il est **rouge ❌** (montage non testé, il peut demander 1–2 réglages), suis la
+> méthode **manuelle** ci-dessous : c'est exactement le même script, lancé sur ton Mac.
+
+Le script `scripts/build-macos-intel.sh` compile une version **x86_64 native** via
+**Rosetta** (la traduction Intel d'Apple). C'est ce qui évite les échecs de
+« cross-compilation » qui bloquaient l'ancien runner Intel. Tu peux le lancer
+toi-même sur un Mac **Apple Silicon** (M1/M2/M3…).
+
+> Cette partie se fait **dans le Terminal** du Mac (app **Terminal**), pas en clics.
+> Copie/colle chaque commande puis `Entrée`.
+
+### 4.A — Préparation (à faire **une seule fois**, sur le Mac)
+
+1. **Rosetta** (le traducteur Intel d'Apple) :
+   ```
+   softwareupdate --install-rosetta --agree-to-license
+   ```
+2. **Homebrew version Intel** (s'installe dans `/usr/local`, à côté de celui Apple
+   Silicon, sans le casser) :
+   ```
+   arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+3. **cmake + llvm** version Intel (nécessaires à la compilation de whisper.cpp) :
+   ```
+   arch -x86_64 /usr/local/bin/brew install cmake llvm
+   ```
+4. **Rust** : si tu n'as pas encore `rustup`, installe-le depuis **https://rustup.rs**
+   (la commande à coller est affichée sur le site). Puis ajoute la **toolchain Intel** :
+   ```
+   rustup toolchain install stable-x86_64-apple-darwin
+   ```
+5. **Node 20+** : installe-le depuis **https://nodejs.org** (le `.pkg` officiel est
+   **universel**, il marche sous Rosetta). ⚠️ N'utilise **pas** `brew install node`
+   du Homebrew Apple Silicon : il est arm64-only et plante sous Rosetta (« *Bad CPU
+   type* »).
+6. **Outils de publication** (pour que les Mac Intel reçoivent la mise à jour auto) :
+   ```
+   arch -x86_64 /usr/local/bin/brew install gh jq
+   gh auth login
+   ```
+   *(`gh` = GitHub en ligne de commande. À `gh auth login`, choisis* **GitHub.com**
+   *→* **HTTPS** *→* **Login with a web browser** *.)*
+7. **La clé de signature** : c'est la **même** que le secret GitHub (Partie 1.A).
+   Copie le contenu du fichier `~/.tauri/tagdash.key` **depuis ton PC Windows** dans
+   un fichier sur le Mac, par ex. `~/tagdash.key`.
+   > Range-la dans ton dossier perso (`~`), **jamais** dans le projet (risque de la
+   > committer). Transfère-la par un moyen sûr (clé USB, gestionnaire de mots de
+   > passe…), pas par mail/chat en clair.
+8. **Récupère le projet** sur le Mac :
+   ```
+   git clone https://github.com/vald0s0h0/TagDash.git
+   ```
+
+### 4.B — À chaque release (après le ✅ GitHub de Windows + Apple Silicon)
+
+> À faire **après** la Partie 2 : le tag et la release doivent déjà exister sur
+> GitHub (c'est sur cette release qu'on ajoute le `.dmg` Intel).
+
+1. Place-toi sur la **version publiée** (remplace `v0.1.6` par ton tag) :
+   ```
+   cd TagDash
+   git fetch --tags
+   git checkout v0.1.6
+   ```
+   *(Se placer sur le tag garantit que le `.dmg` Intel a* **exactement** *la même
+   version que la release.)*
+2. Lance la fabrication **et** la publication :
+   ```
+   TAURI_SIGNING_PRIVATE_KEY="$(cat ~/tagdash.key)" \
+   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+   ./scripts/build-macos-intel.sh --publish v0.1.6
+   ```
+   - Si tu as mis un **mot de passe** à la clé (Partie 1.A), remplace `""` par ce
+     mot de passe.
+   - Le **premier** build est **long** (compilation de whisper.cpp, plusieurs
+     minutes) ; les suivants sont plus rapides (cache).
+3. À la fin, le script :
+   - **téléverse** le `.dmg` Intel + les fichiers d'auto-update sur la release du tag ;
+   - **ajoute** l'entrée `darwin-x86_64` dans `latest.json` → les Mac **Intel** déjà
+     installés se mettront à jour **tout seuls** au prochain lancement.
+
+> **Variante sans auto-update** (juste un `.dmg` à donner à un testeur Intel) : lance
+> le script **sans** `--publish` :
+> ```
+> ./scripts/build-macos-intel.sh
+> ```
+> Le `.dmg` apparaît dans `src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/`.
+> Uploade-le à la main : onglet **Code** → **Releases** → ta version → **Edit** (crayon)
+> → glisse le fichier dans **Assets**.
+
+### En cas de souci (Partie 4)
+
+| Symptôme | Solution |
+|---|---|
+| `x86_64 Rust toolchain missing` | `rustup toolchain install stable-x86_64-apple-darwin` (étape 4.A.4) |
+| `cmake` / `libclang` introuvable pendant le build | refais 4.A.3 : `arch -x86_64 /usr/local/bin/brew install cmake llvm` |
+| `gh` / `jq` introuvable (avec `--publish`) | refais 4.A.6 |
+| Aucun fichier `.sig` produit | la clé n'est pas lue : vérifie `~/tagdash.key` et la commande `TAURI_SIGNING_PRIVATE_KEY="$(cat ~/tagdash.key)"` |
+| `Bad CPU type in executable` | Rosetta manque (refais 4.A.1) ; le script se relance pourtant tout seul sous Rosetta |
+
+---
+
 ## Résumé express (les 5 clics à chaque release)
 
 1. `tauri.conf.json` → monter la version → `Ctrl+S`
@@ -160,6 +275,8 @@ payant). Au 1er lancement, macOS la bloque. À dire aux testeurs **une fois** :
 3. **…** → Tags → **Create Tag** → `v0.1.1` (+ message `v0.1.1`)
 4. **Sync Changes**
 5. GitHub → **Actions** → attendre le ✅
+6. *(Mac Intel uniquement)* sur ton Mac Apple Silicon → **Partie 4.B** :
+   `git checkout v0.1.1` puis `./scripts/build-macos-intel.sh --publish v0.1.1`
 
 ---
 

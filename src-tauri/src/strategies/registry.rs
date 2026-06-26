@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 
 use crate::strategies::{
-    backside_parabolic::BacksideParabolic, micro_pullback::MicroPullback,
+    backside_parabolic::BacksideParabolic, hod_drive::HodDrive, micro_pullback::MicroPullback,
     panic_mean_reversion::PanicMeanReversion, perfect_pullback::PerfectPullback, ScanStrategy,
 };
 
@@ -21,6 +21,7 @@ pub fn all_strategies() -> &'static [Box<dyn ScanStrategy>] {
             Box::new(BacksideParabolic),
             Box::new(PanicMeanReversion),
             Box::new(PerfectPullback),
+            Box::new(HodDrive),
         ]
     })
 }

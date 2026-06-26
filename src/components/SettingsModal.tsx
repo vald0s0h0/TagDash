@@ -24,6 +24,7 @@ import {
 } from "@/stores/hotkeyStore";
 import { GamepadSettings } from "@/components/GamepadSettings";
 import { useChartThemeStore, type ChartTheme, type ChartThemeSection } from "@/stores/chartThemeStore";
+import { useChartInput, SENS_MIN, SENS_MAX } from "@/stores/chartInputStore";
 import { cn } from "@/lib/utils";
 import type { AppConfig, AttentionMode, SecretKey, SecretsUpdate, Session } from "@/types";
 
@@ -339,6 +340,12 @@ function AppearanceTab() {
   const reset = useChartThemeStore((s) => s.reset);
   const [copied, setCopied] = useState(false);
 
+  // Trackpad / wheel X-zoom tuning (frontend pref, persisted in chartInputStore).
+  const zoomSensitivity = useChartInput((s) => s.zoomSensitivity);
+  const zoomInvert = useChartInput((s) => s.zoomInvert);
+  const setZoomSensitivity = useChartInput((s) => s.setZoomSensitivity);
+  const setZoomInvert = useChartInput((s) => s.setZoomInvert);
+
   // Typed thin wrappers so each row stays a one-liner.
   function color<S extends ChartThemeSection>(section: S, key: keyof ChartTheme[S]) {
     return {
@@ -367,6 +374,39 @@ function AppearanceTab() {
         immédiatement à tous les panes ouverts et sont conservés au relancement.
       </p>
       <div className="max-h-[26rem] space-y-3 overflow-y-auto pr-1">
+        <ThemeGroup title="Navigation (trackpad / molette)">
+          <div className="flex items-center justify-between gap-3 py-0.5">
+            <span className="text-xs text-muted-foreground">
+              Sensibilité du zoom (axe X) — scroll 2 doigts
+            </span>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={SENS_MIN}
+                max={SENS_MAX}
+                step={0.1}
+                value={zoomSensitivity}
+                onChange={(e) => setZoomSensitivity(parseFloat(e.target.value))}
+                className="w-32 accent-blue-500"
+              />
+              <span className="w-9 text-right text-[10px] tabular-nums text-muted-foreground">
+                {zoomSensitivity.toFixed(1)}×
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-3 py-0.5">
+            <span className="text-xs text-muted-foreground">
+              Inverser le sens du zoom
+            </span>
+            <input
+              type="checkbox"
+              checked={zoomInvert}
+              onChange={(e) => setZoomInvert(e.target.checked)}
+              className="h-4 w-4 accent-blue-500"
+            />
+          </div>
+        </ThemeGroup>
+
         <ThemeGroup title="Bougies">
           <ColorRow label="Hausse" {...color("candle", "up")} />
           <ColorRow label="Baisse" {...color("candle", "down")} />

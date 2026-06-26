@@ -47,6 +47,9 @@ pub struct AppState {
     pub scanner_running: Arc<AtomicBool>,
     /// Controls the Perfect Pullback engine task lifecycle.
     pub perfect_pullback_running: Arc<AtomicBool>,
+    /// Controls the HOD Drive engine task lifecycle (multi-timeframe clean-drive →
+    /// pullback-toward-HOD detector; see `crate::hod_drive`).
+    pub hod_drive_running: Arc<AtomicBool>,
     /// Controls the Market Attention Gate engine task lifecycle (direction-agnostic
     /// 09:30–12:30 ET ticker selection; see `crate::market_attention`).
     pub market_attention_running: Arc<AtomicBool>,

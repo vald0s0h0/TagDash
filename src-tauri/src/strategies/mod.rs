@@ -8,6 +8,7 @@ use crate::types::{
 };
 
 pub mod backside_parabolic;
+pub mod hod_drive;
 pub mod micro_pullback;
 pub mod panic_mean_reversion;
 pub mod perfect_pullback;

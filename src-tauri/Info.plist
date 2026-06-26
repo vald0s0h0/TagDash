@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Extra macOS Info.plist keys, merged by tauri-bundler into the generated app
+  Info.plist. NSMicrophoneUsageDescription is REQUIRED for the native cpal
+  microphone capture (offline dictée) to work on macOS: without it the app never
+  appears in System Settings ▸ Privacy & Security ▸ Microphone, macOS never shows
+  the permission prompt, and the input stream gets silence. The string is what the
+  prompt displays.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>TagDash utilise le micro pour la dictée vocale de tes notes de trade et de journal (transcription locale, hors-ligne).</string>
+</dict>
+</plist>

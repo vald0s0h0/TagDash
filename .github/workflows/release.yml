@@ -30,6 +30,9 @@ jobs:
   release:
     permissions:
       contents: write
+    # Hard cap so a runner that never gets picked up (e.g. a retired image) fails
+    # fast instead of hanging the workflow for the default 6 hours.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       # Sequential builds: each platform's job merges its entry into the SAME
@@ -53,10 +56,20 @@ jobs:
           - platform: macos-14
             args: ""
             rust_targets: ""
-          # macOS Intel → NATIVE x86_64 build → darwin-x86_64 updater key.
-          - platform: macos-13
+          # macOS Intel (darwin-x86_64) — EXPERIMENTAL, built on the SAME Apple-Silicon
+          # runner via Rosetta (GitHub retired the native Intel `macos-13` runners). An
+          # x86_64 Rust toolchain + x86_64 Node make the whole build run as x86_64
+          # (host == target), so the native deps (whisper.cpp / coreaudio) compile
+          # NATIVE — not cross-compiled, which is what failed before. Driven by the
+          # SAME `scripts/build-macos-intel.sh` used for local builds. It runs LAST
+          # (max-parallel:1, listed last) so the release + latest.json created by the
+          # jobs above already exist for it to merge the darwin-x86_64 entry into. If
+          # it fails, the other platforms still publish (fail-fast:false) and you can
+          # run the script locally (MISES-A-JOUR.md Partie 4).
+          - platform: macos-14
             args: ""
             rust_targets: ""
+            intel: true
           # To also ship Linux, add: { platform: ubuntu-22.04, args: "", rust_targets: "" }
     runs-on: ${{ matrix.platform }}
     steps:
@@ -105,6 +118,8 @@ jobs:
         run: npm ci
 
       - name: Build, sign and publish
+        # The Intel job builds + publishes via its own script (Rosetta), not tauri-action.
+        if: ${{ !matrix.intel }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,3 +133,32 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+      # ── macOS Intel (EXPERIMENTAL, Rosetta-native) ────────────────────────────
+      # Runs only on the `intel: true` matrix entry, after the jobs above created the
+      # release + latest.json. Reuses scripts/build-macos-intel.sh (the same script
+      # used locally), which re-execs under `arch -x86_64`, builds, signs, uploads the
+      # .dmg + updater bundle, and merges the darwin-x86_64 entry into latest.json.
+      - name: Setup Rosetta + x86_64 toolchains (macOS Intel)
+        if: matrix.intel
+        run: |
+          set -eux
+          # Rosetta lets the arm64 runner execute x86_64 binaries.
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          # x86_64 Rust toolchain — its real cargo/rustc are x86_64 → native (not cross).
+          rustup toolchain install stable-x86_64-apple-darwin
+          echo "$HOME/.rustup/toolchains/stable-x86_64-apple-darwin/bin" >> "$GITHUB_PATH"
+          # x86_64 Node — the whole build runs under Rosetta, so node must be x64 too.
+          # Match the exact version actions/setup-node installed.
+          NODE_VERSION="$(node --version | sed 's/^v//')"
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-x64.tar.gz" -o /tmp/node-x64.tgz
+          mkdir -p /tmp/node-x64 && tar -xzf /tmp/node-x64.tgz -C /tmp/node-x64 --strip-components=1
+          echo "/tmp/node-x64/bin" >> "$GITHUB_PATH"
+
+      - name: Build + publish macOS Intel (.dmg + auto-update)
+        if: matrix.intel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash scripts/build-macos-intel.sh --publish "${{ github.ref_name }}"
