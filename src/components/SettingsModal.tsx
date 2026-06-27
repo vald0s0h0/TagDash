@@ -451,6 +451,7 @@ function AppearanceTab() {
           <ColorRow label="Stop Loss" {...color("levels", "sl")} />
           <ColorRow label="Take Profit" {...color("levels", "tp")} />
           <ColorRow label="Alarme" {...color("levels", "alarm")} />
+          <ColorRow label="Ordre Limite" {...color("levels", "limit")} />
         </ThemeGroup>
       </div>
 
@@ -548,8 +549,9 @@ export function SettingsModal({ open, onClose }: Props) {
         <Tabs defaultValue="trading" className="mt-2">
           {/* Equal-width grid columns instead of inline-flex: the 8 tabs can never
               overflow the dialog regardless of the platform font width. */}
-          <TabsList className="grid w-full grid-cols-10">
+          <TabsList className="grid w-full grid-cols-11">
             <TabsTrigger value="trading" className="min-w-0 text-xs">Trading</TabsTrigger>
+            <TabsTrigger value="risque" className="min-w-0 text-xs">Risque</TabsTrigger>
             <TabsTrigger value="strategies" className="min-w-0 text-xs">Stratégies</TabsTrigger>
             <TabsTrigger value="apparence" className="min-w-0 text-xs">Apparence</TabsTrigger>
             <TabsTrigger value="hotkeys" className="min-w-0 text-xs">Hotkeys</TabsTrigger>
@@ -591,6 +593,65 @@ export function SettingsModal({ open, onClose }: Props) {
               type="number"
               onChange={(v) => set("trading", "max_position_size", parseInt(v) || 0)}
             />
+          </TabsContent>
+
+          {/* ── Gestion de risque ── */}
+          <TabsContent value="risque" className="mt-4 space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Réglages de gestion du risque appliqués à chaque nouveau trade.
+            </p>
+
+            <div className="grid grid-cols-2 items-center gap-4">
+              <Label className="text-right text-xs text-muted-foreground">
+                Type d'ordre par défaut
+              </Label>
+              <select
+                value={draft.risk_management?.default_order_type ?? "market"}
+                onChange={(e) =>
+                  set("risk_management", "default_order_type", e.target.value as "limit" | "market")
+                }
+                className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground outline-none"
+              >
+                <option value="market">Market</option>
+                <option value="limit">Limit</option>
+              </select>
+            </div>
+
+            <Separator />
+
+            <div className="rounded-md border border-border px-3 py-2.5">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">Break-Even automatique</div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    Déplace automatiquement le SL au prix d'entrée (BE) lorsque le
+                    trade atteint le multiple de R configuré.
+                  </p>
+                </div>
+                <Switch
+                  checked={draft.risk_management?.auto_be_enabled ?? false}
+                  onCheckedChange={(v) => set("risk_management", "auto_be_enabled", v)}
+                />
+              </div>
+
+              {(draft.risk_management?.auto_be_enabled ?? false) && (
+                <div className="mt-3 grid grid-cols-2 items-center gap-4">
+                  <Label className="text-right text-xs text-muted-foreground">
+                    Déclencher à (×R)
+                  </Label>
+                  <Input
+                    type="number"
+                    min={0.1}
+                    step={0.1}
+                    value={draft.risk_management?.auto_be_r ?? 1}
+                    onChange={(e) =>
+                      set("risk_management", "auto_be_r", parseFloat(e.target.value) || 1)
+                    }
+                    className="h-7 w-20 text-xs tabular-nums"
+                  />
+                </div>
+              )}
+            </div>
           </TabsContent>
 
           {/* ── Strategies (runtime on/off, persisted, no code change) ── */}

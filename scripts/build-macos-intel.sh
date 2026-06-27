@@ -132,7 +132,14 @@ command -v jq >/dev/null 2>&1 || { echo "✗ jq required for --publish" >&2; exi
 [ -n "$DMG" ] || { echo "✗ no .dmg produced — cannot publish" >&2; exit 1; }
 [ -n "$UPDATER" ] && [ -f "$SIG" ] || { echo "✗ no signed updater bundle (.app.tar.gz.sig) — set TAURI_SIGNING_PRIVATE_KEY" >&2; exit 1; }
 
-echo "→ Uploading .dmg + updater bundle to release $PUBLISH_TAG…"
+# Create the release if it doesn't exist yet (Intel may run before tauri-action).
+if ! gh release view "$PUBLISH_TAG" &>/dev/null; then
+  echo "→ Creating release ${PUBLISH_TAG} (first platform to publish)…"
+  gh release create "$PUBLISH_TAG" --title "TagDash ${PUBLISH_TAG}" \
+    --notes "Téléchargez l'installeur ci-dessous. La mise à jour automatique se fait au lancement de l'app."
+fi
+
+echo "→ Uploading .dmg + updater bundle to release ${PUBLISH_TAG}…"
 gh release upload "$PUBLISH_TAG" "$DMG" "$UPDATER" --clobber
 
 # The updater needs a stable download URL for the .app.tar.gz on this release.
@@ -143,7 +150,12 @@ SIG_CONTENT="$(cat "$SIG")"
 
 echo "→ Merging darwin-x86_64 into latest.json…"
 TMP="$(mktemp -d)"
-gh release download "$PUBLISH_TAG" --pattern latest.json --dir "$TMP" --clobber
+# Download existing latest.json; if this is the first platform, seed an empty one.
+if ! gh release download "$PUBLISH_TAG" --pattern latest.json --dir "$TMP" --clobber 2>/dev/null; then
+  VERSION="${PUBLISH_TAG#v}"
+  jq -n --arg ver "$VERSION" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{ version: $ver, notes: "", pub_date: $date, platforms: {} }' > "$TMP/latest.json"
+fi
 jq --arg sig "$SIG_CONTENT" --arg url "$UPDATER_URL" \
    '.platforms."darwin-x86_64" = { "signature": $sig, "url": $url }' \
    "$TMP/latest.json" > "$TMP/latest.patched.json"

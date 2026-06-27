@@ -49,6 +49,7 @@ export interface ZoneGamepad {
   /** Armed layer (R2 held). */
   order: (percent: 25 | 50 | 100) => void;
   close: () => void;
+  confirmHod?: () => void;
   /** TradeTally capture (View button). */
   capture: () => void;
   /** Open the voice-dictation modal for the zone's current trade (Menu button). */

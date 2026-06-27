@@ -41,35 +41,26 @@ jobs:
       max-parallel: 1
       matrix:
         include:
+          # macOS Intel (darwin-x86_64) — runs FIRST so build failures surface
+          # quickly and the run can be cancelled before the longer jobs start.
+          # Built on an Apple-Silicon runner via Rosetta (GitHub retired Intel
+          # `macos-13` runners). An x86_64 Rust toolchain + x86_64 Node make the
+          # whole build run as x86_64 (host == target), so native deps compile
+          # NATIVE — not cross-compiled. Driven by `scripts/build-macos-intel.sh`
+          # which creates the release + seeds latest.json if it's the first to
+          # publish, then subsequent tauri-action jobs merge their platform entry.
+          - platform: macos-14
+            args: ""
+            rust_targets: ""
+            intel: true
           # Windows → .msi / .exe (NSIS) installers → windows-x86_64 updater key.
           - platform: windows-latest
             args: ""
             rust_targets: ""
           # macOS Apple Silicon → NATIVE arm64 build → darwin-aarch64 updater key.
-          # We deliberately do NOT cross-build a universal binary anymore: the
-          # offline-STT native deps (whisper.cpp + Metal, coreaudio-sys/bindgen)
-          # fail to cross-compile the x86_64 slice on an arm64 runner, which broke
-          # the whole macOS job in v0.1.2 and left latest.json with no darwin keys
-          # (Apple-Silicon apps then can't auto-update). Building each arch on its
-          # own native runner is the robust Tauri pattern and, with fail-fast:false,
-          # an Intel failure no longer takes Apple Silicon down with it.
           - platform: macos-14
             args: ""
             rust_targets: ""
-          # macOS Intel (darwin-x86_64) — EXPERIMENTAL, built on the SAME Apple-Silicon
-          # runner via Rosetta (GitHub retired the native Intel `macos-13` runners). An
-          # x86_64 Rust toolchain + x86_64 Node make the whole build run as x86_64
-          # (host == target), so the native deps (whisper.cpp / coreaudio) compile
-          # NATIVE — not cross-compiled, which is what failed before. Driven by the
-          # SAME `scripts/build-macos-intel.sh` used for local builds. It runs LAST
-          # (max-parallel:1, listed last) so the release + latest.json created by the
-          # jobs above already exist for it to merge the darwin-x86_64 entry into. If
-          # it fails, the other platforms still publish (fail-fast:false) and you can
-          # run the script locally (MISES-A-JOUR.md Partie 4).
-          - platform: macos-14
-            args: ""
-            rust_targets: ""
-            intel: true
           # To also ship Linux, add: { platform: ubuntu-22.04, args: "", rust_targets: "" }
     runs-on: ${{ matrix.platform }}
     steps:

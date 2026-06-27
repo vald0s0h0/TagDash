@@ -15,6 +15,7 @@ export type HotkeyActionId =
   | "release" | "sl" | "tp" | "alarm" | "line" | "text"
   | "capture" | "journal"
   | "order_mode" | "order_25" | "order_50" | "order_100" | "close"
+  | "confirm_hod"
   | "run_llm"
   | "tf_5s" | "tf_10s" | "tf_1m" | "tf_2m" | "tf_5m" | "tf_15m" | "tf_daily";
 
@@ -40,7 +41,8 @@ export const HOTKEY_ACTIONS: HotkeyActionDef[] = [
   { id: "order_25",   label: "Ordre 25 %",              group: "Ordres" },
   { id: "order_50",   label: "Ordre 50 %",              group: "Ordres" },
   { id: "order_100",  label: "Ordre 100 %",             group: "Ordres" },
-  { id: "close",      label: "Clôturer la position",    group: "Ordres" },
+  { id: "close",       label: "Clôturer la position",    group: "Ordres" },
+  { id: "confirm_hod", label: "Confirmer HOD Drive",     group: "Ordres" },
 
   { id: "run_llm",    label: "Lancer l'analyse IA",     group: "Analyse" },
 

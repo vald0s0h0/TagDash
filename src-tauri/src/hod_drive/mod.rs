@@ -145,6 +145,11 @@ pub const MAX_RISK_DOLLARS: f64 = 100.0;
 /// the same symbol for this long unless a new bar re-qualifies.
 pub const COOLDOWN_SECS: u64 = 600;
 
+// ── Suggested-trade offsets (fractions of the pullback bar's risk = high−low) ──
+const ENTRY_OFFSET: f64 = 0.05; // limit entry slightly above last.high
+const SL_OFFSET:    f64 = 0.10; // SL slightly below last.low
+const TP_OFFSET:    f64 = 0.10; // TP slightly below HOD
+
 /// How often the engine evaluates (seconds). Structural decisions only change on a
 /// new closed bar; a short loop keeps the 5-second liquidity hold responsive.
 const LOOP_INTERVAL_SECS: u64 = 2;
@@ -195,6 +200,12 @@ pub struct HodDriveEval {
     pub gates_pass:        bool,
     /// The closed bar this evaluation keys on (anti-spam: one fire per bar).
     pub last_bar_time:     DateTime<Utc>,
+
+    // ── Suggested trade levels (R-based offsets from the pullback bar) ──
+    pub suggested_entry:   Option<f64>,
+    pub suggested_sl:      Option<f64>,
+    pub suggested_tp:      Option<f64>,
+    pub suggested_rr:      Option<f64>,
 }
 
 /// The longest bullish sequence found off the open.
@@ -287,6 +298,19 @@ pub fn evaluate(
         0.0
     };
 
+    // Suggested trade levels: R-based offsets from the pullback bar.
+    let base_risk = last.high - last.low;
+    let (s_entry, s_sl, s_tp, s_rr) = if base_risk > 0.0 {
+        let entry = last.high + ENTRY_OFFSET * base_risk;
+        let sl    = last.low  - SL_OFFSET * base_risk;
+        let tp    = hod       - TP_OFFSET * base_risk;
+        let risk  = entry - sl;
+        let rr    = if risk > 0.0 && tp > entry { (tp - entry) / risk } else { 0.0 };
+        (Some(entry), Some(sl), Some(tp), Some(rr))
+    } else {
+        (None, None, None, None)
+    };
+
     Some(HodDriveEval {
         open_price,
         hod,
@@ -304,6 +328,10 @@ pub fn evaluate(
         series_bar_idxs: series_idxs,
         gates_pass: g1 && g2 && g3,
         last_bar_time: last.time,
+        suggested_entry: s_entry,
+        suggested_sl:    s_sl,
+        suggested_tp:    s_tp,
+        suggested_rr:    s_rr,
     })
 }
 
@@ -322,6 +350,72 @@ fn sum_true_range(bars: &[Bar]) -> f64 {
         sum += tr;
     }
     sum
+}
+
+// ── MACD (12/26/9) on close prices ─────────────────────────────────────────
+
+/// EMA seeded with SMA of the first `period` values.
+fn ema(values: &[f64], period: usize) -> Vec<f64> {
+    if values.len() < period || period == 0 {
+        return vec![];
+    }
+    let k = 2.0 / (period as f64 + 1.0);
+    let sma: f64 = values[..period].iter().sum::<f64>() / period as f64;
+    let mut out = Vec::with_capacity(values.len() - period + 1);
+    out.push(sma);
+    for &v in &values[period..] {
+        let prev = *out.last().unwrap();
+        out.push(v * k + prev * (1.0 - k));
+    }
+    out
+}
+
+/// MACD status for the overlay: whether the trend is "open" (histogram > 0) or
+/// "closed" (exhausted), plus a 0..1 strength normalised against the session's
+/// peak histogram magnitude.
+pub struct MacdStatus {
+    pub open:     bool,
+    pub strength: f64,
+}
+
+pub fn macd_status(closes: &[f64]) -> Option<MacdStatus> {
+    const FAST: usize = 12;
+    const SLOW: usize = 26;
+    const SIG:  usize = 9;
+
+    if closes.len() < SLOW {
+        return None;
+    }
+    let fast = ema(closes, FAST);
+    let slow = ema(closes, SLOW);
+    // Align: fast starts at index FAST-1, slow at SLOW-1. The MACD line uses
+    // the overlapping tail: the last `slow.len()` elements of fast.
+    let offset = fast.len() - slow.len();
+    let macd_line: Vec<f64> = fast[offset..]
+        .iter()
+        .zip(&slow)
+        .map(|(f, s)| f - s)
+        .collect();
+    if macd_line.len() < SIG {
+        return None;
+    }
+    let signal = ema(&macd_line, SIG);
+    let hist_offset = macd_line.len() - signal.len();
+    let histogram: f64 = *macd_line.last()? - *signal.last()?;
+    let max_abs = macd_line[hist_offset..]
+        .iter()
+        .zip(&signal)
+        .map(|(m, s)| (m - s).abs())
+        .fold(0.0_f64, f64::max);
+    let strength = if max_abs > 0.0 {
+        (histogram.abs() / max_abs).min(1.0)
+    } else {
+        0.0
+    };
+    Some(MacdStatus {
+        open: histogram > 0.0,
+        strength,
+    })
 }
 
 fn is_green(b: &Bar) -> bool {

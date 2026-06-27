@@ -119,6 +119,17 @@ export function Sidebar() {
   // Filter displayed alerts by currently active session tab
   const sessionAlerts = alerts.filter((a) => a.session === active);
 
+  // Clicking a ticker in Positions / Orders opens the matching scanner alert
+  // (same behaviour as clicking the card in the scanner list).
+  function handleTickerClick(symbol: string) {
+    setSelectedTicker(symbol);
+    const match = alerts.find((a) => a.symbol === symbol && a.session === active)
+                ?? alerts.find((a) => a.symbol === symbol);
+    if (match) {
+      placeAlert(match);
+    }
+  }
+
   return (
     <aside className="flex h-full w-72 flex-col border-r border-border bg-background">
       {/* Top section: live screener (pre-open) vs alert feed (premarket / open).
@@ -161,7 +172,7 @@ export function Sidebar() {
       <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "5rem", maxHeight: "12rem" }}>
         <SectionHeader icon={BriefcaseBusiness} title="Positions" count={positions.length} />
         <div className="flex-1 overflow-y-auto">
-          <PositionsPanel />
+          <PositionsPanel onTickerClick={handleTickerClick} />
         </div>
       </div>
 
@@ -169,7 +180,7 @@ export function Sidebar() {
       <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "5rem", maxHeight: "12rem" }}>
         <SectionHeader icon={ListOrdered} title="Ordres" count={orders.length} />
         <div className="flex-1 overflow-y-auto">
-          <OrdersPanel />
+          <OrdersPanel onTickerClick={handleTickerClick} />
         </div>
       </div>
     </aside>

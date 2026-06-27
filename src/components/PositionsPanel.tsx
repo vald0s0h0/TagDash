@@ -11,7 +11,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-function PosRow({ pos }: { pos: Position }) {
+function PosRow({ pos, onTickerClick }: { pos: Position; onTickerClick?: (symbol: string) => void }) {
   const qc      = useQueryClient();
   const [busy, setBusy] = useState(false);
 
@@ -40,7 +40,13 @@ function PosRow({ pos }: { pos: Position }) {
       )}>
         {isLong ? "L" : "S"}
       </span>
-      <span className="w-10 shrink-0 font-semibold">{pos.symbol}</span>
+      <button
+        onClick={(e) => { e.stopPropagation(); onTickerClick?.(pos.symbol); }}
+        className="w-10 shrink-0 font-semibold text-left hover:text-blue-400 hover:underline"
+        title={`Ouvrir ${pos.symbol} dans le scanner`}
+      >
+        {pos.symbol}
+      </button>
 
       {/* Qty */}
       <span className={cn(
@@ -126,7 +132,7 @@ function PosRow({ pos }: { pos: Position }) {
   );
 }
 
-export function PositionsPanel() {
+export function PositionsPanel({ onTickerClick }: { onTickerClick?: (symbol: string) => void }) {
   const { data: positions = [] } = useQuery({
     queryKey: ["internal_positions"],
     queryFn:  () => api.getInternalPositions(),
@@ -144,7 +150,7 @@ export function PositionsPanel() {
   return (
     <div className="flex flex-col overflow-y-auto">
       {positions.map((pos) => (
-        <PosRow key={pos.trade_id} pos={pos} />
+        <PosRow key={pos.trade_id} pos={pos} onTickerClick={onTickerClick} />
       ))}
     </div>
   );

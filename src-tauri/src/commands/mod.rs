@@ -1359,6 +1359,16 @@ pub struct HodDriveOverlay {
     pub gates_pass:             bool,
     /// (HOD−LOD) / avg range of green daily candles. 1.0 = identical, 0.5 = half.
     pub range_vs_green_atr:     Option<f64>,
+    // ── Suggested trade levels (R-based offsets from the pullback bar) ──
+    pub suggested_entry:        Option<f64>,
+    pub suggested_sl:           Option<f64>,
+    pub suggested_tp:           Option<f64>,
+    pub suggested_rr:           Option<f64>,
+    // ── MACD trend status (computed on M1 session bars) ──
+    /// True = trend still healthy (histogram > 0), false = exhausted.
+    pub macd_open:              Option<bool>,
+    /// 0..1 normalised magnitude of the histogram vs session peak.
+    pub macd_strength:          Option<f64>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1416,6 +1426,10 @@ pub fn get_hod_drive_overlay(
         }
     };
 
+    // MACD on the raw M1 session closes (more granularity than the 5-min bars).
+    let m1_closes: Vec<f64> = m1_session.iter().map(|b| b.close).collect();
+    let macd = crate::hod_drive::macd_status(&m1_closes);
+
     HodDriveOverlay {
         timeframe:              cfg.label.into(),
         series_share:           Some(eval.series_share),
@@ -1434,6 +1448,12 @@ pub fn get_hod_drive_overlay(
             .collect(),
         gates_pass:             eval.gates_pass,
         range_vs_green_atr,
+        suggested_entry:        eval.suggested_entry,
+        suggested_sl:           eval.suggested_sl,
+        suggested_tp:           eval.suggested_tp,
+        suggested_rr:           eval.suggested_rr,
+        macd_open:              macd.as_ref().map(|m| m.open),
+        macd_strength:          macd.as_ref().map(|m| m.strength),
     }
 }
 

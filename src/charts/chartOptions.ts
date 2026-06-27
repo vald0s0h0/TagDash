@@ -52,12 +52,38 @@ export function tpOpts(order: boolean, title = "TP") {
   };
 }
 
+export function limitOpts(side: "long" | "short" | null) {
+  const c = getChartTheme().levels.limit;
+  return {
+    color:            hexToRgba(c, 0.55),
+    lineWidth:        1 as const,
+    lineStyle:        LineStyle.Dotted,
+    axisLabelVisible: false,
+    title:            side === "long" ? "Limit ▲" : side === "short" ? "Limit ▼" : "Limit",
+  };
+}
+
 export const ENTRY_OPTIONS = {
   color:            "rgba(250,250,250,0.25)",
   lineWidth:        1 as const,
   lineStyle:        LineStyle.Dashed,
   axisLabelVisible: true,
   title:            "Entry",
+};
+
+// Draft (suggested) trade lines — faint orange, fine dotted.
+const DRAFT_COLOR = "rgba(245,158,11,0.35)";
+export const DRAFT_ENTRY_OPTS = {
+  color: DRAFT_COLOR, lineWidth: 1 as const, lineStyle: LineStyle.Dotted,
+  axisLabelVisible: false, title: "Entry ⟡",
+};
+export const DRAFT_SL_OPTS = {
+  color: DRAFT_COLOR, lineWidth: 1 as const, lineStyle: LineStyle.Dotted,
+  axisLabelVisible: false, title: "SL ⟡",
+};
+export const DRAFT_TP_OPTS = {
+  color: DRAFT_COLOR, lineWidth: 1 as const, lineStyle: LineStyle.Dotted,
+  axisLabelVisible: false, title: "TP ⟡",
 };
 
 export const BID_ASK_OPTIONS = {

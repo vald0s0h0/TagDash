@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, Fragment } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from "react";
 import {
   AlarmClockPlus,
   Bird,
@@ -36,6 +36,7 @@ import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
 import { nyFilenameStamp } from "@/lib/nyTime";
 import { LightweightChart } from "./LightweightChart";
+import type { LimitLineEntry } from "@/charts/useLimitLines";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -315,6 +316,21 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const openPosition = positions?.find((p) => p.symbol === zone.symbol) ?? null;
   const hasPosition  = openPosition != null;
 
+  // ── Poll pending orders for limit-price lines on the chart ──────────────
+  const { data: pendingOrders } = useQuery({
+    queryKey: ["internal_orders"],
+    queryFn:  () => api.getInternalOrders(),
+    refetchInterval: 1000,
+    enabled: !!zone.symbol,
+  });
+  const limitOrders: LimitLineEntry[] = useMemo(
+    () =>
+      (pendingOrders ?? [])
+        .filter((o) => o.symbol === zone.symbol && o.limit_price != null && !o.reduce_only)
+        .map((o) => ({ orderId: o.order_id, price: o.limit_price!, side: o.side })),
+    [pendingOrders, zone.symbol],
+  );
+
   // ── Per-symbol info-band extras (score / cap / float / BBZ / PM vol / news) ─
   // Mixes static DB data (score, cap, float, meta) with live-derived fields
   // (Bollinger Z off the live price, premarket volume, news presence), so it's
@@ -334,6 +350,34 @@ export function ChartZone({ zone }: ChartZoneProps) {
     enabled:  !!zone.symbol && zone.strategy_id === HOD_DRIVE_ID,
     refetchInterval: 3000,
   });
+
+  // ── HOD Drive draft (suggested) trade levels ──────────────────────────────────
+  // Initialized once when gates_pass flips true; local state not re-synced on each
+  // poll so the user's drag adjustments stick. Cleared when the symbol changes or
+  // gates_pass goes false while no line was dragged.
+  const [draft, setDraft] = useState<{
+    symbol: string; entry: number; sl: number; tp: number;
+  } | null>(null);
+
+  // Initialize drafts when the overlay provides suggested levels for a qualifying setup.
+  useEffect(() => {
+    if (!hodOverlay?.gates_pass || !zone.symbol) { setDraft(null); return; }
+    const { suggested_entry: e, suggested_sl: s, suggested_tp: t } = hodOverlay;
+    if (e == null || s == null || t == null) { setDraft(null); return; }
+    setDraft((prev) => {
+      if (prev?.symbol === zone.symbol) return prev;
+      return { symbol: zone.symbol!, entry: e, sl: s, tp: t };
+    });
+  }, [hodOverlay?.gates_pass, hodOverlay?.suggested_entry, hodOverlay?.suggested_sl,
+      hodOverlay?.suggested_tp, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const draftRr = useMemo(() => {
+    if (!draft) return null;
+    const risk = draft.entry - draft.sl;
+    if (risk <= 0) return null;
+    const reward = draft.tp - draft.entry;
+    return reward / risk;
+  }, [draft]);
 
   // ── Recent single-ticker headlines (Alpaca news REST) for the Micro overlay ─
   // Fetched as soon as the ticker is displayed; refreshed periodically to pick up
@@ -573,6 +617,58 @@ export function ChartZone({ zone }: ChartZoneProps) {
       chartStore.setContext(zone.zone_id, ctx);
     } catch (e) { console.error("updateZoneTp drag failed:", e); }
   }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
+
+  // ── Draft line drag handlers (HOD Drive suggested levels) ───────────────────
+  // Dragging a draft line updates the local draft state. For SL/TP, dragging also
+  // immediately activates it as the real SL/TP (via the existing updateZone* API).
+  const handleDraftEntryDrag = useCallback((price: number) => {
+    setDraft((d) => d ? { ...d, entry: price } : d);
+  }, []);
+  const handleDraftSlDrag = useCallback(async (price: number) => {
+    setDraft((d) => d ? { ...d, sl: price } : d);
+    // Activate this SL immediately.
+    const sym = zone.symbol;
+    if (!sym) return;
+    try {
+      const ctx = await api.updateZoneSl(zone.zone_id, sym, zone.strategy_id ?? "", price);
+      chartStore.setContext(zone.zone_id, ctx);
+    } catch (e) { console.error("draft SL drag failed:", e); }
+  }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
+  const handleDraftTpDrag = useCallback(async (price: number) => {
+    setDraft((d) => d ? { ...d, tp: price } : d);
+    // Activate this TP immediately.
+    const sym = zone.symbol;
+    if (!sym) return;
+    try {
+      const ctx = await api.updateZoneTp(zone.zone_id, sym, zone.strategy_id ?? "", price);
+      chartStore.setContext(zone.zone_id, ctx);
+    } catch (e) { console.error("draft TP drag failed:", e); }
+  }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
+
+  // ── Confirm HOD Drive suggested trade ─────────────────────────────────────
+  // Sets SL + TP (if not already active from a drag) then places a 100% limit
+  // order at the draft entry price. Clears the draft state on success.
+  const handleConfirmHod = useCallback(async () => {
+    if (!draft || !zone.symbol) return;
+    const strat = zone.strategy_id ?? "";
+    try {
+      // 1. Set SL (needed for sizing).
+      if (!hasSl) {
+        const ctx = await api.updateZoneSl(zone.zone_id, zone.symbol, strat, draft.sl);
+        chartStore.setContext(zone.zone_id, ctx);
+      }
+      // 2. Set TP.
+      if (!hasTp) {
+        const ctx = await api.updateZoneTp(zone.zone_id, zone.symbol, strat, draft.tp);
+        chartStore.setContext(zone.zone_id, ctx);
+      }
+      // 3. Place limit order at draft entry price (100% risk).
+      await api.createInternalLimitOrderPercent(zone.zone_id, 100, draft.entry);
+      setDraft(null);
+    } catch (e) {
+      console.error("confirm HOD Drive failed:", e);
+    }
+  }, [draft, zone.zone_id, zone.symbol, zone.strategy_id, hasSl, hasTp, chartStore]);
 
   // ── Delete a user price line from its on-chart ✕ ───────────────────────────
   // SL/TP clear by setting the level to null (also drops the bracket order);
@@ -990,6 +1086,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       case "order_50":   handleOrder(50); break;
       case "order_100":  handleOrder(100); break;
       case "close":      handleClose(); break;
+      case "confirm_hod": handleConfirmHod(); break;
       case "run_llm":
         if (card?.llm && zone.symbol && zone.strategy_id) {
           api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
@@ -1002,7 +1099,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     }
   }, [handleRelease, toggleMode, captureStatus, handleCapture, openJournal,
       chartStore, zone.zone_id, zone.symbol, zone.strategy_id, orderMode,
-      handleOrder, handleClose, card]);
+      handleOrder, handleClose, handleConfirmHod, card]);
 
   useEffect(() => registerZoneHotkeys(zone.zone_id, runAction), [zone.zone_id, runAction]);
 
@@ -1022,6 +1119,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       removeOrdersAndAlarms,
       order:   (pct) => handleOrder(pct),
       close:   handleClose,
+      confirmHod: handleConfirmHod,
       capture: () => { if (captureStatus === "idle") handleCapture(); },
       journalAudio: toggleAudioNote,
       release: handleRelease,
@@ -1030,7 +1128,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       symbol:     () => zone.symbol,
     });
   }, [zone.zone_id, zone.symbol, cycleFocus, cursorPlace, removeOrders,
-      removeOrdersAndAlarms, handleOrder, handleClose, handleCapture, captureStatus, handleRelease, toggleAudioNote]);
+      removeOrdersAndAlarms, handleOrder, handleClose, handleConfirmHod, handleCapture, captureStatus, handleRelease, toggleAudioNote]);
 
   // ── Empty zone ─────────────────────────────────────────────────────────────
   if (!zone.symbol) {
@@ -1546,7 +1644,11 @@ export function ChartZone({ zone }: ChartZoneProps) {
                         news={tickerNews ?? []}
                       />
                     ) : isHod ? (
-                      <HodDriveInfoOverlay overlay={hodOverlay ?? null} />
+                      <HodDriveInfoOverlay
+                        overlay={hodOverlay ?? null}
+                        draftRr={draftRr}
+                        onConfirm={handleConfirmHod}
+                      />
                     ) : (
                       <StrategyInfoOverlay
                         card={card}
@@ -1570,6 +1672,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     bid={liveState?.bid ?? null}
                     ask={liveState?.ask ?? null}
                     ordersActive={hasPosition}
+                    draftEntry={isInteractive && draft ? draft.entry : null}
+                    draftSl={isInteractive && draft && !hasSl ? draft.sl : null}
+                    draftTp={isInteractive && draft && !hasTp ? draft.tp : null}
+                    onDraftEntryDrag={handleDraftEntryDrag}
+                    onDraftSlDrag={handleDraftSlDrag}
+                    onDraftTpDrag={handleDraftTpDrag}
+                    limitOrders={limitOrders}
                     lines={paneLines}
                     annotations={paneAnnotations}
                     alarms={alarms}

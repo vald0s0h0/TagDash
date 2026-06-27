@@ -22,7 +22,7 @@ function OcoBadge() {
   );
 }
 
-function OrderRow({ order }: { order: InternalOrder }) {
+function OrderRow({ order, onTickerClick }: { order: InternalOrder; onTickerClick?: (symbol: string) => void }) {
   const qc      = useQueryClient();
   const [busy, setBusy] = useState(false);
 
@@ -51,7 +51,13 @@ function OrderRow({ order }: { order: InternalOrder }) {
       </span>
 
       {/* Symbol */}
-      <span className="w-10 shrink-0 font-semibold">{order.symbol}</span>
+      <button
+        onClick={(e) => { e.stopPropagation(); onTickerClick?.(order.symbol); }}
+        className="w-10 shrink-0 font-semibold text-left hover:text-blue-400 hover:underline"
+        title={`Ouvrir ${order.symbol} dans le scanner`}
+      >
+        {order.symbol}
+      </button>
 
       {/* Qty */}
       <span className="w-7 shrink-0 tabular-nums text-muted-foreground">
@@ -126,7 +132,7 @@ function OrderRow({ order }: { order: InternalOrder }) {
   );
 }
 
-export function OrdersPanel() {
+export function OrdersPanel({ onTickerClick }: { onTickerClick?: (symbol: string) => void }) {
   const { data: orders = [] } = useQuery({
     queryKey: ["internal_orders"],
     queryFn:  () => api.getInternalOrders(),
@@ -144,7 +150,7 @@ export function OrdersPanel() {
   return (
     <div className="flex flex-col overflow-y-auto">
       {orders.map((order) => (
-        <OrderRow key={order.order_id} order={order} />
+        <OrderRow key={order.order_id} order={order} onTickerClick={onTickerClick} />
       ))}
     </div>
   );

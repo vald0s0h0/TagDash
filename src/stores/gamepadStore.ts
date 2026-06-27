@@ -24,6 +24,7 @@ export type GamepadActionId =
   | "cursor_sl" | "cursor_alarm" | "cursor_tp" | "remove_orders"
   // Armed layer — R2 held (digital)
   | "r2_modifier" | "order_25" | "order_50" | "order_100" | "close_position"
+  | "confirm_hod"
   // Journal / TradeTally (digital)
   | "capture" | "share_tag" | "journal_audio"
   // Analog axes
@@ -69,6 +70,7 @@ export const GAMEPAD_ACTIONS: GamepadActionDef[] = [
   { id: "order_50",      label: "Position 50 %",  group: "Position armée", kind: "digital", armed: true },
   { id: "order_100",     label: "Position 100 %", group: "Position armée", kind: "digital", armed: true },
   { id: "close_position", label: "Clôturer la position", group: "Position armée", kind: "digital", armed: true },
+  { id: "confirm_hod",   label: "Confirmer HOD Drive",   group: "Position armée", kind: "digital", armed: true },
 
   // Journal / TradeTally
   { id: "capture",       label: "Capture TradeTally",          group: "Journal / TradeTally", kind: "digital" },
@@ -148,6 +150,7 @@ export const DEFAULT_BINDINGS: Record<GamepadActionId, GamepadBinding> = {
   order_50:       { kind: "button", index: 1 }, // B
   order_100:      { kind: "button", index: 3 }, // Y
   close_position: { kind: "button", index: 2 }, // X
+  confirm_hod:    { kind: "button", index: 10 }, // L3 (placeholder — rebind later)
 
   // Journal / TradeTally
   capture:       { kind: "button", index: 8 },  // View / Back

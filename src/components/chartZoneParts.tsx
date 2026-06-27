@@ -604,13 +604,19 @@ export function MicroInfoOverlay({
  *  All from the live `get_hod_drive_overlay` recompute; greys a row when its value
  *  isn't available yet. The HOD/LOD points + green-series crosses are drawn on the
  *  candles themselves (chart markers), not here. */
-export function HodDriveInfoOverlay({ overlay }: { overlay: HodDriveOverlay | null }) {
-  const share = overlay?.series_share ?? null;          // 0..1
-  const pbVol = overlay?.pullback_volume ?? null;       // shares
-  const ratio = overlay?.pullback_vol_ratio ?? null;    // 1.0 = equal
-  const power = overlay?.power_score ?? null;            // 0..1
-  const eff   = overlay?.directional_efficiency ?? null; // 0..1
-  const rgAtr = overlay?.range_vs_green_atr ?? null;    // 1.0 = 100%
+export function HodDriveInfoOverlay({ overlay, draftRr, onConfirm }: {
+  overlay: HodDriveOverlay | null;
+  draftRr?: number | null;
+  onConfirm?: () => void;
+}) {
+  const share  = overlay?.series_share ?? null;          // 0..1
+  const pbVol  = overlay?.pullback_volume ?? null;       // shares
+  const ratio  = overlay?.pullback_vol_ratio ?? null;    // 1.0 = equal
+  const power  = overlay?.power_score ?? null;            // 0..1
+  const eff    = overlay?.directional_efficiency ?? null; // 0..1
+  const rgAtr  = overlay?.range_vs_green_atr ?? null;    // 1.0 = 100%
+  const mOpen  = overlay?.macd_open ?? null;              // true/false/null
+  const mStr   = overlay?.macd_strength ?? null;          // 0..1
   const pct = (x: number) => `${Math.round(x * 100)}%`;
 
   return (
@@ -671,6 +677,27 @@ export function HodDriveInfoOverlay({ overlay }: { overlay: HodDriveOverlay | nu
         value={rgAtr != null ? pct(rgAtr) : null}
         tone={rgAtr != null && rgAtr >= 1 ? "red" : "blue"}
       />
+      {/* MACD trend status: open (blue) = momentum healthy, closed (red) = exhausted. */}
+      <MetricBar
+        label="MACD"
+        fill={mStr != null ? clamp01(mStr) : null}
+        value={mOpen != null ? (mOpen ? "Ouvert" : "Fermé") : null}
+        tone={mOpen === true ? "blue" : "red"}
+      />
+      {draftRr != null && onConfirm && (
+        <>
+          <div className="h-px w-full bg-white/10" />
+          <button
+            onClick={onConfirm}
+            className={cn(
+              "pointer-events-auto w-full rounded bg-amber-600/70 px-2 py-1 text-[10px] font-semibold",
+              "text-white transition-colors hover:bg-amber-500/80 active:bg-amber-400/80",
+            )}
+          >
+            Confirmer — {draftRr.toFixed(1)}R
+          </button>
+        </>
+      )}
     </div>
   );
 }

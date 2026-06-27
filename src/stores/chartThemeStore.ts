@@ -39,8 +39,8 @@ export interface ChartTheme {
   /** Candle markers: split ex-dates (dot below the bar) + news pastilles (small
    *  dot at the pane bottom, over the volume). */
   markers: { split: string; news: string };
-  /** User price lines: stop-loss, take-profit, price alarm. */
-  levels: { sl: string; tp: string; alarm: string };
+  /** User price lines: stop-loss, take-profit, price alarm, limit order. */
+  levels: { sl: string; tp: string; alarm: string; limit: string };
 }
 
 /** Top-level theme sections (keys of ChartTheme) — used by the generic setter. */
@@ -62,7 +62,7 @@ export const DEFAULT_CHART_THEME: ChartTheme = {
   },
   executions: { buy: "#22c55e", sell: "#ef4444", profit: "#22c55e", loss: "#ef4444" },
   markers: { split: "#ef4444", news: "#38bdf8" },
-  levels: { sl: "#ef4444", tp: "#22c55e", alarm: "#f59e0b" },
+  levels: { sl: "#ef4444", tp: "#22c55e", alarm: "#f59e0b", limit: "#94a3b8" },
 };
 
 // ─── Store ────────────────────────────────────────────────────────────────────

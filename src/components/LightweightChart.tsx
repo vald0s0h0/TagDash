@@ -37,6 +37,7 @@ import { useIndicators } from "@/charts/useIndicators";
 import { useSessionShading } from "@/charts/useSessionShading";
 import { useCandleMarkers } from "@/charts/useCandleMarkers";
 import { useSlTpLines } from "@/charts/useSlTpLines";
+import { useDraftLines } from "@/charts/useDraftLines";
 import { useExecutionMarkers } from "@/charts/useExecutionMarkers";
 import { useNewsMarkers } from "@/charts/useNewsMarkers";
 import { useCrosshairRegister } from "@/charts/useCrosshairRegister";
@@ -45,6 +46,7 @@ import { useBarSeries } from "@/charts/useBarSeries";
 import { useLiveTicks } from "@/charts/useLiveTicks";
 import { useChartBars } from "@/charts/useChartBars";
 import { useBarTooltip } from "@/charts/useBarTooltip";
+import { useLimitLines, type LimitLineEntry } from "@/charts/useLimitLines";
 
 // ─── Geometry helpers ───────────────────────────────────────────────────────
 
@@ -89,6 +91,9 @@ const DEFAULT_SCROLL = {
 type DragTarget =
   | { kind: "sl" }
   | { kind: "tp" }
+  | { kind: "draft_entry" }
+  | { kind: "draft_sl" }
+  | { kind: "draft_tp" }
   | { kind: "alarm"; id: string }
   | { kind: "line-p1"; id: string }
   | { kind: "line-p2"; id: string }
@@ -120,6 +125,7 @@ interface Props {
   bid:         number | null;
   ask:         number | null;
   ordersActive: boolean; // true when a position is open → SL/TP shown as orders
+  limitOrders?: LimitLineEntry[];
   lines:       ChartLine[];
   annotations: ChartAnnotation[];
   alarms:      ChartAlarm[];
@@ -137,6 +143,13 @@ interface Props {
   crosshairSync?: CrosshairSync;
   /** Stable id of this pane within its zone, for the crosshair sync registry. */
   paneId?: string;
+  // Draft (suggested) trade lines from HOD Drive.
+  draftEntry?:    number | null;
+  draftSl?:       number | null;
+  draftTp?:       number | null;
+  onDraftEntryDrag?: (price: number) => void;
+  onDraftSlDrag?:    (price: number) => void;
+  onDraftTpDrag?:    (price: number) => void;
   onPriceClick:   (price: number, time: number, pixelX: number, pixelY: number, scope: DrawScope) => void;
   onSlDragEnd:    (price: number) => void;
   onTpDragEnd:    (price: number) => void;
@@ -178,6 +191,7 @@ export function LightweightChart({
   bid,
   ask,
   ordersActive,
+  limitOrders = [],
   lines,
   annotations,
   alarms,
@@ -186,6 +200,12 @@ export function LightweightChart({
   markers = [],
   crosshairSync,
   paneId,
+  draftEntry,
+  draftSl,
+  draftTp,
+  onDraftEntryDrag,
+  onDraftSlDrag,
+  onDraftTpDrag,
   onPriceClick,
   onSlDragEnd,
   onTpDragEnd,
@@ -209,6 +229,13 @@ export function LightweightChart({
   const entryLineRef  = useRef<IPriceLine | null>(null);
   const bidLineRef    = useRef<IPriceLine | null>(null);
   const askLineRef    = useRef<IPriceLine | null>(null);
+  // Draft (suggested) trade lines from HOD Drive.
+  const draftEntryLineRef = useRef<IPriceLine | null>(null);
+  const draftSlLineRef    = useRef<IPriceLine | null>(null);
+  const draftTpLineRef    = useRef<IPriceLine | null>(null);
+  const draftEntryPriceRef = useRef<number | null>(draftEntry ?? null);
+  const draftSlPriceRef    = useRef<number | null>(draftSl ?? null);
+  const draftTpPriceRef    = useRef<number | null>(draftTp ?? null);
   // Controller horizontal cursor (right stick) — a movable price line + its price.
   const cursorLineRef  = useRef<IPriceLine | null>(null);
   const cursorPriceRef = useRef<number | null>(null);
@@ -243,6 +270,9 @@ export function LightweightChart({
   const onLimitOrderClickRef = useRef(onLimitOrderClick);
   const slPriceRef      = useRef<number | null>(slPrice);
   const tpPriceRef      = useRef<number | null>(tpPrice);
+  const onDraftEntryDragRef = useRef(onDraftEntryDrag);
+  const onDraftSlDragRef    = useRef(onDraftSlDrag);
+  const onDraftTpDragRef    = useRef(onDraftTpDrag);
   const ordersActiveRef = useRef<boolean>(ordersActive);
   const symbolRef       = useRef<string>(symbol);
   const timeframeRef    = useRef<Timeframe>(timeframe);
@@ -266,6 +296,12 @@ export function LightweightChart({
   useEffect(() => { slPriceRef.current      = slPrice; });
   useEffect(() => { tpPriceRef.current      = tpPrice; });
   useEffect(() => { ordersActiveRef.current = ordersActive; });
+  useEffect(() => { draftEntryPriceRef.current = draftEntry ?? null; });
+  useEffect(() => { draftSlPriceRef.current    = draftSl ?? null; });
+  useEffect(() => { draftTpPriceRef.current    = draftTp ?? null; });
+  useEffect(() => { onDraftEntryDragRef.current = onDraftEntryDrag; });
+  useEffect(() => { onDraftSlDragRef.current    = onDraftSlDrag; });
+  useEffect(() => { onDraftTpDragRef.current    = onDraftTpDrag; });
   useEffect(() => { symbolRef.current       = symbol; });
   useEffect(() => { timeframeRef.current    = timeframe; });
   useEffect(() => { linesRef.current        = lines; });
@@ -710,6 +746,13 @@ export function LightweightChart({
   // ── User SL / TP lines (+ R-ratio title, planned↔order styling) — extracted hook ─
   useSlTpLines(candleRef, slLineRef, tpLineRef, tpPriceRef, slPrice, tpPrice, ordersActive, bars);
 
+  // ── Draft (suggested) trade lines from HOD Drive ──────────────────────────
+  useDraftLines(candleRef, draftEntryLineRef, draftSlLineRef, draftTpLineRef,
+    draftEntry ?? null, draftSl ?? null, draftTp ?? null);
+
+  // ── Pending limit order lines (dotted, light) ─────────────────────────────
+  useLimitLines(candleRef, limitOrders);
+
   // ── Reference price lines — entry + live bid/ask (extracted hook) ──────────
   useReferenceLines(candleRef, entryLineRef, bidLineRef, askLineRef, entryPrice, bid, ask);
 
@@ -780,10 +823,14 @@ export function LightweightChart({
 
   // ── Hit-test which draggable object is under the cursor (container coords) ──
   const hitTest = useCallback((x: number, y: number): DragTarget => {
-    // 1. Price lines (SL / TP / alarms).
+    // 1. Price lines (SL / TP / drafts / alarms).
     const sl = slPriceRef.current, tp = tpPriceRef.current;
     if (sl != null) { const yy = priceToY(sl); if (yy != null && Math.abs(y - yy) <= PRICE_HIT) return { kind: "sl" }; }
     if (tp != null) { const yy = priceToY(tp); if (yy != null && Math.abs(y - yy) <= PRICE_HIT) return { kind: "tp" }; }
+    const de = draftEntryPriceRef.current, ds = draftSlPriceRef.current, dt = draftTpPriceRef.current;
+    if (de != null) { const yy = priceToY(de); if (yy != null && Math.abs(y - yy) <= PRICE_HIT) return { kind: "draft_entry" }; }
+    if (ds != null) { const yy = priceToY(ds); if (yy != null && Math.abs(y - yy) <= PRICE_HIT) return { kind: "draft_sl" }; }
+    if (dt != null) { const yy = priceToY(dt); if (yy != null && Math.abs(y - yy) <= PRICE_HIT) return { kind: "draft_tp" }; }
     for (const a of alarmsRef.current) {
       const yy = priceToY(a.price);
       if (yy != null && Math.abs(y - yy) <= PRICE_HIT) return { kind: "alarm", id: a.id };
@@ -844,6 +891,12 @@ export function LightweightChart({
       slLineRef.current.applyOptions({ price }); slPriceRef.current = price;
     } else if (drag.kind === "tp" && tpLineRef.current) {
       tpLineRef.current.applyOptions({ price }); tpPriceRef.current = price;
+    } else if (drag.kind === "draft_entry" && draftEntryLineRef.current) {
+      draftEntryLineRef.current.applyOptions({ price }); draftEntryPriceRef.current = price;
+    } else if (drag.kind === "draft_sl" && draftSlLineRef.current) {
+      draftSlLineRef.current.applyOptions({ price }); draftSlPriceRef.current = price;
+    } else if (drag.kind === "draft_tp" && draftTpLineRef.current) {
+      draftTpLineRef.current.applyOptions({ price }); draftTpPriceRef.current = price;
     } else if (drag.kind === "alarm") {
       alarmLineMap.current.get(drag.id)?.applyOptions({ price });
     } else if (drag.kind === "line-p1" || drag.kind === "line-p2") {
@@ -877,6 +930,9 @@ export function LightweightChart({
     const preview = dragPreviewRef.current;
     if (drag.kind === "sl") { if (slPriceRef.current != null) onSlDragEndRef.current(slPriceRef.current); }
     else if (drag.kind === "tp") { if (tpPriceRef.current != null) onTpDragEndRef.current(tpPriceRef.current); }
+    else if (drag.kind === "draft_entry") { if (draftEntryPriceRef.current != null) onDraftEntryDragRef.current?.(draftEntryPriceRef.current); }
+    else if (drag.kind === "draft_sl") { if (draftSlPriceRef.current != null) onDraftSlDragRef.current?.(draftSlPriceRef.current); }
+    else if (drag.kind === "draft_tp") { if (draftTpPriceRef.current != null) onDraftTpDragRef.current?.(draftTpPriceRef.current); }
     else if (drag.kind === "alarm") {
       const ln = alarmLineMap.current.get(drag.id);
       const price = (ln?.options() as { price?: number } | undefined)?.price;
@@ -918,6 +974,7 @@ export function LightweightChart({
     if (hit.kind === "sl") target = { type: "sl" };
     else if (hit.kind === "tp") target = { type: "tp" };
     else if (hit.kind === "alarm") target = { type: "alarm", id: hit.id };
+    else if (hit.kind === "draft_entry" || hit.kind === "draft_sl" || hit.kind === "draft_tp") return;
     else { setSelectedId(hit.id); target = { type: "line", id: hit.id }; }
     onContextMenu(target, e.clientX, e.clientY);
   }, [hitTest, onContextMenu]);

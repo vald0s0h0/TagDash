@@ -155,6 +155,18 @@ export interface HodDriveOverlay {
   gates_pass:             boolean;
   /** (HOD−LOD) / avg range of green daily candles. 1.0 = identical, 0.5 = half. */
   range_vs_green_atr:     number | null;
+  /** Suggested limit-entry price (slightly above last bar high). */
+  suggested_entry:        number | null;
+  /** Suggested stop-loss price (slightly below last bar low). */
+  suggested_sl:           number | null;
+  /** Suggested take-profit price (slightly below HOD). */
+  suggested_tp:           number | null;
+  /** R/R of the suggested trade. */
+  suggested_rr:           number | null;
+  /** MACD trend: true = healthy (histogram > 0), false = exhausted. */
+  macd_open:              boolean | null;
+  /** 0..1 normalised histogram magnitude vs session peak. */
+  macd_strength:          number | null;
 }
 
 /** One headline for the Micro Pullback overlay (mirrors CardNews in
@@ -429,6 +441,11 @@ export interface AppConfig {
   data_source: { mode: "api" | "flat_files" };
   /** Offline Speech-to-Text dictée pipeline (whisper.cpp). */
   stt: SttConfig;
+  risk_management: {
+    default_order_type: "limit" | "market";
+    auto_be_enabled: boolean;
+    auto_be_r: number;
+  };
 }
 
 // ─── Speech-to-Text (offline dictée → trade notes / diary) ───────────────────────
