@@ -115,6 +115,7 @@ fn default_steps() -> Vec<StartupStep> {
         StartupStep::new("fetch_massive",    "Fetch Massive float data"),
         StartupStep::new("fetch_sec",        "Fetch SEC company data (country · industry)"),
         StartupStep::new("load_daily",       "Load daily / historical data (250d)"),
+        StartupStep::new("compute_changes", "Compute multi-day price changes"),
         StartupStep::new("compute_metrics",  "Compute ATR · prev close · Pump&Dump score"),
         StartupStep::new("fetch_short_interest", "Fetch short interest (Massive bulk)"),
         StartupStep::new("fetch_splits",     "Fetch stock splits (corporate actions)"),
@@ -138,6 +139,7 @@ fn default_steps_flat_files() -> Vec<StartupStep> {
         StartupStep::new("load_flat_daily",  "Load daily history from flat files"),
         StartupStep::new("fetch_massive",    "Float data (flat-files gap-fill)"),
         StartupStep::new("fetch_sec",        "SEC company data (country · industry)"),
+        StartupStep::new("compute_changes", "Compute multi-day price changes"),
         StartupStep::new("compute_metrics",  "Compute ATR · prev close · Pump&Dump score"),
         StartupStep::new("fetch_short_interest", "Fetch short interest (Massive bulk)"),
         StartupStep::new("fetch_dilution",   "Fetch dilution + financials (SEC XBRL) · scores"),
@@ -472,19 +474,25 @@ pub async fn run_pipeline(
         Some(&format!("{covered} symbols with bar data · {} updated ({mode})", daily_bars.len())));
     let _ = log(&db, "info", &format!("startup: daily bars — {covered} symbols cached, {} updated ({mode})", daily_bars.len()));
 
-    // Recompute the close-to-close % change over 1..6 trading days for every
-    // symbol, now that the daily cache reflects the latest bars. Stored in
-    // fundamentals_cache (change_1d_pct … change_6d_pct); gaps are included since
-    // the calculation is close-to-close off the previous day's close.
+    // ── Step 7b: compute_changes (multi-day close-to-close % changes) ──────────
+    set_step(&state, "compute_changes", StepStatus::Running, None);
     {
         let db_guard = db.lock().unwrap();
         match cache_repository::recompute_multiday_changes(&db_guard) {
-            Ok(n) => { drop(db_guard); let _ = log(&db, "info", &format!("startup: multi-day price changes recomputed for {n} symbols")); }
-            Err(e) => { drop(db_guard); let _ = log(&db, "warn", &format!("startup: multi-day change recompute failed: {e}")); }
+            Ok(n) => {
+                drop(db_guard);
+                set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
+                let _ = log(&db, "info", &format!("startup: multi-day price changes recomputed for {n} symbols"));
+            }
+            Err(e) => {
+                drop(db_guard);
+                set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
+                let _ = log(&db, "warn", &format!("startup: multi-day change recompute failed: {e}"));
+            }
         }
     }
 
-    // ── Step 7b: compute_metrics (ATR + prev_close + Pump&Dump score) ─────────
+    // ── Step 7c: compute_metrics (ATR + prev_close + Pump&Dump score) ─────────
     // CPU-only passes over the daily cache (no network). prev_close/ATR fill the
     // columns the pipeline previously left NULL; the Pump&Dump score is a DB-wide
     // percentile of the daily-wick behaviour (100 = most pump&dump-like).
@@ -799,11 +807,23 @@ pub async fn run_pipeline_flat_files(
     // ── fetch_sec (country / industry; online optional) ───────────────────────
     step_sec(&db, &state, &sec, &today, mock_sec).await;
 
-    // ── compute_metrics (CPU-only over the now-populated daily_cache) ─────────
+    // ── compute_changes (multi-day close-to-close % changes) ──────────────────
+    set_step(&state, "compute_changes", StepStatus::Running, None);
     {
         let g = db.lock().unwrap();
-        let _ = cache_repository::recompute_multiday_changes(&g);
+        match cache_repository::recompute_multiday_changes(&g) {
+            Ok(n) => {
+                drop(g);
+                set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
+            }
+            Err(e) => {
+                drop(g);
+                set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
+            }
+        }
     }
+
+    // ── compute_metrics (CPU-only over the now-populated daily_cache) ─────────
     set_step(&state, "compute_metrics", StepStatus::Running, None);
     {
         let (pc, pd) = {

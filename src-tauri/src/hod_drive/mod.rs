@@ -273,10 +273,17 @@ pub fn evaluate(
         }
         None => (0.0, 0, 0.0, Vec::new(), 0),
     };
+    // Last close must be above the session VWAP (price holding the trend).
+    let session_vwap = if volume_since_open > 0 {
+        dollar_volume_since_open / volume_since_open as f64
+    } else {
+        0.0
+    };
     let g3 = g3_range
         && series.is_some()
         && series_share >= cfg.min_series_share
-        && power_score >= cfg.min_power_score;
+        && power_score >= cfg.min_power_score
+        && last.close >= session_vwap;
 
     // Pullback = bars after the series end → last closed bar.
     let pullback_volume: u64 = if series.is_some() && series_end + 1 < bars.len() {

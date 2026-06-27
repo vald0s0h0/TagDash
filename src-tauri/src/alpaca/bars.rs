@@ -121,7 +121,6 @@ pub async fn fetch_daily_bars_since(
 
     let mut result: HashMap<String, Vec<BarData>> = HashMap::new();
 
-    // ≤200 symbols/request keeps the URL short; pagination handles bar volume.
     for chunk in symbols.chunks(200) {
         let sym_str = chunk.join(",");
         let mut page_token: Option<String> = None;
@@ -130,7 +129,7 @@ pub async fn fetch_daily_bars_since(
                 "https://data.alpaca.markets/v2/stocks/bars?symbols={sym_str}\
                  &timeframe=1Day&start={start}&limit=10000&adjustment=split"
             );
-            push_end(&mut url, 86_400, None); // replay guard: no future daily bar
+            push_end(&mut url, 86_400, None);
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
