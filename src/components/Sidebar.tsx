@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { AlarmClock, Bell, BriefcaseBusiness, ListOrdered, Radar } from "lucide-react";
+import { AlarmClock, Bell, BriefcaseBusiness, ClipboardCheck, ListOrdered, Radar } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useUiStore } from "@/stores/uiStore";
 import { useActiveAlerts, useScreenerMatches, useStartScanner } from "@/queries/useScanner";
@@ -10,6 +10,7 @@ import { ScreenerPanel } from "@/components/ScreenerPanel";
 import { PositionsPanel } from "@/components/PositionsPanel";
 import { OrdersPanel } from "@/components/OrdersPanel";
 import { AlarmsPanel } from "@/components/AlarmsPanel";
+import { TodoPanel } from "@/components/TodoPanel";
 import { api } from "@/lib/tauri";
 import type { AlertSignal, Session } from "@/types";
 
@@ -68,6 +69,11 @@ export function Sidebar() {
     queryKey: ["all_alarms"],
     queryFn:  () => api.getAllAlarms(),
     refetchInterval: 2000,
+  });
+  const { data: todoTrades = [] } = useQuery({
+    queryKey: ["todo_trades"],
+    queryFn:  () => api.getTodoTrades(),
+    refetchInterval: 3000,
   });
   // One badge per ticker, armed alarms only (matches AlarmsPanel's condensing).
   const alarmCount = new Set(
@@ -183,6 +189,16 @@ export function Sidebar() {
           <OrdersPanel onTickerClick={handleTickerClick} />
         </div>
       </div>
+
+      {/* À faire — trades missing screenshot / journal */}
+      {todoTrades.length > 0 && (
+        <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "3rem", maxHeight: "10rem" }}>
+          <SectionHeader icon={ClipboardCheck} title="À faire" count={todoTrades.length} />
+          <div className="flex-1 overflow-y-auto">
+            <TodoPanel onTickerClick={handleTickerClick} />
+          </div>
+        </div>
+      )}
     </aside>
   );
 }

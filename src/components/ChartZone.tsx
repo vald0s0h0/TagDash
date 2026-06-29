@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from "react";
+import { toCanvas as domToCanvas } from "html-to-image";
 import {
   AlarmClockPlus,
   Bird,
@@ -299,7 +300,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   // ── Poll market snapshot for live bid/ask ─────────────────────────────────
   const { data: snapshot } = useQuery({
-    queryKey: ["market_snapshot"],
+    queryKey: ["market-snapshot"],
     queryFn:  () => api.getMarketSnapshot(),
     refetchInterval: 500,
     enabled: !!zone.symbol,
@@ -938,40 +939,21 @@ export function ChartZone({ zone }: ChartZoneProps) {
         ctx.drawImage(src, sr.left - rect.left, sr.top - rect.top + headerH);
       });
 
-      // The on-chart strategy overlay is a DOM layer (not a canvas), so rasterise
-      // its cells onto the composite by hand — at their on-chart position, below
-      // the info header — so screenshots show the strategy-specific fields too.
-      const overlayCells = container.querySelectorAll<HTMLElement>("[data-capture-cell]");
-      overlayCells.forEach((cell) => {
-        const cr = cell.getBoundingClientRect();
-        const x = cr.left - rect.left;
-        const y = cr.top - rect.top + headerH;
-        const w = cr.width;
-        const h = cr.height;
-        const padX = 6;
-        // Opaque box (the live backdrop-blur can't be reproduced on canvas).
-        ctx.fillStyle = "rgba(0,0,0,0.55)";
-        ctx.fillRect(x, y, w, h);
-        // Prefer explicit data-cap-label / data-cap-value (rich Micro overlay,
-        // where a bar sits between them); fall back to the generic overlay's
-        // first two children (label over value).
-        const labelEl = cell.querySelector<HTMLElement>("[data-cap-label]") ?? cell.children[0];
-        const valueEl = cell.querySelector<HTMLElement>("[data-cap-value]") ?? cell.children[1];
-        const label = labelEl?.textContent?.trim() ?? "";
-        const value = valueEl?.textContent?.trim() ?? "";
-        if (label) {
-          ctx.font = "9px ui-monospace, monospace";
-          ctx.textBaseline = "top";
-          ctx.fillStyle = "#9a9a9a";
-          ctx.fillText(label, x + padX, y + 3);
-        }
-        if (value) {
-          ctx.font = "bold 14px ui-monospace, monospace";
-          ctx.textBaseline = "bottom";
-          ctx.fillStyle = "#e5e5e5";
-          ctx.fillText(value, x + padX, y + h - 3);
-        }
-      });
+      // Rasterize on-chart strategy overlays (bars, badges, colored fills) at
+      // their exact screen position via html-to-image so the screenshot matches
+      // the live UI instead of reducing everything to monospace text.
+      const overlays = container.querySelectorAll<HTMLElement>("[data-capture-overlay]");
+      await Promise.all(
+        Array.from(overlays).map(async (overlay) => {
+          try {
+            const or = overlay.getBoundingClientRect();
+            const oc = await domToCanvas(overlay, { pixelRatio: 1 });
+            ctx.drawImage(oc, or.left - rect.left, or.top - rect.top + headerH);
+          } catch (e) {
+            console.warn("overlay capture failed, skipping:", e);
+          }
+        }),
+      );
 
       const dataUrl = canvas.toDataURL("image/png");
 

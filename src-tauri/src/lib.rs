@@ -9,6 +9,7 @@ pub mod enrichment;
 pub mod flat_files;
 pub mod fmp;
 pub mod hod_drive;
+pub mod http;
 pub mod internal_trading;
 pub mod llm;
 pub mod local_db;
@@ -206,41 +207,12 @@ pub fn run() {
             }
 
             // 0. Desktop attention cues for new alerts (flash overlay + foreground).
-            //    Build the full-screen white flash overlay: always-on-top, transparent,
-            //    click-through, no taskbar entry, NOT focused. It stays up permanently
-            //    (invisible while transparent) and just pulses white on a notify event,
-            //    so it never steals focus. `push_alert` reaches it through the AppHandle
-            //    stashed by `notify::init`.
-            {
-                use tauri::{WebviewUrl, WebviewWindowBuilder};
-                // Same SPA entry; main.tsx renders the flash overlay (not the app)
-                // when it detects it's running in the window labelled "flash".
-                match WebviewWindowBuilder::new(app.handle(), "flash", WebviewUrl::App("index.html".into()))
-                    .title("")
-                    .decorations(false)
-                    // No drop shadow / frame: a borderless window still gets a DWM
-                    // shadow on Windows, which shows as a faint outline around the
-                    // (otherwise invisible) transparent overlay. Kill it.
-                    .shadow(false)
-                    .transparent(true)
-                    .always_on_top(true)
-                    .skip_taskbar(true)
-                    .focused(false)
-                    .visible(true)
-                    .resizable(false)
-                    .build()
-                {
-                    Ok(win) => {
-                        let _ = win.set_ignore_cursor_events(true);
-                        // Cover the whole primary monitor (work area + taskbar).
-                        if let Ok(Some(mon)) = win.primary_monitor() {
-                            let _ = win.set_size(*mon.size());
-                            let _ = win.set_position(tauri::PhysicalPosition::new(0, 0));
-                        }
-                    }
-                    Err(e) => eprintln!("[tagdash] flash overlay window not created: {e}"),
-                }
-            }
+            //    The full-screen white flash overlay is NO LONGER created at startup
+            //    — it was a permanent resident webview (extra WebView2 process tree)
+            //    even when flash alerts were off. It's now built on demand from
+            //    Settings (`set_flash_overlay` → `notify::ensure_flash_overlay`) when
+            //    the user enables the flash cue, and closed when they disable it.
+            //    `notify::on_alert` just pulses it (a no-op if it isn't open).
             notify::init(app.handle().clone());
 
             // 0b. Trade tape recorder: persists every live trade print (and the
@@ -267,13 +239,7 @@ pub fn run() {
                 let focus_rx          = state.focus_symbols_tx.subscribe();
                 let app_handle        = app.handle().clone();
                 let news_feed_running = state.news_feed_running.clone();
-                // Extra handles for the flat-files Market Replay auto-start (the
-                // latest downloaded day is parked, paused, after that pipeline).
                 let app_dir          = state.app_dir.clone();
-                let replay_shared    = state.replay.clone();
-                let active_alerts    = state.active_alerts.clone();
-                let alert_history    = state.alert_history.clone();
-                let focus_rx_restart = state.focus_symbols_tx.subscribe();
                 // Dedicated handles for the company-intel collection job (kept as
                 // its own clones so it can run after the pipeline without fighting
                 // the moves above).
@@ -284,38 +250,12 @@ pub fn run() {
                     let is_flat = config.read().unwrap().data_source.is_flat_files();
                     if is_flat {
                         // Flat-files boot: dedicated pipeline (no Alpaca — universe +
-                        // daily history from disk, FMP/Massive/SEC for gaps), then the
-                        // latest downloaded day is parked in Market Replay, PAUSED at
-                        // 04:00 ET. Charts populate from disk; pressing Play runs the
-                        // engines so the strategies emit signals. No live / news feed.
+                        // daily history from disk, FMP/Massive/SEC for gaps). The user
+                        // picks a day from the calendar modal before any replay starts.
                         startup::run_pipeline_flat_files(
                             db.clone(), config.clone(), secrets.clone(), startup, app_dir.clone(),
                         )
                         .await;
-                        match crate::flat_files::minute::latest_complete_day(&app_dir) {
-                            Some(day) => {
-                                let deps = crate::replay::ReplayDeps {
-                                    app_dir: app_dir.clone(),
-                                    market: market.clone(),
-                                    db: db.clone(),
-                                    config: config.clone(),
-                                    secrets: secrets.clone(),
-                                    live_feed_running,
-                                    news_feed_running,
-                                    focus_rx,
-                                    focus_rx_restart,
-                                    active_alerts,
-                                    alert_history,
-                                    app: app_handle,
-                                };
-                                // 240 = 04:00 ET start (includes the premarket window).
-                                match crate::replay::start(replay_shared, deps, day.clone(), 240) {
-                                    Ok(_)  => eprintln!("[tagdash] flat files: jour {day} chargé dans Market Replay (en pause)"),
-                                    Err(e) => eprintln!("[tagdash] flat files: replay non démarré: {e}"),
-                                }
-                            }
-                            None => eprintln!("[tagdash] flat files: aucun jour minute téléchargé — replay non démarré"),
-                        }
                     } else {
                         // API boot: Alpaca-centric pipeline, then connect the live
                         // WebSocket + premarket news feed so real-time data flows.
@@ -488,6 +428,12 @@ pub fn run() {
             commands::get_journal_entry,
             // Screenshot
             commands::save_screenshot_local,
+            // Todo trades
+            commands::get_todo_trades,
+            // All trades DB view
+            commands::get_all_trades_db,
+            commands::get_trade_days,
+            commands::delete_trade_db,
             // Logs
             commands::get_local_logs,
             // Bug reports (persisted)
@@ -560,9 +506,13 @@ pub fn run() {
             commands::open_mood_target,
             commands::get_default_dashboard,
             commands::export_dashboard_default,
-            // Embedded TradeTally webview (native child webview over the tab)
+            // Embedded TradeTally child webview
             commands::tradetally_set_bounds,
-            commands::tradetally_hide,
+            commands::tradetally_close,
+            commands::tradetally_reload,
+            commands::tradetally_clear_data,
+            // Flash alert overlay (built on demand from Settings)
+            commands::set_flash_overlay,
             // Chart / trade context
             commands::get_zone_trade_context,
             commands::create_or_get_trade_id_for_zone,
@@ -592,6 +542,7 @@ pub fn run() {
             commands::replay_seek_relative,
             commands::replay_seek_clock,
             commands::replay_next_alert,
+            commands::replay_next_bar,
             commands::replay_next_day,
             commands::get_replay_status,
             // Flat files (download / calendar / open folder)

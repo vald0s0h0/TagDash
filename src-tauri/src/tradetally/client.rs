@@ -21,7 +21,7 @@ pub struct TtClient {
 impl TtClient {
     pub fn new(base_url: String, token: String, mock_mode: bool) -> Self {
         Self {
-            inner: Client::new(),
+            inner: crate::http::client(),
             base_url,
             token,
             mock_mode,

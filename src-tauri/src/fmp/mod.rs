@@ -22,7 +22,7 @@ struct RawFmpFloat {
 }
 
 pub async fn fetch_shares_float_all(api_key: &str) -> Result<Vec<FmpFloat>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!(
         "https://financialmodelingprep.com/stable/shares-float-all?apikey={api_key}"
     );
@@ -35,6 +35,9 @@ pub async fn fetch_shares_float_all(api_key: &str) -> Result<Vec<FmpFloat>, Stri
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 429 {
+            return Err("FMP rate limited — free tier quota exhausted".into());
+        }
         return Err(format!("FMP HTTP {status}: {body}"));
     }
 

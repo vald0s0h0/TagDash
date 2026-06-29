@@ -471,6 +471,8 @@ const ALTERS: &[&str] = &[
     "ALTER TABLE chart_drawings ADD COLUMN width REAL",
     "ALTER TABLE chart_drawings ADD COLUMN line_style TEXT",
     "ALTER TABLE chart_drawings ADD COLUMN font_size REAL",
+    "CREATE INDEX IF NOT EXISTS idx_executions_trade ON executions(trade_id)",
+    "CREATE INDEX IF NOT EXISTS idx_screenshot_files_trade ON screenshot_files(trade_id)",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

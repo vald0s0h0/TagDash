@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { Session } from "@/types";
 import { api } from "@/lib/tauri";
 
-type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | "flat-files" | "stt" | "update" | null;
+type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | "trades-db" | "flat-files" | "stt" | "update" | null;
 
 /** Top-level view: the trading workspace (sessions + charts + sidebar), the
  *  standalone KPI dashboard (moodboard, no sidebar), or the embedded TradeTally

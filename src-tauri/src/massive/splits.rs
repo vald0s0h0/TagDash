@@ -74,10 +74,14 @@ pub async fn fetch_latest_split(api_key: &str, ticker: &str) -> Result<Option<Sp
         &format!("{BASE_URL}/stocks/vX/corporate-actions/splits?ticker={ticker}&limit=1&sort=execution_date.desc"),
         api_key,
     );
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("Massive splits HTTP {}", resp.status()));
+        let status = resp.status();
+        if status.as_u16() == 429 {
+            return Err("Massive splits rate limited".into());
+        }
+        return Err(format!("Massive splits HTTP {status}"));
     }
     let parsed: SplitsResponse = resp.json().await.map_err(|e| e.to_string())?;
     Ok(parsed.results.into_iter().filter_map(RawSplit::into_split).next())

@@ -90,7 +90,7 @@ pub(crate) fn with_key(url: &str, api_key: &str) -> String {
 /// Respects the free-tier rate limit by sleeping `RATE_LIMIT` between page
 /// requests. With ~7–8k US equities at 5000/page this is ~2 pages (≈13 s).
 pub async fn fetch_float_all(api_key: &str) -> Result<Vec<MassiveFloat>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: Vec<MassiveFloat> = Vec::new();
 
     let mut url = with_key(
@@ -108,6 +108,10 @@ pub async fn fetch_float_all(api_key: &str) -> Result<Vec<MassiveFloat>, String>
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                eprintln!("[tagdash][massive] rate limited — stopping float fetch");
+                break;
+            }
             let snippet = &body[..body.len().min(200)];
             return Err(format!("Massive HTTP {status}: {snippet}"));
         }
@@ -132,7 +136,7 @@ pub async fn fetch_float_all(api_key: &str) -> Result<Vec<MassiveFloat>, String>
 
 /// Fetch the float for a single ticker (used by tests / on-demand lookups).
 pub async fn fetch_float(api_key: &str, ticker: &str) -> Result<Option<MassiveFloat>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = with_key(
         &format!("{BASE_URL}/stocks/vX/float?ticker={ticker}"),
         api_key,
@@ -180,7 +184,7 @@ pub async fn fetch_float_asof(
     ticker: &str,
     day: &str,
 ) -> Result<Option<AsOfFloat>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = with_key(
         &format!("{BASE_URL}/stocks/vX/float?ticker={ticker}&date={day}&limit=50"),
         api_key,

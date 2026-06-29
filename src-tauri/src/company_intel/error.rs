@@ -32,9 +32,15 @@ impl IntelError {
     }
 
     pub fn http(status: u16, body: String) -> Self {
-        // 429 (rate limited) and 5xx are transient; 4xx (except 429) are not.
-        let retryable = status == 429 || (500..600).contains(&status);
+        // 5xx are transient and worth retrying. 429 means the provider's quota
+        // is exhausted (the rate-limiter already handles per-minute pacing) —
+        // retrying just hammers the API for nothing.
+        let retryable = (500..600).contains(&status);
         IntelError::Http { status, retryable, body }
+    }
+
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, IntelError::Http { status: 429, .. })
     }
 }
 

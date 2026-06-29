@@ -47,6 +47,35 @@ pub const EV_CHANGED: &str = "stt-changed";
 pub const EV_SPECTRUM: &str = "stt-spectrum";
 pub const EV_DIARY_RESULT: &str = "stt-diary-result";
 
+// ─── Platform guard ──────────────────────────────────────────────────────────
+//
+// whisper.cpp's BLAS backend crashes (NULL fn-ptr in ggml_backend_blas_graph_compute)
+// on macOS ≤ 13 with the old Accelerate framework shipped on Intel Macs.  Disable
+// the entire STT pipeline there; Apple-Silicon Macs on macOS ≥ 14 are fine.
+
+/// Returns `true` when the current platform can safely run whisper transcription.
+pub fn platform_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        // ProductVersion → "14.5" / "12.7.6" etc.
+        let ok = Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|v| v.trim().split('.').next().map(String::from))
+            .and_then(|maj| maj.parse::<u32>().ok())
+            .map(|maj| maj >= 14)
+            .unwrap_or(false);
+        return ok;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 // ─── Paths ────────────────────────────────────────────────────────────────────
 
 pub fn models_dir(app_dir: &Path) -> PathBuf {
@@ -130,6 +159,8 @@ pub struct WorkerState {
 #[derive(Debug, Clone, Serialize)]
 pub struct SttStatus {
     pub enabled: bool,
+    /// `false` on macOS ≤ 13 where whisper's BLAS backend crashes.
+    pub platform_available: bool,
     pub model: String,
     pub model_present: bool,
     pub downloading: bool,
@@ -216,6 +247,7 @@ impl SttShared {
         let recording_kind = self.pending.lock().unwrap().as_ref().map(|p| p.kind);
         SttStatus {
             enabled: cfg.enabled,
+            platform_available: platform_available(),
             model: cfg.model.clone(),
             model_present,
             downloading: self.downloading.load(std::sync::atomic::Ordering::Relaxed),

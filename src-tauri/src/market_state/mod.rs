@@ -446,8 +446,12 @@ impl MarketState {
             .num_milliseconds()
             .clamp(0, u32::MAX as i64) as u32;
 
-        // Update VWAP accumulator before borrowing tickers mutably
-        let acc = self.vwap_acc.entry(symbol.to_string()).or_insert((0.0, 0.0));
+        // Update VWAP accumulator before borrowing tickers mutably.
+        // Use get_mut first to avoid a String allocation when the key exists (hot path).
+        let acc = match self.vwap_acc.get_mut(symbol) {
+            Some(a) => a,
+            None => self.vwap_acc.entry(symbol.to_string()).or_insert((0.0, 0.0)),
+        };
         acc.0 += price * size as f64;
         acc.1 += size as f64;
         let new_vwap = if acc.1 > 0.0 { Some(acc.0 / acc.1) } else { None };
@@ -458,8 +462,10 @@ impl MarketState {
             if pc > 0.0 { Some((price - pc) / pc * 100.0) } else { None }
         });
 
-        // Update live ticker state
-        let state = self.tickers.entry(symbol.to_string()).or_insert_with(|| TickerLiveState::new(symbol, now));
+        let state = match self.tickers.get_mut(symbol) {
+            Some(s) => s,
+            None => self.tickers.entry(symbol.to_string()).or_insert_with(|| TickerLiveState::new(symbol, now)),
+        };
 
         state.last_price    = Some(price);
         state.volume_day   += size;
@@ -500,10 +506,13 @@ impl MarketState {
         // midnight so it lands on today's daily slot.
         if crate::time::is_premarket(event_time) {
             let stamp = crate::time::et_midnight_utc(event_time);
-            let bar = self.premarket_daily.entry(symbol.to_string()).or_insert_with(|| Bar {
-                time: stamp, open: price, high: price, low: price, close: price,
-                volume: 0, vwap: None, trade_count: Some(0),
-            });
+            let bar = match self.premarket_daily.get_mut(symbol) {
+                Some(b) => b,
+                None => self.premarket_daily.entry(symbol.to_string()).or_insert_with(|| Bar {
+                    time: stamp, open: price, high: price, low: price, close: price,
+                    volume: 0, vwap: None, trade_count: Some(0),
+                }),
+            };
             // A bar left over from a previous day → restart it for today.
             if ny_date(bar.time) != ny_date(event_time) {
                 *bar = Bar {
@@ -522,18 +531,18 @@ impl MarketState {
             self.premarket_daily.remove(symbol);
         }
 
-        // Record the print(s) in the rolling trade-rate counter (acceleration).
-        self.trade_counts
-            .entry(symbol.to_string())
-            .or_default()
-            .record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+        if let Some(tc) = self.trade_counts.get_mut(symbol) {
+            tc.record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+        } else {
+            self.trade_counts.entry(symbol.to_string()).or_default()
+                .record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+        }
 
-        // Extend the fill window (price path since the book last drained it) so
-        // resting SL/TP/entry orders fill against the whole micro-bar.
-        self.fill_windows
-            .entry(symbol.to_string())
-            .and_modify(|w| w.record(price))
-            .or_insert_with(|| FillAccum::new(price));
+        if let Some(w) = self.fill_windows.get_mut(symbol) {
+            w.record(price);
+        } else {
+            self.fill_windows.insert(symbol.to_string(), FillAccum::new(price));
+        }
     }
 
     /// Take and clear the per-symbol fill windows accumulated since the last call.

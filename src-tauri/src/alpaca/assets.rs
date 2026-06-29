@@ -25,7 +25,7 @@ struct RawAsset {
 }
 
 pub async fn fetch_assets(key: &str, secret: &str) -> Result<Vec<AlpacaAsset>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = "https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity";
     let resp = client
         .get(url)

@@ -25,6 +25,7 @@ import {
 import { GamepadSettings } from "@/components/GamepadSettings";
 import { useChartThemeStore, type ChartTheme, type ChartThemeSection } from "@/stores/chartThemeStore";
 import { useChartInput, SENS_MIN, SENS_MAX } from "@/stores/chartInputStore";
+import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import type { AppConfig, AttentionMode, SecretKey, SecretsUpdate, Session } from "@/types";
 
@@ -499,9 +500,16 @@ export function SettingsModal({ open, onClose }: Props) {
     if (config) setDraft(structuredClone(config));
   }, [config]);
 
-  if (!draft) return null;
+  // Reset transient state when opening the modal (the component is never
+  // unmounted, so useState initialisers only run once).
+  useEffect(() => {
+    if (open) {
+      setShowRestart(false);
+      setSecretInputs({});
+    }
+  }, [open]);
 
-  const tags = draft.journal?.tags ?? [];
+  const tags = draft?.journal?.tags ?? [];
   const addTag = (raw: string) => {
     const t = raw.trim().toLowerCase();
     if (t && !tags.includes(t)) set("journal", "tags", [...tags, t]);
@@ -531,21 +539,28 @@ export function SettingsModal({ open, onClose }: Props) {
     const modeChanged =
       (draft.data_source?.mode ?? "api") !== (config?.data_source?.mode ?? "api");
     update.mutate(draft, {
-      onSuccess: () => (modeChanged ? setShowRestart(true) : onClose()),
+      onSuccess: () => {
+        // Build/destroy the flash overlay on demand from here — it's never created
+        // at startup, only when the user has the flash cue enabled.
+        api.setFlashOverlay(draft.ui.flash_alerts !== "off").catch(() => {});
+        modeChanged ? setShowRestart(true) : onClose();
+      },
     });
   }
 
   return (
     <>
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      {/* `overflow-hidden` keeps any child (notably the 8-tab strip, which is
-          wider with the macOS system font) from spilling past the rounded right
-          border. */}
       <DialogContent className="max-w-3xl overflow-hidden">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
         </DialogHeader>
 
+        {!draft ? (
+          <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+            Chargement…
+          </div>
+        ) : <>
         <Tabs defaultValue="trading" className="mt-2">
           {/* Equal-width grid columns instead of inline-flex: the 8 tabs can never
               overflow the dialog regardless of the platform font width. */}
@@ -774,7 +789,9 @@ export function SettingsModal({ open, onClose }: Props) {
                 <div className="text-sm font-medium">Flash blanc à l'écran</div>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   Un flash blanc plein écran (500&nbsp;ms) à chaque alerte — visible
-                  même si TagDash est caché derrière d'autres fenêtres.
+                  même si TagDash est caché derrière d'autres fenêtres. L'overlay
+                  est créé à l'enregistrement (jamais au démarrage) ; choisis
+                  «&nbsp;Désactivé&nbsp;» pour le fermer.
                 </p>
               </div>
               <AttentionSelect
@@ -1089,11 +1106,12 @@ export function SettingsModal({ open, onClose }: Props) {
           <Button
             size="sm"
             onClick={save}
-            disabled={update.isPending}
+            disabled={update.isPending || !draft}
           >
             {update.isPending ? "Saving…" : "Save"}
           </Button>
         </div>
+        </>}
       </DialogContent>
     </Dialog>
     <RestartRequiredDialog

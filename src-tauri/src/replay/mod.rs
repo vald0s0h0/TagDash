@@ -40,9 +40,8 @@ use crate::types::AlertSignal;
 
 /// Real interval of the engine tick.
 const TICK_MS: u64 = 100;
-/// Speed used by « passer à la prochaine alerte » (assez rapide pour avancer,
-/// assez lent pour que les moteurs évaluent chaque barre 10 s).
-const NEXT_ALERT_SPEED: f64 = 10.0;
+/// Speed used by « passer à la prochaine alerte » — fast-forward aggressif.
+const NEXT_ALERT_SPEED: f64 = 120.0;
 /// Min interval between pushed market-tick events per focus symbol (real ms).
 const TICK_THROTTLE_MS: u128 = 100;
 
@@ -121,6 +120,8 @@ pub enum ReplayCmd {
     SeekClock { minutes: u32 },
     /// Avance jusqu'à la prochaine alerte scanner, puis pause.
     NextAlert,
+    /// Avance jusqu'au prochain close de barre 1 min, puis pause.
+    NextBar,
     /// Charge la prochaine séance (jour ouvré suivant) à l'heure de départ.
     NextDay,
     Stop,
@@ -259,9 +260,13 @@ async fn engine(
                     // Rattrapage instantané : tout ce qui précède l'heure de départ
                     // (ex. 04:00→07:00) est injecté d'un bloc pour amorcer l'état.
                     cursor = emit_until(&deps, &dd, cursor, sim, &mut last_tick_emit);
+                    // Drain the premarket catch-up windows so resting bracket
+                    // orders don't fire on the bulk injection's price range.
+                    let _ = deps.market.write().unwrap().drain_fill_windows();
                     {
                         let mut st = shared.status.write().unwrap();
                         st.state = "paused".into();
+                        st.playing = false;
                         st.source = Some(dd.source.to_string());
                         st.symbols = dd.symbols;
                         st.events_total = dd.events.len();
@@ -306,18 +311,20 @@ async fn engine(
                     ReplayCmd::Play => {
                         if day_data.is_some() {
                             playing = true;
-                            shared.status.write().unwrap().state = "playing".into();
+                            let mut st = shared.status.write().unwrap();
+                            st.state = "playing".into();
+                            st.playing = true;
                         }
                     }
                     ReplayCmd::Pause => {
                         playing = false;
-                        // Un Pause manuel désarme aussi le mode « prochaine alerte ».
                         if let Some((_, prev)) = next_alert_baseline.take() {
                             speed = prev;
                             clock::set_speed(speed);
                         }
                         let mut st = shared.status.write().unwrap();
                         st.state = "paused".into();
+                        st.playing = false;
                         st.next_alert_armed = false;
                         st.speed = speed;
                     }
@@ -361,8 +368,28 @@ async fn engine(
                             playing = true;
                             let mut st = shared.status.write().unwrap();
                             st.state = "playing".into();
+                            st.playing = true;
                             st.speed = speed;
                             st.next_alert_armed = true;
+                        }
+                    }
+                    ReplayCmd::NextBar => {
+                        if let Some(dd) = &day_data {
+                            let cur_s = sim.timestamp();
+                            let next_min = cur_s - (cur_s % 60) + 60;
+                            let target = chrono::TimeZone::timestamp_opt(&Utc, next_min, 0)
+                                .single()
+                                .unwrap_or(sim);
+                            let target = target.min(day_end);
+                            let (ns, nc) = seek(&deps, dd, sim, cursor, target, day_end, &mut last_tick_emit);
+                            sim = ns;
+                            cursor = nc;
+                            playing = false;
+                            let mut st = shared.status.write().unwrap();
+                            st.state = "paused".into();
+                            st.playing = false;
+                            st.sim_time = Some(sim);
+                            st.events_done = cursor;
                         }
                     }
                     ReplayCmd::NextDay => {
@@ -391,6 +418,7 @@ async fn engine(
                         playing = false;
                         let mut st = shared.status.write().unwrap();
                         st.state = "paused".into();
+                        st.playing = false;
                         st.next_alert_armed = false;
                         st.speed = speed;
                     }
@@ -405,6 +433,7 @@ async fn engine(
                     }
                     let mut st = shared.status.write().unwrap();
                     st.state = "ended".into();
+                    st.playing = false;
                     st.next_alert_armed = false;
                 }
 
@@ -504,6 +533,10 @@ fn seek(
         clock::bump_generation();
         clock::set_sim(target);
         let nc = emit_until(deps, dd, 0, target, last_tick_emit);
+        // The catch-up re-emission filled the windows with the entire price
+        // range from day start to target — drain them so bracket orders don't
+        // fire on historical prices the trading loop hasn't seen live.
+        let _ = deps.market.write().unwrap().drain_fill_windows();
         (target, nc)
     }
 }

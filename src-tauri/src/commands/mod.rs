@@ -44,38 +44,54 @@ pub struct AppStatus {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_app_status(state: tauri::State<'_, AppState>) -> AppStatus {
-    let latency = state.market.read().unwrap().latency.clone();
-    AppStatus {
-        version: env!("CARGO_PKG_VERSION"),
-        backend: "rust-tauri",
-        latency,
-    }
+pub async fn get_app_status(state: tauri::State<'_, AppState>) -> Result<AppStatus, String> {
+    let market = state.market.clone();
+    tokio::task::spawn_blocking(move || {
+        let latency = market.read().unwrap().latency.clone();
+        AppStatus {
+            version: env!("CARGO_PKG_VERSION"),
+            backend: "rust-tauri",
+            latency,
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_local_config(state: tauri::State<'_, AppState>) -> AppConfig {
-    state.config.read().unwrap().clone()
+pub async fn get_local_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String> {
+    let config = state.config.clone();
+    tokio::task::spawn_blocking(move || config.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn update_local_config(
+pub async fn update_local_config(
     config: AppConfig,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let path = state.app_dir.join("tagdash.toml");
-    config::save(&path, &config).map_err(|e| e.to_string())?;
-    *state.config.write().unwrap() = config;
-    Ok(())
+    let cfg_arc = state.config.clone();
+    tokio::task::spawn_blocking(move || {
+        config::save(&path, &config).map_err(|e| e.to_string())?;
+        *cfg_arc.write().unwrap() = config;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─── Secrets (status only — values never leave Rust) ─────────────────────────
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_secrets_status(state: tauri::State<'_, AppState>) -> SecretsStatus {
-    state.secrets.read().unwrap().status()
+pub async fn get_secrets_status(state: tauri::State<'_, AppState>) -> Result<SecretsStatus, String> {
+    let secrets = state.secrets.clone();
+    tokio::task::spawn_blocking(move || secrets.read().unwrap().status())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Set/replace API secrets from Settings → API Keys and persist them to
@@ -83,14 +99,20 @@ pub fn get_secrets_status(state: tauri::State<'_, AppState>) -> SecretsStatus {
 /// the existing value), so the user types just what they want to change. Returns
 /// the refreshed status (booleans only — secret values never leave Rust).
 #[tauri::command(rename_all = "snake_case")]
-pub fn update_secrets(
+pub async fn update_secrets(
     updates: crate::config::secrets::SecretsUpdate,
     state: tauri::State<'_, AppState>,
 ) -> Result<SecretsStatus, String> {
-    let mut guard = state.secrets.write().unwrap();
-    guard.apply_update(updates);
-    config::secrets::save(&state.app_dir, &guard)?;
-    Ok(guard.status())
+    let secrets = state.secrets.clone();
+    let app_dir = state.app_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = secrets.write().unwrap();
+        guard.apply_update(updates);
+        config::secrets::save(&app_dir, &guard)?;
+        Ok(guard.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─── Journal tags (user-defined, stored in tagdash.toml) ──────────────────────
@@ -214,6 +236,206 @@ pub fn save_screenshot_local(
     }
 
     Ok(local_path)
+}
+
+// ─── Todo trades (missing screenshot / journal) ─────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct TodoTrade {
+    pub trade_id:       String,
+    pub symbol:         String,
+    pub open:           bool,
+    pub pnl:            f64,
+    pub has_screenshot: bool,
+    pub has_journal:    bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_todo_trades(state: tauri::State<'_, AppState>) -> Vec<TodoTrade> {
+    let db = state.db.lock().unwrap();
+    let mut stmt = match db.prepare(
+        "SELECT
+             e.trade_id,
+             e.symbol,
+             SUM(e.quantity) AS net_qty,
+             SUM(-CAST(e.quantity AS REAL) * e.fill_price) AS cash_flow,
+             EXISTS(SELECT 1 FROM screenshot_files s WHERE s.trade_id = e.trade_id) AS has_ss,
+             EXISTS(SELECT 1 FROM journal_entries j WHERE j.trade_id = e.trade_id AND j.notes != '') AS has_jr
+         FROM executions e
+         GROUP BY e.trade_id
+         HAVING NOT has_ss OR NOT has_jr
+         ORDER BY MIN(e.filled_at) DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let prices: HashMap<String, f64> = all_market_prices(&state.market)
+        .into_iter()
+        .map(|(sym, (bid, ask))| (sym, (bid + ask) / 2.0))
+        .collect();
+
+    let rows = stmt.query_map([], |row| {
+        let trade_id: String = row.get(0)?;
+        let symbol: String   = row.get(1)?;
+        let net_qty: i64     = row.get(2)?;
+        let cash_flow: f64   = row.get(3)?;
+        let has_ss: bool     = row.get(4)?;
+        let has_jr: bool     = row.get(5)?;
+        Ok((trade_id, symbol, net_qty, cash_flow, has_ss, has_jr))
+    });
+
+    let mut out = Vec::new();
+    if let Ok(rows) = rows {
+        for r in rows.flatten() {
+            let (trade_id, symbol, net_qty, cash_flow, has_ss, has_jr) = r;
+            let open = net_qty != 0;
+            let pnl = if open {
+                let mid = prices.get(&symbol).copied().unwrap_or(0.0);
+                cash_flow + (net_qty as f64) * mid
+            } else {
+                cash_flow
+            };
+            out.push(TodoTrade {
+                trade_id,
+                symbol,
+                open,
+                pnl,
+                has_screenshot: has_ss,
+                has_journal: has_jr,
+            });
+        }
+    }
+    out
+}
+
+// ─── All trades DB view ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct TradeDbRow {
+    pub trade_id:       String,
+    pub symbol:         String,
+    pub side:           String,
+    pub open:           bool,
+    pub pnl:            f64,
+    pub fills:          i64,
+    pub first_fill_at:  String,
+    pub last_fill_at:   String,
+    pub has_note:       bool,
+    pub has_screenshot: bool,
+    pub sent_to_tradetally: bool,
+    pub synced_on_tradetally: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_all_trades_db(state: tauri::State<'_, AppState>) -> Vec<TradeDbRow> {
+    let db = state.db.lock().unwrap();
+    let mut stmt = match db.prepare(
+        "SELECT
+             e.trade_id,
+             e.symbol,
+             SUM(e.quantity) AS net_qty,
+             SUM(-CAST(e.quantity AS REAL) * e.fill_price) AS cash_flow,
+             COUNT(*) AS fill_count,
+             MIN(e.filled_at) AS first_fill,
+             MAX(e.filled_at) AS last_fill,
+             EXISTS(SELECT 1 FROM journal_entries j WHERE j.trade_id = e.trade_id AND j.notes != '') AS has_note,
+             EXISTS(SELECT 1 FROM screenshot_files s WHERE s.trade_id = e.trade_id) AS has_ss,
+             EXISTS(SELECT 1 FROM tradetally_sync_queue q WHERE q.trade_id = e.trade_id AND q.event_type = 'trade_created') AS sent_tt,
+             EXISTS(SELECT 1 FROM tradetally_trade_ids t WHERE t.local_trade_id = e.trade_id) AS synced_tt
+         FROM executions e
+         GROUP BY e.trade_id
+         ORDER BY MIN(e.filled_at) DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let prices: HashMap<String, f64> = all_market_prices(&state.market)
+        .into_iter()
+        .map(|(sym, (bid, ask))| (sym, (bid + ask) / 2.0))
+        .collect();
+
+    let rows = stmt.query_map([], |row| {
+        let trade_id: String = row.get(0)?;
+        let symbol: String   = row.get(1)?;
+        let net_qty: i64     = row.get(2)?;
+        let cash_flow: f64   = row.get(3)?;
+        let fill_count: i64  = row.get(4)?;
+        let first_fill: String = row.get(5)?;
+        let last_fill: String  = row.get(6)?;
+        let has_note: bool   = row.get(7)?;
+        let has_ss: bool     = row.get(8)?;
+        let sent_tt: bool    = row.get(9)?;
+        let synced_tt: bool  = row.get(10)?;
+        Ok((trade_id, symbol, net_qty, cash_flow, fill_count, first_fill, last_fill, has_note, has_ss, sent_tt, synced_tt))
+    });
+
+    let mut out = Vec::new();
+    if let Ok(rows) = rows {
+        for r in rows.flatten() {
+            let (trade_id, symbol, net_qty, cash_flow, fill_count, first_fill, last_fill, has_note, has_ss, sent_tt, synced_tt) = r;
+            let open = net_qty != 0;
+            let side = if net_qty > 0 { "long" } else if net_qty < 0 { "short" } else {
+                // Closed: infer from first fill direction
+                "closed"
+            };
+            let pnl = if open {
+                let mid = prices.get(&symbol).copied().unwrap_or(0.0);
+                cash_flow + (net_qty as f64) * mid
+            } else {
+                cash_flow
+            };
+            out.push(TradeDbRow {
+                trade_id,
+                symbol,
+                side: side.to_string(),
+                open,
+                pnl,
+                fills: fill_count,
+                first_fill_at: first_fill,
+                last_fill_at: last_fill,
+                has_note,
+                has_screenshot: has_ss,
+                sent_to_tradetally: sent_tt,
+                synced_on_tradetally: synced_tt,
+            });
+        }
+    }
+    out
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_trade_days(state: tauri::State<'_, AppState>) -> Vec<String> {
+    let db = state.db.lock().unwrap();
+    let mut stmt = match db.prepare(
+        "SELECT DISTINCT date(filled_at) AS d FROM executions ORDER BY d DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn delete_trade_db(
+    trade_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    db.execute("DELETE FROM executions WHERE trade_id = ?1", rusqlite::params![&trade_id])
+        .map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM trade_levels WHERE trade_id = ?1", rusqlite::params![&trade_id])
+        .map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM journal_entries WHERE trade_id = ?1", rusqlite::params![&trade_id])
+        .map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM screenshot_files WHERE trade_id = ?1", rusqlite::params![&trade_id])
+        .map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM tradetally_sync_queue WHERE trade_id = ?1", rusqlite::params![&trade_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ─── Local logs ──────────────────────────────────────────────────────────────
@@ -386,39 +608,46 @@ pub async fn run_startup_pipeline(state: tauri::State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_startup_status(state: tauri::State<'_, AppState>) -> StartupState {
-    state.startup.read().unwrap().clone()
+pub async fn get_startup_status(state: tauri::State<'_, AppState>) -> Result<StartupState, String> {
+    let startup = state.startup.clone();
+    tokio::task::spawn_blocking(move || startup.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_streamable_universe(state: tauri::State<'_, AppState>) -> Vec<StreamableSymbol> {
-    let db     = state.db.lock().unwrap();
-    let assets = universe_repository::get_all(&db).unwrap_or_default();
-    // Join sec-api company metadata (country of origin + industry) by symbol.
-    let meta: HashMap<String, (Option<String>, Option<String>)> =
-        company_meta_repository::get_all(&db)
-            .unwrap_or_default()
+pub async fn get_streamable_universe(state: tauri::State<'_, AppState>) -> Result<Vec<StreamableSymbol>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let db = db.lock().unwrap();
+        let assets = universe_repository::get_all(&db).unwrap_or_default();
+        let meta: HashMap<String, (Option<String>, Option<String>)> =
+            company_meta_repository::get_all(&db)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.symbol, (m.country, m.industry)))
+                .collect();
+        assets
             .into_iter()
-            .map(|m| (m.symbol, (m.country, m.industry)))
-            .collect();
-    assets
-        .into_iter()
-        .filter(|a| a.tradable)
-        .map(|a| {
-            let (country, industry) = meta.get(&a.symbol).cloned().unwrap_or((None, None));
-            StreamableSymbol {
-                symbol:      a.symbol,
-                exchange:    a.exchange,
-                tradable:    a.tradable,
-                shortable:   a.shortable,
-                float_shares: a.float_shares,
-                market_cap:  a.market_cap,
-                avg_volume:  a.avg_volume,
-                country,
-                industry,
-            }
-        })
-        .collect()
+            .filter(|a| a.tradable)
+            .map(|a| {
+                let (country, industry) = meta.get(&a.symbol).cloned().unwrap_or((None, None));
+                StreamableSymbol {
+                    symbol:      a.symbol,
+                    exchange:    a.exchange,
+                    tradable:    a.tradable,
+                    shortable:   a.shortable,
+                    float_shares: a.float_shares,
+                    market_cap:  a.market_cap,
+                    avg_volume:  a.avg_volume,
+                    country,
+                    industry,
+                }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ─── Mock alerts (dev / test only) ───────────────────────────────────────────
@@ -664,21 +893,27 @@ pub fn set_focus_symbols(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_market_snapshot(state: tauri::State<'_, AppState>) -> MarketSnapshot {
-    state.market.read().unwrap().snapshot()
+pub async fn get_market_snapshot(state: tauri::State<'_, AppState>) -> Result<MarketSnapshot, String> {
+    let market = state.market.clone();
+    tokio::task::spawn_blocking(move || market.read().unwrap().snapshot())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_ticker_bars(
+pub async fn get_ticker_bars(
     symbol:    String,
     timeframe: String,
     state:     tauri::State<'_, AppState>,
-) -> Vec<Bar> {
+) -> Result<Vec<Bar>, String> {
     let tf = match crate::market_state::aggregators::Timeframe::from_str(&timeframe) {
         Some(tf) => tf,
-        None     => return vec![],
+        None     => return Ok(vec![]),
     };
-    state.market.read().unwrap().get_bars(&symbol, tf)
+    let market = state.market.clone();
+    tokio::task::spawn_blocking(move || market.read().unwrap().get_bars(&symbol, tf))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Convert a cached daily bar (the offline daily source loaded from the flat files
@@ -930,74 +1165,86 @@ pub struct PrevDayLevels {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_previous_day_levels(
+pub async fn get_previous_day_levels(
     symbol: String,
     state:  tauri::State<'_, AppState>,
-) -> Option<PrevDayLevels> {
-    // ET date (DST-aware, matching the rest of the app; the SIMULATED day during
-    // a Market Replay). The previous trading day is the most recent cached daily
-    // bar dated strictly before this — queried with the date bound so a replay
-    // of an older day still finds ITS previous session (not just the last 10).
-    let today = crate::time::et_date(crate::time::now());
-
-    let rows = {
-        let conn = state.db.lock().unwrap();
-        cache_repository::get_daily_bars_before(&conn, &symbol, &today, 10).unwrap_or_default()
-    };
-    // Rows are date DESC → the first one before today is the previous trading day.
-    rows.into_iter().find_map(|d| {
-        let date = d.date.get(..10).unwrap_or(&d.date);
-        if date >= today.as_str() {
-            return None;
-        }
-        Some(PrevDayLevels {
-            date:  date.to_string(),
-            close: d.close?,
-            high:  d.high?,
-            low:   d.low?,
+) -> Result<Option<PrevDayLevels>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let today = crate::time::et_date(crate::time::now());
+        let rows = {
+            let conn = db.lock().unwrap();
+            cache_repository::get_daily_bars_before(&conn, &symbol, &today, 10).unwrap_or_default()
+        };
+        rows.into_iter().find_map(|d| {
+            let date = d.date.get(..10).unwrap_or(&d.date);
+            if date >= today.as_str() {
+                return None;
+            }
+            Some(PrevDayLevels {
+                date:  date.to_string(),
+                close: d.close?,
+                high:  d.high?,
+                low:   d.low?,
+            })
         })
     })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_latency_status(state: tauri::State<'_, AppState>) -> LatencyStatus {
-    state.market.read().unwrap().latency.clone()
+pub async fn get_latency_status(state: tauri::State<'_, AppState>) -> Result<LatencyStatus, String> {
+    let market = state.market.clone();
+    tokio::task::spawn_blocking(move || market.read().unwrap().latency.clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Live Alpaca feed health (connection state, subscribed count, trade/quote
 /// counters, last error, reconnects) for the diagnostics panel.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_feed_diagnostics(state: tauri::State<'_, AppState>) -> FeedDiagnostics {
-    state.market.read().unwrap().feed.clone()
+pub async fn get_feed_diagnostics(state: tauri::State<'_, AppState>) -> Result<FeedDiagnostics, String> {
+    let market = state.market.clone();
+    tokio::task::spawn_blocking(move || market.read().unwrap().feed.clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Alpaca news feed health + recent headlines (premarket news investor), for the
 /// news debug panel.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_news_diagnostics(state: tauri::State<'_, AppState>) -> NewsDiagnostics {
-    state.market.read().unwrap().news_diagnostics()
+pub async fn get_news_diagnostics(state: tauri::State<'_, AppState>) -> Result<NewsDiagnostics, String> {
+    let market = state.market.clone();
+    tokio::task::spawn_blocking(move || market.read().unwrap().news_diagnostics())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_strategies(state: tauri::State<'_, AppState>) -> Vec<Strategy> {
-    let overrides = state.strategy_enabled.read().unwrap();
-    let risk      = state.strategy_risk.read().unwrap();
-    registry::all_strategies()
-        .iter()
-        .map(|s| Strategy {
-            id:               s.id().to_string(),
-            name:             s.name().to_string(),
-            // Runtime on/off (Settings toggle), falling back to the compiled default.
-            enabled:          overrides.get(s.id()).copied().unwrap_or_else(|| s.enabled()),
-            sessions:         s.sessions().to_vec(),
-            priority:         s.priority(),
-            // Effective $-risk: Settings override, else the compiled default.
-            max_risk_dollars: risk.get(s.id()).copied()
-                .unwrap_or_else(|| s.risk_config().max_risk_dollars),
-        })
-        .collect()
+pub async fn get_strategies(state: tauri::State<'_, AppState>) -> Result<Vec<Strategy>, String> {
+    let se = state.strategy_enabled.clone();
+    let sr = state.strategy_risk.clone();
+    tokio::task::spawn_blocking(move || {
+        let overrides = se.read().unwrap();
+        let risk      = sr.read().unwrap();
+        registry::all_strategies()
+            .iter()
+            .map(|s| Strategy {
+                id:               s.id().to_string(),
+                name:             s.name().to_string(),
+                enabled:          overrides.get(s.id()).copied().unwrap_or_else(|| s.enabled()),
+                sessions:         s.sessions().to_vec(),
+                priority:         s.priority(),
+                max_risk_dollars: risk.get(s.id()).copied()
+                    .unwrap_or_else(|| s.risk_config().max_risk_dollars),
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Toggle a strategy on/off at runtime (no code change needed). Persisted in the
@@ -1113,28 +1360,40 @@ pub fn get_alert_enrichment(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_active_alerts(state: tauri::State<'_, AppState>) -> Vec<AlertSignal> {
-    state.active_alerts.read().unwrap().clone()
+pub async fn get_active_alerts(state: tauri::State<'_, AppState>) -> Result<Vec<AlertSignal>, String> {
+    let alerts = state.active_alerts.clone();
+    tokio::task::spawn_blocking(move || alerts.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_alert_history(state: tauri::State<'_, AppState>) -> Vec<AlertSignal> {
-    state.alert_history.read().unwrap().clone()
+pub async fn get_alert_history(state: tauri::State<'_, AppState>) -> Result<Vec<AlertSignal>, String> {
+    let history = state.alert_history.clone();
+    tokio::task::spawn_blocking(move || history.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Live pre-open screener matches (currently-matching tickers, recomputed every
 /// scan pass). Drives the pre-open tab sidebar.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_screener_matches(state: tauri::State<'_, AppState>) -> Vec<ScreenerMatch> {
-    state.screener.read().unwrap().clone()
+pub async fn get_screener_matches(state: tauri::State<'_, AppState>) -> Result<Vec<ScreenerMatch>, String> {
+    let screener = state.screener.clone();
+    tokio::task::spawn_blocking(move || screener.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Market Attention top list (direction-agnostic, top 10, refreshed once a minute
 /// 09:30–12:30 ET; see `crate::market_attention`). Read-only debug/inspection
 /// command — the list's primary consumer is the Perfect Pullback engine.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_market_attention(state: tauri::State<'_, AppState>) -> Vec<AttentionEntry> {
-    state.attention.read().unwrap().clone()
+pub async fn get_market_attention(state: tauri::State<'_, AppState>) -> Result<Vec<AttentionEntry>, String> {
+    let attention = state.attention.clone();
+    tokio::task::spawn_blocking(move || attention.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Today's ET trading date (DST-aware, matching the rest of the app), used to
@@ -1266,71 +1525,70 @@ pub struct CardNews {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> CardInfo {
-    let db = state.db.lock().unwrap();
-    let asset = universe_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
-    let score = crate::local_db::scoring_repository::get_one(&db, &symbol).unwrap_or(None);
-    let meta  = company_meta_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
-    let risk  = cache_repository::get_risk_scores(&db, &symbol).unwrap_or_default();
-    let (mr_score, mr_score_kind, mr_direction) = match score {
-        Some(s) => (Some(s.value), Some(s.list_kind), Some(s.direction)),
-        None => (None, None, None),
-    };
+pub async fn get_card_info(symbol: String, state: tauri::State<'_, AppState>) -> Result<CardInfo, String> {
+    let db_arc = state.db.clone();
+    let market_arc = state.market.clone();
+    tokio::task::spawn_blocking(move || {
+        let db = db_arc.lock().unwrap();
+        let asset = universe_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
+        let score = crate::local_db::scoring_repository::get_one(&db, &symbol).unwrap_or(None);
+        let meta  = company_meta_repository::get_by_symbol(&db, &symbol).unwrap_or(None);
+        let risk  = cache_repository::get_risk_scores(&db, &symbol).unwrap_or_default();
+        let (mr_score, mr_score_kind, mr_direction) = match score {
+            Some(s) => (Some(s.value), Some(s.list_kind), Some(s.direction)),
+            None => (None, None, None),
+        };
 
-    // Daily closes (ASC) for the current Bollinger Z. Cache returns newest-first.
-    let daily = cache_repository::get_daily_bars(&db, &symbol, 30).unwrap_or_default();
-    let closes_asc: Vec<f64> = daily.iter().rev().filter_map(|b| b.close).collect();
+        let daily = cache_repository::get_daily_bars(&db, &symbol, 30).unwrap_or_default();
+        let closes_asc: Vec<f64> = daily.iter().rev().filter_map(|b| b.close).collect();
+        drop(db);
 
-    // One market lock for the live price (BBZ), premarket volume and news.
-    let (bbz, premarket_volume, news_title, live_volume) = {
-        let market = state.market.read().unwrap();
-        // Live price drives the BBZ; fall back to the last cached daily close.
-        let price = market.last_price(&symbol).or_else(|| closes_asc.last().copied());
-        let bbz = price.and_then(|p| crate::scoring::current_bbz(&closes_asc, p));
+        let (bbz, premarket_volume, news_title, live_volume) = {
+            let market = market_arc.read().unwrap();
+            let price = market.last_price(&symbol).or_else(|| closes_asc.last().copied());
+            let bbz = price.and_then(|p| crate::scoring::current_bbz(&closes_asc, p));
 
-        // Premarket volume: sum today's 1-minute bars inside 04:00–09:30 ET.
-        let now    = crate::time::now();
-        let today  = crate::time::et_date(now);
-        let m1     = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
-        let mut pm_sum: i64 = 0;
-        let mut pm_any = false;
-        for b in &m1 {
-            if crate::time::et_date(b.time) != today {
-                continue;
+            let now    = crate::time::now();
+            let today  = crate::time::et_date(now);
+            let m1     = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
+            let mut pm_sum: i64 = 0;
+            let mut pm_any = false;
+            for b in &m1 {
+                if crate::time::et_date(b.time) != today { continue; }
+                let mins = crate::time::et_minutes(b.time);
+                if (240..570).contains(&mins) {
+                    pm_sum += b.volume as i64;
+                    pm_any = true;
+                }
             }
-            let mins = crate::time::et_minutes(b.time);
-            if (240..570).contains(&mins) {
-                pm_sum += b.volume as i64;
-                pm_any = true;
-            }
+            let premarket_volume = if pm_any { Some(pm_sum) } else { None };
+            let news_title = market.latest_news(&symbol).map(|h| h.headline);
+            let live_volume = market.volume_in_last(&symbol, 60, now);
+            (bbz, premarket_volume, news_title, live_volume)
+        };
+
+        CardInfo {
+            market_cap:    asset.as_ref().and_then(|a| a.market_cap),
+            float_shares:  asset.as_ref().and_then(|a| a.float_shares),
+            mr_score,
+            mr_score_kind,
+            mr_direction,
+            industry:      meta.as_ref().and_then(|m| m.industry.clone()),
+            country:       meta.as_ref().and_then(|m| m.country.clone()),
+            bbz,
+            premarket_volume,
+            has_news:      news_title.is_some(),
+            news_title,
+            short_interest_score:    risk.short_interest_score,
+            dilution_capacity_score: risk.dilution_capacity_score,
+            dilution_need_score:     risk.dilution_need_score,
+            dilution_score:          risk.dilution_score,
+            pump_dump_score:         risk.pump_dump_score,
+            live_volume,
         }
-        let premarket_volume = if pm_any { Some(pm_sum) } else { None };
-
-        let news_title = market.latest_news(&symbol).map(|h| h.headline);
-        // Real-time liquidity: shares traded in the last 60 seconds (rolling).
-        let live_volume = market.volume_in_last(&symbol, 60, now);
-        (bbz, premarket_volume, news_title, live_volume)
-    };
-
-    CardInfo {
-        market_cap:    asset.as_ref().and_then(|a| a.market_cap),
-        float_shares:  asset.as_ref().and_then(|a| a.float_shares),
-        mr_score,
-        mr_score_kind,
-        mr_direction,
-        industry:      meta.as_ref().and_then(|m| m.industry.clone()),
-        country:       meta.as_ref().and_then(|m| m.country.clone()),
-        bbz,
-        premarket_volume,
-        has_news:      news_title.is_some(),
-        news_title,
-        short_interest_score:    risk.short_interest_score,
-        dilution_capacity_score: risk.dilution_capacity_score,
-        dilution_need_score:     risk.dilution_need_score,
-        dilution_score:          risk.dilution_score,
-        pump_dump_score:         risk.pump_dump_score,
-        live_volume,
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The HOD Drive on-chart overlay payload for one symbol: the five KPIs plus the
@@ -1372,89 +1630,93 @@ pub struct HodDriveOverlay {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_hod_drive_overlay(
+pub async fn get_hod_drive_overlay(
     symbol: String,
     state:  tauri::State<'_, AppState>,
-) -> HodDriveOverlay {
-    let cfg = &crate::hod_drive::CFG_5M;
-    let now = crate::time::now();
-    let session_open = crate::time::et_session_open_utc(now);
+) -> Result<HodDriveOverlay, String> {
+    let market_arc = state.market.clone();
+    let db_arc = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let cfg = &crate::hod_drive::CFG_5M;
+        let now = crate::time::now();
+        let session_open = crate::time::et_session_open_utc(now);
 
-    let (m1, price) = {
-        let market = state.market.read().unwrap();
-        let m1 = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
-        let price = market.last_price(&symbol);
-        (m1, price)
-    };
-    let Some(price) = price else { return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() } };
+        let (m1, price) = {
+            let market = market_arc.read().unwrap();
+            let m1 = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
+            let price = market.last_price(&symbol);
+            (m1, price)
+        };
+        let Some(price) = price else { return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() } };
 
-    // Session-bounded M1 → closed 5-minute bars (the engine's aggregation).
-    let m1_session: Vec<_> = m1.into_iter().filter(|b| b.time >= session_open).collect();
-    let bars = crate::hod_drive::session_bars(cfg, &m1_session, now);
-    let volume_since_open: u64 = bars.iter().map(|b| b.volume).sum();
-    let dollar_volume_since_open: f64 = bars
-        .iter()
-        .map(|b| ((b.high + b.low + b.close) / 3.0) * b.volume as f64)
-        .sum();
+        let m1_session: Vec<_> = m1.into_iter().filter(|b| b.time >= session_open).collect();
+        let bars = crate::hod_drive::session_bars(cfg, &m1_session, now);
+        let volume_since_open: u64 = bars.iter().map(|b| b.volume).sum();
+        let dollar_volume_since_open: f64 = bars
+            .iter()
+            .map(|b| ((b.high + b.low + b.close) / 3.0) * b.volume as f64)
+            .sum();
 
-    let Some(eval) =
-        crate::hod_drive::evaluate(cfg, &bars, price, volume_since_open, dollar_volume_since_open)
-    else {
-        return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() };
-    };
+        let Some(eval) =
+            crate::hod_drive::evaluate(cfg, &bars, price, volume_since_open, dollar_volume_since_open)
+        else {
+            return HodDriveOverlay { timeframe: cfg.label.into(), ..Default::default() };
+        };
 
-    let range_vs_green_atr = {
-        let open_range = eval.hod - eval.lod;
-        if open_range > 0.0 {
-            let today = Utc::now().format("%Y-%m-%d").to_string();
-            let db = state.db.lock().unwrap();
-            let daily = cache_repository::ohlcv_ascending(&db, &symbol, 60, &today)
-                .unwrap_or_default();
-            let green_ranges: Vec<f64> = daily
-                .iter()
-                .filter(|(o, _h, _l, c, _v)| *c > *o)
-                .map(|(_o, h, l, _c, _v)| h - l)
-                .collect();
-            if !green_ranges.is_empty() {
-                let avg: f64 = green_ranges.iter().sum::<f64>() / green_ranges.len() as f64;
-                if avg > 0.0 { Some(open_range / avg) } else { None }
+        let range_vs_green_atr = {
+            let open_range = eval.hod - eval.lod;
+            if open_range > 0.0 {
+                let today = Utc::now().format("%Y-%m-%d").to_string();
+                let db = db_arc.lock().unwrap();
+                let daily = cache_repository::ohlcv_ascending(&db, &symbol, 60, &today)
+                    .unwrap_or_default();
+                let green_ranges: Vec<f64> = daily
+                    .iter()
+                    .filter(|(o, _h, _l, c, _v)| *c > *o)
+                    .map(|(_o, h, l, _c, _v)| h - l)
+                    .collect();
+                if !green_ranges.is_empty() {
+                    let avg: f64 = green_ranges.iter().sum::<f64>() / green_ranges.len() as f64;
+                    if avg > 0.0 { Some(open_range / avg) } else { None }
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            None
+        };
+
+        let m1_closes: Vec<f64> = m1_session.iter().map(|b| b.close).collect();
+        let macd = crate::hod_drive::macd_status(&m1_closes);
+
+        HodDriveOverlay {
+            timeframe:              cfg.label.into(),
+            series_share:           Some(eval.series_share),
+            pullback_volume:        Some(eval.pullback_volume as f64),
+            pullback_vol_ratio:     Some(eval.pullback_vol_ratio),
+            power_score:            Some(eval.power_score),
+            directional_efficiency: Some(eval.directional_efficiency),
+            hod:                    Some(eval.hod),
+            lod:                    Some(eval.lod),
+            hod_time:               bars.get(eval.hod_bar_idx).map(|b| b.time.timestamp()),
+            lod_time:               bars.get(eval.lod_bar_idx).map(|b| b.time.timestamp()),
+            series_bar_times:       eval
+                .series_bar_idxs
+                .iter()
+                .filter_map(|&i| bars.get(i).map(|b| b.time.timestamp()))
+                .collect(),
+            gates_pass:             eval.gates_pass,
+            range_vs_green_atr,
+            suggested_entry:        eval.suggested_entry,
+            suggested_sl:           eval.suggested_sl,
+            suggested_tp:           eval.suggested_tp,
+            suggested_rr:           eval.suggested_rr,
+            macd_open:              macd.as_ref().map(|m| m.open),
+            macd_strength:          macd.as_ref().map(|m| m.strength),
         }
-    };
-
-    // MACD on the raw M1 session closes (more granularity than the 5-min bars).
-    let m1_closes: Vec<f64> = m1_session.iter().map(|b| b.close).collect();
-    let macd = crate::hod_drive::macd_status(&m1_closes);
-
-    HodDriveOverlay {
-        timeframe:              cfg.label.into(),
-        series_share:           Some(eval.series_share),
-        pullback_volume:        Some(eval.pullback_volume as f64),
-        pullback_vol_ratio:     Some(eval.pullback_vol_ratio),
-        power_score:            Some(eval.power_score),
-        directional_efficiency: Some(eval.directional_efficiency),
-        hod:                    Some(eval.hod),
-        lod:                    Some(eval.lod),
-        hod_time:               bars.get(eval.hod_bar_idx).map(|b| b.time.timestamp()),
-        lod_time:               bars.get(eval.lod_bar_idx).map(|b| b.time.timestamp()),
-        series_bar_times:       eval
-            .series_bar_idxs
-            .iter()
-            .filter_map(|&i| bars.get(i).map(|b| b.time.timestamp()))
-            .collect(),
-        gates_pass:             eval.gates_pass,
-        range_vs_green_atr,
-        suggested_entry:        eval.suggested_entry,
-        suggested_sl:           eval.suggested_sl,
-        suggested_tp:           eval.suggested_tp,
-        suggested_rr:           eval.suggested_rr,
-        macd_open:              macd.as_ref().map(|m| m.open),
-        macd_strength:          macd.as_ref().map(|m| m.strength),
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The most recent single-ticker headlines for `symbol` (Alpaca news REST), for the
@@ -1881,7 +2143,9 @@ fn sync_fill(
         let side  = pos.as_ref().map(|p| p.side).unwrap_or(fill.side);
         let sl    = pos.as_ref().and_then(|p| p.stop_loss);
         let tp    = pos.as_ref().and_then(|p| p.take_profit);
-        let strat = pos.as_ref().map(|p| p.strategy_id.clone())
+        let strat = pos.as_ref()
+            .map(|p| p.strategy_id.clone())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| lc.trade.strategy_id.clone());
         // MAE/MFE are stamped onto the trade record when it goes flat.
         (lc.fills.clone(), pos, side, sl, tp, strat, lc.trade.mae, lc.trade.mfe)
@@ -2212,7 +2476,7 @@ pub fn delete_drawing(
 /// ("04:00" | "07:00" | "09:30"). Stops the live feeds, switches the app clock
 /// to simulated time and loads the day's data (progress via get_replay_status).
 #[tauri::command(rename_all = "snake_case")]
-pub fn replay_start(
+pub async fn replay_start(
     day:      String,
     start_hm: String,
     app:      tauri::AppHandle,
@@ -2233,7 +2497,10 @@ pub fn replay_start(
         alert_history:     state.alert_history.clone(),
         app,
     };
-    crate::replay::start(state.replay.clone(), deps, day, start_min)
+    let replay = state.replay.clone();
+    tokio::task::spawn_blocking(move || crate::replay::start(replay, deps, day, start_min))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn parse_hm(hm: &str) -> Result<u32, String> {
@@ -2294,6 +2561,12 @@ pub fn replay_next_alert(state: tauri::State<'_, AppState>) -> Result<(), String
     state.replay.send(crate::replay::ReplayCmd::NextAlert)
 }
 
+/// Avance jusqu'au prochain close de barre 1 min, puis pause.
+#[tauri::command(rename_all = "snake_case")]
+pub fn replay_next_bar(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.replay.send(crate::replay::ReplayCmd::NextBar)
+}
+
 /// Charge la séance suivante (jour ouvré suivant) à la même heure de départ.
 #[tauri::command(rename_all = "snake_case")]
 pub fn replay_next_day(state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -2301,8 +2574,11 @@ pub fn replay_next_day(state: tauri::State<'_, AppState>) -> Result<(), String> 
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_replay_status(state: tauri::State<'_, AppState>) -> crate::replay::ReplayStatus {
-    state.replay.status.read().unwrap().clone()
+pub async fn get_replay_status(state: tauri::State<'_, AppState>) -> Result<crate::replay::ReplayStatus, String> {
+    let replay = state.replay.clone();
+    tokio::task::spawn_blocking(move || replay.status.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ─── Flat files (offline market-data download for Market Replay) ────────────────
@@ -2556,30 +2832,62 @@ pub fn export_dashboard_default(
     Ok(state.app_dir.join("dashboard-default.json").to_string_lossy().to_string())
 }
 
-// ─── Embedded TradeTally webview ──────────────────────────────────────────────
+// ─── Embedded TradeTally web app ──────────────────────────────────────────────
 //
-// The self-hosted TradeTally site refuses to be framed (`X-Frame-Options: DENY`
-// + CSP `frame-ancestors 'none'`), so it can't live in an <iframe>. Instead we
-// embed a real native child webview inside the main window: it loads the site as
-// a top-level document, so the frame-blocking headers don't apply, and WebView2 /
-// WKWebView persists its cookies + localStorage in the app's user-data dir — log
-// in once and the session survives restarts (lands straight on the main page).
+// The TradeTally site sends `X-Frame-Options` / CSP `frame-ancestors` → no
+// iframe. We embed it as a real native webview that loads the site as a top-level
+// document, so the frame-blocking headers don't apply.
 //
-// The frontend owns layout, so it tells us the content rect (CSS px == window
-// logical px) to place the webview over, and hides it when the TradeTally tab is
-// left or a modal opens — native webviews always paint above the DOM, so they'd
-// otherwise cover the app's own overlays.
+// Platform split — this matters:
+//   • Windows: a separate **child window** (`WebviewWindowBuilder::parent_raw`,
+//     WS_CHILD) confined to and auto-following the main window's client area.
+//     The earlier approach (`Window::add_child`, Tauri's `unstable` multi-webview)
+//     is broken on Windows/WebView2: putting a second webview inside the main
+//     window corrupts its shared compositor — the page wouldn't render, and the
+//     first modal opened afterwards (a DOM dialog in the main webview) silently
+//     crashed the renderer. A separate HWND with its own WebView2 controller
+//     doesn't touch the main window's compositor, so both symptoms go away.
+//   • macOS / Linux: `Window::add_child` (the multi-webview API is mature on
+//     WKWebView / WebKitGTK), unchanged.
+//
+// Isolated storage: the webview gets its OWN WebView2/WKWebView data directory
+// (`<app_dir>/tradetally-webview`), separate from the main app's. So TradeTally's
+// cookies/cache/localStorage can't corrupt (or be corrupted by) the app's own
+// localStorage (dashboard layout, hotkeys…), and "clear cache & cookies" only
+// wipes TradeTally — never the app. Cookies persist across the destroy/recreate.
+//
+// Lifecycle = *destroy*, not hide. It exists ONLY while the TradeTally tab is the
+// active view and no modal is open; the frontend creates it (`tradetally_set_bounds`)
+// on enter / modal-close and destroys it (`tradetally_close`) on leave / modal-open.
+//
+// The commands are `async` so window/webview creation runs on the tokio runtime;
+// the runtime dispatches the actual creation to the main thread without
+// deadlocking the caller.
 
 const TRADETALLY_LABEL: &str = "tradetally";
-const TRADETALLY_URL:   &str = "https://trade.fabrelexos.synology.me/";
 
-/// Position + size the embedded TradeTally webview over the given rect and show
-/// it. Lazily creates the child webview (loading the site) on the first call.
-///
-/// `async` is load-bearing: `Window::add_child` blocks waiting on the main thread
-/// to build the webview, so it must NOT run *on* the main thread. Sync Tauri
-/// commands execute on the main thread (→ self-deadlock); async ones run on the
-/// async runtime, leaving the main thread free to service the build.
+/// The TradeTally site URL (the configured base; the SPA routes to /dashboard or
+/// /login itself). Same base as the REST client, so it can't carry a path.
+fn tradetally_url(app: &tauri::AppHandle) -> Result<tauri::Url, String> {
+    use tauri::Manager;
+    let base = app
+        .state::<AppState>()
+        .config
+        .read()
+        .unwrap()
+        .tradetally
+        .api_base_url
+        .clone();
+    tauri::Url::parse(&base).map_err(|e| e.to_string())
+}
+
+/// Dedicated WebView2/WKWebView data dir so TradeTally's web storage is isolated
+/// from the app's own (and from any cache corruption).
+fn tradetally_data_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+    use tauri::Manager;
+    app.state::<AppState>().app_dir.join("tradetally-webview")
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tradetally_set_bounds(
     app:    tauri::AppHandle,
@@ -2588,11 +2896,70 @@ pub async fn tradetally_set_bounds(
     width:  f64,
     height: f64,
 ) -> Result<(), String> {
+    tt_place(&app, x, y, width.max(1.0), height.max(1.0))
+}
+
+/// Windows: create-or-reposition the TradeTally child window (WS_CHILD over the
+/// main window's client area).
+#[cfg(windows)]
+fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
     use tauri::Manager;
     let pos  = tauri::LogicalPosition::new(x, y);
-    // Clamp to a sane minimum so a transient zero-size measurement can't make the
-    // webview collapse / vanish.
-    let size = tauri::LogicalSize::new(width.max(1.0), height.max(1.0));
+    let size = tauri::LogicalSize::new(width, height);
+
+    if let Some(ww) = app.get_webview_window(TRADETALLY_LABEL) {
+        ww.set_position(pos).map_err(|e| e.to_string())?;
+        ww.set_size(size).map_err(|e| e.to_string())?;
+        ww.show().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let url    = tradetally_url(app)?;
+    let main   = app.get_webview_window("main").ok_or("main window not found")?;
+    let parent = main.hwnd().map_err(|e| e.to_string())?;
+    let app_evt = app.clone();
+
+    match tauri::WebviewWindowBuilder::new(app, TRADETALLY_LABEL, tauri::WebviewUrl::External(url))
+        .parent_raw(parent)
+        .data_directory(tradetally_data_dir(app))
+        .decorations(false)
+        .shadow(false)
+        .skip_taskbar(true)
+        .focused(false)
+        .resizable(false)
+        .position(x, y)
+        .inner_size(width, height)
+        // Tell the React placeholder the page finished loading (status dot → ready).
+        // Full-document loads only — SPA route changes don't fire this.
+        .on_page_load(move |_w, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                use tauri::Emitter;
+                let _ = app_evt.emit("tradetally-loaded", ());
+            }
+        })
+        .build()
+    {
+        Ok(w) => w.show().map_err(|e| e.to_string())?,
+        // Lost a create race (mount effects / dev StrictMode): reposition the winner.
+        Err(e) => match app.get_webview_window(TRADETALLY_LABEL) {
+            Some(w) => {
+                w.set_position(pos).map_err(|e| e.to_string())?;
+                w.set_size(size).map_err(|e| e.to_string())?;
+                w.show().map_err(|e| e.to_string())?;
+            }
+            None => return Err(format!("failed to create tradetally window: {e}")),
+        },
+    }
+    Ok(())
+}
+
+/// macOS / Linux: create-or-reposition the TradeTally child webview embedded in
+/// the main window (the multi-webview API is stable on these platforms).
+#[cfg(not(windows))]
+fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+    use tauri::Manager;
+    let pos  = tauri::LogicalPosition::new(x, y);
+    let size = tauri::LogicalSize::new(width, height);
 
     if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
         wv.set_position(pos).map_err(|e| e.to_string())?;
@@ -2601,31 +2968,99 @@ pub async fn tradetally_set_bounds(
         return Ok(());
     }
 
-    // First show: create the child webview as a top-level document over the rect.
+    let url    = tradetally_url(app)?;
     let window = app.get_window("main").ok_or("main window not found")?;
-    let url = tauri::Url::parse(TRADETALLY_URL).map_err(|e| e.to_string())?;
-    window
-        .add_child(
-            tauri::webview::WebviewBuilder::new(
-                TRADETALLY_LABEL,
-                tauri::WebviewUrl::External(url),
-            ),
-            pos,
-            size,
-        )
-        .map_err(|e| e.to_string())?;
+    let app_evt = app.clone();
+    let builder = tauri::webview::WebviewBuilder::new(TRADETALLY_LABEL, tauri::WebviewUrl::External(url))
+        .data_directory(tradetally_data_dir(app))
+        .on_page_load(move |_wv, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                use tauri::Emitter;
+                let _ = app_evt.emit("tradetally-loaded", ());
+            }
+        });
+
+    match window.add_child(builder, pos, size) {
+        Ok(wv) => wv.show().map_err(|e| e.to_string())?,
+        Err(e) => match app.get_webview(TRADETALLY_LABEL) {
+            Some(wv) => {
+                wv.set_position(pos).map_err(|e| e.to_string())?;
+                wv.set_size(size).map_err(|e| e.to_string())?;
+                wv.show().map_err(|e| e.to_string())?;
+            }
+            None => return Err(format!("failed to create tradetally webview: {e}")),
+        },
+    }
     Ok(())
 }
 
-/// Hide the embedded TradeTally webview (left the tab, or a modal opened over it).
-/// Keeps the webview alive so its session/scroll position survive the round-trip.
+/// Destroy the embedded webview/window (tab left / modal opened). Cookies +
+/// localStorage persist in the isolated data dir, so login + theme are kept.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn tradetally_hide(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn tradetally_close(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
+    #[cfg(windows)]
+    if let Some(ww) = app.get_webview_window(TRADETALLY_LABEL) {
+        ww.close().map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
     if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
-        wv.hide().map_err(|e| e.to_string())?;
+        wv.close().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Soft reload of the embedded page (toolbar → Recharger). Keeps cache, cookies
+/// and the current session — the first thing to try when the page looks stuck.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tradetally_reload(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    #[cfg(windows)]
+    if let Some(ww) = app.get_webview_window(TRADETALLY_LABEL) {
+        ww.reload().map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
+        wv.reload().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Clear ONLY TradeTally's cache + cookies + localStorage (its data dir is
+/// isolated from the app's), then load a fresh page. Logs the user out of
+/// TradeTally and resets its dark/light preference — the recovery path when a
+/// corrupted cache leaves the page stuck loading. No-op if it's closed.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tradetally_clear_data(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let url = tradetally_url(&app)?;
+    #[cfg(windows)]
+    if let Some(ww) = app.get_webview_window(TRADETALLY_LABEL) {
+        ww.clear_all_browsing_data().map_err(|e| e.to_string())?;
+        ww.navigate(url).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
+        wv.clear_all_browsing_data().map_err(|e| e.to_string())?;
+        wv.navigate(url).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// ─── Flash alert overlay (built on demand, not at startup) ────────────────────
+
+/// Create or destroy the full-screen white flash overlay window. Driven from
+/// Settings: enabled when the flash cue is on (mode ≠ "off"), disabled otherwise.
+/// Idempotent. `async` so window creation dispatches to the main thread without
+/// deadlocking the caller.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_flash_overlay(enabled: bool, app: tauri::AppHandle) -> Result<(), String> {
+    if enabled {
+        crate::notify::ensure_flash_overlay(&app)
+    } else {
+        crate::notify::close_flash_overlay(&app);
+        Ok(())
+    }
 }
 
 // ─── Speech-to-Text (offline dictée → trade notes / diary) ────────────────────────
@@ -2642,6 +3077,9 @@ pub fn stt_status(state: tauri::State<'_, AppState>) -> crate::stt::SttStatus {
 /// progress is surfaced through `stt_status`.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn stt_download_model(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if !crate::stt::platform_available() {
+        return Err("dictée vocale non disponible sur ce Mac (macOS < 14)".into());
+    }
     let model = state.config.read().unwrap().stt.model.clone();
     let shared = state.stt.clone();
     crate::stt::model::download_model(&shared, &model).await
@@ -2656,6 +3094,9 @@ pub fn stt_start_recording(
     app:      tauri::AppHandle,
     state:    tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    if !crate::stt::platform_available() {
+        return Err("dictée vocale non disponible sur ce Mac (macOS < 14)".into());
+    }
     let device = {
         let c = state.config.read().unwrap();
         if !c.stt.enabled {

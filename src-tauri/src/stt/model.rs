@@ -51,7 +51,7 @@ async fn download_inner(shared: &Arc<SttShared>, model: &str) -> Result<(), Stri
     let path = model_path(&shared.app_dir, model);
     let tmp = path.with_extension("bin.tmp");
 
-    let resp = reqwest::Client::new()
+    let resp = crate::http::client()
         .get(model_url(model))
         .send()
         .await

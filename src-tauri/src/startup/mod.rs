@@ -275,7 +275,11 @@ pub async fn run_pipeline(
     // provider key never masks a later fetch the same day. ET date (DST-aware) for
     // the once-per-day markers, so "a new day" flips at Eastern midnight.
     let today = crate::time::et_date(Utc::now());
-    let floats = step_floats(&db, &state, &sec, &today, mock_float, has_massive).await;
+    // fetch_massive + fetch_sec run concurrently (independent providers).
+    let (floats, _) = tokio::join!(
+        step_floats(&db, &state, &sec, &today, mock_float, has_massive),
+        step_sec(&db, &state, &sec, &today, mock_sec),
+    );
     let float_map: std::collections::HashMap<String, &crate::massive::MassiveFloat> =
         floats.iter().map(|f| (f.symbol.clone(), f)).collect();
     let with_float = alpaca_active.iter().filter(|a| float_map.contains_key(&a.symbol)).count();
@@ -292,11 +296,6 @@ pub async fn run_pipeline(
             Some(&format!("{} float records ({with_float} in universe)", floats.len())));
     }
     let _ = log(&db, "info", &format!("startup: {} float records (Massive/FMP)", floats.len()));
-
-    // ── Step 6: fetch_sec (country of origin + SIC industry) ──────────────────
-    // Shared with the flat-files pipeline (see `step_sec`): dedicated freshness
-    // marker, forced fetch when company_meta is empty, mock never poisons it.
-    step_sec(&db, &state, &sec, &today, mock_sec).await;
 
     // ── Step 7: load_daily (incremental: 250d first run, missing days after) ──
     set_step(&state, "load_daily", StepStatus::Running, None);
@@ -777,7 +776,7 @@ pub async fn run_pipeline_flat_files(
             let _ = log(&db, "info",
                 &format!("startup: flat daily loaded — {n} bars, {} symbols", flat_symbols.len()));
         }
-        Err(e) => {
+        Err(ref e) => {
             push_warning(&state, &format!("flat daily load failed: {e}"));
             set_step(&state, "load_flat_daily", StepStatus::Warning, Some(&format!("error: {e}")));
         }
@@ -790,7 +789,11 @@ pub async fn run_pipeline_flat_files(
     };
 
     // ── fetch_massive (floats; gap-fill, online optional) ─────────────────────
-    let floats = step_floats(&db, &state, &sec, &today, mock_float, has_massive).await;
+    // fetch_massive + fetch_sec run concurrently (independent providers).
+    let (floats, _) = tokio::join!(
+        step_floats(&db, &state, &sec, &today, mock_float, has_massive),
+        step_sec(&db, &state, &sec, &today, mock_sec),
+    );
     let float_map: std::collections::HashMap<String, &crate::massive::MassiveFloat> =
         floats.iter().map(|f| (f.symbol.clone(), f)).collect();
     let active_set: std::collections::HashSet<&String> = active_symbols.iter().collect();
@@ -804,37 +807,40 @@ pub async fn run_pipeline_flat_files(
             Some(&format!("{} float records ({with_float} in universe)", floats.len())));
     }
 
-    // ── fetch_sec (country / industry; online optional) ───────────────────────
-    step_sec(&db, &state, &sec, &today, mock_sec).await;
-
     // ── compute_changes (multi-day close-to-close % changes) ──────────────────
-    set_step(&state, "compute_changes", StepStatus::Running, None);
-    {
-        let g = db.lock().unwrap();
-        match cache_repository::recompute_multiday_changes(&g) {
-            Ok(n) => {
-                drop(g);
-                set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
-            }
-            Err(e) => {
-                drop(g);
-                set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
+    // Skip when daily_cache is empty (no flat daily file downloaded yet).
+    let has_daily = copied.as_ref().map(|n| *n > 0).unwrap_or(false);
+    if has_daily {
+        set_step(&state, "compute_changes", StepStatus::Running, None);
+        {
+            let g = db.lock().unwrap();
+            match cache_repository::recompute_multiday_changes(&g) {
+                Ok(n) => {
+                    drop(g);
+                    set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
+                }
+                Err(e) => {
+                    drop(g);
+                    set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
+                }
             }
         }
-    }
 
-    // ── compute_metrics (CPU-only over the now-populated daily_cache) ─────────
-    set_step(&state, "compute_metrics", StepStatus::Running, None);
-    {
-        let (pc, pd) = {
-            let g = db.lock().unwrap();
-            (
-                cache_repository::recompute_atr_prev_close(&g).unwrap_or(0),
-                cache_repository::recompute_pump_dump_scores(&g).unwrap_or(0),
-            )
-        };
-        set_step(&state, "compute_metrics", StepStatus::Success,
-            Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
+        set_step(&state, "compute_metrics", StepStatus::Running, None);
+        {
+            let (pc, pd) = {
+                let g = db.lock().unwrap();
+                (
+                    cache_repository::recompute_atr_prev_close(&g).unwrap_or(0),
+                    cache_repository::recompute_pump_dump_scores(&g).unwrap_or(0),
+                )
+            };
+            set_step(&state, "compute_metrics", StepStatus::Success,
+                Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
+        }
+    } else {
+        set_step(&state, "compute_changes", StepStatus::Success, Some("skipped (no daily data)"));
+        set_step(&state, "compute_metrics", StepStatus::Success, Some("skipped (no daily data)"));
     }
 
     // ── fetch_short_interest (Massive bulk, once/day, online optional) ────────
@@ -959,6 +965,7 @@ fn persist_company_meta<'a>(
 ) {
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let db_guard = db.lock().unwrap();
+    let _ = db_guard.execute_batch("BEGIN");
     for c in companies {
         let row = company_meta_repository::CompanyMeta {
             symbol: c.symbol.clone(),
@@ -970,6 +977,7 @@ fn persist_company_meta<'a>(
         };
         let _ = company_meta_repository::upsert(&db_guard, &row);
     }
+    let _ = db_guard.execute_batch("COMMIT");
 }
 
 // ─── Shared provider steps (used by BOTH pipelines) ────────────────────────────
@@ -1066,6 +1074,7 @@ async fn step_floats(
     {
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let g = db.lock().unwrap();
+        let _ = g.execute_batch("BEGIN");
         for f in &floats {
             let fund = cache_repository::FundamentalCache {
                 symbol: f.symbol.clone(),
@@ -1082,6 +1091,7 @@ async fn step_floats(
         if float_fetch_ok {
             let _ = cache_repository::set_app_meta(&g, FLOATS_DATE_KEY, today);
         }
+        let _ = g.execute_batch("COMMIT");
     }
     set_step(state, "fetch_massive", StepStatus::Success,
         Some(&format!("{} float records", floats.len())));

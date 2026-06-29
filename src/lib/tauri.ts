@@ -44,6 +44,8 @@ import type {
   StreamableSymbol,
   SyncQueueStatus,
   TickerTableRow,
+  TodoTrade,
+  TradeDbRow,
   Timeframe,
   TradeExecutions,
   TradeLifecycle,
@@ -70,10 +72,16 @@ export const api = {
   exportDashboardDefault: (layout_json: string) =>
     invoke<string>("export_dashboard_default", { layout_json }),
 
-  // Embedded TradeTally webview (native child webview positioned over its tab)
+  // Embedded TradeTally child webview (created/destroyed by the TradeTally tab).
   tradetallySetBounds: (x: number, y: number, width: number, height: number) =>
     invoke<void>("tradetally_set_bounds", { x, y, width, height }),
-  tradetallyHide:      () => invoke<void>("tradetally_hide"),
+  tradetallyClose:     () => invoke<void>("tradetally_close"),
+  tradetallyReload:    () => invoke<void>("tradetally_reload"),
+  tradetallyClearData: () => invoke<void>("tradetally_clear_data"),
+
+  // Flash alert overlay — built on demand from Settings (never at startup).
+  setFlashOverlay: (enabled: boolean) =>
+    invoke<void>("set_flash_overlay", { enabled }),
 
   // Config
   getLocalConfig:    () => invoke<AppConfig>("get_local_config"),
@@ -101,6 +109,14 @@ export const api = {
   // Screenshot
   saveScreenshotLocal: (zone_id: string, trade_id: string | null, image_base64: string, filename: string) =>
     invoke<string>("save_screenshot_local", { zone_id, trade_id, image_base64, filename }),
+
+  // Todo trades (missing screenshot / journal)
+  getTodoTrades: () => invoke<TodoTrade[]>("get_todo_trades"),
+
+  // All trades DB view
+  getAllTradesDb:  () => invoke<TradeDbRow[]>("get_all_trades_db"),
+  getTradeDays:   () => invoke<string[]>("get_trade_days"),
+  deleteTradeDb:  (trade_id: string) => invoke<void>("delete_trade_db", { trade_id }),
 
   // Logs
   getLocalLogs: (limit?: number) =>
@@ -264,6 +280,7 @@ export const api = {
   replaySeekClock: (hm: string) =>
     invoke<void>("replay_seek_clock", { hm }),
   replayNextAlert: () => invoke<void>("replay_next_alert"),
+  replayNextBar:   () => invoke<void>("replay_next_bar"),
   replayNextDay:   () => invoke<void>("replay_next_day"),
   getReplayStatus: () => invoke<ReplayStatus>("get_replay_status"),
 

@@ -203,6 +203,9 @@ export function StartupPanel() {
     final_universe: 0,
   };
 
+  const isRunning = startupData != null && !startupData.completed
+    && startupData.steps.some((s) => s.status === "running");
+
   return (
     <div className="flex flex-col gap-4 p-6 max-w-2xl mx-auto w-full">
       {/* Header */}
@@ -210,7 +213,9 @@ export function StartupPanel() {
         <div>
           <h2 className="text-lg font-semibold">Startup Pipeline</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Prepares the trading universe before connecting to Alpaca WebSocket
+            {isRunning
+              ? "Préparation de l'univers de trading en cours…"
+              : "Prepares the trading universe before connecting to Alpaca WebSocket"}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -219,14 +224,17 @@ export function StartupPanel() {
               MOCK MODE
             </Badge>
           )}
-          <Button
-            size="sm"
-            onClick={() => run.mutate()}
-            disabled={run.isPending || (startupData != null && !startupData.completed && startupData.steps.some((s) => s.status === "running"))}
-          >
-            <Play className="mr-1.5 h-3.5 w-3.5" />
-            {run.isPending ? "Starting…" : "Run pipeline"}
-          </Button>
+          {startupData?.completed && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => run.mutate()}
+              disabled={run.isPending}
+            >
+              <Play className="mr-1.5 h-3.5 w-3.5" />
+              Relancer
+            </Button>
+          )}
         </div>
       </div>
 
@@ -259,9 +267,10 @@ export function StartupPanel() {
         ) : (
           <>
             <div className="ml-7 h-px bg-border/30" />
-            <p className="py-2 pl-7 text-sm text-muted-foreground">
-              Cliquez sur « Run pipeline » pour démarrer
-            </p>
+            <div className="flex items-center gap-2 py-2 pl-7 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Initialisation…
+            </div>
           </>
         )}
       </div>

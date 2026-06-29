@@ -102,7 +102,7 @@ fn non_empty(s: &str) -> Option<String> {
 
 /// Fetch one exchange's full company listing (includes delisted rows).
 async fn fetch_by_exchange(token: &str, exchange: &str) -> Result<Vec<RawCompany>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!("{BASE_URL}/mapping/exchange/{exchange}?token={token}");
     let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {

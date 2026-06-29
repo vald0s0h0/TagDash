@@ -5,6 +5,6 @@ export function useAppStatus() {
   return useQuery({
     queryKey:        ["app-status"],
     queryFn:         api.getAppStatus,
-    refetchInterval: 500, // real latency from market state, needs fast refresh
+    refetchInterval: 2_000,
   });
 }

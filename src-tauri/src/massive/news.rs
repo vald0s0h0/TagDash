@@ -52,10 +52,14 @@ pub async fn fetch_latest_news(api_key: &str, ticker: &str) -> Result<Vec<NewsIt
         &format!("{BASE_URL}/stocks/vX/news?ticker={ticker}&limit=5&sort=published_utc.desc"),
         api_key,
     );
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("Massive news HTTP {}", resp.status()));
+        let status = resp.status();
+        if status.as_u16() == 429 {
+            return Err("Massive news rate limited".into());
+        }
+        return Err(format!("Massive news HTTP {status}"));
     }
     let parsed: NewsResponse = resp.json().await.map_err(|e| e.to_string())?;
     Ok(parsed.results.into_iter().filter_map(RawNews::into_item).collect())

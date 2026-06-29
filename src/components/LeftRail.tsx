@@ -18,6 +18,7 @@ import {
   Sun,
   Sunrise,
   Table2,
+  TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/stores/uiStore";
@@ -36,6 +37,7 @@ import { FeedDiagnosticsModal } from "@/components/FeedDiagnosticsModal";
 import { NewsDebugModal } from "@/components/NewsDebugModal";
 import { BugReportModal } from "@/components/BugReportModal";
 import { TickersTableModal } from "@/components/TickersTableModal";
+import { TradesDBModal } from "@/components/TradesDBModal";
 import { FlatFilesModal } from "@/components/FlatFilesModal";
 import { SttModal } from "@/components/SttModal";
 import { UpdateModal } from "@/components/UpdateModal";
@@ -185,6 +187,10 @@ export function LeftRail() {
                 <Table2 className="mr-2 h-4 w-4" />
                 Données tickers (DB)
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => showModal("trades-db")}>
+                <TrendingUp className="mr-2 h-4 w-4" />
+                Trades (DB)
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => showModal("flat-files")}>
                 <Database className="mr-2 h-4 w-4" />
                 Gestion Flat Files
@@ -240,6 +246,10 @@ export function LeftRail() {
       />
       <TickersTableModal
         open={openModal === "tickers-table"}
+        onClose={closeModal}
+      />
+      <TradesDBModal
+        open={openModal === "trades-db"}
         onClose={closeModal}
       />
       <FlatFilesModal

@@ -449,6 +449,10 @@ impl InternalBook {
             let fill_id = gen_id();
             let effective_tid = order.trade_id.clone().unwrap_or_else(|| gen_id());
 
+            let strat_id = self.trades.get(&effective_tid)
+                .map(|t| t.strategy_id.clone())
+                .unwrap_or_default();
+
             let fill = Fill {
                 fill_id,
                 order_id:   oid.clone(),
@@ -463,7 +467,7 @@ impl InternalBook {
 
             self.apply_fill(
                 &order.symbol, &effective_tid, &order.zone_id,
-                "", // strategy_id not stored on order; position already has it
+                &strat_id,
                 order.side, order.quantity, fill_price,
                 order.stop_loss, order.take_profit, now,
             );

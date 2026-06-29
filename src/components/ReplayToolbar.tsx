@@ -1,15 +1,7 @@
-// Market Replay toolbar. Rendered only when activated from the LeftRail menu
-// (uiStore.replayOpen). Drives the backend replay engine through the replay_*
-// commands and polls get_replay_status (~500 ms) for the simulated clock, the
-// loading progress and the transport state.
-//
-// While a replay is active the whole platform runs on the simulated day: live
-// feeds are stopped, the scanner / strategy engines / internal trading / journal
-// all follow the simulated clock; closing the replay restores live mode.
-
 import { useEffect, useRef, useState } from "react";
 import {
   AlarmClock,
+  ArrowRight,
   Bell,
   CalendarDays,
   ChevronsRight,
@@ -18,7 +10,7 @@ import {
   Loader2,
   Pause,
   Play,
-  Rewind,
+  SkipForward,
   Square,
   X,
 } from "lucide-react";
@@ -26,18 +18,77 @@ import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { nyTime } from "@/lib/nyTime";
 import { useUiStore } from "@/stores/uiStore";
+import { DayPickerModal } from "@/components/DayPickerModal";
 import type { ReplayStatus } from "@/types";
 
 const SPEEDS = [0.5, 1, 2, 5, 10, 30, 60, 120];
 const SESSION_STARTS = ["04:00", "07:00", "09:30"] as const;
 
-/** Most recent weekday strictly before today (default replay date). */
-function lastWeekday(): string {
-  const d = new Date();
-  do {
-    d.setDate(d.getDate() - 1);
-  } while (d.getDay() === 0 || d.getDay() === 6);
-  return d.toISOString().slice(0, 10);
+function EditableTime({
+  simTime,
+  onSeek,
+}: {
+  simTime: string | null;
+  onSeek: (hm: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const display = simTime ? nyTime(simTime, true) : "—";
+
+  const startEditing = () => {
+    setDraft(simTime ? nyTime(simTime, false) : "04:00");
+    setEditing(true);
+  };
+
+  useEffect(() => {
+    if (editing) inputRef.current?.focus();
+  }, [editing]);
+
+  const commit = () => {
+    const cleaned = draft.trim();
+    if (/^\d{1,2}:\d{2}$/.test(cleaned)) {
+      onSeek(cleaned);
+    }
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <span className="flex items-center gap-0.5">
+        <input
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") setEditing(false);
+          }}
+          onBlur={() => setEditing(false)}
+          className="w-[52px] rounded border border-amber-500/40 bg-background px-1 py-0.5 font-mono text-sm font-semibold tabular-nums text-amber-300 outline-none focus:border-amber-400"
+          placeholder="HH:MM"
+        />
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={commit}
+          className="flex h-5 w-5 items-center justify-center rounded text-amber-300/60 hover:bg-amber-500/20 hover:text-amber-300"
+          title="Aller à cette heure"
+        >
+          <ArrowRight className="h-3.5 w-3.5" />
+        </button>
+      </span>
+    );
+  }
+
+  return (
+    <span
+      onClick={startEditing}
+      className="min-w-[72px] cursor-pointer font-mono text-base font-semibold tabular-nums text-amber-300 hover:text-amber-200"
+      title="Cliquer pour modifier l'heure"
+    >
+      {display}
+    </span>
+  );
 }
 
 export function ReplayToolbar() {
@@ -45,30 +96,40 @@ export function ReplayToolbar() {
   const toggleReplay = useUiStore((s) => s.toggleReplay);
 
   const [status, setStatus] = useState<ReplayStatus | null>(null);
-  const [day, setDay] = useState<string>(lastWeekday());
+  const [day, setDay] = useState<string | null>(null);
   const [startHm, setStartHm] = useState<string>("04:00");
   const [startErr, setStartErr] = useState<string | null>(null);
+  const [localPlaying, setLocalPlaying] = useState<boolean | null>(null);
+  const [calendarOpen, setCalendarOpen] = useState(false);
   const pollRef = useRef<number | null>(null);
+  const busyRef = useRef(false);
 
-  // Poll the backend status while the toolbar is shown.
   useEffect(() => {
     if (!replayOpen) return;
     const tick = () => api.getReplayStatus().then(setStatus).catch(() => {});
     tick();
-    pollRef.current = window.setInterval(tick, 500);
+    const interval = status?.playing ? 500 : 2_000;
+    pollRef.current = window.setInterval(tick, interval);
     return () => {
       if (pollRef.current !== null) window.clearInterval(pollRef.current);
     };
-  }, [replayOpen]);
+  }, [replayOpen, status?.playing]);
+
+  useEffect(() => {
+    if (status && localPlaying !== null && status.playing === localPlaying) {
+      setLocalPlaying(null);
+    }
+  }, [status, localPlaying]);
 
   if (!replayOpen) return null;
 
   const active = status?.active ?? false;
   const st = status?.state ?? "idle";
-  const playing = status?.playing ?? false;
+  const playing = localPlaying ?? status?.playing ?? false;
   const loading = st === "loading";
 
   const start = async () => {
+    if (!day) return;
     setStartErr(null);
     try {
       await api.replayStart(day, startHm);
@@ -78,6 +139,12 @@ export function ReplayToolbar() {
   };
 
   const stop = () => api.replayStop().catch(() => {});
+
+  const cmd = (fn: () => Promise<void>) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    fn().catch(() => {}).finally(() => { busyRef.current = false; });
+  };
 
   const Btn = ({
     title,
@@ -115,26 +182,36 @@ export function ReplayToolbar() {
 
       {!active && (
         <>
-          <CalendarDays className="h-4 w-4 text-muted-foreground" />
-          <input
-            type="date"
-            value={day}
-            onChange={(e) => setDay(e.target.value)}
-            className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground"
-          />
-          <select
-            value={startHm}
-            onChange={(e) => setStartHm(e.target.value)}
-            title="Heure de départ (ET)"
-            className="h-7 rounded border border-border bg-background px-1.5 text-xs text-foreground"
+          <button
+            title="Choisir un jour"
+            onClick={() => setCalendarOpen(true)}
+            className={cn(
+              "flex h-7 items-center gap-1.5 rounded border px-2 text-xs transition-colors",
+              day
+                ? "border-border bg-background text-foreground"
+                : "border-amber-500/40 bg-amber-500/10 text-amber-300 animate-pulse",
+            )}
           >
-            {SESSION_STARTS.map((s) => (
-              <option key={s} value={s}>{s} ET</option>
-            ))}
-          </select>
-          <Btn title="Démarrer le replay" onClick={start}>
-            <Play className="h-3.5 w-3.5" /> Démarrer
-          </Btn>
+            <CalendarDays className="h-3.5 w-3.5" />
+            {day ?? "Sélectionner un jour"}
+          </button>
+          {day && (
+            <>
+              <select
+                value={startHm}
+                onChange={(e) => setStartHm(e.target.value)}
+                title="Heure de départ (ET)"
+                className="h-7 rounded border border-border bg-background px-1.5 text-xs text-foreground"
+              >
+                {SESSION_STARTS.map((s) => (
+                  <option key={s} value={s}>{s} ET</option>
+                ))}
+              </select>
+              <Btn title="Démarrer le replay" onClick={start}>
+                <Play className="h-3.5 w-3.5" /> Démarrer
+              </Btn>
+            </>
+          )}
           {startErr && <span className="text-red-400">{startErr}</span>}
           {st === "error" && status?.error && (
             <span className="truncate text-red-400" title={status.error}>{status.error}</span>
@@ -157,7 +234,6 @@ export function ReplayToolbar() {
 
       {active && !loading && (
         <>
-          {/* Day + source + simulated NY clock */}
           <span className="font-medium text-foreground">{status?.day}</span>
           <span
             className={cn(
@@ -174,21 +250,21 @@ export function ReplayToolbar() {
           >
             {status?.source === "tape" ? "TAPE" : "MINUTES"}
           </span>
-          <span className="min-w-[72px] font-mono text-base font-semibold tabular-nums text-amber-300">
-            {status?.sim_time ? nyTime(status.sim_time, true) : "—"}
-          </span>
+          <EditableTime
+            simTime={status?.sim_time ?? null}
+            onSeek={(hm) => cmd(() => api.replaySeekClock(hm))}
+          />
           {st === "ended" && (
             <span className="text-[10px] uppercase text-muted-foreground">fin de séance</span>
           )}
 
           <span className="mx-1 h-4 w-px bg-border" />
 
-          {/* Session jump points */}
           {SESSION_STARTS.map((hm) => (
             <Btn
               key={hm}
-              title={`Aller à ${hm} ET (retour en arrière = rejoue depuis le début)`}
-              onClick={() => api.replaySeekClock(hm).catch(() => {})}
+              title={`Aller à ${hm} ET`}
+              onClick={() => cmd(() => api.replaySeekClock(hm))}
             >
               <AlarmClock className="h-3 w-3" />
               {hm}
@@ -198,30 +274,40 @@ export function ReplayToolbar() {
           <span className="mx-1 h-4 w-px bg-border" />
 
           {/* Transport */}
-          <Btn title="Reculer de 10 min" onClick={() => api.replaySeekRelative(-600).catch(() => {})}>
-            <Rewind className="h-3.5 w-3.5" /> 10m
-          </Btn>
-          <Btn title="Reculer de 1 min" onClick={() => api.replaySeekRelative(-60).catch(() => {})}>
-            <Rewind className="h-3 w-3" /> 1m
-          </Btn>
           <button
             title={playing ? "Pause" : "Lecture"}
-            onClick={() => api.replaySetPlaying(!playing).catch(() => {})}
+            onClick={() => {
+              const next = !playing;
+              setLocalPlaying(next);
+              cmd(() => api.replaySetPlaying(next));
+            }}
             className="flex h-8 w-8 items-center justify-center rounded-full bg-amber-500/20 text-amber-300 hover:bg-amber-500/30"
           >
             {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
           </button>
-          <Btn title="Avancer de 1 min" onClick={() => api.replaySeekRelative(60).catch(() => {})}>
+          <Btn
+            title="Avancer de 1 min"
+            onClick={() => cmd(() => api.replaySeekRelative(60))}
+          >
             1m <FastForward className="h-3 w-3" />
           </Btn>
-          <Btn title="Avancer de 10 min" onClick={() => api.replaySeekRelative(600).catch(() => {})}>
+          <Btn
+            title="Avancer de 10 min"
+            onClick={() => cmd(() => api.replaySeekRelative(600))}
+          >
             10m <FastForward className="h-3.5 w-3.5" />
+          </Btn>
+          <Btn
+            title="Barre suivante (prochain close 1 min)"
+            onClick={() => cmd(() => api.replayNextBar())}
+          >
+            <SkipForward className="h-3.5 w-3.5" /> Barre
           </Btn>
 
           {/* Speed */}
           <select
             value={String(status?.speed ?? 1)}
-            onChange={(e) => api.replaySetSpeed(Number(e.target.value)).catch(() => {})}
+            onChange={(e) => cmd(() => api.replaySetSpeed(Number(e.target.value)))}
             title="Vitesse de lecture"
             className="h-7 rounded border border-border bg-background px-1.5 text-xs text-foreground"
           >
@@ -234,14 +320,14 @@ export function ReplayToolbar() {
 
           <Btn
             title="Avancer en accéléré jusqu'à la prochaine alerte scanner, puis pause"
-            onClick={() => api.replayNextAlert().catch(() => {})}
+            onClick={() => cmd(() => api.replayNextAlert())}
             activeCls={status?.next_alert_armed}
           >
             <Bell className="h-3.5 w-3.5" /> Prochaine alerte
           </Btn>
           <Btn
             title="Passer à la séance suivante (même heure de départ)"
-            onClick={() => api.replayNextDay().catch(() => {})}
+            onClick={() => cmd(() => api.replayNextDay())}
           >
             <ChevronsRight className="h-3.5 w-3.5" /> Jour suivant
           </Btn>
@@ -264,6 +350,12 @@ export function ReplayToolbar() {
           <X className="h-4 w-4" />
         </button>
       )}
+
+      <DayPickerModal
+        open={calendarOpen}
+        onClose={() => setCalendarOpen(false)}
+        onSelect={(d) => setDay(d)}
+      />
     </div>
   );
 }

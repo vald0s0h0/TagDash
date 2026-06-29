@@ -38,7 +38,7 @@ impl Deepseek {
         user: &str,
         temperature: f32,
     ) -> Result<String, String> {
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let body = json!({
             "model": MODEL,
             "messages": [

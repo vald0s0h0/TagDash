@@ -609,6 +609,30 @@ export interface JournalEntry {
 
 // ─── Logs ────────────────────────────────────────────────────────────────────
 
+export interface TodoTrade {
+  trade_id:       string;
+  symbol:         string;
+  open:           boolean;
+  pnl:            number;
+  has_screenshot: boolean;
+  has_journal:    boolean;
+}
+
+export interface TradeDbRow {
+  trade_id:             string;
+  symbol:               string;
+  side:                 string;
+  open:                 boolean;
+  pnl:                  number;
+  fills:                number;
+  first_fill_at:        string;
+  last_fill_at:         string;
+  has_note:             boolean;
+  has_screenshot:       boolean;
+  sent_to_tradetally:   boolean;
+  synced_on_tradetally: boolean;
+}
+
 export interface LocalLogEntry {
   id: number;
   level: "info" | "warn" | "error";

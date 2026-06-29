@@ -129,7 +129,7 @@ pub(crate) async fn fetch_bars_window(
     end: &str,
     progress: &(dyn Fn(f32) + Sync),
 ) -> Result<HashMap<String, Vec<RawBar>>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: HashMap<String, Vec<RawBar>> = HashMap::new();
     let chunks: Vec<Vec<String>> = symbols
         .iter()
@@ -251,7 +251,7 @@ pub(crate) async fn fetch_trades_window(
     start: &str,
     end: &str,
 ) -> Result<HashMap<String, Vec<RawTrade>>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: HashMap<String, Vec<RawTrade>> = HashMap::new();
     let mut syms: Vec<String> = symbols.iter().filter(|s| is_rest_symbol(s)).cloned().collect();
     let mut page_token: Option<String> = None;
@@ -313,7 +313,7 @@ pub(crate) async fn fetch_quotes_window(
     start: &str,
     end: &str,
 ) -> Result<HashMap<String, Vec<RawQuote>>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: HashMap<String, Vec<RawQuote>> = HashMap::new();
     let mut syms: Vec<String> = symbols.iter().filter(|s| is_rest_symbol(s)).cloned().collect();
     let mut page_token: Option<String> = None;
@@ -395,7 +395,7 @@ pub(crate) async fn fetch_news_window(
     end: &str,
     symbols: &[String],
 ) -> Result<Vec<NewsHeadline>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: Vec<NewsHeadline> = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
@@ -609,16 +609,27 @@ pub async fn load_day(
 
     // 5. Synthetic slices from minute bars. With a tape, only from the cash open
     //    (premarket granularity comes from the tape); without, the whole day.
+    //    Each slice also emits a synthetic NBBO quote (±$0.005 around the trade
+    //    price) so the trading engine sees a realistic bid/ask spread during
+    //    replay instead of the ±0.1% fallback in market_prices().
     for (sym, bars) in &minutes {
         for b in bars {
             if tape_available && b.time < cash_open {
                 continue;
             }
-            let _ = b.vwap; // session VWAP is rebuilt from the slices themselves
             for (ts_ms, price, size, prints) in slices_of(b) {
                 events.push(TimedEvent {
                     ts_ms,
                     ev: Event::Trade { symbol: sym.clone(), price, size, prints },
+                });
+                let half_spread = (price * 0.0003).max(0.005);
+                events.push(TimedEvent {
+                    ts_ms,
+                    ev: Event::Quote {
+                        symbol: sym.clone(),
+                        bid: price - half_spread,
+                        ask: price + half_spread,
+                    },
                 });
             }
         }

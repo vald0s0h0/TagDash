@@ -103,7 +103,7 @@ pub async fn fetch_splits(
     let start = (now - Duration::days(years.max(1) * 366)).format("%Y-%m-%d").to_string();
     let end = now.format("%Y-%m-%d").to_string();
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: Vec<Split> = Vec::new();
     let mut page_token: Option<String> = None;
 
@@ -172,7 +172,7 @@ pub async fn fetch_recent_split_symbols(
     }
     let start = start.get(..10).unwrap_or(start).to_string();
     let end = Utc::now().format("%Y-%m-%d").to_string();
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut hit: HashSet<String> = HashSet::new();
 
     for chunk in symbols.chunks(100) {
@@ -245,7 +245,7 @@ pub async fn fetch_all_splits(
     }
     let start = start.get(..10).unwrap_or(start).to_string();
     let end = crate::time::now().format("%Y-%m-%d").to_string();
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: Vec<SplitEvent> = Vec::new();
 
     for chunk in symbols.chunks(100) {

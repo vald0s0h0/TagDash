@@ -45,6 +45,12 @@ async fn run(
     config: Arc<RwLock<AppConfig>>,
     market: Arc<RwLock<MarketState>>,
 ) {
+    if !super::platform_available() {
+        eprintln!("[tagdash] STT désactivé : macOS < 14 (BLAS crash whisper.cpp)");
+        set_worker(&shared, &app, "paused", Some("non disponible sur ce Mac".into()));
+        return;
+    }
+
     let mut sys = System::new();
     loop {
         let Some(job_id) = first_queued_id(&shared) else {

@@ -45,7 +45,7 @@ impl TagObject {
 
 /// Fetch tags from TradeTally API. Returns names only.
 pub async fn fetch_tags(token: &str, base_url: &str) -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!("{base_url}/api/tags");
     let resp = client
         .get(&url)

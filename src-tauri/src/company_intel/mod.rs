@@ -163,11 +163,18 @@ pub async fn refresh_company_intel_batch(
     };
 
     for symbol in &tickers {
-        match refresh_one(&db, &providers, &keys, &cik_map, symbol).await {
-            true => summary.succeeded += 1,
-            false => summary.with_errors += 1,
-        }
+        let (ok, rate_limited) = refresh_one(&db, &providers, &keys, &cik_map, symbol).await;
+        if ok { summary.succeeded += 1; } else { summary.with_errors += 1; }
         summary.processed += 1;
+        if rate_limited {
+            let remaining = tickers.len() - summary.processed;
+            if remaining > 0 {
+                eprintln!(
+                    "[tagdash][company_intel] provider rate-limited — skipping {remaining} remaining ticker(s)"
+                );
+            }
+            break;
+        }
     }
     summary
 }
@@ -453,29 +460,32 @@ pub async fn collect_sec_bulk(
 
 // ─── One ticker ────────────────────────────────────────────────────────────────
 
-/// Collect + store every section for one ticker. Returns true when no section hit
-/// a genuine (non-NotFound, non-MissingKey) error.
+/// Collect + store every section for one ticker. Returns `(success, rate_limited)`.
 async fn refresh_one(
     db: &Arc<Mutex<rusqlite::Connection>>,
     p: &Providers,
     keys: &Keys,
     cik_map: &HashMap<String, String>,
     symbol: &str,
-) -> bool {
+) -> (bool, bool) {
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut errors: HashMap<String, String> = HashMap::new();
+    let mut rate_limited = false;
 
     // Resolve CIK (cached → ticker map). SEC sections need it; Massive doesn't.
     let cik: Option<String> = resolve_cik(db, cik_map, symbol);
 
     // ── Section 1: short interest (Massive) ──────────────────────────────────
-    if let Some(key) = &keys.massive {
-        match massive_si::fetch_short_interest(&p.massive_http, &p.massive_rl, &p.policy, key, symbol)
-            .await
-        {
-            Ok(si) => with_db(db, |c| { let _ = repo::upsert_short_interest(c, symbol, &si, "Massive", &now); }),
-            Err(E::NotFound) | Err(E::MissingKey) => {}
-            Err(e) => { errors.insert("short_interest".into(), e.to_string()); }
+    if !rate_limited {
+        if let Some(key) = &keys.massive {
+            match massive_si::fetch_short_interest(&p.massive_http, &p.massive_rl, &p.policy, key, symbol)
+                .await
+            {
+                Ok(si) => with_db(db, |c| { let _ = repo::upsert_short_interest(c, symbol, &si, "Massive", &now); }),
+                Err(E::NotFound) | Err(E::MissingKey) => {}
+                Err(ref e) if e.is_rate_limited() => { rate_limited = true; }
+                Err(e) => { errors.insert("short_interest".into(), e.to_string()); }
+            }
         }
     }
 
@@ -491,14 +501,15 @@ async fn refresh_one(
             Err(e) => { errors.insert("financials".into(), e.to_string()); }
         }
     }
-    if !fin_done {
+    if !fin_done && !rate_limited {
         if let Some(key) = &keys.fmp {
             match fmp_fin::fetch_financials(&p.fmp_http, &p.fmp_rl, &p.policy, key, symbol).await {
                 Ok(fh) => {
                     with_db(db, |c| { let _ = repo::upsert_financials(c, symbol, &fh, "FMP", &now); });
-                    errors.remove("financials"); // FMP recovered it
+                    errors.remove("financials");
                 }
                 Err(E::NotFound) | Err(E::MissingKey) => {}
+                Err(ref e) if e.is_rate_limited() => { rate_limited = true; }
                 Err(e) => { errors.entry("financials".into()).or_insert_with(|| e.to_string()); }
             }
         }
@@ -550,7 +561,7 @@ async fn refresh_one(
         serde_json::to_string(&errors).ok()
     };
     with_db(db, |c| { let _ = repo::touch(c, symbol, &now, err_json.as_deref()); });
-    errors.is_empty()
+    (errors.is_empty(), rate_limited)
 }
 
 /// Resolve a ticker's CIK from the cache, else from the ticker→CIK map (persisting

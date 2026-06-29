@@ -78,7 +78,7 @@ pub async fn fetch_recent_headlines(
     }
     let url = reqwest::Url::parse_with_params(NEWS_URL, &params).map_err(|e| e.to_string())?;
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .get(url)
         .header("APCA-API-KEY-ID", key)
@@ -147,7 +147,7 @@ pub async fn fetch_recent_news(
     }
     let url = reqwest::Url::parse_with_params(NEWS_URL, &params).map_err(|e| e.to_string())?;
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .get(url)
         .header("APCA-API-KEY-ID", key)

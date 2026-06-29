@@ -35,10 +35,7 @@ pub struct Http {
 
 impl Http {
     pub fn new(provider: &'static str) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = crate::http::client();
         Self { client, provider }
     }
 

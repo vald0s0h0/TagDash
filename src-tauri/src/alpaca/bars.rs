@@ -116,7 +116,7 @@ pub async fn fetch_daily_bars_since(
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let start = format!("{start_date}T00:00:00Z");
 
     let mut result: HashMap<String, Vec<BarData>> = HashMap::new();
@@ -211,7 +211,7 @@ pub async fn fetch_minute_bars_since(
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: HashMap<String, Vec<Bar>> = HashMap::new();
 
     for chunk in symbols.chunks(200) {
@@ -361,7 +361,7 @@ pub async fn fetch_recent_bars(
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut url = format!(
         "https://data.alpaca.markets/v2/stocks/bars?symbols={symbol}\
          &timeframe={timeframe}&start={start}&limit={limit}&sort=desc&adjustment=split"
@@ -428,7 +428,7 @@ pub async fn fetch_bars_before(
         return Ok(vec![]);
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     // Replay guard: keep the caller's `end` unless the simulated clock is earlier.
     let end = effective_end(tf.seconds(), Some(end)).unwrap_or_else(|| end.to_string());
     let url = format!(

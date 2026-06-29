@@ -89,7 +89,7 @@ pub async fn fetch_short_interest_all(api_key: &str) -> Result<Vec<MassiveShortI
     if api_key.trim().is_empty() {
         return Err("missing Massive API key".into());
     }
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut out: Vec<MassiveShortInterest> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -106,6 +106,10 @@ pub async fn fetch_short_interest_all(api_key: &str) -> Result<Vec<MassiveShortI
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                eprintln!("[tagdash][massive] rate limited — stopping short-interest fetch");
+                break;
+            }
             return Err(format!("Massive short-interest HTTP {status}: {}", &body[..body.len().min(200)]));
         }
         let parsed: Response = resp.json().await.map_err(|e| e.to_string())?;

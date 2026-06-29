@@ -22,7 +22,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
 
-BASE_URL = "https://trade.fabrelexos.synology.me"
+BASE_URL = "https://trade.fabrelexos.synology.me/dashboard"
 TOKEN    = "tt_live_ky0LOz0RE-7xKZJPTVnOf4kxtOpm5pcz"
 ACCOUNT  = "démo mock"
 
