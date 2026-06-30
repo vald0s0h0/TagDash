@@ -1,5 +1,30 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { CheckCircle2, XCircle, X, Play } from "lucide-react";
+import {
+  Bell,
+  CheckCircle2,
+  Database,
+  DownloadCloud,
+  Gamepad2,
+  Gauge,
+  KeyRound,
+  Keyboard,
+  LineChart,
+  ListChecks,
+  Mic,
+  Newspaper,
+  Palette,
+  Play,
+  Radio,
+  Receipt,
+  RefreshCw,
+  ScrollText,
+  ShieldHalf,
+  Table2,
+  Tag,
+  X,
+  XCircle,
+  type LucideIcon,
+} from "lucide-react";
 import { NOTIF_SOUNDS, playNotifSound } from "@/lib/notifSounds";
 import {
   Dialog,
@@ -13,9 +38,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { Badge } from "@/components/ui/badge";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
-import { RestartRequiredDialog } from "@/components/RestartRequiredDialog";
 import { useSecretsStatus, useUpdateSecrets } from "@/queries/useSecretsStatus";
 import { useStrategies, useSetStrategyEnabled, useSetStrategyRisk } from "@/queries/useScanner";
 import {
@@ -23,6 +46,16 @@ import {
   setRecordingActive, type Binding, type HotkeyActionDef, type HotkeyGroup,
 } from "@/stores/hotkeyStore";
 import { GamepadSettings } from "@/components/GamepadSettings";
+import { DataSourceTab } from "@/components/settings/DataSourceTab";
+import { TickersDbTab } from "@/components/settings/TickersDbTab";
+import { TradesDbTab } from "@/components/settings/TradesDbTab";
+import { DicteeTab } from "@/components/settings/DicteeTab";
+import { SyncTab } from "@/components/settings/SyncTab";
+import { StartupTab } from "@/components/settings/StartupTab";
+import { FeedDiagnosticsTab } from "@/components/settings/FeedDiagnosticsTab";
+import { NewsDebugTab } from "@/components/settings/NewsDebugTab";
+import { LogsTab } from "@/components/settings/LogsTab";
+import { UpdateTab } from "@/components/settings/UpdateTab";
 import { useChartThemeStore, type ChartTheme, type ChartThemeSection } from "@/stores/chartThemeStore";
 import { useChartInput, SENS_MIN, SENS_MAX } from "@/stores/chartInputStore";
 import { api } from "@/lib/tauri";
@@ -71,7 +104,8 @@ interface Props {
   onClose: () => void;
 }
 
-/** Editable API-key fields shown in Settings → API Keys (order = display order). */
+/** Editable API-key fields shown in Settings → API Keys (order = display order). The
+ *  tradetally_* keys are rendered in a dedicated "TradeTally" subsection below the rest. */
 const SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
   { key: "alpaca_key",          label: "Alpaca key" },
   { key: "alpaca_secret",       label: "Alpaca secret" },
@@ -80,6 +114,9 @@ const SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
   { key: "fmp_api_key",         label: "FMP API key (fallback)" },
   { key: "claude_api_key",      label: "Claude API key" },
   { key: "deepseek_api_key",    label: "Deepseek API key (news / dilution)" },
+];
+
+const TRADETALLY_SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
   { key: "tradetally_token",    label: "TradeTally token (tt_live_…)" },
   { key: "tradetally_email",    label: "TradeTally email (screenshots)", type: "email" },
   { key: "tradetally_password", label: "TradeTally password (screenshots)" },
@@ -184,6 +221,39 @@ function RiskInput({
           if (e.key === "Enter") (e.target as HTMLInputElement).blur();
         }}
         className="h-6 w-16 text-xs tabular-nums"
+      />
+    </div>
+  );
+}
+
+/** TradeTally API base URL — commits on blur/Enter via its own immediate mutate
+ *  (consistent with the rest of the merged API Keys tab, which doesn't go through
+ *  the parent `draft` + global Save button). */
+function TradeTallyUrlField() {
+  const { data: config } = useLocalConfig();
+  const update = useUpdateLocalConfig();
+  const [text, setText] = useState("");
+
+  useEffect(() => {
+    if (config) setText(config.tradetally.api_base_url);
+  }, [config?.tradetally.api_base_url]);
+
+  function commit() {
+    if (!config || text === config.tradetally.api_base_url) return;
+    update.mutate({ ...config, tradetally: { api_base_url: text } });
+  }
+
+  return (
+    <div className="grid grid-cols-2 items-center gap-4">
+      <Label className="text-right text-xs text-muted-foreground">API base URL</Label>
+      <Input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+        className="h-7 text-xs"
       />
     </div>
   );
@@ -374,7 +444,7 @@ function AppearanceTab() {
         Couleurs et opacités des graphiques. Les changements s'appliquent
         immédiatement à tous les panes ouverts et sont conservés au relancement.
       </p>
-      <div className="max-h-[26rem] space-y-3 overflow-y-auto pr-1">
+      <div className="space-y-3">
         <ThemeGroup title="Navigation (trackpad / molette)">
           <div className="flex items-center justify-between gap-3 py-0.5">
             <span className="text-xs text-muted-foreground">
@@ -468,6 +538,66 @@ function AppearanceTab() {
   );
 }
 
+// ─── Sidebar: tabs grouped by category ──────────────────────────────────────
+
+type TabId =
+  | "trading" | "risque" | "strategies"
+  | "apparence" | "keyboard" | "gamepad" | "notifs"
+  | "data-source" | "latency" | "feed-diagnostics" | "news-debug"
+  | "tickers-db" | "trades-db" | "dictee" | "tags"
+  | "secrets" | "sync" | "startup" | "logs" | "update";
+
+interface TabDef { id: TabId; label: string; icon: LucideIcon }
+interface TabGroup { label: string; tabs: TabDef[] }
+
+const TAB_GROUPS: TabGroup[] = [
+  {
+    label: "Trading",
+    tabs: [
+      { id: "trading",    label: "Trading",     icon: LineChart },
+      { id: "risque",     label: "Risque",      icon: ShieldHalf },
+      { id: "strategies", label: "Stratégies",  icon: ListChecks },
+    ],
+  },
+  {
+    label: "Interface",
+    tabs: [
+      { id: "apparence", label: "Apparence",     icon: Palette },
+      { id: "keyboard",  label: "Clavier",       icon: Keyboard },
+      { id: "gamepad",   label: "Manette Xbox",  icon: Gamepad2 },
+      { id: "notifs",    label: "Notifications", icon: Bell },
+    ],
+  },
+  {
+    label: "Flux de données",
+    tabs: [
+      { id: "data-source",       label: "Source de données", icon: Database },
+      { id: "latency",           label: "Latency",           icon: Gauge },
+      { id: "feed-diagnostics",  label: "Flux live",         icon: Radio },
+      { id: "news-debug",        label: "News premarket",    icon: Newspaper },
+    ],
+  },
+  {
+    label: "Données stockées",
+    tabs: [
+      { id: "tickers-db", label: "Tickers (DB)",  icon: Table2 },
+      { id: "trades-db",  label: "Trades (DB)",   icon: Receipt },
+      { id: "dictee",     label: "Dictée vocale", icon: Mic },
+      { id: "tags",       label: "Tags",          icon: Tag },
+    ],
+  },
+  {
+    label: "Comptes & Système",
+    tabs: [
+      { id: "secrets", label: "API Keys",              icon: KeyRound },
+      { id: "sync",    label: "Sync TradeTally",       icon: RefreshCw },
+      { id: "startup", label: "Pipeline de démarrage", icon: Play },
+      { id: "logs",    label: "Logs",                  icon: ScrollText },
+      { id: "update",  label: "Mise à jour",           icon: DownloadCloud },
+    ],
+  },
+];
+
 export function SettingsModal({ open, onClose }: Props) {
   const { data: config } = useLocalConfig();
   const { data: secrets } = useSecretsStatus();
@@ -479,8 +609,6 @@ export function SettingsModal({ open, onClose }: Props) {
 
   const [draft, setDraft] = useState<AppConfig | null>(null);
   const [tagInput, setTagInput] = useState("");
-  // Changing the data source switches the startup pipeline → prompt for a restart.
-  const [showRestart, setShowRestart] = useState(false);
   // Secret inputs are local + write-only: we only ever send the keys the user
   // typed (non-empty), and clear them after a successful save.
   const [secretInputs, setSecretInputs] = useState<SecretsUpdate>({});
@@ -488,7 +616,7 @@ export function SettingsModal({ open, onClose }: Props) {
 
   function saveSecrets() {
     const updates: SecretsUpdate = {};
-    for (const { key } of SECRET_FIELDS) {
+    for (const { key } of [...SECRET_FIELDS, ...TRADETALLY_SECRET_FIELDS]) {
       const v = secretInputs[key]?.trim();
       if (v) updates[key] = v;
     }
@@ -504,7 +632,6 @@ export function SettingsModal({ open, onClose }: Props) {
   // unmounted, so useState initialisers only run once).
   useEffect(() => {
     if (open) {
-      setShowRestart(false);
       setSecretInputs({});
     }
   }, [open]);
@@ -534,208 +661,202 @@ export function SettingsModal({ open, onClose }: Props) {
 
   function save() {
     if (!draft) return;
-    // A data-source mode change needs a restart (different startup pipeline): keep
-    // the modal flow but raise the restart prompt instead of just closing.
-    const modeChanged =
-      (draft.data_source?.mode ?? "api") !== (config?.data_source?.mode ?? "api");
     update.mutate(draft, {
       onSuccess: () => {
         // Build/destroy the flash overlay on demand from here — it's never created
         // at startup, only when the user has the flash cue enabled.
         api.setFlashOverlay(draft.ui.flash_alerts !== "off").catch(() => {});
-        modeChanged ? setShowRestart(true) : onClose();
+        onClose();
       },
     });
   }
 
   return (
-    <>
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-3xl overflow-hidden">
-        <DialogHeader>
+      <DialogContent className="flex h-[85vh] max-h-[760px] w-[1040px] max-w-[94vw] flex-col gap-0 overflow-hidden p-0">
+        <DialogHeader className="shrink-0 border-b border-border px-4 py-3">
           <DialogTitle>Settings</DialogTitle>
         </DialogHeader>
 
         {!draft ? (
-          <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
             Chargement…
           </div>
-        ) : <>
-        <Tabs defaultValue="trading" className="mt-2">
-          {/* Equal-width grid columns instead of inline-flex: the 8 tabs can never
-              overflow the dialog regardless of the platform font width. */}
-          <TabsList className="grid w-full grid-cols-11">
-            <TabsTrigger value="trading" className="min-w-0 text-xs">Trading</TabsTrigger>
-            <TabsTrigger value="risque" className="min-w-0 text-xs">Risque</TabsTrigger>
-            <TabsTrigger value="strategies" className="min-w-0 text-xs">Stratégies</TabsTrigger>
-            <TabsTrigger value="apparence" className="min-w-0 text-xs">Apparence</TabsTrigger>
-            <TabsTrigger value="hotkeys" className="min-w-0 text-xs">Hotkeys</TabsTrigger>
-            <TabsTrigger value="notifs" className="min-w-0 text-xs">Notifs</TabsTrigger>
-            <TabsTrigger value="latency" className="min-w-0 text-xs">Latency</TabsTrigger>
-            <TabsTrigger value="tags" className="min-w-0 text-xs">Tags</TabsTrigger>
-            <TabsTrigger value="dictee" className="min-w-0 text-xs">Dictée</TabsTrigger>
-            <TabsTrigger value="tradetally" className="min-w-0 text-xs">TradeTally</TabsTrigger>
-            <TabsTrigger value="secrets" className="min-w-0 text-xs">API Keys</TabsTrigger>
-          </TabsList>
-
-          {/* ── Trading ── */}
-          <TabsContent value="trading" className="mt-4 space-y-3">
-            <Field
-              label="Default broker"
-              value={draft.trading.default_broker}
-              onChange={(v) => set("trading", "default_broker", v)}
-            />
-            <Field
-              label="Default account"
-              value={draft.trading.default_account}
-              onChange={(v) => set("trading", "default_account", v)}
-            />
-            <Field
-              label="Commission ($)"
-              value={draft.trading.default_commission}
-              type="number"
-              onChange={(v) => set("trading", "default_commission", parseFloat(v) || 0)}
-            />
-            <Field
-              label="Fees ($)"
-              value={draft.trading.default_fees}
-              type="number"
-              onChange={(v) => set("trading", "default_fees", parseFloat(v) || 0)}
-            />
-            <Field
-              label="Max position size"
-              value={draft.trading.max_position_size}
-              type="number"
-              onChange={(v) => set("trading", "max_position_size", parseInt(v) || 0)}
-            />
-          </TabsContent>
-
-          {/* ── Gestion de risque ── */}
-          <TabsContent value="risque" className="mt-4 space-y-3">
-            <p className="text-xs text-muted-foreground">
-              Réglages de gestion du risque appliqués à chaque nouveau trade.
-            </p>
-
-            <div className="grid grid-cols-2 items-center gap-4">
-              <Label className="text-right text-xs text-muted-foreground">
-                Type d'ordre par défaut
-              </Label>
-              <select
-                value={draft.risk_management?.default_order_type ?? "market"}
-                onChange={(e) =>
-                  set("risk_management", "default_order_type", e.target.value as "limit" | "market")
-                }
-                className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground outline-none"
-              >
-                <option value="market">Market</option>
-                <option value="limit">Limit</option>
-              </select>
-            </div>
-
-            <Separator />
-
-            <div className="rounded-md border border-border px-3 py-2.5">
-              <div className="flex items-center justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium">Break-Even automatique</div>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    Déplace automatiquement le SL au prix d'entrée (BE) lorsque le
-                    trade atteint le multiple de R configuré.
-                  </p>
-                </div>
-                <Switch
-                  checked={draft.risk_management?.auto_be_enabled ?? false}
-                  onCheckedChange={(v) => set("risk_management", "auto_be_enabled", v)}
-                />
-              </div>
-
-              {(draft.risk_management?.auto_be_enabled ?? false) && (
-                <div className="mt-3 grid grid-cols-2 items-center gap-4">
-                  <Label className="text-right text-xs text-muted-foreground">
-                    Déclencher à (×R)
-                  </Label>
-                  <Input
-                    type="number"
-                    min={0.1}
-                    step={0.1}
-                    value={draft.risk_management?.auto_be_r ?? 1}
-                    onChange={(e) =>
-                      set("risk_management", "auto_be_r", parseFloat(e.target.value) || 1)
-                    }
-                    className="h-7 w-20 text-xs tabular-nums"
-                  />
-                </div>
-              )}
-            </div>
-          </TabsContent>
-
-          {/* ── Strategies (runtime on/off, persisted, no code change) ── */}
-          <TabsContent value="strategies" className="mt-4 space-y-2">
-            <p className="text-xs text-muted-foreground">
-              Active/désactive une stratégie et règle le risque $ par trade. Effet
-              immédiat, conservé au relancement — pas besoin de toucher au code.
-            </p>
-            <div className="max-h-72 space-y-1.5 overflow-y-auto pr-1">
-              {strategies.length === 0 && (
-                <span className="text-xs text-muted-foreground/60">Aucune stratégie.</span>
-              )}
-              {strategies.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex items-center justify-between rounded-md border border-border px-3 py-2"
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">{s.name}</span>
-                      <span className="rounded bg-muted px-1 py-0.5 text-[9px] tabular-nums text-muted-foreground">
-                        P{s.priority}
-                      </span>
-                    </div>
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {s.sessions.map((sess) => (
-                        <span
-                          key={sess}
-                          className="rounded bg-blue-900/40 px-1.5 py-0.5 text-[9px] text-blue-300"
-                        >
-                          {SESSION_LABELS[sess] ?? sess}
-                        </span>
-                      ))}
-                    </div>
+        ) : (
+          <Tabs defaultValue="trading" orientation="vertical" className="flex min-h-0 flex-1 flex-row">
+            {/* Sidebar — always visible, grouped by category. */}
+            <TabsList className="flex h-full w-56 shrink-0 flex-col items-stretch justify-start gap-0.5 overflow-y-auto rounded-none border-r border-border bg-card/40 p-2">
+              {TAB_GROUPS.map((group) => (
+                <div key={group.label} className="mt-3 first:mt-0">
+                  <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                    {group.label}
                   </div>
-                  <div className="flex shrink-0 items-center gap-3">
-                    <RiskInput
-                      value={s.max_risk_dollars}
-                      disabled={setStrategyRisk.isPending}
-                      onCommit={(risk) => setStrategyRisk.mutate({ id: s.id, risk })}
-                    />
-                    <Switch
-                      checked={s.enabled}
-                      disabled={setStrategyEnabled.isPending}
-                      onCheckedChange={(v) =>
-                        setStrategyEnabled.mutate({ id: s.id, enabled: v })
-                      }
-                    />
-                  </div>
+                  {group.tabs.map((t) => (
+                    <TabsTrigger
+                      key={t.id}
+                      value={t.id}
+                      className="w-full justify-start gap-2 rounded-md px-2.5 py-1.5 text-left text-xs font-normal text-muted-foreground data-[state=active]:bg-accent data-[state=active]:text-foreground data-[state=active]:shadow-none"
+                    >
+                      <t.icon className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{t.label}</span>
+                    </TabsTrigger>
+                  ))}
                 </div>
               ))}
-            </div>
-          </TabsContent>
+            </TabsList>
 
-          {/* ── Apparence (chart palette: colours + opacities, live) ── */}
-          <TabsContent value="apparence" className="mt-4">
-            <AppearanceTab />
-          </TabsContent>
+            {/* Content pane — scrolls independently of the sidebar. */}
+            <div className="min-w-0 flex-1 overflow-y-auto p-4">
+              {/* ── Trading ── */}
+              <TabsContent value="trading" className="mt-0 space-y-3">
+                <Field
+                  label="Default broker"
+                  value={draft.trading.default_broker}
+                  onChange={(v) => set("trading", "default_broker", v)}
+                />
+                <Field
+                  label="Default account"
+                  value={draft.trading.default_account}
+                  onChange={(v) => set("trading", "default_account", v)}
+                />
+                <Field
+                  label="Commission ($)"
+                  value={draft.trading.default_commission}
+                  type="number"
+                  onChange={(v) => set("trading", "default_commission", parseFloat(v) || 0)}
+                />
+                <Field
+                  label="Fees ($)"
+                  value={draft.trading.default_fees}
+                  type="number"
+                  onChange={(v) => set("trading", "default_fees", parseFloat(v) || 0)}
+                />
+                <Field
+                  label="Max position size"
+                  value={draft.trading.max_position_size}
+                  type="number"
+                  onChange={(v) => set("trading", "max_position_size", parseInt(v) || 0)}
+                />
+              </TabsContent>
 
-          {/* ── Hotkeys → Clavier / Manette Xbox sub-tabs ── */}
-          <TabsContent value="hotkeys" className="mt-4">
-            <Tabs defaultValue="clavier">
-              <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="clavier" className="text-xs">Clavier / Souris</TabsTrigger>
-                <TabsTrigger value="xbox" className="text-xs">Manette Xbox</TabsTrigger>
-              </TabsList>
+              {/* ── Gestion de risque ── */}
+              <TabsContent value="risque" className="mt-0 space-y-3">
+                <p className="text-xs text-muted-foreground">
+                  Réglages de gestion du risque appliqués à chaque nouveau trade.
+                </p>
 
-              {/* Clavier / souris — existing chord recorder. */}
-              <TabsContent value="clavier" className="mt-3 space-y-3">
+                <div className="grid grid-cols-2 items-center gap-4">
+                  <Label className="text-right text-xs text-muted-foreground">
+                    Type d'ordre par défaut
+                  </Label>
+                  <select
+                    value={draft.risk_management?.default_order_type ?? "market"}
+                    onChange={(e) =>
+                      set("risk_management", "default_order_type", e.target.value as "limit" | "market")
+                    }
+                    className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground outline-none"
+                  >
+                    <option value="market">Market</option>
+                    <option value="limit">Limit</option>
+                  </select>
+                </div>
+
+                <Separator />
+
+                <div className="rounded-md border border-border px-3 py-2.5">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">Break-Even automatique</div>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Déplace automatiquement le SL au prix d'entrée (BE) lorsque le
+                        trade atteint le multiple de R configuré.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={draft.risk_management?.auto_be_enabled ?? false}
+                      onCheckedChange={(v) => set("risk_management", "auto_be_enabled", v)}
+                    />
+                  </div>
+
+                  {(draft.risk_management?.auto_be_enabled ?? false) && (
+                    <div className="mt-3 grid grid-cols-2 items-center gap-4">
+                      <Label className="text-right text-xs text-muted-foreground">
+                        Déclencher à (×R)
+                      </Label>
+                      <Input
+                        type="number"
+                        min={0.1}
+                        step={0.1}
+                        value={draft.risk_management?.auto_be_r ?? 1}
+                        onChange={(e) =>
+                          set("risk_management", "auto_be_r", parseFloat(e.target.value) || 1)
+                        }
+                        className="h-7 w-20 text-xs tabular-nums"
+                      />
+                    </div>
+                  )}
+                </div>
+              </TabsContent>
+
+              {/* ── Strategies (runtime on/off, persisted, no code change) ── */}
+              <TabsContent value="strategies" className="mt-0 space-y-2">
+                <p className="text-xs text-muted-foreground">
+                  Active/désactive une stratégie et règle le risque $ par trade. Effet
+                  immédiat, conservé au relancement — pas besoin de toucher au code.
+                </p>
+                <div className="space-y-1.5">
+                  {strategies.length === 0 && (
+                    <span className="text-xs text-muted-foreground/60">Aucune stratégie.</span>
+                  )}
+                  {strategies.map((s) => (
+                    <div
+                      key={s.id}
+                      className="flex items-center justify-between rounded-md border border-border px-3 py-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-sm font-medium">{s.name}</span>
+                          <span className="rounded bg-muted px-1 py-0.5 text-[9px] tabular-nums text-muted-foreground">
+                            P{s.priority}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {s.sessions.map((sess) => (
+                            <span
+                              key={sess}
+                              className="rounded bg-blue-900/40 px-1.5 py-0.5 text-[9px] text-blue-300"
+                            >
+                              {SESSION_LABELS[sess] ?? sess}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3">
+                        <RiskInput
+                          value={s.max_risk_dollars}
+                          disabled={setStrategyRisk.isPending}
+                          onCommit={(risk) => setStrategyRisk.mutate({ id: s.id, risk })}
+                        />
+                        <Switch
+                          checked={s.enabled}
+                          disabled={setStrategyEnabled.isPending}
+                          onCheckedChange={(v) =>
+                            setStrategyEnabled.mutate({ id: s.id, enabled: v })
+                          }
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </TabsContent>
+
+              {/* ── Apparence (chart palette: colours + opacities, live) ── */}
+              <TabsContent value="apparence" className="mt-0">
+                <AppearanceTab />
+              </TabsContent>
+
+              {/* ── Clavier / Souris — chord recorder ── */}
+              <TabsContent value="keyboard" className="mt-0 space-y-3">
                 <p className="text-xs text-muted-foreground">
                   Assigne une touche, une combinaison clavier ou un bouton de souris
                   (boutons latéraux d'une souris multi-boutons) à chaque commande.
@@ -745,7 +866,7 @@ export function SettingsModal({ open, onClose }: Props) {
                   souris</strong> (son pane de gauche), sinon sur la zone active. Clic
                   gauche/droit réservés.
                 </p>
-                <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+                <div className="space-y-3">
                   {HOTKEY_GROUPS.map((group) => (
                     <div key={group}>
                       <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
@@ -761,366 +882,321 @@ export function SettingsModal({ open, onClose }: Props) {
                 </div>
               </TabsContent>
 
-              {/* Manette Xbox — bindings, sensibilité, test en direct. */}
-              <TabsContent value="xbox" className="mt-3">
+              {/* ── Manette Xbox — bindings, sensibilité, test en direct ── */}
+              <TabsContent value="gamepad" className="mt-0">
                 <GamepadSettings />
               </TabsContent>
-            </Tabs>
-          </TabsContent>
 
-          {/* ── Notifications (native OS desktop alerts) ── */}
-          <TabsContent value="notifs" className="mt-4 space-y-3">
-            <div className="flex items-center justify-between rounded-md border border-border px-3 py-2.5">
-              <div className="min-w-0 pr-4">
-                <div className="text-sm font-medium">Alertes système</div>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Envoie une notification Windows / macOS à chaque alerte du scanner,
-                  quelle que soit la stratégie et l'onglet actif.
-                </p>
-              </div>
-              <Switch
-                checked={draft.ui.desktop_alerts}
-                onCheckedChange={(v) => set("ui", "desktop_alerts", v)}
-              />
-            </div>
-
-            <div className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">Flash blanc à l'écran</div>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Un flash blanc plein écran (500&nbsp;ms) à chaque alerte — visible
-                  même si TagDash est caché derrière d'autres fenêtres. L'overlay
-                  est créé à l'enregistrement (jamais au démarrage) ; choisis
-                  «&nbsp;Désactivé&nbsp;» pour le fermer.
-                </p>
-              </div>
-              <AttentionSelect
-                value={draft.ui.flash_alerts}
-                onChange={(v) => set("ui", "flash_alerts", v)}
-              />
-            </div>
-
-            <div className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">Forcer au premier plan</div>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Ramène la fenêtre TagDash au premier plan et fait clignoter son
-                  icône dans la barre des tâches à chaque alerte.
-                </p>
-              </div>
-              <AttentionSelect
-                value={draft.ui.foreground_alerts}
-                onChange={(v) => set("ui", "foreground_alerts", v)}
-              />
-            </div>
-
-            {/* Sound cue: when (by session) + which sound, each previewable. */}
-            <div className="rounded-md border border-border px-3 py-2.5">
-              <div className="flex items-center justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium">Son de notification</div>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    Joue un son léger et discret à chaque alerte du scanner. Choisis
-                    le moment de la session et le son ci-dessous (▶ pour l'écouter).
-                  </p>
-                </div>
-                <AttentionSelect
-                  value={draft.ui.alert_sound_mode}
-                  onChange={(v) => set("ui", "alert_sound_mode", v)}
-                />
-              </div>
-              <div className="mt-2 space-y-1">
-                {NOTIF_SOUNDS.map((s) => {
-                  const selected = draft.ui.alert_sound === s.id;
-                  return (
-                    <div
-                      key={s.id}
-                      className={cn(
-                        "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5",
-                        selected ? "border-blue-500/70 bg-blue-900/20" : "border-border/60",
-                      )}
-                    >
-                      <button
-                        onClick={() => set("ui", "alert_sound", s.id)}
-                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                      >
-                        <span
-                          className={cn(
-                            "h-2.5 w-2.5 shrink-0 rounded-full border",
-                            selected ? "border-blue-400 bg-blue-400" : "border-muted-foreground/40",
-                          )}
-                        />
-                        <span className="truncate text-xs">{s.label}</span>
-                      </button>
-                      <button
-                        onClick={() => playNotifSound(s.id)}
-                        title="Écouter"
-                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
-                      >
-                        <Play className="h-3 w-3" />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <p className="text-[11px] leading-relaxed text-muted-foreground">
-              Réglages côté système&nbsp;:
-              <br />
-              <span className="text-foreground">Windows</span> — autorise les
-              notifications pour TagDash (Paramètres → Système → Notifications) et
-              désactive l'Assistant de concentration / «&nbsp;Ne pas déranger&nbsp;».
-              En mode dev les toasts peuvent ne pas s'afficher&nbsp;; elles
-              fonctionnent une fois l'app installée.
-              <br />
-              <span className="text-foreground">macOS</span> — à la première
-              activation, autorise les notifications dans la fenêtre système (ou
-              Réglages → Notifications → TagDash).
-            </p>
-          </TabsContent>
-
-          {/* ── Latency ── */}
-          <TabsContent value="latency" className="mt-4 space-y-3">
-            <Field
-              label="Warn threshold (ms)"
-              value={draft.latency.warn_ms}
-              type="number"
-              onChange={(v) => set("latency", "warn_ms", parseInt(v) || 0)}
-            />
-            <Field
-              label="Critical threshold (ms)"
-              value={draft.latency.critical_ms}
-              type="number"
-              onChange={(v) => set("latency", "critical_ms", parseInt(v) || 0)}
-            />
-            <Separator />
-            <div className="grid grid-cols-2 items-center gap-4">
-              <Label className="text-right text-xs text-muted-foreground">
-                Alpaca feed
-              </Label>
-              <Input
-                value={draft.alpaca.feed}
-                onChange={(e) => set("alpaca", "feed", e.target.value)}
-                className="h-7 text-xs"
-              />
-            </div>
-            <div className="grid grid-cols-2 items-center gap-4">
-              <Label className="text-right text-xs text-muted-foreground">
-                Use news feed
-              </Label>
-              <Switch
-                checked={draft.alpaca.use_news}
-                onCheckedChange={(v) => set("alpaca", "use_news", v)}
-              />
-            </div>
-          </TabsContent>
-
-          {/* ── Tags (user-defined journal tags) ── */}
-          <TabsContent value="tags" className="mt-4 space-y-3">
-            <p className="text-xs text-muted-foreground">
-              Your journal tags. These appear as suggestions when tagging a trade.
-            </p>
-            <div className="flex flex-wrap gap-1.5">
-              {tags.length === 0 && (
-                <span className="text-xs text-muted-foreground/60">No tags yet.</span>
-              )}
-              {tags.map((t) => (
-                <span
-                  key={t}
-                  className="flex items-center gap-1 rounded bg-blue-900/40 px-2 py-0.5 text-[11px] text-blue-300"
-                >
-                  {t}
-                  <button
-                    onClick={() => removeTag(t)}
-                    className="text-blue-400/60 hover:text-blue-300"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </span>
-              ))}
-            </div>
-            <Input
-              value={tagInput}
-              placeholder="Add a tag and press Enter…"
-              onChange={(e) => setTagInput(e.target.value)}
-              onKeyDown={(e) => {
-                if ((e.key === "Enter" || e.key === ",") && tagInput.trim()) {
-                  e.preventDefault();
-                  addTag(tagInput);
-                }
-              }}
-              className="h-7 text-xs"
-            />
-          </TabsContent>
-
-          {/* ── TradeTally ── */}
-          <TabsContent value="tradetally" className="mt-4 space-y-3">
-            <Field
-              label="API base URL"
-              value={draft.tradetally.api_base_url}
-              onChange={(v) => set("tradetally", "api_base_url", v)}
-            />
-          </TabsContent>
-
-          {/* ── API Keys (status only) ── */}
-          <TabsContent value="secrets" className="mt-4 space-y-1">
-            {/* Data source: live API vs offline flat files (same toggle as in
-                Gestion Flat Files). Persisted in tagdash.toml. */}
-            <div className="mb-3 flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">Source de données</div>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  {(draft.data_source?.mode ?? "api") === "flat_files"
-                    ? "Flat files — pas de temps réel, Market Replay uniquement (ouvert par défaut)."
-                    : "API Alpaca — données temps réel."}
-                </p>
-              </div>
-              <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
-                {(["api", "flat_files"] as const).map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => set("data_source", "mode", m)}
-                    className={cn(
-                      "px-3 py-1.5 text-xs transition-colors",
-                      (draft.data_source?.mode ?? "api") === m
-                        ? "bg-accent text-foreground"
-                        : "text-muted-foreground hover:bg-accent/50",
-                    )}
-                  >
-                    {m === "api" ? "API" : "Flat files"}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <Separator className="mb-3" />
-            <p className="mb-3 text-xs text-muted-foreground">
-              Saisis tes clés ci-dessous puis <strong>Enregistrer les clés</strong> —
-              elles sont écrites dans{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                tagdash.secrets.toml
-              </code>
-              . Un champ laissé vide conserve la clé existante. Les valeurs ne sont
-              jamais relues par l'interface (seul l'état configuré/non est affiché).
-            </p>
-            <div className="max-h-72 space-y-0.5 overflow-y-auto pr-1">
-              {SECRET_FIELDS.map((f) => (
-                <SecretField
-                  key={f.key}
-                  label={f.label}
-                  type={f.type}
-                  configured={secrets?.[f.key] ?? false}
-                  value={secretInputs[f.key] ?? ""}
-                  onChange={(v) => setSecretInputs((s) => ({ ...s, [f.key]: v }))}
-                />
-              ))}
-            </div>
-            <div className="mt-3 flex items-center justify-end gap-2">
-              {updateSecrets.isSuccess && !hasSecretEdits && (
-                <span className="text-xs text-emerald-400">Clés enregistrées ✓</span>
-              )}
-              <Button
-                size="sm"
-                onClick={saveSecrets}
-                disabled={updateSecrets.isPending || !hasSecretEdits}
-              >
-                {updateSecrets.isPending ? "Enregistrement…" : "Enregistrer les clés"}
-              </Button>
-            </div>
-          </TabsContent>
-
-          {/* ── Dictée vocale (Speech-to-Text) ── */}
-          {draft.stt && (
-            <TabsContent value="dictee" className="mt-4 space-y-3">
-              <label className="grid grid-cols-2 items-center gap-4">
-                <span className="text-right text-xs text-muted-foreground">Activer la dictée</span>
-                <input
-                  type="checkbox"
-                  checked={draft.stt.enabled}
-                  onChange={(e) => set("stt", "enabled", e.target.checked)}
-                  className="h-4 w-4 justify-self-start accent-blue-500"
-                />
-              </label>
-
-              <div className="grid grid-cols-2 items-center gap-4">
-                <Label className="text-right text-xs text-muted-foreground">Modèle</Label>
-                <select
-                  value={draft.stt.model}
-                  onChange={(e) => set("stt", "model", e.target.value)}
-                  className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground outline-none"
-                >
-                  <option value="small">small (~466 Mo · rapide)</option>
-                  <option value="medium">medium (~1,5 Go · précis)</option>
-                </select>
-              </div>
-
-              <Field
-                label="Langue (ISO)"
-                value={draft.stt.language}
-                onChange={(v) => set("stt", "language", v)}
-              />
-              <Field
-                label="Pause si CPU > (%)"
-                type="number"
-                value={draft.stt.pause_cpu_pct}
-                onChange={(v) => set("stt", "pause_cpu_pct", parseFloat(v) || 0)}
-              />
-              <Field
-                label="Pause après open (min)"
-                type="number"
-                value={draft.stt.pause_market_open_minutes}
-                onChange={(v) => set("stt", "pause_market_open_minutes", parseInt(v) || 0)}
-              />
-
-              <div className="grid grid-cols-2 gap-4">
-                <Label className="pt-1 text-right text-xs text-muted-foreground">
-                  Jargon (1 terme / ligne)
-                </Label>
-                <div className="space-y-1">
-                  <textarea
-                    value={draft.stt.jargon.join("\n")}
-                    onChange={(e) =>
-                      set(
-                        "stt",
-                        "jargon",
-                        e.target.value.split("\n").map((s) => s.trim()).filter(Boolean),
-                      )
-                    }
-                    rows={6}
-                    className="w-full resize-y rounded border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none"
+              {/* ── Notifications (native OS desktop alerts) ── */}
+              <TabsContent value="notifs" className="mt-0 space-y-3">
+                <div className="flex items-center justify-between rounded-md border border-border px-3 py-2.5">
+                  <div className="min-w-0 pr-4">
+                    <div className="text-sm font-medium">Alertes système</div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Envoie une notification Windows / macOS à chaque alerte du scanner,
+                      quelle que soit la stratégie et l'onglet actif.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={draft.ui.desktop_alerts}
+                    onCheckedChange={(v) => set("ui", "desktop_alerts", v)}
                   />
-                  <p className="text-[10px] text-muted-foreground/60">
-                    Force le français mais autorise ces termes (ex. halt, VWAP, ticker). Bias la
-                    reconnaissance vers le vocabulaire trading.
-                  </p>
                 </div>
-              </div>
-            </TabsContent>
-          )}
-        </Tabs>
 
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            size="sm"
-            onClick={save}
-            disabled={update.isPending || !draft}
-          >
-            {update.isPending ? "Saving…" : "Save"}
-          </Button>
-        </div>
-        </>}
+                <div className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">Flash blanc à l'écran</div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Un flash blanc plein écran (500&nbsp;ms) à chaque alerte — visible
+                      même si TagDash est caché derrière d'autres fenêtres. L'overlay
+                      est créé à l'enregistrement (jamais au démarrage) ; choisis
+                      «&nbsp;Désactivé&nbsp;» pour le fermer.
+                    </p>
+                  </div>
+                  <AttentionSelect
+                    value={draft.ui.flash_alerts}
+                    onChange={(v) => set("ui", "flash_alerts", v)}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">Forcer au premier plan</div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Ramène la fenêtre TagDash au premier plan et fait clignoter son
+                      icône dans la barre des tâches à chaque alerte.
+                    </p>
+                  </div>
+                  <AttentionSelect
+                    value={draft.ui.foreground_alerts}
+                    onChange={(v) => set("ui", "foreground_alerts", v)}
+                  />
+                </div>
+
+                {/* Sound cue: when (by session) + which sound, each previewable. */}
+                <div className="rounded-md border border-border px-3 py-2.5">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">Son de notification</div>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Joue un son léger et discret à chaque alerte du scanner. Choisis
+                        le moment de la session et le son ci-dessous (▶ pour l'écouter).
+                      </p>
+                    </div>
+                    <AttentionSelect
+                      value={draft.ui.alert_sound_mode}
+                      onChange={(v) => set("ui", "alert_sound_mode", v)}
+                    />
+                  </div>
+                  <div className="mt-2 space-y-1">
+                    {NOTIF_SOUNDS.map((s) => {
+                      const selected = draft.ui.alert_sound === s.id;
+                      return (
+                        <div
+                          key={s.id}
+                          className={cn(
+                            "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5",
+                            selected ? "border-blue-500/70 bg-blue-900/20" : "border-border/60",
+                          )}
+                        >
+                          <button
+                            onClick={() => set("ui", "alert_sound", s.id)}
+                            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                          >
+                            <span
+                              className={cn(
+                                "h-2.5 w-2.5 shrink-0 rounded-full border",
+                                selected ? "border-blue-400 bg-blue-400" : "border-muted-foreground/40",
+                              )}
+                            />
+                            <span className="truncate text-xs">{s.label}</span>
+                          </button>
+                          <button
+                            onClick={() => playNotifSound(s.id)}
+                            title="Écouter"
+                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                          >
+                            <Play className="h-3 w-3" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  Réglages côté système&nbsp;:
+                  <br />
+                  <span className="text-foreground">Windows</span> — autorise les
+                  notifications pour TagDash (Paramètres → Système → Notifications) et
+                  désactive l'Assistant de concentration / «&nbsp;Ne pas déranger&nbsp;».
+                  En mode dev les toasts peuvent ne pas s'afficher&nbsp;; elles
+                  fonctionnent une fois l'app installée.
+                  <br />
+                  <span className="text-foreground">macOS</span> — à la première
+                  activation, autorise les notifications dans la fenêtre système (ou
+                  Réglages → Notifications → TagDash).
+                </p>
+              </TabsContent>
+
+              {/* ── Source de données (flat files + toggle API/flat files) ── */}
+              <TabsContent value="data-source" className="mt-0">
+                <DataSourceTab />
+              </TabsContent>
+
+              {/* ── Latency ── */}
+              <TabsContent value="latency" className="mt-0 space-y-3">
+                <Field
+                  label="Warn threshold (ms)"
+                  value={draft.latency.warn_ms}
+                  type="number"
+                  onChange={(v) => set("latency", "warn_ms", parseInt(v) || 0)}
+                />
+                <Field
+                  label="Critical threshold (ms)"
+                  value={draft.latency.critical_ms}
+                  type="number"
+                  onChange={(v) => set("latency", "critical_ms", parseInt(v) || 0)}
+                />
+                <Separator />
+                <div className="grid grid-cols-2 items-center gap-4">
+                  <Label className="text-right text-xs text-muted-foreground">
+                    Alpaca feed
+                  </Label>
+                  <Input
+                    value={draft.alpaca.feed}
+                    onChange={(e) => set("alpaca", "feed", e.target.value)}
+                    className="h-7 text-xs"
+                  />
+                </div>
+                <div className="grid grid-cols-2 items-center gap-4">
+                  <Label className="text-right text-xs text-muted-foreground">
+                    Use news feed
+                  </Label>
+                  <Switch
+                    checked={draft.alpaca.use_news}
+                    onCheckedChange={(v) => set("alpaca", "use_news", v)}
+                  />
+                </div>
+              </TabsContent>
+
+              {/* ── Flux live (Alpaca feed diagnostics) ── */}
+              <TabsContent value="feed-diagnostics" className="mt-0">
+                <FeedDiagnosticsTab />
+              </TabsContent>
+
+              {/* ── News premarket diagnostics ── */}
+              <TabsContent value="news-debug" className="mt-0">
+                <NewsDebugTab />
+              </TabsContent>
+
+              {/* ── Tickers (DB) ── */}
+              <TabsContent value="tickers-db" className="mt-0 h-full">
+                <TickersDbTab />
+              </TabsContent>
+
+              {/* ── Trades (DB) ── */}
+              <TabsContent value="trades-db" className="mt-0 h-full">
+                <TradesDbTab />
+              </TabsContent>
+
+              {/* ── Dictée vocale (config + mic test + queue) ── */}
+              <TabsContent value="dictee" className="mt-0">
+                <DicteeTab />
+              </TabsContent>
+
+              {/* ── Tags (user-defined journal tags) ── */}
+              <TabsContent value="tags" className="mt-0 space-y-3">
+                <p className="text-xs text-muted-foreground">
+                  Your journal tags. These appear as suggestions when tagging a trade.
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {tags.length === 0 && (
+                    <span className="text-xs text-muted-foreground/60">No tags yet.</span>
+                  )}
+                  {tags.map((t) => (
+                    <span
+                      key={t}
+                      className="flex items-center gap-1 rounded bg-blue-900/40 px-2 py-0.5 text-[11px] text-blue-300"
+                    >
+                      {t}
+                      <button
+                        onClick={() => removeTag(t)}
+                        className="text-blue-400/60 hover:text-blue-300"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <Input
+                  value={tagInput}
+                  placeholder="Add a tag and press Enter…"
+                  onChange={(e) => setTagInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if ((e.key === "Enter" || e.key === ",") && tagInput.trim()) {
+                      e.preventDefault();
+                      addTag(tagInput);
+                    }
+                  }}
+                  className="h-7 text-xs"
+                />
+              </TabsContent>
+
+              {/* ── API Keys (status only) + TradeTally (URL + token/email/password) ── */}
+              <TabsContent value="secrets" className="mt-0 space-y-1">
+                <p className="mb-3 text-xs text-muted-foreground">
+                  Saisis tes clés ci-dessous puis <strong>Enregistrer les clés</strong> —
+                  elles sont écrites dans{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                    tagdash.secrets.toml
+                  </code>
+                  . Un champ laissé vide conserve la clé existante. Les valeurs ne sont
+                  jamais relues par l'interface (seul l'état configuré/non est affiché).
+                </p>
+                <div className="space-y-0.5">
+                  {SECRET_FIELDS.map((f) => (
+                    <SecretField
+                      key={f.key}
+                      label={f.label}
+                      type={f.type}
+                      configured={secrets?.[f.key] ?? false}
+                      value={secretInputs[f.key] ?? ""}
+                      onChange={(v) => setSecretInputs((s) => ({ ...s, [f.key]: v }))}
+                    />
+                  ))}
+                </div>
+
+                <Separator className="my-3" />
+                <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                  TradeTally
+                </div>
+                <div className="space-y-2">
+                  <TradeTallyUrlField />
+                  {TRADETALLY_SECRET_FIELDS.map((f) => (
+                    <SecretField
+                      key={f.key}
+                      label={f.label}
+                      type={f.type}
+                      configured={secrets?.[f.key] ?? false}
+                      value={secretInputs[f.key] ?? ""}
+                      onChange={(v) => setSecretInputs((s) => ({ ...s, [f.key]: v }))}
+                    />
+                  ))}
+                </div>
+
+                <div className="mt-3 flex items-center justify-end gap-2">
+                  {updateSecrets.isSuccess && !hasSecretEdits && (
+                    <span className="text-xs text-emerald-400">Clés enregistrées ✓</span>
+                  )}
+                  <Button
+                    size="sm"
+                    onClick={saveSecrets}
+                    disabled={updateSecrets.isPending || !hasSecretEdits}
+                  >
+                    {updateSecrets.isPending ? "Enregistrement…" : "Enregistrer les clés"}
+                  </Button>
+                </div>
+              </TabsContent>
+
+              {/* ── Sync TradeTally ── */}
+              <TabsContent value="sync" className="mt-0">
+                <SyncTab />
+              </TabsContent>
+
+              {/* ── Pipeline de démarrage (read-only review) ── */}
+              <TabsContent value="startup" className="mt-0">
+                <StartupTab />
+              </TabsContent>
+
+              {/* ── Logs ── */}
+              <TabsContent value="logs" className="mt-0 h-full">
+                <LogsTab />
+              </TabsContent>
+
+              {/* ── Mise à jour ── */}
+              <TabsContent value="update" className="mt-0">
+                <UpdateTab />
+              </TabsContent>
+            </div>
+          </Tabs>
+        )}
+
+        {draft && (
+          <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-4 py-3">
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={save}
+              disabled={update.isPending || !draft}
+            >
+              {update.isPending ? "Saving…" : "Save"}
+            </Button>
+          </div>
+        )}
       </DialogContent>
     </Dialog>
-    <RestartRequiredDialog
-      open={showRestart}
-      onClose={() => {
-        setShowRestart(false);
-        onClose();
-      }}
-    />
-    </>
   );
 }

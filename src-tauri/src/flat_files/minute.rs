@@ -282,6 +282,43 @@ fn prior_trading_days(day: &str, n: usize) -> Vec<String> {
 
 // ─── Reader (offline replay source) ─────────────────────────────────────────────
 
+/// Premarket `[start_ms, end_ms)` 1-minute bars for every symbol in the day's minute
+/// file, keyed by symbol. Used by the trade pre-scan as its candidate universe
+/// (`flat_files::trade::write_day`) instead of re-fetching from Alpaca: the minute
+/// file already holds the day's top-2000-by-volume active set, so this gives the
+/// pre-scan a day-correct, float-agnostic candidate pool for free.
+pub fn read_premarket_bars(
+    app_dir: &Path,
+    day: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<HashMap<String, Vec<(i64, f64, f64, f64, f64, i64)>>, String> {
+    let path = minute_path(app_dir, day);
+    let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT symbol, t_ms, o, h, l, c, v FROM minute_bars WHERE t_ms >= ?1 AND t_ms < ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![start_ms, end_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, f64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out: HashMap<String, Vec<(i64, f64, f64, f64, f64, i64)>> = HashMap::new();
+    for row in rows.flatten() {
+        let (symbol, t_ms, o, h, l, c, v) = row;
+        out.entry(symbol).or_default().push((t_ms, o, h, l, c, v));
+    }
+    Ok(out)
+}
+
 /// Rebuild a `DayData` from the minute file, optionally overlaying real trades+quotes
 /// from the trade file (the synthetic slices inside an overlay window are suppressed).
 pub fn read_day(

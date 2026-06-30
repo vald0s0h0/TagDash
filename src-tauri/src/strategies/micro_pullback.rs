@@ -122,7 +122,9 @@ impl ScanStrategy for MicroPullback {
                 InfoField { key: "days_since_split".into(),label: "Split".into(),    source: InfoSource::Enrichment },
                 InfoField { key: "classification".into(),  label: "Profil".into(),   source: InfoSource::Enrichment },
             ],
-            // Two Deepseek calls (prompts FR). {placeholders} filled at call time.
+            // Declared so the info-bar "Analyse IA" button shows for this strategy.
+            // Two Deepseek calls (prompts FR), user-triggered only — see
+            // `enrichment::run_micro_pullback_llm` (the template below is documentary).
             llm: Some(LlmSpec {
                 prompt_template: "1) Si une news est détectée pour {symbol}, lis-la et dis très \
                     brièvement en français si elle est du bluff ou solide (mots-clés, arguments). \

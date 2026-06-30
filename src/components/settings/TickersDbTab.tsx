@@ -1,15 +1,13 @@
+// Settings → Données stockées → Tickers (DB). Ported from the former TickersTableModal —
+// same query/table/search/sort, just dropped the Dialog wrapper and resized to fill the
+// fixed-size Settings content pane (the table scrolls internally, both axes).
+
 import { useEffect, useMemo, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, ChevronsUpDown, Database, RefreshCw, Search } from "lucide-react";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { ArrowDown, ArrowUp, ChevronsUpDown, RefreshCw, Search } from "lucide-react";
 import { api } from "@/lib/tauri";
 import type { TickerTableRow } from "@/types";
 import { cn } from "@/lib/utils";
-
-interface Props {
-  open: boolean;
-  onClose: () => void;
-}
 
 /** Max rows returned per query (the universe is too big to load whole). */
 const LIMIT = 200;
@@ -219,7 +217,7 @@ function formatCell(kind: Kind, value: unknown): React.ReactNode {
 
 type SortState = { key: keyof TickerTableRow; dir: "asc" | "desc" } | null;
 
-export function TickersTableModal({ open, onClose }: Props) {
+export function TickersDbTab() {
   // Backend-driven search (debounced) — only a bounded extract is ever loaded.
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
@@ -231,20 +229,9 @@ export function TickersTableModal({ open, onClose }: Props) {
     return () => clearTimeout(t);
   }, [search]);
 
-  // Reset everything when the modal opens.
-  useEffect(() => {
-    if (open) {
-      setSearch("");
-      setDebounced("");
-      setLocalFilter("");
-      setSort(null);
-    }
-  }, [open]);
-
   const { data = [], isLoading, isFetching, refetch } = useQuery({
     queryKey: ["tickers_table", debounced],
     queryFn: () => api.getTickersTable(debounced, LIMIT),
-    enabled: open,
     staleTime: 30_000,
     placeholderData: keepPreviousData,
   });
@@ -282,134 +269,127 @@ export function TickersTableModal({ open, onClose }: Props) {
     );
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="flex h-[92vh] w-[96vw] max-w-none flex-col gap-0 p-0">
-        {/* Header / toolbar */}
-        <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2.5 pr-12">
-          <div className="flex items-center gap-2 text-sm font-semibold">
-            <Database className="h-4 w-4" />
-            Données tickers (DB)
-          </div>
-
-          <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1">
-            <Search className="h-3.5 w-3.5 text-muted-foreground" />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Rechercher un ticker (ex: AAPL) ou un nom…"
-              className="w-72 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-            />
-          </div>
-
+    <div className="flex h-full flex-col gap-0">
+      {/* Toolbar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border pb-2.5">
+        <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1">
+          <Search className="h-3.5 w-3.5 text-muted-foreground" />
           <input
-            value={localFilter}
-            onChange={(e) => setLocalFilter(e.target.value)}
-            placeholder="Filtrer l'extrait…"
-            className="rounded-md border border-border bg-background px-2 py-1 text-xs outline-none placeholder:text-muted-foreground"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Rechercher un ticker (ex: AAPL) ou un nom…"
+            className="w-72 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
           />
-
-          <button
-            onClick={() => refetch()}
-            title="Rafraîchir"
-            className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
-          >
-            <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Rafraîchir
-          </button>
-
-          <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">
-            {debounced
-              ? `${rows.length} résultat(s)`
-              : `extrait : ${rows.length} ligne(s) récemment collectées`}
-            {data.length >= LIMIT && ` · max ${LIMIT}, affinez la recherche`}
-          </span>
         </div>
 
-        {/* Table */}
-        {isLoading ? (
-          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-            Chargement…
-          </div>
-        ) : rows.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">
-            {debounced
-              ? `Aucun résultat pour « ${debounced} ».`
-              : "Aucun ticker enrichi pour l'instant — recherchez un ticker (ex: AAPL) pour voir ses données."}
-          </div>
-        ) : (
-          <div className="flex-1 overflow-auto">
-            <table className="w-max border-collapse text-[11px]">
-              <thead className="sticky top-0 z-10 bg-card">
-                {/* Theme group headers — each spans its columns. */}
-                <tr className="border-b border-border">
-                  {GROUPS.map((g, gi) => (
-                    <th
-                      key={g.title}
-                      colSpan={g.cols.length}
-                      className={cn(
-                        "select-none border-r border-border/60 px-1.5 py-1 text-center text-[10px] font-bold uppercase tracking-wide text-muted-foreground/80",
-                        gi % 2 ? "bg-muted/20" : "bg-muted/40"
-                      )}
-                    >
-                      {g.title}
-                    </th>
-                  ))}
-                </tr>
-                <tr className="border-b border-border">
-                  {COLS.map((c) => {
-                    const active = sort?.key === c.key;
-                    return (
-                      <th
-                        key={c.key}
-                        onClick={() => toggleSort(c.key)}
-                        style={{ width: c.w, minWidth: c.w }}
-                        className="cursor-pointer select-none border-r border-border/40 px-1.5 py-1.5 text-left font-semibold text-muted-foreground hover:text-foreground"
-                        title="Cliquer pour trier"
-                      >
-                        <div className="flex items-center gap-0.5">
-                          <span className="truncate">{c.header}</span>
-                          {active ? (
-                            sort!.dir === "asc" ? (
-                              <ArrowUp className="h-3 w-3 shrink-0 text-foreground" />
-                            ) : (
-                              <ArrowDown className="h-3 w-3 shrink-0 text-foreground" />
-                            )
-                          ) : (
-                            <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-20" />
-                          )}
-                        </div>
-                      </th>
-                    );
-                  })}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row, i) => (
-                  <tr
-                    key={row.symbol}
+        <input
+          value={localFilter}
+          onChange={(e) => setLocalFilter(e.target.value)}
+          placeholder="Filtrer l'extrait…"
+          className="rounded-md border border-border bg-background px-2 py-1 text-xs outline-none placeholder:text-muted-foreground"
+        />
+
+        <button
+          onClick={() => refetch()}
+          title="Rafraîchir"
+          className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+        >
+          <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Rafraîchir
+        </button>
+
+        <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">
+          {debounced
+            ? `${rows.length} résultat(s)`
+            : `extrait : ${rows.length} ligne(s) récemment collectées`}
+          {data.length >= LIMIT && ` · max ${LIMIT}, affinez la recherche`}
+        </span>
+      </div>
+
+      {/* Table */}
+      {isLoading ? (
+        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          Chargement…
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">
+          {debounced
+            ? `Aucun résultat pour « ${debounced} ».`
+            : "Aucun ticker enrichi pour l'instant — recherchez un ticker (ex: AAPL) pour voir ses données."}
+        </div>
+      ) : (
+        <div className="flex-1 overflow-auto">
+          <table className="w-max border-collapse text-[11px]">
+            <thead className="sticky top-0 z-10 bg-card">
+              {/* Theme group headers — each spans its columns. */}
+              <tr className="border-b border-border">
+                {GROUPS.map((g, gi) => (
+                  <th
+                    key={g.title}
+                    colSpan={g.cols.length}
                     className={cn(
-                      "border-b border-border/30 hover:bg-accent/30",
-                      i % 2 ? "bg-transparent" : "bg-muted/20"
+                      "select-none border-r border-border/60 px-1.5 py-1 text-center text-[10px] font-bold uppercase tracking-wide text-muted-foreground/80",
+                      gi % 2 ? "bg-muted/20" : "bg-muted/40"
                     )}
                   >
-                    {COLS.map((c) => (
-                      <td
-                        key={c.key}
-                        style={{ width: c.w, minWidth: c.w, maxWidth: c.w }}
-                        className={cn(
-                          "overflow-hidden truncate whitespace-nowrap border-r border-border/20 px-1.5 py-1 tabular-nums",
-                          c.key === "symbol" && "font-semibold text-foreground"
-                        )}
-                      >
-                        {formatCell(c.kind, row[c.key])}
-                      </td>
-                    ))}
-                  </tr>
+                    {g.title}
+                  </th>
                 ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
+              </tr>
+              <tr className="border-b border-border">
+                {COLS.map((c) => {
+                  const active = sort?.key === c.key;
+                  return (
+                    <th
+                      key={c.key}
+                      onClick={() => toggleSort(c.key)}
+                      style={{ width: c.w, minWidth: c.w }}
+                      className="cursor-pointer select-none border-r border-border/40 px-1.5 py-1.5 text-left font-semibold text-muted-foreground hover:text-foreground"
+                      title="Cliquer pour trier"
+                    >
+                      <div className="flex items-center gap-0.5">
+                        <span className="truncate">{c.header}</span>
+                        {active ? (
+                          sort!.dir === "asc" ? (
+                            <ArrowUp className="h-3 w-3 shrink-0 text-foreground" />
+                          ) : (
+                            <ArrowDown className="h-3 w-3 shrink-0 text-foreground" />
+                          )
+                        ) : (
+                          <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-20" />
+                        )}
+                      </div>
+                    </th>
+                  );
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => (
+                <tr
+                  key={row.symbol}
+                  className={cn(
+                    "border-b border-border/30 hover:bg-accent/30",
+                    i % 2 ? "bg-transparent" : "bg-muted/20"
+                  )}
+                >
+                  {COLS.map((c) => (
+                    <td
+                      key={c.key}
+                      style={{ width: c.w, minWidth: c.w, maxWidth: c.w }}
+                      className={cn(
+                        "overflow-hidden truncate whitespace-nowrap border-r border-border/20 px-1.5 py-1 tabular-nums",
+                        c.key === "symbol" && "font-semibold text-foreground"
+                      )}
+                    >
+                      {formatCell(c.kind, row[c.key])}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }

@@ -55,9 +55,11 @@ pub async fn run(
         e.strategy_id = strategy_id.clone();
     });
 
-    // Hydrate the last persisted LLM result (panic) so a re-opened zone shows the
-    // previous verdict immediately, without re-calling the model. A fresh button
-    // click overwrites it (and appends a new history row).
+    // Hydrate the last persisted LLM result so a re-opened zone shows the previous
+    // read immediately, without re-calling the model. A fresh button click
+    // overwrites it (and appends a new history row). Both panic (context/verdict)
+    // and micro_pullback (dilution/news) results are appended to the same table;
+    // map them back to the fields each strategy's card actually reads.
     if strategy_id == crate::strategies::panic_mean_reversion::ID {
         let latest = {
             let conn = db.lock().unwrap();
@@ -69,16 +71,25 @@ pub async fn run(
                 e.llm_reversion = a.verdict;
             });
         }
+    } else if strategy_id == crate::strategies::micro_pullback::ID {
+        let latest = {
+            let conn = db.lock().unwrap();
+            crate::local_db::llm_repository::get_latest(&conn, &symbol).ok().flatten()
+        };
+        if let Some(a) = latest {
+            update(&store, &symbol, |e| {
+                e.llm_dilution = a.context;
+                e.llm_news = a.verdict;
+            });
+        }
     }
 
-    // Snapshot the secrets we need (don't hold the lock across awaits).
-    let (alpaca_key, alpaca_secret, deepseek_key) = {
+    // Snapshot the secrets we need (don't hold the lock across awaits). The
+    // Deepseek key isn't needed here — both strategies' LLM reads are
+    // user-triggered (see `run_panic_llm` / `run_micro_pullback_llm`).
+    let (alpaca_key, alpaca_secret) = {
         let s = secrets.read().unwrap();
-        (
-            s.alpaca_key.clone(),
-            s.alpaca_secret.clone(),
-            s.deepseek_api_key.clone(),
-        )
+        (s.alpaca_key.clone(), s.alpaca_secret.clone())
     };
 
     // ── Step 1: immediate, from the local DB (country / industry / float) ──
@@ -159,42 +170,9 @@ pub async fn run(
         e.news_checked = true;
     });
 
-    // ── Step 5: Deepseek (max 2 calls). No-op when the key is absent. ──
-    // panic_mean_reversion does NOT auto-run the LLM — its context/verdict read is
-    // user-triggered via a button (see `run_panic_llm` + the `run_alert_llm`
-    // command). The micro_pullback auto-read below is unchanged.
-    if strategy_id == crate::strategies::panic_mean_reversion::ID {
-        update(&store, &symbol, |e| e.status = "done".into());
-        return;
-    }
-    if let Some(dk) = &deepseek_key {
-        update(&store, &symbol, |e| e.llm_pending = true);
-        let ds = crate::llm::deepseek::Deepseek::new(dk.clone());
-
-        // (a) Recent risks, dilution-focused (always).
-        let dilution_prompt = format!(
-            "Quels sont les risques récents autour de {symbol}, surtout la dilution \
-             (contexte: scalping intraday, pas d'analyse long terme) ? Réponds en quelques mots."
-        );
-        if let Ok(ans) = ds.complete(SYSTEM_FR, &dilution_prompt).await {
-            update(&store, &symbol, |e| e.llm_dilution = Some(ans));
-        }
-
-        // (b) News bluff vs solid (only when a news item was found).
-        if let Some(n) = &news_item {
-            let news_prompt = format!(
-                "Voici une news sur {symbol}: \"{}\". Est-ce du bluff ou solide ? \
-                 Réponds très brièvement (mots-clés, arguments).",
-                n.headline
-            );
-            if let Ok(ans) = ds.complete(SYSTEM_FR, &news_prompt).await {
-                update(&store, &symbol, |e| e.llm_news = Some(ans));
-            }
-        }
-
-        update(&store, &symbol, |e| e.llm_pending = false);
-    }
-
+    // Neither strategy auto-runs the LLM step — both reads are user-triggered via
+    // the info-bar button (see `run_panic_llm` / `run_micro_pullback_llm` + the
+    // `run_alert_llm` command).
     update(&store, &symbol, |e| e.status = "done".into());
 }
 
@@ -294,6 +272,65 @@ pub async fn run_panic_llm(
         Err(err) => {
             update(&store, &symbol, |e| e.llm_context = Some(format!("Erreur LLM: {err}")));
         }
+    }
+
+    update(&store, &symbol, |e| {
+        e.llm_pending = false;
+        e.status = "done".into();
+    });
+}
+
+/// On-demand micro_pullback LLM read (button-triggered, never automatic). Used
+/// to fire on every alert — that hammered the Deepseek quota on a busy scanner
+/// day, so the read is now a click like panic's. Reuses the news headline
+/// already gathered by the automatic enrichment steps instead of re-fetching it.
+pub async fn run_micro_pullback_llm(
+    symbol: String,
+    db: Arc<Mutex<rusqlite::Connection>>,
+    secrets: Arc<RwLock<Secrets>>,
+    store: Store,
+) {
+    let deepseek_key = secrets.read().unwrap().deepseek_api_key.clone();
+    let Some(dk) = deepseek_key else { return };
+
+    update(&store, &symbol, |e| e.llm_pending = true);
+    let ds = crate::llm::deepseek::Deepseek::new(dk);
+    let news_title = store.read().unwrap().get(&symbol).and_then(|e| e.news_title.clone());
+
+    // (a) Recent risks, dilution-focused (always).
+    let dilution_prompt = format!(
+        "Quels sont les risques récents autour de {symbol}, surtout la dilution \
+         (contexte: scalping intraday, pas d'analyse long terme) ? Réponds en quelques mots."
+    );
+    let dilution_ans = ds.complete(SYSTEM_FR, &dilution_prompt).await.ok();
+    if let Some(ans) = &dilution_ans {
+        update(&store, &symbol, |e| e.llm_dilution = Some(ans.clone()));
+    }
+
+    // (b) News bluff vs solid (only when a news item was found).
+    let mut news_ans = None;
+    if let Some(headline) = &news_title {
+        let news_prompt = format!(
+            "Voici une news sur {symbol}: \"{headline}\". Est-ce du bluff ou solide ? \
+             Réponds très brièvement (mots-clés, arguments)."
+        );
+        news_ans = ds.complete(SYSTEM_FR, &news_prompt).await.ok();
+        if let Some(ans) = &news_ans {
+            update(&store, &symbol, |e| e.llm_news = Some(ans.clone()));
+        }
+    }
+
+    // Persist only the outputs, appended to history (mirrors `run_panic_llm`),
+    // so a re-opened zone hydrates the last read without re-calling the model.
+    {
+        let conn = db.lock().unwrap();
+        let _ = crate::local_db::llm_repository::insert_result(
+            &conn,
+            &symbol,
+            crate::strategies::micro_pullback::ID,
+            dilution_ans.as_deref(),
+            news_ans.as_deref(),
+        );
     }
 
     update(&store, &symbol, |e| {

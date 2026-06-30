@@ -1325,19 +1325,18 @@ pub fn start_alert_enrichment(
     tauri::async_runtime::spawn(crate::enrichment::run(symbol, strategy_id, db, secrets, market, store));
 }
 
-/// User-triggered LLM read for the displayed alert (NOT automatic). Currently only
-/// panic_mean_reversion uses it: a button in the info band fires this, which makes
-/// one Deepseek call producing a short context summary + a mean-reversion verdict
-/// (see `enrichment::run_panic_llm`). Ignored while a call is already in flight.
+/// User-triggered LLM read for the displayed alert (NOT automatic). A button in
+/// the info band fires this for any strategy whose card declares an `llm` spec
+/// (currently panic_mean_reversion and micro_pullback) — one Deepseek call (or
+/// two, for micro_pullback) producing a short context/verdict pair (see
+/// `enrichment::run_panic_llm` / `enrichment::run_micro_pullback_llm`). Ignored
+/// while a call is already in flight.
 #[tauri::command(rename_all = "snake_case")]
 pub fn run_alert_llm(
     symbol:      String,
     strategy_id: String,
     state:       tauri::State<'_, AppState>,
 ) {
-    if strategy_id != crate::strategies::panic_mean_reversion::ID {
-        return;
-    }
     // Don't stack calls if one is already running for this symbol.
     if let Some(e) = state.enrichments.read().unwrap().get(&symbol) {
         if e.llm_pending {
@@ -1347,7 +1346,11 @@ pub fn run_alert_llm(
     let db = state.db.clone();
     let secrets = state.secrets.clone();
     let store = state.enrichments.clone();
-    tauri::async_runtime::spawn(crate::enrichment::run_panic_llm(symbol, db, secrets, store));
+    if strategy_id == crate::strategies::panic_mean_reversion::ID {
+        tauri::async_runtime::spawn(crate::enrichment::run_panic_llm(symbol, db, secrets, store));
+    } else if strategy_id == crate::strategies::micro_pullback::ID {
+        tauri::async_runtime::spawn(crate::enrichment::run_micro_pullback_llm(symbol, db, secrets, store));
+    }
 }
 
 /// Current progressive enrichment for a symbol (polled by the info band).

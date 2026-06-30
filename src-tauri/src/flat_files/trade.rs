@@ -17,6 +17,17 @@
 // cost of a candidate set that is close to — but not strictly identical to — the live
 // alerts. The genuine alerts are still produced by the real engine during replay, now on
 // real ticks.
+//
+// The pre-scan's candidate universe is read straight from the day's already-downloaded
+// `minute-<day>.db` (its top-2000-by-volume active set, day-correct — not today's
+// possibly-stale `universe_assets` snapshot, and not float-filtered upfront: a symbol
+// with no known float is admitted to the scan, mirroring micro_pullback's
+// `allow_unknown_float` gate — see `admit_float`). The current float is only used as a
+// generous heuristic prefilter on symbols that DO have one on record.
+//
+// News is fetched per (symbol, ignition window) over the NEWS_LOOKBACK_MS days
+// strictly BEFORE that alert's `alert_ms` — never after, to avoid leaking news a
+// trader reviewing the alert offline couldn't have known about at the time.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,8 +45,8 @@ use crate::replay::data;
 // ── Pre-scan tuning (coarse minute-resolution approximation of the ignition gate) ──
 /// Generous current-float ceiling for the candidate fetch. Wider than the strategy's
 /// `float_max` so a name that has DILUTED since the day (float grew) is still fetched;
-/// the as-of float is the final arbiter. Names with no known float are excluded (can't
-/// bound the prescan otherwise).
+/// the as-of float is the final arbiter. Names with NO known float are admitted
+/// unconditionally (see `admit_float`) — mirrors `allow_unknown_float`.
 const PREFILTER_FLOAT_MULT: u64 = 3;
 /// A minute ignites when volume or range clears these multiples of the trailing
 /// 5-minute baseline (and the absolute volume floor below).
@@ -49,8 +60,13 @@ const MIN_BASELINE_MIN: usize = 2;
 const WIN_BEFORE_MS: i64 = 60_000;
 const WIN_AFTER_MS: i64 = 600_000;
 /// Cap on ignition symbols per day (bounds the per-ticker as-of float calls — Massive's
-/// free tier is ~1 req/13s — and the trade/quote downloads).
-const MAX_WINDOW_SYMBOLS: usize = 60;
+/// free tier is ~1 req/13s — and the trade/quote downloads). 120 ≈ 26 min of as-of
+/// calls/day.
+const MAX_WINDOW_SYMBOLS: usize = 120;
+/// News lookback before each ignition alert — strictly BEFORE the alert, never after:
+/// a trader reviewing the alert offline must only see what was knowable at that
+/// moment (no look-ahead / data leakage).
+const NEWS_LOOKBACK_MS: i64 = 3 * 24 * 60 * 60 * 1_000;
 
 // ─── Availability + calendar ────────────────────────────────────────────────────
 
@@ -144,40 +160,46 @@ pub async fn write_day(
     let noon = data::noon_utc(nd);
     let pm_start = crate::time::et_clock_utc(noon, 4, 0); // 04:00 ET
     let cash_open = crate::time::et_clock_utc(noon, 9, 30); // 09:30 ET (Micro Pullback is premarket-only)
-    let day_end = crate::time::et_clock_utc(noon, 20, 0); // 20:00 ET
 
-    // 1. Candidate universe: known float ≤ generous ceiling (price filtered later via bars).
+    // 1. Candidate universe + premarket bars: read straight from the day's minute
+    // file (already downloaded — it holds the day's top-2000-by-volume active set,
+    // day-correct, not float-filtered). No Alpaca re-fetch needed.
+    if !super::minute::has_day(app_dir, day) {
+        return Err(format!("le fichier minute du {day} doit être téléchargé avant le fichier trade"));
+    }
+    let bars = super::minute::read_premarket_bars(
+        app_dir, day, pm_start.timestamp_millis(), cash_open.timestamp_millis(),
+    )?;
+    if bars.is_empty() {
+        return Err(format!("aucune donnée minute premarket pour le {day}"));
+    }
+    shared.set_progress(0.15);
+
+    // 2. Current float lookup (batch, used as a heuristic prefilter — the as-of
+    // float in step 4 is the final arbiter). A symbol with no known float is
+    // admitted, mirroring micro_pullback's gate1_tradeable (`allow_unknown_float`).
     let prefilter_max = cfg.float_max.saturating_mul(PREFILTER_FLOAT_MULT);
-    let candidates: Vec<String> = {
+    let current_floats: HashMap<String, u64> = {
         let conn = db.lock().unwrap();
         crate::local_db::universe_repository::get_all(&conn)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter_map(|a| {
-                let f = a.float_shares.filter(|f| *f > 0)? as u64;
-                (f <= prefilter_max).then_some(a.symbol)
-            })
+            .filter_map(|a| a.float_shares.filter(|f| *f > 0).map(|f| (a.symbol, f as u64)))
             .collect()
     };
-    if candidates.is_empty() {
-        return Err("aucun candidat low-float — univers vide ?".into());
-    }
-
-    // 2. Premarket 1-minute bars for the candidates (the pre-scan input).
-    let min_start = pm_start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let min_end = cash_open.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let bars = data::fetch_bars_window(
-        key, secret, &candidates, "1Min", &min_start, &min_end, &|f| shared.set_progress(f * 0.5),
-    )
-    .await?;
 
     // 3. Pre-scan → ignition windows per symbol (strongest first, capped).
     let mut scored: Vec<(String, f64, Vec<Window>)> = Vec::new();
     for (sym, raw) in &bars {
+        if !admit_float(current_floats.get(sym).copied(), prefilter_max) {
+            continue;
+        }
         if let Some((strength, wins)) = scan_symbol(raw, &cfg) {
             scored.push((sym.clone(), strength, wins));
         }
     }
+    let ignited_candidates = scored.len();
+    let capped = ignited_candidates > MAX_WINDOW_SYMBOLS;
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(MAX_WINDOW_SYMBOLS);
     shared.set_progress(0.55);
@@ -246,7 +268,7 @@ pub async fn write_day(
             let (Some(s), Some(e)) = (ms_to_rfc3339(w.start_ms), ms_to_rfc3339(w.end_ms)) else {
                 continue;
             };
-            match data::fetch_trades_window(key, secret, &one, &s, &e).await {
+            match fetch_with_retry(|| data::fetch_trades_window(key, secret, &one, &s, &e)).await {
                 Ok(map) => {
                     for t in map.get(sym).into_iter().flatten() {
                         if let Some(ms) = rfc3339_to_ms(&t.t) {
@@ -256,7 +278,7 @@ pub async fn write_day(
                 }
                 Err(e) => eprintln!("[tagdash] flat_files trade: fetch trades {sym}: {e}"),
             }
-            match data::fetch_quotes_window(key, secret, &one, &s, &e).await {
+            match fetch_with_retry(|| data::fetch_quotes_window(key, secret, &one, &s, &e)).await {
                 Ok(map) => {
                     for q in map.get(sym).into_iter().flatten() {
                         if let Some(ms) = rfc3339_to_ms(&q.t) {
@@ -270,22 +292,32 @@ pub async fn write_day(
     }
     shared.set_progress(0.93);
 
-    // 5b. Fetch news for kept symbols (48h before premarket → end of day).
-    let kept_syms: Vec<String> = kept.iter().map(|(s, _)| s.clone()).collect();
-    let all_news = if !kept_syms.is_empty() {
-        let news_start = (pm_start - chrono::Duration::hours(48))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        let news_end = day_end.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        data::fetch_news_window(key, secret, &news_start, &news_end, &kept_syms)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("[tagdash] flat_files trade: {day} news ignorées ({e})");
-                Vec::new()
-            })
-    } else {
-        Vec::new()
-    };
+    // 5b. Fetch news per (symbol, alert) — strictly the NEWS_LOOKBACK_MS window
+    // BEFORE each ignition, never after: a trader reviewing the alert offline must
+    // only see what was knowable at the alert moment, not future-leaking news.
+    let mut news_by_id: HashMap<i64, crate::types::NewsHeadline> = HashMap::new();
+    for (sym, wins) in &kept {
+        if shared.cancelled() {
+            break;
+        }
+        let one = [sym.clone()];
+        for w in wins {
+            let (Some(s), Some(e)) =
+                (ms_to_rfc3339(w.alert_ms - NEWS_LOOKBACK_MS), ms_to_rfc3339(w.alert_ms - 1_000))
+            else {
+                continue;
+            };
+            match fetch_with_retry(|| data::fetch_news_window(key, secret, &s, &e, &one)).await {
+                Ok(items) => {
+                    for h in items {
+                        news_by_id.entry(h.id).or_insert(h);
+                    }
+                }
+                Err(e) => eprintln!("[tagdash] flat_files trade: news {sym} {day}: {e}"),
+            }
+        }
+    }
+    let all_news: Vec<crate::types::NewsHeadline> = news_by_id.into_values().collect();
     shared.set_progress(0.98);
 
     // 6. Write atomically (even when empty — a complete file marks the day done).
@@ -347,6 +379,8 @@ pub async fn write_day(
         set_meta(&tx, "trade_count", &trade_count.to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "quote_count", &all_quotes.len().to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "news_count", &all_news.len().to_string()).map_err(|e| e.to_string())?;
+        set_meta(&tx, "ignited_candidates", &ignited_candidates.to_string()).map_err(|e| e.to_string())?;
+        set_meta(&tx, "capped", if capped { "1" } else { "0" }).map_err(|e| e.to_string())?;
         set_meta(&tx, "complete", "1").map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         drop(conn);
@@ -357,15 +391,46 @@ pub async fn write_day(
     Ok(trade_count)
 }
 
+/// Retry a fallible fetch up to 2 extra times (3 attempts total) with a short fixed
+/// backoff, so a transient API hiccup doesn't silently zero out a kept symbol's window.
+async fn fetch_with_retry<T, F, Fut>(mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Mirrors micro_pullback::gate1_tradeable's float admission: known float must clear
+/// the (generous) prefilter ceiling; unknown float is admitted (the real gate's
+/// `allow_unknown_float` default — the pre-scan must not be narrower than the gate it
+/// approximates).
+fn admit_float(float: Option<u64>, prefilter_max: u64) -> bool {
+    match float {
+        Some(f) => f <= prefilter_max,
+        None => true,
+    }
+}
+
 /// Minute-resolution ignition pre-scan for one symbol's premarket bars. Returns the
 /// strongest volume ratio seen (ranking key) and the merged ignition windows, or None
 /// when nothing fired. Coarse approximation of `micro_pullback`'s gate.
-fn scan_symbol(raw: &[data::RawBar], cfg: &crate::micro_pullback::Config) -> Option<(f64, Vec<Window>)> {
-    // Parse + sort the minute bars (t, o, h, l, c, v).
-    let mut bars: Vec<(i64, f64, f64, f64, f64, i64)> = raw
-        .iter()
-        .filter_map(|b| rfc3339_to_ms(&b.t).map(|ms| (ms, b.o, b.h, b.l, b.c, b.v)))
-        .collect();
+fn scan_symbol(
+    raw: &[(i64, f64, f64, f64, f64, i64)],
+    cfg: &crate::micro_pullback::Config,
+) -> Option<(f64, Vec<Window>)> {
+    // Sort the minute bars (t, o, h, l, c, v).
+    let mut bars: Vec<(i64, f64, f64, f64, f64, i64)> = raw.to_vec();
     bars.sort_by_key(|b| b.0);
     if bars.len() <= MIN_BASELINE_MIN {
         return None;
@@ -538,13 +603,13 @@ mod tests {
     use super::*;
     use crate::micro_pullback::Config;
 
-    fn bar(t: &str, o: f64, h: f64, l: f64, c: f64, v: i64) -> data::RawBar {
-        data::RawBar { t: t.into(), o, h, l, c, v, n: None, vw: None }
+    fn bar(t: &str, o: f64, h: f64, l: f64, c: f64, v: i64) -> (i64, f64, f64, f64, f64, i64) {
+        (rfc3339_to_ms(t).unwrap(), o, h, l, c, v)
     }
 
     #[test]
     fn quiet_tape_produces_no_window() {
-        let bars: Vec<data::RawBar> = (0..10)
+        let bars: Vec<(i64, f64, f64, f64, f64, i64)> = (0..10)
             .map(|i| {
                 let t = format!("2026-06-10T08:{:02}:00Z", i);
                 bar(&t, 2.0, 2.01, 1.99, 2.0, 1_000)
@@ -555,7 +620,7 @@ mod tests {
 
     #[test]
     fn volume_spike_fires_a_window() {
-        let mut bars: Vec<data::RawBar> = (0..6)
+        let mut bars: Vec<(i64, f64, f64, f64, f64, i64)> = (0..6)
             .map(|i| bar(&format!("2026-06-10T08:{:02}:00Z", i), 2.0, 2.02, 1.98, 2.0, 1_000))
             .collect();
         // A sudden 50k-share, wide-range minute well in the price band.
@@ -578,5 +643,13 @@ mod tests {
         assert!(ov.covers("AAA", 900, 1_100));
         assert!(!ov.covers("AAA", 2_100, 2_200));
         assert!(!ov.covers("BBB", 1_500, 1_600));
+    }
+
+    #[test]
+    fn admit_float_keeps_unknown_and_low_known() {
+        let ceiling = 90_000_000u64;
+        assert!(admit_float(None, ceiling), "unknown float must be admitted");
+        assert!(admit_float(Some(50_000_000), ceiling));
+        assert!(!admit_float(Some(100_000_000), ceiling));
     }
 }

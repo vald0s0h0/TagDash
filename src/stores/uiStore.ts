@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { Session } from "@/types";
 import { api } from "@/lib/tauri";
 
-type Modal = "settings" | "sync-status" | "startup" | "feed-diagnostics" | "news-debug" | "bug-report" | "tickers-table" | "trades-db" | "flat-files" | "stt" | "update" | null;
+type Modal = "settings" | "startup" | "bug-report" | null;
 
 /** Top-level view: the trading workspace (sessions + charts + sidebar), the
  *  standalone KPI dashboard (moodboard, no sidebar), or the embedded TradeTally
@@ -15,7 +15,6 @@ interface UiState {
   activeView:        View;
   setActiveView:     (v: View) => void;
   activeSession:     Session;
-  logsOpen:          boolean;
   openModal:         Modal;
   selectedTicker:    string | null;
   /** Symbols the user dismissed from the pre-open screener. Persisted per trading
@@ -26,7 +25,6 @@ interface UiState {
   replayOpen:        boolean;
   toggleReplay:      () => void;
   setActiveSession:  (s: Session) => void;
-  toggleLogs:        () => void;
   showModal:         (m: Modal) => void;
   closeModal:        () => void;
   setSelectedTicker: (symbol: string | null) => void;
@@ -43,7 +41,6 @@ export const useUiStore = create<UiState>((set) => ({
   // Start on the premarket tab (where the trading session begins) and surface the
   // startup pipeline modal so launch progress is visible right away.
   activeSession:     "premarket",
-  logsOpen:          false,
   openModal:         "startup",
   selectedTicker:    null,
   dismissedScreener: [],
@@ -51,7 +48,6 @@ export const useUiStore = create<UiState>((set) => ({
 
   toggleReplay:      () => set((state) => ({ replayOpen: !state.replayOpen })),
   setActiveSession:  (s) => set({ activeSession: s }),
-  toggleLogs:        () => set((state) => ({ logsOpen: !state.logsOpen })),
   showModal:         (m) => set({ openModal: m }),
   closeModal:        () => set({ openModal: null }),
   setSelectedTicker: (symbol) => set({ selectedTicker: symbol }),

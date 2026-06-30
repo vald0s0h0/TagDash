@@ -3,7 +3,6 @@ import { TitleBar } from "@/components/TitleBar";
 import { LeftRail } from "@/components/LeftRail";
 import { Sidebar } from "@/components/Sidebar";
 import { MainWindow } from "@/components/MainWindow";
-import { LogsPanel } from "@/components/LogsPanel";
 import { ReplayToolbar } from "@/components/ReplayToolbar";
 import { TickerSpotlight } from "@/components/TickerSpotlight";
 import { Dashboard } from "@/components/dashboard/Dashboard";
@@ -20,7 +19,6 @@ import { useSttEvents } from "@/hooks/useSttEvents";
 import { api } from "@/lib/tauri";
 
 export default function App() {
-  const logsOpen = useUiStore((s) => s.logsOpen);
   const activeView = useUiStore((s) => s.activeView);
   const setDismissedScreener = useUiStore((s) => s.setDismissedScreener);
 
@@ -128,7 +126,6 @@ export default function App() {
               {/* Market Replay transport bar — rendered only when activated (menu). */}
               <ReplayToolbar />
               <MainWindow />
-              {logsOpen && <LogsPanel />}
             </div>
           </>
         )}
