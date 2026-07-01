@@ -175,7 +175,7 @@ pub struct Strategy {
     pub enabled: bool,
     pub sessions: Vec<Session>,
     pub priority: u8,
-    pub max_risk_dollars: f64,
+    pub risk: StrategyRiskConfig,
 }
 
 /// Internal trade aggregate (one tradeID = one open lifecycle).
@@ -324,10 +324,35 @@ pub struct LatencyStatus {
     pub measured_at: DateTime<Utc>,
 }
 
-/// Risk parameters defined per-strategy.
+/// Risk parameters defined per-strategy. All fields are persisted in the DB as
+/// JSON and can be overridden at runtime without touching the compiled defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyRiskConfig {
+    /// Maximum risk in dollars per trade.
     pub max_risk_dollars: f64,
+    /// Default order type at entry. "market" or "limit".
+    pub default_order_type: String,
+    /// Automatically place a take-profit after entry?
+    pub auto_tp_enabled: bool,
+    /// At how many R to place the auto TP (e.g. 2.0 = 2R).
+    pub auto_tp_r: f64,
+    /// Automatically move SL to breakeven after entry?
+    pub auto_be_enabled: bool,
+    /// At how many R to trigger the auto BE (e.g. 1.0 = 1R).
+    pub auto_be_r: f64,
+}
+
+impl Default for StrategyRiskConfig {
+    fn default() -> Self {
+        Self {
+            max_risk_dollars: 150.0,
+            default_order_type: "market".into(),
+            auto_tp_enabled: false,
+            auto_tp_r: 2.0,
+            auto_be_enabled: false,
+            auto_be_r: 1.0,
+        }
+    }
 }
 
 // ─── Strategy identity card ───────────────────────────────────────────────────

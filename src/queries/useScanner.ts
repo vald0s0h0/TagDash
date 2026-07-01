@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
+import type { StrategyRiskConfig } from "@/types";
 
 export function useStrategies() {
   return useQuery({
@@ -21,11 +22,11 @@ export function useSetStrategyEnabled() {
   });
 }
 
-/** Set the $-risk-per-trade for a strategy at runtime (persisted backend-side). */
+/** Set the full risk config for a strategy at runtime (persisted backend-side). */
 export function useSetStrategyRisk() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, risk }: { id: string; risk: number }) =>
+    mutationFn: ({ id, risk }: { id: string; risk: StrategyRiskConfig }) =>
       api.setStrategyRisk(id, risk),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["strategies"] });

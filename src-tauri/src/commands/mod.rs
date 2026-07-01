@@ -1238,8 +1238,8 @@ pub async fn get_strategies(state: tauri::State<'_, AppState>) -> Result<Vec<Str
                 enabled:          overrides.get(s.id()).copied().unwrap_or_else(|| s.enabled()),
                 sessions:         s.sessions().to_vec(),
                 priority:         s.priority(),
-                max_risk_dollars: risk.get(s.id()).copied()
-                    .unwrap_or_else(|| s.risk_config().max_risk_dollars),
+                risk: risk.get(s.id()).cloned()
+                    .unwrap_or_else(|| s.risk_config().clone()),
             })
             .collect()
     })
@@ -1264,21 +1264,27 @@ pub fn set_strategy_enabled(
     cache_repository::set_app_meta(&db, "strategy_overrides", &json).map_err(|e| e.to_string())
 }
 
-/// Set the $-risk-per-trade for a strategy at runtime. Persisted in the
+/// Set the full risk config for a strategy at runtime. Persisted in the
 /// `app_config` table so it survives a relaunch; position sizing reads it on the
-/// next order (effet immédiat). A negative value is rejected.
+/// next order (effet immédiat). Replaces the old single-f64 `set_strategy_risk`.
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_strategy_risk(
-    strategy_id:      String,
-    max_risk_dollars: f64,
-    state:            tauri::State<'_, AppState>,
+    strategy_id: String,
+    risk:        crate::types::StrategyRiskConfig,
+    state:       tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !(max_risk_dollars.is_finite() && max_risk_dollars >= 0.0) {
-        return Err("risk must be a positive number".into());
+    if !(risk.max_risk_dollars.is_finite() && risk.max_risk_dollars >= 0.0) {
+        return Err("max_risk_dollars must be a positive number".into());
+    }
+    if !(risk.auto_tp_r.is_finite() && risk.auto_tp_r > 0.0) {
+        return Err("auto_tp_r must be positive".into());
+    }
+    if !(risk.auto_be_r.is_finite() && risk.auto_be_r > 0.0) {
+        return Err("auto_be_r must be positive".into());
     }
     let json = {
         let mut m = state.strategy_risk.write().unwrap();
-        m.insert(strategy_id, max_risk_dollars);
+        m.insert(strategy_id, risk);
         serde_json::to_string(&*m).map_err(|e| e.to_string())?
     };
     let db = state.db.lock().unwrap();
@@ -1977,8 +1983,8 @@ fn all_market_prices(market: &RwLock<MarketState>) -> HashMap<String, (f64, f64)
 
 fn strategy_max_risk(state: &tauri::State<'_, AppState>, strategy_id: &str) -> f64 {
     // Runtime Settings override wins; else the strategy's compiled default.
-    if let Some(r) = state.strategy_risk.read().unwrap().get(strategy_id).copied() {
-        return r;
+    if let Some(r) = state.strategy_risk.read().unwrap().get(strategy_id) {
+        return r.max_risk_dollars;
     }
     registry::all_strategies()
         .iter()
@@ -2932,6 +2938,9 @@ fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> 
         .resizable(false)
         .position(x, y)
         .inner_size(width, height)
+        // Dark background injected before any page content so the brief window
+        // between WebView2 creation and TradeTally's CSS loading is dark (not white).
+        .initialization_script("document.documentElement.style.backgroundColor='#0d0d0d'")
         // Tell the React placeholder the page finished loading (status dot → ready).
         // Full-document loads only — SPA route changes don't fire this.
         .on_page_load(move |_w, payload| {
@@ -2976,6 +2985,7 @@ fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> 
     let app_evt = app.clone();
     let builder = tauri::webview::WebviewBuilder::new(TRADETALLY_LABEL, tauri::WebviewUrl::External(url))
         .data_directory(tradetally_data_dir(app))
+        .initialization_script("document.documentElement.style.backgroundColor='#0d0d0d'")
         .on_page_load(move |_wv, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 use tauri::Emitter;

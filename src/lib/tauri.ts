@@ -41,6 +41,7 @@ import type {
   StartupState,
   Strategy,
   StrategyCard,
+  StrategyRiskConfig,
   StreamableSymbol,
   SyncQueueStatus,
   TickerTableRow,
@@ -199,8 +200,8 @@ export const api = {
   getStrategies:    () => invoke<Strategy[]>("get_strategies"),
   setStrategyEnabled: (strategy_id: string, enabled: boolean) =>
     invoke<void>("set_strategy_enabled", { strategy_id, enabled }),
-  setStrategyRisk: (strategy_id: string, max_risk_dollars: number) =>
-    invoke<void>("set_strategy_risk", { strategy_id, max_risk_dollars }),
+  setStrategyRisk: (strategy_id: string, risk: StrategyRiskConfig) =>
+    invoke<void>("set_strategy_risk", { strategy_id, risk }),
   getStrategyCards: () => invoke<Record<string, StrategyCard>>("get_strategy_cards"),
   startAlertEnrichment: (symbol: string, strategy_id: string) =>
     invoke<void>("start_alert_enrichment", { symbol, strategy_id }),

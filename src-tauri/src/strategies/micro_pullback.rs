@@ -70,6 +70,7 @@ impl ScanStrategy for MicroPullback {
     fn risk_config(&self) -> StrategyRiskConfig {
         StrategyRiskConfig {
             max_risk_dollars: MAX_RISK_DOLLARS,
+            ..Default::default()
         }
     }
 

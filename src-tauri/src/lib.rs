@@ -72,18 +72,25 @@ pub fn run() {
         m
     };
 
-    // ── Strategy $-risk map: compiled defaults + persisted runtime overrides ──
-    let strategy_risk: std::collections::HashMap<String, f64> = {
-        let mut m: std::collections::HashMap<String, f64> = strategies::registry::all_strategies()
+    // ── Strategy risk-config map: compiled defaults + persisted runtime overrides ──
+    // Format v2: HashMap<String, StrategyRiskConfig> (full struct).
+    // Migration: if the stored JSON parses as the old HashMap<String, f64>, convert
+    // each f64 to a StrategyRiskConfig with defaults so existing risk-$ settings survive.
+    let strategy_risk: std::collections::HashMap<String, types::StrategyRiskConfig> = {
+        let mut m: std::collections::HashMap<String, types::StrategyRiskConfig> = strategies::registry::all_strategies()
             .iter()
-            .map(|s| (s.id().to_string(), s.risk_config().max_risk_dollars))
+            .map(|s| (s.id().to_string(), s.risk_config()))
             .collect();
         if let Some(json) = local_db::cache_repository::get_app_meta(&db, "strategy_risk_overrides") {
-            if let Ok(over) = serde_json::from_str::<std::collections::HashMap<String, f64>>(&json) {
-                for (id, risk) in over {
-                    if m.contains_key(&id) {
-                        m.insert(id, risk);
-                    }
+            // Try new format first (full StrategyRiskConfig per strategy).
+            if let Ok(over) = serde_json::from_str::<std::collections::HashMap<String, types::StrategyRiskConfig>>(&json) {
+                for (id, cfg) in over {
+                    if m.contains_key(&id) { m.insert(id, cfg); }
+                }
+            // Migrate old format (f64 = max_risk_dollars only).
+            } else if let Ok(old) = serde_json::from_str::<std::collections::HashMap<String, f64>>(&json) {
+                for (id, dollars) in old {
+                    if let Some(cfg) = m.get_mut(&id) { cfg.max_risk_dollars = dollars; }
                 }
             }
         }

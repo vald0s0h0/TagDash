@@ -325,14 +325,20 @@ export function LightweightChart({
   // the styling hooks/effects below when the palette is edited, for a live update.
   const theme = useChartTheme();
 
-  // Trackpad / wheel X-zoom tuning (Settings → Apparence). Mirrored into refs so the
-  // once-bound `onWheel` handler reads the live values without re-binding.
-  const zoomSensitivity = useChartInput((s) => s.zoomSensitivity);
-  const zoomInvert      = useChartInput((s) => s.zoomInvert);
-  const zoomSensRef     = useRef(zoomSensitivity);
-  const zoomInvertRef   = useRef(zoomInvert);
-  useEffect(() => { zoomSensRef.current = zoomSensitivity; }, [zoomSensitivity]);
-  useEffect(() => { zoomInvertRef.current = zoomInvert; }, [zoomInvert]);
+  // Wheel / trackpad tuning (Settings → Apparence). Mirrored into refs so the
+  // once-bound `onWheel` handler reads live values without re-binding.
+  const mouseSensitivity = useChartInput((s) => s.mouseSensitivity);
+  const zoomSensitivity  = useChartInput((s) => s.zoomSensitivity);
+  const zoomInvert       = useChartInput((s) => s.zoomInvert);
+  const scrollSwapAxes   = useChartInput((s) => s.scrollSwapAxes);
+  const mouseSensRef     = useRef(mouseSensitivity);
+  const zoomSensRef      = useRef(zoomSensitivity);
+  const zoomInvertRef    = useRef(zoomInvert);
+  const scrollSwapRef    = useRef(scrollSwapAxes);
+  useEffect(() => { mouseSensRef.current  = mouseSensitivity; }, [mouseSensitivity]);
+  useEffect(() => { zoomSensRef.current   = zoomSensitivity; },  [zoomSensitivity]);
+  useEffect(() => { zoomInvertRef.current = zoomInvert; },       [zoomInvert]);
+  useEffect(() => { scrollSwapRef.current = scrollSwapAxes; },   [scrollSwapAxes]);
 
   // ── Bar-loading pipeline (history refresh + RAM poll + lazy back-fill) — hook ─
   const { bars, loadOlderBars } = useChartBars(
@@ -663,21 +669,34 @@ export function LightweightChart({
     });
 
     const onWheel = (e: WheelEvent) => {
-      // Horizontal wheel (Logitech 2nd wheel / tilt) → vertical price-axis zoom.
-      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+      const absX = Math.abs(e.deltaX);
+      const absY = Math.abs(e.deltaY);
+      if (absX === 0 && absY === 0) return;
+
+      // Determine dominant scroll axis, then apply the swap-axes preference.
+      // Default: horizontal dominant → price-axis zoom, vertical dominant → time-axis zoom.
+      // swapAxes: flip that mapping (vertical → price, horizontal → time).
+      const hDominant = absX > absY;
+      const zoomPrice = scrollSwapRef.current ? !hDominant : hDominant;
+
+      if (zoomPrice) {
         e.preventDefault();
-        zoomPriceAxis(e.deltaX < 0 ? -0.02 : 0.02); // one way zooms in, the other out
+        const delta = hDominant ? e.deltaX : e.deltaY;
+        zoomPriceAxis(delta < 0 ? -0.02 : 0.02);
         return;
       }
-      // Main wheel / 2-finger trackpad scroll → time-axis (X) zoom, current bar
-      // pinned at the default view. The step is proportional to the wheel delta and
-      // scaled by the user's sensitivity, so a trackpad's many small events stay
-      // smooth while a mouse notch (~100) keeps the classic ~1.1× at sensitivity 1.
-      // The invert toggle flips zoom-in/zoom-out (e.g. macOS "natural" scrolling).
-      if (e.deltaY === 0) return;
+
+      // Time-axis (X) zoom.
+      // Mouse-wheel notches produce large deltas (~100 px); trackpad frames are tiny.
+      // Use separate sensitivities so each can be tuned independently.
+      const delta = hDominant ? e.deltaX : e.deltaY;
+      if (delta === 0) return;
       e.preventDefault();
-      const mag = Math.min(Math.abs(e.deltaY) * 0.001 * zoomSensRef.current, 0.5);
-      let zoomIn = e.deltaY < 0; // up = zoom in by default
+      const absD  = Math.abs(delta);
+      const isMouse = absD >= 50;
+      const sens  = isMouse ? mouseSensRef.current : zoomSensRef.current;
+      const mag   = Math.min(absD * 0.001 * sens, 0.5);
+      let zoomIn  = delta < 0;
       if (zoomInvertRef.current) zoomIn = !zoomIn;
       const factor = zoomIn ? 1 + mag : 1 / (1 + mag);
       zoomTimeAxis(factor, e.clientX - container.getBoundingClientRect().left);

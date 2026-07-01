@@ -70,7 +70,7 @@ pub struct AppState {
     /// strategy's compiled `risk_config().max_risk_dollars`, editable from
     /// Settings and persisted in the `app_config` table). Position sizing reads
     /// this live so edits take effect on the very next order.
-    pub strategy_risk: Arc<RwLock<HashMap<String, f64>>>,
+    pub strategy_risk: Arc<RwLock<HashMap<String, crate::types::StrategyRiskConfig>>>,
     /// Current active alerts (newest first, capped at 100).
     pub active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
     /// Full alert history for the session (newest first, capped at 500).

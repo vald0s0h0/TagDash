@@ -18,7 +18,6 @@ import {
   Receipt,
   RefreshCw,
   ScrollText,
-  ShieldHalf,
   Table2,
   Tag,
   X,
@@ -60,7 +59,7 @@ import { useChartThemeStore, type ChartTheme, type ChartThemeSection } from "@/s
 import { useChartInput, SENS_MIN, SENS_MAX } from "@/stores/chartInputStore";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import type { AppConfig, AttentionMode, SecretKey, SecretsUpdate, Session } from "@/types";
+import type { AppConfig, AttentionMode, SecretKey, SecretsUpdate, Session, StrategyRiskConfig } from "@/types";
 
 const SESSION_LABELS: Record<Session, string> = {
   premarket:  "Premarket",
@@ -185,43 +184,141 @@ function Field({
   );
 }
 
-/** Editable $-risk-per-trade field for a strategy. Commits on blur or Enter so
- *  the change takes effect immediately on the next order. */
-function RiskInput({
+/** Inline number input that commits on blur or Enter. */
+function NumInput({
   value,
+  min = 0,
+  step = "1",
+  width = "w-16",
   disabled,
   onCommit,
 }: {
   value: number;
+  min?: number;
+  step?: string;
+  width?: string;
   disabled?: boolean;
-  onCommit: (risk: number) => void;
+  onCommit: (v: number) => void;
 }) {
   const [text, setText] = useState(String(value));
-  // Re-seed when the upstream value changes (e.g. after a refetch).
   useEffect(() => { setText(String(value)); }, [value]);
 
   function commit() {
     const n = parseFloat(text);
-    if (Number.isFinite(n) && n >= 0 && n !== value) onCommit(n);
+    if (Number.isFinite(n) && n >= min && n !== value) onCommit(n);
     else setText(String(value));
   }
 
   return (
-    <div className="flex items-center gap-1">
-      <span className="text-[10px] text-muted-foreground">Risque $</span>
-      <Input
-        type="number"
-        min={0}
-        step="1"
-        value={text}
-        disabled={disabled}
-        onChange={(e) => setText(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-        }}
-        className="h-6 w-16 text-xs tabular-nums"
-      />
+    <Input
+      type="number"
+      min={min}
+      step={step}
+      value={text}
+      disabled={disabled}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+      }}
+      className={`h-6 text-xs tabular-nums ${width}`}
+    />
+  );
+}
+
+/** Expanded per-strategy risk settings panel. Commits any change immediately. */
+function StrategyRiskPanel({
+  risk,
+  disabled,
+  onCommit,
+}: {
+  risk: StrategyRiskConfig;
+  disabled: boolean;
+  onCommit: (cfg: StrategyRiskConfig) => void;
+}) {
+  const [draft, setDraft] = useState<StrategyRiskConfig>(risk);
+  useEffect(() => { setDraft(risk); }, [risk]);
+
+  function patch(partial: Partial<StrategyRiskConfig>): StrategyRiskConfig {
+    const next = { ...draft, ...partial };
+    setDraft(next);
+    return next;
+  }
+
+  return (
+    <div className="mt-2 space-y-1.5 border-t border-border/40 pt-2">
+      {/* Row 1: Risque $ + type d'ordre */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground">Risque $</span>
+          <NumInput
+            value={draft.max_risk_dollars}
+            min={0}
+            step="1"
+            width="w-16"
+            disabled={disabled}
+            onCommit={(v) => onCommit(patch({ max_risk_dollars: v }))}
+          />
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground">Ordre</span>
+          <select
+            value={draft.default_order_type}
+            disabled={disabled}
+            onChange={(e) => onCommit(patch({ default_order_type: e.target.value as "market" | "limit" }))}
+            className="h-6 rounded border border-border bg-background px-1.5 text-xs text-foreground outline-none disabled:opacity-50"
+          >
+            <option value="market">Market</option>
+            <option value="limit">Limit</option>
+          </select>
+        </div>
+      </div>
+      {/* Row 2: TP auto */}
+      <div className="flex items-center gap-2">
+        <Switch
+          checked={draft.auto_tp_enabled}
+          disabled={disabled}
+          onCheckedChange={(v) => onCommit(patch({ auto_tp_enabled: v }))}
+        />
+        <span className="text-[10px] text-muted-foreground">TP auto</span>
+        {draft.auto_tp_enabled && (
+          <>
+            <span className="text-[10px] text-muted-foreground">à</span>
+            <NumInput
+              value={draft.auto_tp_r}
+              min={0.1}
+              step="0.1"
+              width="w-14"
+              disabled={disabled}
+              onCommit={(v) => onCommit(patch({ auto_tp_r: v }))}
+            />
+            <span className="text-[10px] text-muted-foreground">R</span>
+          </>
+        )}
+      </div>
+      {/* Row 3: BE auto */}
+      <div className="flex items-center gap-2">
+        <Switch
+          checked={draft.auto_be_enabled}
+          disabled={disabled}
+          onCheckedChange={(v) => onCommit(patch({ auto_be_enabled: v }))}
+        />
+        <span className="text-[10px] text-muted-foreground">BE auto</span>
+        {draft.auto_be_enabled && (
+          <>
+            <span className="text-[10px] text-muted-foreground">à</span>
+            <NumInput
+              value={draft.auto_be_r}
+              min={0.1}
+              step="0.1"
+              width="w-14"
+              disabled={disabled}
+              onCommit={(v) => onCommit(patch({ auto_be_r: v }))}
+            />
+            <span className="text-[10px] text-muted-foreground">R</span>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -411,11 +508,15 @@ function AppearanceTab() {
   const reset = useChartThemeStore((s) => s.reset);
   const [copied, setCopied] = useState(false);
 
-  // Trackpad / wheel X-zoom tuning (frontend pref, persisted in chartInputStore).
-  const zoomSensitivity = useChartInput((s) => s.zoomSensitivity);
-  const zoomInvert = useChartInput((s) => s.zoomInvert);
-  const setZoomSensitivity = useChartInput((s) => s.setZoomSensitivity);
-  const setZoomInvert = useChartInput((s) => s.setZoomInvert);
+  // Wheel / trackpad tuning (frontend pref, persisted in chartInputStore).
+  const mouseSensitivity  = useChartInput((s) => s.mouseSensitivity);
+  const zoomSensitivity   = useChartInput((s) => s.zoomSensitivity);
+  const zoomInvert        = useChartInput((s) => s.zoomInvert);
+  const scrollSwapAxes    = useChartInput((s) => s.scrollSwapAxes);
+  const setMouseSensitivity = useChartInput((s) => s.setMouseSensitivity);
+  const setZoomSensitivity  = useChartInput((s) => s.setZoomSensitivity);
+  const setZoomInvert       = useChartInput((s) => s.setZoomInvert);
+  const setScrollSwapAxes   = useChartInput((s) => s.setScrollSwapAxes);
 
   // Typed thin wrappers so each row stays a one-liner.
   function color<S extends ChartThemeSection>(section: S, key: keyof ChartTheme[S]) {
@@ -445,10 +546,29 @@ function AppearanceTab() {
         immédiatement à tous les panes ouverts et sont conservés au relancement.
       </p>
       <div className="space-y-3">
-        <ThemeGroup title="Navigation (trackpad / molette)">
+        <ThemeGroup title="Navigation (molette / trackpad)">
           <div className="flex items-center justify-between gap-3 py-0.5">
             <span className="text-xs text-muted-foreground">
-              Sensibilité du zoom (axe X) — scroll 2 doigts
+              Molette souris — sensibilité
+            </span>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={SENS_MIN}
+                max={SENS_MAX}
+                step={0.1}
+                value={mouseSensitivity}
+                onChange={(e) => setMouseSensitivity(parseFloat(e.target.value))}
+                className="w-32 accent-blue-500"
+              />
+              <span className="w-9 text-right text-[10px] tabular-nums text-muted-foreground">
+                {mouseSensitivity.toFixed(1)}×
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-3 py-0.5">
+            <span className="text-xs text-muted-foreground">
+              Scroll 2 doigts — sensibilité
             </span>
             <div className="flex items-center gap-2">
               <input
@@ -467,12 +587,26 @@ function AppearanceTab() {
           </div>
           <div className="flex items-center justify-between gap-3 py-0.5">
             <span className="text-xs text-muted-foreground">
-              Inverser le sens du zoom
+              Scroll 2 doigts — inverser le sens du zoom
             </span>
             <input
               type="checkbox"
               checked={zoomInvert}
               onChange={(e) => setZoomInvert(e.target.checked)}
+              className="h-4 w-4 accent-blue-500"
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 py-0.5">
+            <span className="text-xs text-muted-foreground">
+              Scroll 2 doigts — inverser vertical/horizontal
+              <span className="ml-1 text-muted-foreground/60">
+                (défaut : vertical→zoom X, horizontal→zoom Y)
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              checked={scrollSwapAxes}
+              onChange={(e) => setScrollSwapAxes(e.target.checked)}
               className="h-4 w-4 accent-blue-500"
             />
           </div>
@@ -541,7 +675,7 @@ function AppearanceTab() {
 // ─── Sidebar: tabs grouped by category ──────────────────────────────────────
 
 type TabId =
-  | "trading" | "risque" | "strategies"
+  | "trading" | "strategies"
   | "apparence" | "keyboard" | "gamepad" | "notifs"
   | "data-source" | "latency" | "feed-diagnostics" | "news-debug"
   | "tickers-db" | "trades-db" | "dictee" | "tags"
@@ -554,9 +688,8 @@ const TAB_GROUPS: TabGroup[] = [
   {
     label: "Trading",
     tabs: [
-      { id: "trading",    label: "Trading",     icon: LineChart },
-      { id: "risque",     label: "Risque",      icon: ShieldHalf },
-      { id: "strategies", label: "Stratégies",  icon: ListChecks },
+      { id: "trading",    label: "Trading",    icon: LineChart },
+      { id: "strategies", label: "Stratégies", icon: ListChecks },
     ],
   },
   {
@@ -739,104 +872,41 @@ export function SettingsModal({ open, onClose }: Props) {
                 />
               </TabsContent>
 
-              {/* ── Gestion de risque ── */}
-              <TabsContent value="risque" className="mt-0 space-y-3">
-                <p className="text-xs text-muted-foreground">
-                  Réglages de gestion du risque appliqués à chaque nouveau trade.
-                </p>
-
-                <div className="grid grid-cols-2 items-center gap-4">
-                  <Label className="text-right text-xs text-muted-foreground">
-                    Type d'ordre par défaut
-                  </Label>
-                  <select
-                    value={draft.risk_management?.default_order_type ?? "market"}
-                    onChange={(e) =>
-                      set("risk_management", "default_order_type", e.target.value as "limit" | "market")
-                    }
-                    className="h-7 rounded border border-border bg-background px-2 text-xs text-foreground outline-none"
-                  >
-                    <option value="market">Market</option>
-                    <option value="limit">Limit</option>
-                  </select>
-                </div>
-
-                <Separator />
-
-                <div className="rounded-md border border-border px-3 py-2.5">
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium">Break-Even automatique</div>
-                      <p className="mt-0.5 text-xs text-muted-foreground">
-                        Déplace automatiquement le SL au prix d'entrée (BE) lorsque le
-                        trade atteint le multiple de R configuré.
-                      </p>
-                    </div>
-                    <Switch
-                      checked={draft.risk_management?.auto_be_enabled ?? false}
-                      onCheckedChange={(v) => set("risk_management", "auto_be_enabled", v)}
-                    />
-                  </div>
-
-                  {(draft.risk_management?.auto_be_enabled ?? false) && (
-                    <div className="mt-3 grid grid-cols-2 items-center gap-4">
-                      <Label className="text-right text-xs text-muted-foreground">
-                        Déclencher à (×R)
-                      </Label>
-                      <Input
-                        type="number"
-                        min={0.1}
-                        step={0.1}
-                        value={draft.risk_management?.auto_be_r ?? 1}
-                        onChange={(e) =>
-                          set("risk_management", "auto_be_r", parseFloat(e.target.value) || 1)
-                        }
-                        className="h-7 w-20 text-xs tabular-nums"
-                      />
-                    </div>
-                  )}
-                </div>
-              </TabsContent>
-
-              {/* ── Strategies (runtime on/off, persisted, no code change) ── */}
+              {/* ── Stratégies (on/off + risk complet par stratégie) ── */}
               <TabsContent value="strategies" className="mt-0 space-y-2">
                 <p className="text-xs text-muted-foreground">
-                  Active/désactive une stratégie et règle le risque $ par trade. Effet
-                  immédiat, conservé au relancement — pas besoin de toucher au code.
+                  Active/désactive et configure le risque de chaque stratégie. Effet
+                  immédiat, conservé au relancement.
                 </p>
-                <div className="space-y-1.5">
+                <div className="space-y-2">
                   {strategies.length === 0 && (
                     <span className="text-xs text-muted-foreground/60">Aucune stratégie.</span>
                   )}
                   {strategies.map((s) => (
                     <div
                       key={s.id}
-                      className="flex items-center justify-between rounded-md border border-border px-3 py-2"
+                      className="rounded-md border border-border px-3 py-2"
                     >
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate text-sm font-medium">{s.name}</span>
-                          <span className="rounded bg-muted px-1 py-0.5 text-[9px] tabular-nums text-muted-foreground">
-                            P{s.priority}
-                          </span>
-                        </div>
-                        <div className="mt-1 flex flex-wrap gap-1">
-                          {s.sessions.map((sess) => (
-                            <span
-                              key={sess}
-                              className="rounded bg-blue-900/40 px-1.5 py-0.5 text-[9px] text-blue-300"
-                            >
-                              {SESSION_LABELS[sess] ?? sess}
+                      {/* Header row: name + sessions + toggle */}
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-sm font-medium">{s.name}</span>
+                            <span className="rounded bg-muted px-1 py-0.5 text-[9px] tabular-nums text-muted-foreground">
+                              P{s.priority}
                             </span>
-                          ))}
+                          </div>
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {s.sessions.map((sess) => (
+                              <span
+                                key={sess}
+                                className="rounded bg-blue-900/40 px-1.5 py-0.5 text-[9px] text-blue-300"
+                              >
+                                {SESSION_LABELS[sess] ?? sess}
+                              </span>
+                            ))}
+                          </div>
                         </div>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-3">
-                        <RiskInput
-                          value={s.max_risk_dollars}
-                          disabled={setStrategyRisk.isPending}
-                          onCommit={(risk) => setStrategyRisk.mutate({ id: s.id, risk })}
-                        />
                         <Switch
                           checked={s.enabled}
                           disabled={setStrategyEnabled.isPending}
@@ -845,6 +915,12 @@ export function SettingsModal({ open, onClose }: Props) {
                           }
                         />
                       </div>
+                      {/* Risk settings panel */}
+                      <StrategyRiskPanel
+                        risk={s.risk}
+                        disabled={setStrategyRisk.isPending}
+                        onCommit={(risk) => setStrategyRisk.mutate({ id: s.id, risk })}
+                      />
                     </div>
                   ))}
                 </div>

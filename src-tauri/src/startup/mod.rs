@@ -269,16 +269,17 @@ pub async fn run_pipeline(
     }
     let _ = log(&db, "info", &format!("startup: {} Alpaca tradable assets", alpaca_active.len()));
 
-    // ── Step 5: fetch_massive (floats) ────────────────────────────────────────
-    // Shared with the flat-files pipeline (see `step_floats`): cache-first, real
-    // fetch when stale OR empty, marker stamped only on a real success so a missing
-    // provider key never masks a later fetch the same day. ET date (DST-aware) for
-    // the once-per-day markers, so "a new day" flips at Eastern midnight.
+    // ── Steps 5+6+7 (floats · sec · daily) — all three run in parallel ──────────
+    // fetch_massive and fetch_sec are independent providers; load_daily only needs
+    // `symbols_for_bars` (from fetch_alpaca above) + Alpaca keys, so it can start
+    // at the same time. Starting all three together shaves the longest of the three
+    // off the total wall time instead of stacking them.
     let today = crate::time::et_date(Utc::now());
-    // fetch_massive + fetch_sec run concurrently (independent providers).
-    let (floats, _) = tokio::join!(
+    let symbols_for_bars: Vec<String> = alpaca_active.iter().map(|a| a.symbol.clone()).collect();
+    let (floats, _, (volume_map, prev_close_map)) = tokio::join!(
         step_floats(&db, &state, &sec, &today, mock_float, has_massive),
         step_sec(&db, &state, &sec, &today, mock_sec),
+        step_daily(&db, &state, &sec, &symbols_for_bars, mock_alpaca, &today),
     );
     let float_map: std::collections::HashMap<String, &crate::massive::MassiveFloat> =
         floats.iter().map(|f| (f.symbol.clone(), f)).collect();
@@ -286,8 +287,6 @@ pub async fn run_pipeline(
     {
         state.write().unwrap().stats.with_float = with_float;
     }
-    // Append the in-universe count, but only when the step succeeded — don't clobber
-    // a Warning from a failed fetch that fell back to cache.
     if matches!(
         state.read().unwrap().steps.iter().find(|s| s.id == "fetch_massive").map(|s| &s.status),
         Some(StepStatus::Success)
@@ -297,319 +296,44 @@ pub async fn run_pipeline(
     }
     let _ = log(&db, "info", &format!("startup: {} float records (Massive/FMP)", floats.len()));
 
-    // ── Step 7: load_daily (incremental: 250d first run, missing days after) ──
-    set_step(&state, "load_daily", StepStatus::Running, None);
-    let symbols_for_bars: Vec<String> = alpaca_active.iter().map(|a| a.symbol.clone()).collect();
-    // Target ~250 calendar days of history so the mean-reversion scoring engine
-    // (Panic Mean Reversion) has enough self-relative history (well above its
-    // MIN_HISTORY_DAYS floor) without storing years of bars. The daily cache is
-    // never pruned, so history still accumulates forward over time.
-    //
-    // Depth-aware backfill: we fetch the FULL 250-day window when the cache is
-    // empty OR when its OLDEST bar is more recent than the desired start (a
-    // shallow cache seeded by an earlier short-window build — which never got
-    // backfilled because the old logic only ever extended forward). Upserts are
-    // idempotent, so re-fetching the overlapping recent days is harmless; this
-    // deep fetch happens once, then later runs just top up the missing new days
-    // from the last cached date.
-    let desired_start = (Utc::now() - chrono::Duration::days(250)).format("%Y-%m-%d").to_string();
-    // Backfill is triggered when our OLDEST bar is more recent than this threshold
-    // (~2 weeks inside the 250-day target). The slack is essential: Alpaca's first
-    // available bar lands a few days after our requested calendar start (weekends /
-    // first trading day), so comparing against `desired_start` directly would mark
-    // the cache "shallow" forever and re-fetch the full window on every launch.
-    let backfill_threshold = (Utc::now() - chrono::Duration::days(235)).format("%Y-%m-%d").to_string();
-    let (latest_cached, earliest_cached) = {
-        let db_guard = db.lock().unwrap();
-        (
-            cache_repository::latest_bar_date(&db_guard).unwrap_or(None),
-            cache_repository::earliest_bar_date(&db_guard).unwrap_or(None),
-        )
-    };
-    // One-time migration to split-adjusted bars. The cache used to store raw
-    // (unadjusted) bars, where every past split shows up as a fake gap. The first
-    // run on the new code force-fetches the full window with adjustment=split so
-    // the whole cache is internally consistent; the `bars_adjustment` marker keeps
-    // it from repeating. (Mock runs keep their synthetic bars untouched.)
-    let split_adjusted = {
-        let db_guard = db.lock().unwrap();
-        cache_repository::get_app_meta(&db_guard, "bars_adjustment").as_deref() == Some("split")
-    };
-    let force_readjust = !split_adjusted && !mock_alpaca;
-    let need_backfill = force_readjust || match earliest_cached.as_deref() {
-        Some(d) if !d.is_empty() => d > backfill_threshold.as_str(), // shallow → backfill
-        _ => true,                                                   // empty → backfill
-    };
-    let start_date = if need_backfill {
-        desired_start.clone()
-    } else {
-        latest_cached
-            .as_deref()
-            .filter(|d| !d.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| desired_start.clone())
-    };
-    let incremental = !need_backfill;
-    let mut daily_fetch_ok = true;
-    let daily_bars = if mock_alpaca {
-        crate::alpaca::bars::mock_daily_bars(&symbols_for_bars)
-    } else {
-        let key = sec.alpaca_key.as_deref().unwrap_or_default();
-        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
-        match crate::alpaca::bars::fetch_daily_bars_since(key, secret, &symbols_for_bars, &start_date).await {
-            Ok(bars) => bars,
-            Err(e) => {
-                // Real keys configured but the fetch failed: keep the existing
-                // cache untouched rather than injecting synthetic mock bars over
-                // real symbols (which would corrupt the daily history and make the
-                // scorer rank garbage). Nothing new is committed this run.
-                daily_fetch_ok = false;
-                push_warning(&state, &format!("Alpaca bars fetch failed: {e} — keeping cached bars"));
-                std::collections::HashMap::new()
-            }
-        }
-    };
-
-    // ── Split reconciliation ──────────────────────────────────────────────────
-    // adjustment=split rescales the whole series to the LATEST split factor, so a
-    // split that goes ex after our last cached bar leaves the older cached bars at
-    // the old scale (a fake gap). On incremental runs, find symbols that split
-    // since the last check and refetch their full window so the series stays
-    // consistent; these override the incremental rows below. Backfill runs already
-    // fetched a consistent full series, so they skip this.
-    let readjusted_bars = if mock_alpaca || need_backfill || !daily_fetch_ok {
-        std::collections::HashMap::new()
-    } else {
-        let key = sec.alpaca_key.as_deref().unwrap_or_default();
-        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
-        let last_check = {
-            let db_guard = db.lock().unwrap();
-            cache_repository::get_app_meta(&db_guard, "splits_checked_through")
-        }
-        .unwrap_or_else(|| start_date.clone());
-        match crate::alpaca::corporate_actions::fetch_recent_split_symbols(key, secret, &symbols_for_bars, &last_check).await {
-            Ok(syms) if !syms.is_empty() => {
-                let _ = log(&db, "info", &format!("startup: {} symbol(s) split since {last_check} — refetching split-adjusted history", syms.len()));
-                match crate::alpaca::bars::fetch_daily_bars_since(key, secret, &syms, &desired_start).await {
-                    Ok(bars) => bars,
-                    Err(e) => {
-                        push_warning(&state, &format!("split refetch failed: {e}"));
-                        std::collections::HashMap::new()
-                    }
+    // ── Steps 7b–7e: compute + network pulls — all five in parallel ───────────
+    // compute_changes and compute_metrics are CPU/DB passes (no network); they
+    // run in async blocks so they interleave naturally with the three network
+    // calls. Total wall time = max(CPU, network) instead of their sum.
+    tokio::join!(
+        async {
+            set_step(&state, "compute_changes", StepStatus::Running, None);
+            let g = db.lock().unwrap();
+            match cache_repository::recompute_multiday_changes(&g) {
+                Ok(n) => {
+                    drop(g);
+                    set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
+                    let _ = log(&db, "info", &format!("startup: multi-day price changes recomputed for {n} symbols"));
+                }
+                Err(e) => {
+                    drop(g);
+                    set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
+                    let _ = log(&db, "warn", &format!("startup: multi-day change recompute failed: {e}"));
                 }
             }
-            Ok(_) => std::collections::HashMap::new(),
-            Err(e) => {
-                push_warning(&state, &format!("split check failed: {e}"));
-                std::collections::HashMap::new()
-            }
-        }
-    };
-    // Persist freshly fetched bars, then derive avg_volume / prev_close from the
-    // DB so they stay correct for incremental loads. The daily cache is NOT
-    // pruned: history is kept beyond the 250-day window to progressively enrich
-    // the DB (only the queries that need a recent window limit themselves).
-    let (volume_map, prev_close_map) = {
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let db_guard = db.lock().unwrap();
-        // Wrap every write in ONE transaction. Without it each upsert and each
-        // avg_volume UPDATE is its own auto-commit (an fsync in WAL), and the
-        // UPDATE loop runs over the WHOLE universe (~thousands of symbols) on
-        // every startup — so this step was thousands of fsyncs even on an
-        // incremental run that fetched almost no new bars. One commit instead.
-        let _ = db_guard.execute_batch("BEGIN");
-        // Purge the symbols we're about to rewrite with a fresh split-adjusted
-        // series so old-scale rows don't linger; the readjusted bars (chained
-        // last) then override any incremental rows just fetched for them.
-        for sym in readjusted_bars.keys() {
-            let _ = cache_repository::delete_symbol_bars(&db_guard, sym);
-        }
-        for (_symbol, bars) in daily_bars.iter().chain(readjusted_bars.iter()) {
-            for bar in bars {
-                let db_bar = cache_repository::DailyBar {
-                    symbol: bar.symbol.clone(),
-                    date: bar.date.clone(),
-                    open: bar.open,
-                    high: bar.high,
-                    low: bar.low,
-                    close: bar.close,
-                    volume: bar.volume,
-                    updated_at: now.clone(),
-                };
-                let _ = cache_repository::upsert_daily_bar(&db_guard, &db_bar);
-            }
-        }
-        // Average daily volume over the last 20 trading days (reads see the
-        // freshly-upserted rows within the open transaction).
-        let volume_map: std::collections::HashMap<String, i64> =
-            cache_repository::avg_volumes(&db_guard, 20).unwrap_or_default().into_iter().collect();
-        let prev_close_map: std::collections::HashMap<String, f64> =
-            cache_repository::latest_closes(&db_guard).unwrap_or_default().into_iter().collect();
-        // Update avg_volume in universe_assets.
-        for (sym, avg_vol) in &volume_map {
-            let _ = db_guard.execute(
-                "UPDATE universe_assets SET avg_volume=?1 WHERE symbol=?2",
-                rusqlite::params![avg_vol, sym],
-            );
-        }
-        // Record that the cache is now split-adjusted (suppresses the one-time
-        // re-backfill) and the date through which splits have been reconciled, so
-        // only newer splits are checked next run. Guarded on a successful real
-        // fetch so a transient Alpaca outage doesn't falsely mark the cache fixed.
-        if !mock_alpaca && daily_fetch_ok {
-            let today = Utc::now().format("%Y-%m-%d").to_string();
-            let _ = cache_repository::set_app_meta(&db_guard, "bars_adjustment", "split");
-            let _ = cache_repository::set_app_meta(&db_guard, "splits_checked_through", &today);
-        }
-        let _ = db_guard.execute_batch("COMMIT");
-        (volume_map, prev_close_map)
-    };
-    let covered = {
-        let db_guard = db.lock().unwrap();
-        cache_repository::symbols_with_bars(&db_guard).unwrap_or(0)
-    };
-    let mode = if incremental { format!("incremental since {start_date}") } else { format!("250d backfill since {start_date}") };
-    set_step(&state, "load_daily", StepStatus::Success,
-        Some(&format!("{covered} symbols with bar data · {} updated ({mode})", daily_bars.len())));
-    let _ = log(&db, "info", &format!("startup: daily bars — {covered} symbols cached, {} updated ({mode})", daily_bars.len()));
-
-    // ── Step 7b: compute_changes (multi-day close-to-close % changes) ──────────
-    set_step(&state, "compute_changes", StepStatus::Running, None);
-    {
-        let db_guard = db.lock().unwrap();
-        match cache_repository::recompute_multiday_changes(&db_guard) {
-            Ok(n) => {
-                drop(db_guard);
-                set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
-                let _ = log(&db, "info", &format!("startup: multi-day price changes recomputed for {n} symbols"));
-            }
-            Err(e) => {
-                drop(db_guard);
-                set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
-                let _ = log(&db, "warn", &format!("startup: multi-day change recompute failed: {e}"));
-            }
-        }
-    }
-
-    // ── Step 7c: compute_metrics (ATR + prev_close + Pump&Dump score) ─────────
-    // CPU-only passes over the daily cache (no network). prev_close/ATR fill the
-    // columns the pipeline previously left NULL; the Pump&Dump score is a DB-wide
-    // percentile of the daily-wick behaviour (100 = most pump&dump-like).
-    set_step(&state, "compute_metrics", StepStatus::Running, None);
-    {
-        let (pc, pd) = {
-            let db_guard = db.lock().unwrap();
-            let pc = cache_repository::recompute_atr_prev_close(&db_guard).unwrap_or(0);
-            let pd = cache_repository::recompute_pump_dump_scores(&db_guard).unwrap_or(0);
-            (pc, pd)
-        };
-        set_step(&state, "compute_metrics", StepStatus::Success,
-            Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
-        let _ = log(&db, "info", &format!("startup: ATR/prev_close {pc}, Pump&Dump scored {pd}"));
-    }
-
-    // ── Step 7c: fetch_short_interest (Massive bulk, once/day) ────────────────
-    // The whole-universe dump replaces the per-ticker company_intel path (which
-    // only ever reached ~50 tickers/launch). Persisted into the company_intel
-    // short-interest columns the UI already reads.
-    set_step(&state, "fetch_short_interest", StepStatus::Running, None);
-    const SI_DATE_KEY: &str = "short_interest_fetch_date";
-    let si_fresh_today = {
-        let g = db.lock().unwrap();
-        cache_repository::get_app_meta(&g, SI_DATE_KEY).as_deref() == Some(today.as_str())
-    };
-    if si_fresh_today {
-        set_step(&state, "fetch_short_interest", StepStatus::Success, Some("cached today"));
-    } else if !has_massive {
-        push_warning(&state, "No Massive key — short interest not collected");
-        set_step(&state, "fetch_short_interest", StepStatus::Warning, Some("no Massive key"));
-    } else {
-        match crate::company_intel::collect_short_interest_bulk(db.clone(), secrets.clone()).await {
-            Ok(n) => {
+        },
+        async {
+            set_step(&state, "compute_metrics", StepStatus::Running, None);
+            let (pc, pd) = {
                 let g = db.lock().unwrap();
-                let _ = cache_repository::set_app_meta(&g, SI_DATE_KEY, &today);
-                drop(g);
-                set_step(&state, "fetch_short_interest", StepStatus::Success, Some(&format!("{n} tickers")));
-                let _ = log(&db, "info", &format!("startup: short interest bulk — {n} tickers"));
-            }
-            Err(e) => {
-                push_warning(&state, &format!("short interest fetch failed: {e}"));
-                set_step(&state, "fetch_short_interest", StepStatus::Warning, Some(&format!("error: {e}")));
-            }
-        }
-    }
-
-    // ── Step 7d: fetch_splits (Alpaca corporate actions, once/day) ────────────
-    // Persist the last ~13 months of splits into `ticker_splits` (display + the
-    // dilution score's split-neutralisation), then roll up the display columns.
-    set_step(&state, "fetch_splits", StepStatus::Running, None);
-    const SPLITS_DATE_KEY: &str = "splits_full_fetch_date";
-    let splits_fresh_today = {
-        let g = db.lock().unwrap();
-        cache_repository::get_app_meta(&g, SPLITS_DATE_KEY).as_deref() == Some(today.as_str())
-    };
-    if !splits_fresh_today && !mock_alpaca {
-        let key = sec.alpaca_key.as_deref().unwrap_or_default();
-        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
-        let start = (Utc::now() - chrono::Duration::days(400)).format("%Y-%m-%d").to_string();
-        match crate::alpaca::corporate_actions::fetch_all_splits(key, secret, &symbols_for_bars, &start).await {
-            Ok(events) => {
-                let rows: Vec<cache_repository::SplitRow> = events
-                    .into_iter()
-                    .map(|e| cache_repository::SplitRow {
-                        symbol: e.symbol, ex_date: e.date, label: e.label,
-                        from_factor: e.from, to_factor: e.to,
-                    })
-                    .collect();
-                let n = {
-                    let g = db.lock().unwrap();
-                    let n = cache_repository::replace_ticker_splits(&g, &rows).unwrap_or(0);
-                    let _ = cache_repository::set_app_meta(&g, SPLITS_DATE_KEY, &today);
-                    n
-                };
-                let _ = log(&db, "info", &format!("startup: splits bulk — {n} events"));
-            }
-            Err(e) => push_warning(&state, &format!("splits fetch failed: {e}")),
-        }
-    }
-    {
-        let one_year_ago = (Utc::now() - chrono::Duration::days(365)).format("%Y-%m-%d").to_string();
-        let n = {
-            let g = db.lock().unwrap();
-            cache_repository::recompute_split_rollups(&g, &one_year_ago).unwrap_or(0)
-        };
-        set_step(&state, "fetch_splits", StepStatus::Success, Some(&format!("{n} tickers with splits")));
-    }
-
-    // ── Step 7e: fetch_dilution (SEC XBRL frames, once/day) + dilution score ──
-    // Bulk historical shares-outstanding snapshots → `dilution_snapshots`; then the
-    // split-adjusted 12-month dilution % + DB-wide percentile (100 = most dilutive).
-    set_step(&state, "fetch_dilution", StepStatus::Running, None);
-    const DIL_DATE_KEY: &str = "dilution_fetch_date";
-    let dil_fresh_today = {
-        let g = db.lock().unwrap();
-        cache_repository::get_app_meta(&g, DIL_DATE_KEY).as_deref() == Some(today.as_str())
-    };
-    if !dil_fresh_today && !mock_alpaca {
-        match crate::company_intel::collect_sec_bulk(db.clone(), config.clone()).await {
-            Ok((snaps, fins)) => {
-                let g = db.lock().unwrap();
-                let _ = cache_repository::set_app_meta(&g, DIL_DATE_KEY, &today);
-                drop(g);
-                let _ = log(&db, "info",
-                    &format!("startup: SEC bulk — {snaps} shares snapshots, {fins} financials"));
-            }
-            Err(e) => push_warning(&state, &format!("SEC bulk fetch failed: {e}")),
-        }
-    }
-    {
-        let n = {
-            let g = db.lock().unwrap();
-            cache_repository::recompute_dilution_scores(&g, &today).unwrap_or(0)
-        };
-        set_step(&state, "fetch_dilution", StepStatus::Success, Some(&format!("{n} scored")));
-        let _ = log(&db, "info", &format!("startup: dilution scored {n} symbols"));
-    }
+                (
+                    cache_repository::recompute_atr_prev_close(&g).unwrap_or(0),
+                    cache_repository::recompute_pump_dump_scores(&g).unwrap_or(0),
+                )
+            };
+            set_step(&state, "compute_metrics", StepStatus::Success,
+                Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
+            let _ = log(&db, "info", &format!("startup: ATR/prev_close {pc}, Pump&Dump scored {pd}"));
+        },
+        step_short_interest(&db, &state, &secrets, has_massive, &today),
+        step_splits_bulk(&db, &state, &sec, &symbols_for_bars, mock_alpaca, &today),
+        step_dilution(&db, &state, &config, &today, !mock_alpaca),
+    );
 
     // ── Step 8: persist float / market cap / avg volume ───────────────────────
     // There are no more "universes": we stream the whole US market (wildcard) and
@@ -807,84 +531,47 @@ pub async fn run_pipeline_flat_files(
             Some(&format!("{} float records ({with_float} in universe)", floats.len())));
     }
 
-    // ── compute_changes (multi-day close-to-close % changes) ──────────────────
-    // Skip when daily_cache is empty (no flat daily file downloaded yet).
+    // ── compute passes + network pulls — all parallel ─────────────────────────
+    // Skip CPU passes when there are no local daily bars at all.
     let has_daily = copied.as_ref().map(|n| *n > 0).unwrap_or(false);
-    if has_daily {
-        set_step(&state, "compute_changes", StepStatus::Running, None);
-        {
-            let g = db.lock().unwrap();
-            match cache_repository::recompute_multiday_changes(&g) {
-                Ok(n) => {
-                    drop(g);
-                    set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
-                }
-                Err(e) => {
-                    drop(g);
-                    set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
-                }
-            }
-        }
-
-        set_step(&state, "compute_metrics", StepStatus::Running, None);
-        {
-            let (pc, pd) = {
+    tokio::join!(
+        async {
+            if has_daily {
+                set_step(&state, "compute_changes", StepStatus::Running, None);
                 let g = db.lock().unwrap();
-                (
-                    cache_repository::recompute_atr_prev_close(&g).unwrap_or(0),
-                    cache_repository::recompute_pump_dump_scores(&g).unwrap_or(0),
-                )
-            };
-            set_step(&state, "compute_metrics", StepStatus::Success,
-                Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
-        }
-    } else {
-        set_step(&state, "compute_changes", StepStatus::Success, Some("skipped (no daily data)"));
-        set_step(&state, "compute_metrics", StepStatus::Success, Some("skipped (no daily data)"));
-    }
-
-    // ── fetch_short_interest (Massive bulk, once/day, online optional) ────────
-    set_step(&state, "fetch_short_interest", StepStatus::Running, None);
-    let si_fresh = {
-        let g = db.lock().unwrap();
-        cache_repository::get_app_meta(&g, "short_interest_fetch_date").as_deref() == Some(today.as_str())
-    };
-    if si_fresh {
-        set_step(&state, "fetch_short_interest", StepStatus::Success, Some("cached today"));
-    } else if !has_massive {
-        set_step(&state, "fetch_short_interest", StepStatus::Warning, Some("no Massive key (offline / not configured)"));
-    } else {
-        match crate::company_intel::collect_short_interest_bulk(db.clone(), secrets.clone()).await {
-            Ok(n) => {
-                { let g = db.lock().unwrap(); let _ = cache_repository::set_app_meta(&g, "short_interest_fetch_date", &today); }
-                set_step(&state, "fetch_short_interest", StepStatus::Success, Some(&format!("{n} tickers")));
+                match cache_repository::recompute_multiday_changes(&g) {
+                    Ok(n) => {
+                        drop(g);
+                        set_step(&state, "compute_changes", StepStatus::Success, Some(&format!("{n} symbols")));
+                    }
+                    Err(e) => {
+                        drop(g);
+                        set_step(&state, "compute_changes", StepStatus::Warning, Some(&format!("failed: {e}")));
+                    }
+                }
+            } else {
+                set_step(&state, "compute_changes", StepStatus::Success, Some("skipped (no daily data)"));
             }
-            Err(e) => {
-                push_warning(&state, &format!("short interest fetch failed: {e}"));
-                set_step(&state, "fetch_short_interest", StepStatus::Warning, Some(&format!("error: {e}")));
+        },
+        async {
+            if has_daily {
+                set_step(&state, "compute_metrics", StepStatus::Running, None);
+                let (pc, pd) = {
+                    let g = db.lock().unwrap();
+                    (
+                        cache_repository::recompute_atr_prev_close(&g).unwrap_or(0),
+                        cache_repository::recompute_pump_dump_scores(&g).unwrap_or(0),
+                    )
+                };
+                set_step(&state, "compute_metrics", StepStatus::Success,
+                    Some(&format!("ATR/prev_close {pc} · Pump&Dump {pd}")));
+            } else {
+                set_step(&state, "compute_metrics", StepStatus::Success, Some("skipped (no daily data)"));
             }
-        }
-    }
-
-    // ── fetch_dilution (SEC XBRL, once/day, online optional) + scores ─────────
-    set_step(&state, "fetch_dilution", StepStatus::Running, None);
-    let dil_fresh = {
-        let g = db.lock().unwrap();
-        cache_repository::get_app_meta(&g, "dilution_fetch_date").as_deref() == Some(today.as_str())
-    };
-    if !dil_fresh && has_sec {
-        match crate::company_intel::collect_sec_bulk(db.clone(), config.clone()).await {
-            Ok((snaps, fins)) => {
-                { let g = db.lock().unwrap(); let _ = cache_repository::set_app_meta(&g, "dilution_fetch_date", &today); }
-                let _ = log(&db, "info", &format!("startup: SEC bulk — {snaps} snapshots, {fins} financials"));
-            }
-            Err(e) => push_warning(&state, &format!("SEC bulk fetch failed: {e}")),
-        }
-    }
-    {
-        let n = { let g = db.lock().unwrap(); cache_repository::recompute_dilution_scores(&g, &today).unwrap_or(0) };
-        set_step(&state, "fetch_dilution", StepStatus::Success, Some(&format!("{n} scored")));
-    }
+        },
+        step_short_interest(&db, &state, &secrets, has_massive, &today),
+        step_dilution(&db, &state, &config, &today, has_sec),
+    );
 
     // ── compute_universe: persist float / market cap / avg volume ─────────────
     set_step(&state, "compute_universe", StepStatus::Running, None);
@@ -1155,4 +842,235 @@ async fn step_sec(
             set_step(state, "fetch_sec", StepStatus::Warning, Some(&format!("fetch error — {count} cached")));
         }
     }
+}
+
+/// Daily bars step (`load_daily`): incremental Alpaca fetch (250d first run, missing
+/// days on subsequent runs). Returns (volume_map, prev_close_map) built inside the
+/// same transaction so compute_universe can use them without a second DB pass.
+async fn step_daily(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    state: &Arc<RwLock<StartupState>>,
+    sec: &Secrets,
+    symbols: &[String],
+    mock_alpaca: bool,
+    today: &str,
+) -> (
+    std::collections::HashMap<String, i64>,
+    std::collections::HashMap<String, f64>,
+) {
+    set_step(state, "load_daily", StepStatus::Running, None);
+    let desired_start = (Utc::now() - chrono::Duration::days(250)).format("%Y-%m-%d").to_string();
+    let backfill_threshold = (Utc::now() - chrono::Duration::days(235)).format("%Y-%m-%d").to_string();
+    let (latest_cached, earliest_cached) = {
+        let g = db.lock().unwrap();
+        (
+            cache_repository::latest_bar_date(&g).unwrap_or(None),
+            cache_repository::earliest_bar_date(&g).unwrap_or(None),
+        )
+    };
+    let split_adjusted = {
+        let g = db.lock().unwrap();
+        cache_repository::get_app_meta(&g, "bars_adjustment").as_deref() == Some("split")
+    };
+    let force_readjust = !split_adjusted && !mock_alpaca;
+    let need_backfill = force_readjust || match earliest_cached.as_deref() {
+        Some(d) if !d.is_empty() => d > backfill_threshold.as_str(),
+        _ => true,
+    };
+    let start_date = if need_backfill {
+        desired_start.clone()
+    } else {
+        latest_cached
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| desired_start.clone())
+    };
+    let incremental = !need_backfill;
+    let mut daily_fetch_ok = true;
+    let daily_bars = if mock_alpaca {
+        crate::alpaca::bars::mock_daily_bars(symbols)
+    } else {
+        let key = sec.alpaca_key.as_deref().unwrap_or_default();
+        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
+        match crate::alpaca::bars::fetch_daily_bars_since(key, secret, symbols, &start_date).await {
+            Ok(bars) => bars,
+            Err(e) => {
+                daily_fetch_ok = false;
+                push_warning(state, &format!("Alpaca bars fetch failed: {e} — keeping cached bars"));
+                std::collections::HashMap::new()
+            }
+        }
+    };
+    // Split reconciliation: on incremental runs refetch split-adjusted history for
+    // symbols that split since the last check.
+    let readjusted_bars = if mock_alpaca || need_backfill || !daily_fetch_ok {
+        std::collections::HashMap::new()
+    } else {
+        let key = sec.alpaca_key.as_deref().unwrap_or_default();
+        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
+        let last_check = {
+            let g = db.lock().unwrap();
+            cache_repository::get_app_meta(&g, "splits_checked_through")
+        }
+        .unwrap_or_else(|| start_date.clone());
+        match crate::alpaca::corporate_actions::fetch_recent_split_symbols(key, secret, symbols, &last_check).await {
+            Ok(syms) if !syms.is_empty() => {
+                let _ = log(db, "info", &format!("startup: {} symbol(s) split since {last_check} — refetching", syms.len()));
+                match crate::alpaca::bars::fetch_daily_bars_since(key, secret, &syms, &desired_start).await {
+                    Ok(bars) => bars,
+                    Err(e) => {
+                        push_warning(state, &format!("split refetch failed: {e}"));
+                        std::collections::HashMap::new()
+                    }
+                }
+            }
+            Ok(_) => std::collections::HashMap::new(),
+            Err(e) => {
+                push_warning(state, &format!("split check failed: {e}"));
+                std::collections::HashMap::new()
+            }
+        }
+    };
+    // Persist bars + compute volume/prev-close in ONE transaction.
+    let (volume_map, prev_close_map) = {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let g = db.lock().unwrap();
+        let _ = g.execute_batch("BEGIN");
+        for sym in readjusted_bars.keys() {
+            let _ = cache_repository::delete_symbol_bars(&g, sym);
+        }
+        for (_sym, bars) in daily_bars.iter().chain(readjusted_bars.iter()) {
+            for bar in bars {
+                let _ = cache_repository::upsert_daily_bar(&g, &cache_repository::DailyBar {
+                    symbol: bar.symbol.clone(),
+                    date: bar.date.clone(),
+                    open: bar.open, high: bar.high, low: bar.low,
+                    close: bar.close, volume: bar.volume,
+                    updated_at: now.clone(),
+                });
+            }
+        }
+        let volume_map: std::collections::HashMap<String, i64> =
+            cache_repository::avg_volumes(&g, 20).unwrap_or_default().into_iter().collect();
+        let prev_close_map: std::collections::HashMap<String, f64> =
+            cache_repository::latest_closes(&g).unwrap_or_default().into_iter().collect();
+        for (sym, avg_vol) in &volume_map {
+            let _ = g.execute(
+                "UPDATE universe_assets SET avg_volume=?1 WHERE symbol=?2",
+                rusqlite::params![avg_vol, sym],
+            );
+        }
+        if !mock_alpaca && daily_fetch_ok {
+            let _ = cache_repository::set_app_meta(&g, "bars_adjustment", "split");
+            let _ = cache_repository::set_app_meta(&g, "splits_checked_through", today);
+        }
+        let _ = g.execute_batch("COMMIT");
+        (volume_map, prev_close_map)
+    };
+    let covered = { let g = db.lock().unwrap(); cache_repository::symbols_with_bars(&g).unwrap_or(0) };
+    let mode = if incremental { format!("incremental since {start_date}") } else { format!("250d backfill since {start_date}") };
+    set_step(state, "load_daily", StepStatus::Success,
+        Some(&format!("{covered} symbols with bar data · {} updated ({mode})", daily_bars.len())));
+    let _ = log(db, "info", &format!("startup: daily bars — {covered} cached, {} updated ({mode})", daily_bars.len()));
+    (volume_map, prev_close_map)
+}
+
+/// Short interest bulk step (`fetch_short_interest`): Massive whole-universe dump,
+/// once per ET day. No-ops when already cached or key is missing.
+async fn step_short_interest(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    state: &Arc<RwLock<StartupState>>,
+    secrets: &Arc<RwLock<crate::config::secrets::Secrets>>,
+    has_massive: bool,
+    today: &str,
+) {
+    const SI_KEY: &str = "short_interest_fetch_date";
+    set_step(state, "fetch_short_interest", StepStatus::Running, None);
+    let fresh = { let g = db.lock().unwrap(); cache_repository::get_app_meta(&g, SI_KEY).as_deref() == Some(today) };
+    if fresh {
+        set_step(state, "fetch_short_interest", StepStatus::Success, Some("cached today"));
+        return;
+    }
+    if !has_massive {
+        push_warning(state, "No Massive key — short interest not collected");
+        set_step(state, "fetch_short_interest", StepStatus::Warning, Some("no Massive key"));
+        return;
+    }
+    match crate::company_intel::collect_short_interest_bulk(db.clone(), secrets.clone()).await {
+        Ok(n) => {
+            { let g = db.lock().unwrap(); let _ = cache_repository::set_app_meta(&g, SI_KEY, today); }
+            set_step(state, "fetch_short_interest", StepStatus::Success, Some(&format!("{n} tickers")));
+            let _ = log(db, "info", &format!("startup: short interest bulk — {n} tickers"));
+        }
+        Err(e) => {
+            push_warning(state, &format!("short interest fetch failed: {e}"));
+            set_step(state, "fetch_short_interest", StepStatus::Warning, Some(&format!("error: {e}")));
+        }
+    }
+}
+
+/// Splits bulk step (`fetch_splits`): Alpaca corporate-actions dump, once/day.
+/// Skipped in mock mode (no Alpaca keys) or when already cached today.
+async fn step_splits_bulk(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    state: &Arc<RwLock<StartupState>>,
+    sec: &Secrets,
+    symbols: &[String],
+    mock_alpaca: bool,
+    today: &str,
+) {
+    const SPLITS_KEY: &str = "splits_full_fetch_date";
+    set_step(state, "fetch_splits", StepStatus::Running, None);
+    let fresh = { let g = db.lock().unwrap(); cache_repository::get_app_meta(&g, SPLITS_KEY).as_deref() == Some(today) };
+    if !fresh && !mock_alpaca {
+        let key = sec.alpaca_key.as_deref().unwrap_or_default();
+        let secret = sec.alpaca_secret.as_deref().unwrap_or_default();
+        let start = (Utc::now() - chrono::Duration::days(400)).format("%Y-%m-%d").to_string();
+        match crate::alpaca::corporate_actions::fetch_all_splits(key, secret, symbols, &start).await {
+            Ok(events) => {
+                let rows: Vec<cache_repository::SplitRow> = events.into_iter().map(|e| cache_repository::SplitRow {
+                    symbol: e.symbol, ex_date: e.date, label: e.label,
+                    from_factor: e.from, to_factor: e.to,
+                }).collect();
+                let n = {
+                    let g = db.lock().unwrap();
+                    let n = cache_repository::replace_ticker_splits(&g, &rows).unwrap_or(0);
+                    let _ = cache_repository::set_app_meta(&g, SPLITS_KEY, today);
+                    n
+                };
+                let _ = log(db, "info", &format!("startup: splits bulk — {n} events"));
+            }
+            Err(e) => push_warning(state, &format!("splits fetch failed: {e}")),
+        }
+    }
+    let one_year_ago = (Utc::now() - chrono::Duration::days(365)).format("%Y-%m-%d").to_string();
+    let n = { let g = db.lock().unwrap(); cache_repository::recompute_split_rollups(&g, &one_year_ago).unwrap_or(0) };
+    set_step(state, "fetch_splits", StepStatus::Success, Some(&format!("{n} tickers with splits")));
+}
+
+/// Dilution step (`fetch_dilution`): SEC XBRL bulk + score, once/day.
+/// `should_fetch` is `!mock_alpaca` in API mode or `has_sec` in flat-files mode.
+async fn step_dilution(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    state: &Arc<RwLock<StartupState>>,
+    config: &Arc<RwLock<AppConfig>>,
+    today: &str,
+    should_fetch: bool,
+) {
+    const DIL_KEY: &str = "dilution_fetch_date";
+    set_step(state, "fetch_dilution", StepStatus::Running, None);
+    let fresh = { let g = db.lock().unwrap(); cache_repository::get_app_meta(&g, DIL_KEY).as_deref() == Some(today) };
+    if !fresh && should_fetch {
+        match crate::company_intel::collect_sec_bulk(db.clone(), config.clone()).await {
+            Ok((snaps, fins)) => {
+                { let g = db.lock().unwrap(); let _ = cache_repository::set_app_meta(&g, DIL_KEY, today); }
+                let _ = log(db, "info", &format!("startup: SEC bulk — {snaps} snapshots, {fins} financials"));
+            }
+            Err(e) => push_warning(state, &format!("SEC bulk fetch failed: {e}")),
+        }
+    }
+    let n = { let g = db.lock().unwrap(); cache_repository::recompute_dilution_scores(&g, today).unwrap_or(0) };
+    set_step(state, "fetch_dilution", StepStatus::Success, Some(&format!("{n} scored")));
+    let _ = log(db, "info", &format!("startup: dilution scored {n} symbols"));
 }

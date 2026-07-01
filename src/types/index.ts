@@ -40,7 +40,7 @@ export interface Strategy {
   enabled: boolean;
   sessions: Session[];
   priority: number;
-  max_risk_dollars: number;
+  risk: StrategyRiskConfig;
 }
 
 // ─── Live pre-open screener match (mirrors ScreenerMatch in types/mod.rs) ──────
@@ -182,6 +182,11 @@ export interface CardNews {
 
 export interface StrategyRiskConfig {
   max_risk_dollars: number;
+  default_order_type: "market" | "limit";
+  auto_tp_enabled: boolean;
+  auto_tp_r: number;
+  auto_be_enabled: boolean;
+  auto_be_r: number;
 }
 
 // ─── Strategy identity card (mirrors StrategyCard in types/mod.rs) ────────────
