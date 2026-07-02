@@ -32,7 +32,7 @@ import {
   registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
 import { registerZoneGamepad, getChartControl } from "@/lib/gamepadBus";
-import { useStrategyCards } from "@/queries/useScanner";
+import { useStrategyCards, useStrategies } from "@/queries/useScanner";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
 import { nyFilenameStamp } from "@/lib/nyTime";
@@ -149,6 +149,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   // ── Strategy identity card → panes + info-band fields ──────────────────────
   const { data: cards } = useStrategyCards();
+  // Risk manager settings (Settings ▸ Stratégies) — read here only to seed the
+  // toolbar's Mkt/Lmt toggle below; the same list Settings edits, so live and
+  // replay (which share one backend risk map) always agree with the toolbar.
+  const { data: strategies } = useStrategies();
   const isManual = zone.strategy_id === MANUAL_STRATEGY_ID;
   const card  = isManual
     ? MANUAL_CARD
@@ -411,6 +415,24 @@ export function ChartZone({ zone }: ChartZoneProps) {
       chartStore.setContext(zone.zone_id, ctx ?? null);
     });
   }, [zone.zone_id, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Seed the Mkt/Lmt toolbar toggle from the strategy's risk manager setting
+  //    (Settings ▸ Stratégies ▸ "Ordre") when a new ticker lands in this zone —
+  //    previously the toolbar always started at "Market" regardless of that
+  //    setting. Seeds once per (zone, symbol) via the ref guard below so it
+  //    never re-fires (and silently discards the user's manual toggle) just
+  //    because the `strategies` list was refetched/invalidated for an
+  //    unrelated Settings edit while this zone stayed mounted.
+  const seededOrderModeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!zone.symbol) return;
+    const seedKey = `${zone.zone_id}:${zone.symbol}`;
+    if (seededOrderModeRef.current === seedKey) return;
+    if (!strategies) return; // wait for the list rather than seed "market" then flip
+    const defaultOrderType = strategies.find((s) => s.id === zone.strategy_id)?.risk.default_order_type;
+    chartStore.setOrderMode(zone.zone_id, defaultOrderType === "limit" ? "limit" : "market");
+    seededOrderModeRef.current = seedKey;
+  }, [zone.zone_id, zone.symbol, zone.strategy_id, strategies]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load + keep persisted price alarms in sync for this symbol ─────────────
   // Polled (not one-shot) so a deletion from the Alarms sidebar/panel — which
@@ -868,75 +890,68 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
     setCaptureStatus("pending");
     try {
-      // Build the info-band header text (strategy + chips + reason + LLM). Each
-      // top-level child of the band becomes one line; its internal chips are
-      // joined with " · ". Canvas text can't be tainted, so this is safe.
-      const PAD = 8;
-      const LINE_H = 15;
-      const FONT = "11px ui-monospace, monospace";
-      const headerLines: string[] = [];
       const band = infoBandRef.current;
-      if (band) {
-        band.childNodes.forEach((node) => {
-          if (node.nodeType !== Node.ELEMENT_NODE) return;
-          const txt = ((node as HTMLElement).innerText || "")
-            .replace(/\s*\n\s*/g, " · ")
-            .replace(/\s{2,}/g, " ")
-            .trim();
-          if (txt) headerLines.push(txt);
-        });
-      }
-
       const rect = container.getBoundingClientRect();
-      const width = Math.round(rect.width);
+      const bandRect = band ? band.getBoundingClientRect() : null;
+      // The info band is a sibling outside chartAreaRef (its own padding vs.
+      // the chart area's margin), so their left edges/widths can differ
+      // slightly. Use a shared origin/width spanning both so neither is
+      // ever cropped against the other.
+      const originX = bandRect ? Math.min(rect.left, bandRect.left) : rect.left;
+      const contentRight = bandRect ? Math.max(rect.right, bandRect.right) : rect.right;
+      const width  = Math.round(contentRight - originX);
+      const height = Math.round(rect.height);
+      const headerH = bandRect && bandRect.height > 0 ? Math.round(bandRect.height) : 0;
 
-      // Wrap header lines to the canvas width so long LLM summaries don't clip.
-      const measure = document.createElement("canvas").getContext("2d")!;
-      measure.font = FONT;
-      const wrapped: string[] = [];
-      const maxTextW = width - PAD * 2;
-      for (const line of headerLines) {
-        const words = line.split(" ");
-        let cur = "";
-        for (const w of words) {
-          const next = cur ? `${cur} ${w}` : w;
-          if (measure.measureText(next).width > maxTextW && cur) {
-            wrapped.push(cur);
-            cur = w;
-          } else {
-            cur = next;
-          }
-        }
-        if (cur) wrapped.push(cur);
-      }
-      const headerH = wrapped.length > 0 ? wrapped.length * LINE_H + PAD * 2 : 0;
+      // lightweight-charts backs each <canvas> with a bitmap sized at
+      // devicePixelRatio × its CSS rect, while getBoundingClientRect() stays in
+      // CSS pixels. drawImage(src, dx, dy) with no explicit destination size
+      // draws the source at its native bitmap size, not its CSS size — on any
+      // HiDPI display that stamps each canvas 2–3x too large at a CSS-pixel
+      // offset, spilling candles/axes off the composite (truncated axes,
+      // "missing" candles). Always pass explicit dWidth/dHeight below so every
+      // canvas is scaled back down to the CSS-pixel footprint it actually
+      // occupies on screen — this is what makes the capture match what the
+      // user sees. The composite is then rendered at devicePixelRatio so the
+      // output stays crisp instead of falling back to 1x.
+      const dpr = window.devicePixelRatio || 1;
 
-      // Composite the info header (text) + all chart canvases onto one canvas.
+      // Composite the info band + all chart canvases onto one canvas.
+      // Backing store is at devicePixelRatio; all drawing below happens in
+      // CSS-pixel space via ctx.scale, matching `rect`/`getBoundingClientRect()`.
       const canvas = document.createElement("canvas");
-      canvas.width  = width;
-      canvas.height = Math.round(rect.height) + headerH;
+      canvas.width  = Math.round(width * dpr);
+      canvas.height = Math.round((height + headerH) * dpr);
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("no 2d context");
+      ctx.scale(dpr, dpr);
 
       ctx.fillStyle = "#0a0a0a";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillRect(0, 0, width, height + headerH);
 
-      if (headerH > 0) {
-        ctx.font = FONT;
-        ctx.textBaseline = "top";
-        ctx.fillStyle = "#cfcfcf";
-        wrapped.forEach((line, i) => {
-          ctx.fillText(line, PAD, PAD + i * LINE_H);
-        });
+      // Rasterize the real info bar (badges/colors/icons) via html-to-image,
+      // same technique as the on-chart overlays below, so it matches the live
+      // UI instead of being reduced to plain text.
+      if (band && headerH > 0 && bandRect) {
+        try {
+          const bc = await domToCanvas(band, { pixelRatio: dpr, backgroundColor: "#0a0a0a" });
+          ctx.drawImage(bc, bandRect.left - originX, 0, bandRect.width, bandRect.height);
+        } catch (e) {
+          console.warn("info bar capture failed, skipping:", e);
+        }
         // Thin separator between the info band and the chart.
         ctx.fillStyle = "#1e1e1e";
-        ctx.fillRect(0, headerH - 1, canvas.width, 1);
+        ctx.fillRect(0, headerH - 1, width, 1);
       }
 
       const srcCanvases = container.querySelectorAll("canvas");
       srcCanvases.forEach((src) => {
         const sr = src.getBoundingClientRect();
-        ctx.drawImage(src, sr.left - rect.left, sr.top - rect.top + headerH);
+        ctx.drawImage(
+          src,
+          sr.left - originX, sr.top - rect.top + headerH,
+          sr.width, sr.height,
+        );
       });
 
       // Rasterize on-chart strategy overlays (bars, badges, colored fills) at
@@ -947,8 +962,12 @@ export function ChartZone({ zone }: ChartZoneProps) {
         Array.from(overlays).map(async (overlay) => {
           try {
             const or = overlay.getBoundingClientRect();
-            const oc = await domToCanvas(overlay, { pixelRatio: 1 });
-            ctx.drawImage(oc, or.left - rect.left, or.top - rect.top + headerH);
+            const oc = await domToCanvas(overlay, { pixelRatio: dpr });
+            ctx.drawImage(
+              oc,
+              or.left - originX, or.top - rect.top + headerH,
+              or.width, or.height,
+            );
           } catch (e) {
             console.warn("overlay capture failed, skipping:", e);
           }

@@ -389,7 +389,8 @@ pub fn run() {
                 let db            = state.db.clone();
                 let config        = state.config.clone();
                 let chart         = state.chart.clone();
-                commands::spawn_trading_loop(running, market, internal_book, db, config, chart);
+                let strategy_risk = state.strategy_risk.clone();
+                commands::spawn_trading_loop(running, market, internal_book, db, config, chart, strategy_risk);
             }
 
             // 5. On-demand "capacité à diluer" collector: a background worker that

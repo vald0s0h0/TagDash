@@ -242,6 +242,14 @@ pub struct Position {
     pub high_water:      f64,
     #[serde(default)]
     pub low_water:       f64,
+    /// Auto BE / auto TP fire at most once per position (see
+    /// `InternalBook::apply_auto_risk_management`) — once set, a level the user
+    /// then drags away (deletes the TP, widens the SL past breakeven) is never
+    /// silently reasserted by the next tick.
+    #[serde(default)]
+    pub auto_be_applied: bool,
+    #[serde(default)]
+    pub auto_tp_applied: bool,
 }
 
 /// Single executed fill (internal simulation only — no broker).

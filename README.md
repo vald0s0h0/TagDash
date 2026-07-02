@@ -21,9 +21,15 @@ Scanner trading live (Alpaca → RAM → Rust → UI) construit sur Tauri + Reac
      --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --add Microsoft.VisualStudio.Component.Windows11SDK.22621"
    ```
 
+## Prérequis (macOS)
+
+1. **Node.js** ≥ 20 : `brew install node`
+2. **Rust** (rustup) : `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+3. **Xcode Command Line Tools** : `xcode-select --install`
+
 ## Lancer en dev
 
-```powershell
+```bash
 npm install              # une fois
 npm run tauri:dev        # lance Vite + Tauri (Rust compile la 1re fois)
 ```

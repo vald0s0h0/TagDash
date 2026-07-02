@@ -27,6 +27,8 @@ export type GamepadActionId =
   | "confirm_hod"
   // Journal / TradeTally (digital)
   | "capture" | "share_tag" | "journal_audio"
+  // Replay (digital, global — not tied to a zone)
+  | "replay_next_alert"
   // Analog axes
   | "zoom_time" | "zoom_price" | "cursor_move";
 
@@ -34,7 +36,7 @@ export type GamepadActionKind = "digital" | "analog";
 
 export type GamepadGroup =
   | "Navigation" | "Curseur / Ordres" | "Position armée"
-  | "Journal / TradeTally" | "Axes (analogique)";
+  | "Journal / TradeTally" | "Replay" | "Axes (analogique)";
 
 export interface GamepadActionDef {
   id: GamepadActionId;
@@ -77,6 +79,9 @@ export const GAMEPAD_ACTIONS: GamepadActionDef[] = [
   { id: "share_tag",     label: "Ajouter un tag (TradeTally)", group: "Journal / TradeTally", kind: "digital" },
   { id: "journal_audio", label: "Note audio (dictée trade)",   group: "Journal / TradeTally", kind: "digital" },
 
+  // Replay (global — pas de zone ciblée)
+  { id: "replay_next_alert", label: "Replay : prochaine alerte", group: "Replay", kind: "digital" },
+
   // Analog axes
   { id: "zoom_time",   label: "Zoom horizontal (temps)", group: "Axes (analogique)", kind: "analog" },
   { id: "zoom_price",  label: "Zoom vertical (prix)",    group: "Axes (analogique)", kind: "analog" },
@@ -84,7 +89,7 @@ export const GAMEPAD_ACTIONS: GamepadActionDef[] = [
 ];
 
 export const GAMEPAD_GROUPS: GamepadGroup[] = [
-  "Navigation", "Curseur / Ordres", "Position armée", "Journal / TradeTally", "Axes (analogique)",
+  "Navigation", "Curseur / Ordres", "Position armée", "Journal / TradeTally", "Replay", "Axes (analogique)",
 ];
 
 export function actionDef(id: GamepadActionId): GamepadActionDef | undefined {
@@ -126,7 +131,9 @@ export function bindingLabel(b: GamepadBinding | undefined): string {
 // ─── Default layout (the spec; = distribution defaults) ───────────────────────
 // W3C "standard" mapping (native Gamepad API): A=0 B=1 X=2 Y=3 · LB=4 RB=5 LT=6
 // RT=7 · View=8 Menu=9 L3=10 R3=11 · D-pad 12↑/13↓/14←/15→ · Guide=16 Share=17 ·
-// axes LX=0 LY=1 RX=2 RY=3. Auto-tag on D-pad → (Xbox One/360 have no Share).
+// axes LX=0 LY=1 RX=2 RY=3. Auto-tag on D-pad → (Xbox One/360 have no Share);
+// D-pad → also carries confirm_hod as its R2-armed twin (share_tag isn't
+// needed while aiming/firing a trade, mirroring how A/B/X/Y double up below).
 // PS names map to Xbox: L1=LB L2=LT R1=RB R2=RT.
 
 export const DEFAULT_BINDINGS: Record<GamepadActionId, GamepadBinding> = {
@@ -145,17 +152,20 @@ export const DEFAULT_BINDINGS: Record<GamepadActionId, GamepadBinding> = {
   remove_orders: { kind: "button", index: 2 }, // X
 
   // Armed layer (R2 held) — share the face buttons
-  r2_modifier:    { kind: "button", index: 7 }, // R2 / RT
-  order_25:       { kind: "button", index: 0 }, // A
-  order_50:       { kind: "button", index: 1 }, // B
-  order_100:      { kind: "button", index: 3 }, // Y
-  close_position: { kind: "button", index: 2 }, // X
-  confirm_hod:    { kind: "button", index: 10 }, // L3 (placeholder — rebind later)
+  r2_modifier:    { kind: "button", index: 7 },  // R2 / RT
+  order_25:       { kind: "button", index: 0 },  // A
+  order_50:       { kind: "button", index: 1 },  // B
+  order_100:      { kind: "button", index: 3 },  // Y
+  close_position: { kind: "button", index: 2 },  // X
+  confirm_hod:    { kind: "button", index: 15 }, // D-pad → (armed twin of share_tag)
 
   // Journal / TradeTally
   capture:       { kind: "button", index: 8 },  // View / Back
   share_tag:     { kind: "button", index: 15 }, // D-pad → (no Share on this pad)
   journal_audio: { kind: "button", index: 9 },  // Menu / Start (reserved no-op)
+
+  // Replay
+  replay_next_alert: { kind: "button", index: 11 }, // R3 (right stick click)
 
   // Analog axes
   zoom_time:   { kind: "axis", index: 0 }, // left stick X
@@ -209,10 +219,20 @@ export const useGamepadStore = create<GamepadState>()(
       name: "tagdash-gamepad",
       // v3: back to the W3C "standard" mapping (native Gamepad API) after the gilrs
       // polyfill detour — any older persisted indices are meaningless, so reset.
-      version: 3,
+      // v4: confirm_hod's shipped default (L3, button 10) was an unfinished
+      // placeholder that never worked well two-handed with R2 — moved to D-pad →.
+      version: 4,
       migrate: (persisted, version) => {
         const p = (persisted ?? {}) as Partial<GamepadState>;
         if (version < 3) return { ...p, bindings: { ...DEFAULT_BINDINGS } };
+        if (version < 4) {
+          const b = p.bindings?.confirm_hod;
+          // Only replace it if the user never rebound it away from the old
+          // placeholder themselves — an intentional rebind is left alone.
+          if (b && b.kind === "button" && b.index === 10) {
+            return { ...p, bindings: { ...p.bindings, confirm_hod: DEFAULT_BINDINGS.confirm_hod } };
+          }
+        }
         return p;
       },
       // Fill in any newly-added default bindings the persisted blob predates, so

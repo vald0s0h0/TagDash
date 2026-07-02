@@ -156,6 +156,8 @@ export function useGamepad(): void {
         case "capture": if (zone?.hasTradeId()) zone.capture(); break;
         case "share_tag": shareTag(); break;
         case "journal_audio": if (zone?.hasTradeId()) zone.journalAudio(); break;
+        // Global — not tied to a zone; backend no-ops when no replay is active.
+        case "replay_next_alert": api.replayNextAlert().catch(() => {}); break;
         case "r2_modifier":   break; // handled as a held modifier, not an edge
       }
     };

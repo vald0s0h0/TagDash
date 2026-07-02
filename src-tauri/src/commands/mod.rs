@@ -2215,9 +2215,15 @@ fn sync_fill(
 /// orders that path crossed (range-based, so a level spiked through and retraced
 /// still fills, and SL/TP inside one window resolve by which the price reached
 /// first), (2) re-arms the bracket orders for symbols that just filled,
-/// (3) refreshes live PnL + MAE/MFE watermarks, then (4) mirrors each new fill to
+/// (3) refreshes live PnL + MAE/MFE watermarks, (4) applies each position's
+/// strategy auto-BE / auto-TP settings off that refreshed PnL and mirrors any
+/// change into the chart's SL/TP lines, then (5) mirrors each new fill to
 /// TradeTally. So fills happen at a steady cadence whether or not any panel is
-/// open, and the getters are pure reads.
+/// open, and the getters are pure reads. There is exactly one instance of this
+/// loop for the whole app — live and Market Replay both feed the same
+/// `MarketState` it reads, so a replay session gets identical fills, brackets
+/// and auto-BE/TP behaviour as live trading, off the very same Settings ▸
+/// Stratégies config.
 pub fn spawn_trading_loop(
     running:       Arc<std::sync::atomic::AtomicBool>,
     market:        Arc<RwLock<MarketState>>,
@@ -2225,6 +2231,7 @@ pub fn spawn_trading_loop(
     db:            Arc<Mutex<rusqlite::Connection>>,
     config:        Arc<RwLock<AppConfig>>,
     chart:         Arc<RwLock<crate::chart_state::ChartState>>,
+    strategy_risk: Arc<RwLock<HashMap<String, crate::types::StrategyRiskConfig>>>,
 ) {
     if running.load(Ordering::Relaxed) {
         return;
@@ -2237,7 +2244,7 @@ pub fn spawn_trading_loop(
             // so there's no lock nesting.
             let windows = market.write().unwrap().drain_fill_windows();
             let prices  = all_market_prices(&market);
-            let new_fills = {
+            let (new_fills, risk_updates) = {
                 let mut book = internal_book.write().unwrap();
                 let nf = book.try_fill_pending(&windows);
                 // Reconcile bracket orders for any symbol that just filled (entry →
@@ -2247,10 +2254,33 @@ pub fn spawn_trading_loop(
                 }
                 // Refresh live PnL + MAE/MFE watermarks even when no panel polls.
                 let _ = book.positions_with_pnl(&prices);
-                nf
+
+                // Auto BE / auto TP off the R-multiple just refreshed above, then
+                // re-arm brackets for whatever changed.
+                let touched = book.apply_auto_risk_management(&strategy_risk.read().unwrap());
+                for sym in &touched {
+                    book.sync_bracket_orders(sym);
+                }
+                let updates: Vec<(String, Option<f64>, Option<f64>)> = touched.iter()
+                    .filter_map(|sym| book.positions.get(sym).map(|p| (sym.clone(), p.stop_loss, p.take_profit)))
+                    .collect();
+                (nf, updates)
             };
             for f in &new_fills {
                 sync_fill(&internal_book, &db, &config, &chart, f);
+            }
+            if !risk_updates.is_empty() {
+                // Mirror the auto-adjusted levels into the chart's per-ticker
+                // context so the SL/TP lines move with the bracket, then persist
+                // both (chart line + re-armed bracket must survive a restart).
+                {
+                    let mut cs = chart.write().unwrap();
+                    for (sym, sl, tp) in &risk_updates {
+                        cs.sync_levels(sym, *sl, *tp);
+                    }
+                }
+                persist_chart(&chart, &db);
+                persist_book(&internal_book, &db);
             }
             // 500 ms of market time (scaled during an accelerated replay so
             // pending orders / brackets fill at the live-equivalent cadence).

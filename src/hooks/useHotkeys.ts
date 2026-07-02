@@ -6,6 +6,7 @@ import {
 } from "@/stores/hotkeyStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useUiStore } from "@/stores/uiStore";
+import { api } from "@/lib/tauri";
 
 // Global hotkey listener. Mounted once (App). Routes a matched chord to the zone
 // under the mouse cursor (its registered ChartZone dispatcher), falling back to
@@ -62,6 +63,15 @@ export function useHotkeys(): void {
       if (!b) return;
       const id = matchAction(b);
       if (!id) return;
+      // Replay is global (no chart zone involved) — bypass the zone dispatch.
+      // The backend no-ops when no replay is active, so this is safe to fire
+      // unconditionally.
+      if (id === "replay_next_alert") {
+        e.preventDefault();
+        e.stopPropagation();
+        api.replayNextAlert().catch(() => {});
+        return;
+      }
       const zone = targetZone(e.target);
       if (!zone) return;
       e.preventDefault();

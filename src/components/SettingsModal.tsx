@@ -361,6 +361,7 @@ const HOTKEY_GROUP_LABELS: Record<HotkeyGroup, string> = {
   Ordres:     "Ordres",
   Analyse:    "Analyse IA",
   Timeframes: "Timeframes (pane de gauche)",
+  Replay:     "Market Replay",
 };
 
 /** One bindable action row: shows the current chord and records a new one (the

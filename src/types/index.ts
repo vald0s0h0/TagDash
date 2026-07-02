@@ -446,11 +446,6 @@ export interface AppConfig {
   data_source: { mode: "api" | "flat_files" };
   /** Offline Speech-to-Text dictée pipeline (whisper.cpp). */
   stt: SttConfig;
-  risk_management: {
-    default_order_type: "limit" | "market";
-    auto_be_enabled: boolean;
-    auto_be_r: number;
-  };
 }
 
 // ─── Speech-to-Text (offline dictée → trade notes / diary) ───────────────────────

@@ -162,6 +162,19 @@ impl ChartState {
         self.zone_symbol.remove(zone_id);
     }
 
+    /// Mirrors a backend-driven SL/TP change (auto breakeven / auto take-profit,
+    /// from the trading loop) into the ticker's chart context, so the on-chart
+    /// line matches the position it just adjusted. Unlike `update_sl`/`update_tp`
+    /// this never creates a context or a tradeID — the open position that
+    /// triggered the change already has both. No-op if the ticker has no context
+    /// (shouldn't happen: an open position always has one).
+    pub fn sync_levels(&mut self, symbol: &str, stop_loss: Option<f64>, take_profit: Option<f64>) {
+        if let Some(c) = self.contexts.get_mut(symbol) {
+            c.stop_loss   = stop_loss;
+            c.take_profit = take_profit;
+        }
+    }
+
     /// Called when a trade closes (position flat). Clears the owning TICKER's
     /// SL/TP so the chart bracket lines disappear, but KEEPS the tradeID and flags
     /// the context `closed` — the journal/screenshots can still be filled in for

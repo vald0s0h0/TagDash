@@ -17,9 +17,11 @@ export type HotkeyActionId =
   | "order_mode" | "order_25" | "order_50" | "order_100" | "close"
   | "confirm_hod"
   | "run_llm"
-  | "tf_5s" | "tf_10s" | "tf_1m" | "tf_2m" | "tf_5m" | "tf_15m" | "tf_daily";
+  | "tf_5s" | "tf_10s" | "tf_1m" | "tf_2m" | "tf_5m" | "tf_15m" | "tf_daily"
+  // Replay (global — not tied to a chart zone, special-cased in useHotkeys)
+  | "replay_next_alert";
 
-export type HotkeyGroup = "Toolbar" | "Ordres" | "Analyse" | "Timeframes";
+export type HotkeyGroup = "Toolbar" | "Ordres" | "Analyse" | "Timeframes" | "Replay";
 
 export interface HotkeyActionDef {
   id: HotkeyActionId;
@@ -53,9 +55,11 @@ export const HOTKEY_ACTIONS: HotkeyActionDef[] = [
   { id: "tf_5m",    label: "Timeframe 5m",    group: "Timeframes" },
   { id: "tf_15m",   label: "Timeframe 15m",   group: "Timeframes" },
   { id: "tf_daily", label: "Timeframe daily", group: "Timeframes" },
+
+  { id: "replay_next_alert", label: "Replay : prochaine alerte", group: "Replay" },
 ];
 
-export const HOTKEY_GROUPS: HotkeyGroup[] = ["Toolbar", "Ordres", "Analyse", "Timeframes"];
+export const HOTKEY_GROUPS: HotkeyGroup[] = ["Toolbar", "Ordres", "Analyse", "Timeframes", "Replay"];
 
 /** Map a timeframe action to its Timeframe value (null for non-timeframe actions). */
 export const TF_FOR_ACTION: Partial<Record<HotkeyActionId, Timeframe>> = {

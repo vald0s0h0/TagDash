@@ -341,6 +341,8 @@ impl InternalBook {
                 opened_at:       now,
                 high_water:      fill_price,
                 low_water:       fill_price,
+                auto_be_applied: false,
+                auto_tp_applied: false,
             });
         }
     }
@@ -596,6 +598,70 @@ impl InternalBook {
         }
     }
 
+    // ── Automatic risk management (BE / TP) ───────────────────────────────────
+    //
+    // Applies each open position's STRATEGY risk settings — the same map
+    // Settings ▸ Stratégies edits and both live and replay read (one shared
+    // `spawn_trading_loop`, so the two can never disagree on when a bracket
+    // auto-adjusts):
+    //   • auto TP — the first time a position has a known risk distance (an
+    //     SL) and no TP yet (never manually set, and auto hasn't already had
+    //     its shot), places one at `auto_tp_r` × risk from entry.
+    //   • auto BE — once the position's R-multiple reaches `auto_be_r` AND the
+    //     current SL is still on the risk side of entry, pins the SL to
+    //     breakeven. The risk-side check means this only ever "catches up" a
+    //     stop to breakeven — it can never demote an SL the user (or a trail)
+    //     already moved past entry to something better.
+    // Each fires AT MOST ONCE per position (`auto_tp_applied` / `auto_be_applied`
+    // — see Position), so a level the user drags away afterward (deletes the
+    // auto TP, widens the SL back past breakeven) is never silently reasserted
+    // on the next tick. Returns the symbols whose bracket orders need
+    // re-syncing; the caller also owns mirroring the new levels into the chart
+    // context.
+    pub fn apply_auto_risk_management(
+        &mut self,
+        configs: &HashMap<String, crate::types::StrategyRiskConfig>,
+    ) -> Vec<String> {
+        let mut touched = vec![];
+        for (symbol, pos) in self.positions.iter_mut() {
+            let Some(cfg) = configs.get(&pos.strategy_id) else { continue };
+            let mut changed = false;
+
+            if cfg.auto_tp_enabled && !pos.auto_tp_applied && pos.take_profit.is_none() {
+                if let Some(sl) = pos.stop_loss {
+                    let risk = (pos.avg_entry_price - sl).abs();
+                    if risk > 1e-8 {
+                        pos.take_profit = Some(match pos.side {
+                            Side::Long  => pos.avg_entry_price + cfg.auto_tp_r * risk,
+                            Side::Short => pos.avg_entry_price - cfg.auto_tp_r * risk,
+                        });
+                        pos.auto_tp_applied = true;
+                        changed = true;
+                    }
+                }
+            }
+
+            if cfg.auto_be_enabled && !pos.auto_be_applied {
+                let sl_is_risky = pos.stop_loss.is_some_and(|sl| match pos.side {
+                    Side::Long  => sl < pos.avg_entry_price,
+                    Side::Short => sl > pos.avg_entry_price,
+                });
+                if let Some(r) = pos.r_multiple {
+                    if r >= cfg.auto_be_r && sl_is_risky {
+                        pos.stop_loss = Some(pos.avg_entry_price);
+                        pos.auto_be_applied = true;
+                        changed = true;
+                    }
+                }
+            }
+
+            if changed {
+                touched.push(symbol.clone());
+            }
+        }
+        touched
+    }
+
     // ── Close open position at market (bid/ask unfavorable) ───────────────────
 
     pub fn close_position(
@@ -701,6 +767,7 @@ impl InternalBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::StrategyRiskConfig;
 
     fn prices(sym: &str, bid: f64, ask: f64) -> HashMap<String, (f64, f64)> {
         let mut m = HashMap::new();
@@ -931,5 +998,155 @@ mod tests {
         assert_eq!(fills.len(), 1, "TP fills on the spike even though last < TP");
         assert!((fills[0].fill_price - 11.00).abs() < 1e-6);
         assert!(book.positions.get("AAA").is_none(), "flat after TP");
+    }
+
+    // Auto TP must place a resting TP at entry ± auto_tp_r × risk the first time
+    // it sees a position with an SL and no TP, then never touch it again — even
+    // once the user deletes the level it placed (it already had its one shot).
+    #[test]
+    fn auto_tp_places_once_and_does_not_respawn_after_delete() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.00), None, // risk = 1.00/share, no TP
+        );
+        let mut cfgs = HashMap::new();
+        cfgs.insert("strat".to_string(), StrategyRiskConfig {
+            auto_tp_enabled: true, auto_tp_r: 2.0, ..Default::default()
+        });
+
+        let touched = book.apply_auto_risk_management(&cfgs);
+        assert_eq!(touched, vec!["AAA".to_string()]);
+        let pos = book.positions.get("AAA").unwrap();
+        assert!((pos.take_profit.unwrap() - 12.00).abs() < 1e-6, "TP = entry + 2R");
+        assert!(pos.auto_tp_applied);
+
+        // Same config, next tick: already applied — must not re-touch.
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty());
+
+        // User deletes the auto-placed TP (e.g. dragged off chart) — must not
+        // be silently reinstated by the next tick.
+        book.positions.get_mut("AAA").unwrap().take_profit = None;
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty(),
+            "auto TP must not respawn after a manual delete");
+        assert!(book.positions.get("AAA").unwrap().take_profit.is_none());
+    }
+
+    // Short side: the auto TP must land BELOW entry, not above.
+    #[test]
+    fn auto_tp_short_places_below_entry() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Short, 100, 10.00, Some(11.00), None, // risk = 1.00/share
+        );
+        let mut cfgs = HashMap::new();
+        cfgs.insert("strat".to_string(), StrategyRiskConfig {
+            auto_tp_enabled: true, auto_tp_r: 2.0, ..Default::default()
+        });
+
+        book.apply_auto_risk_management(&cfgs);
+        let tp = book.positions.get("AAA").unwrap().take_profit.unwrap();
+        assert!((tp - 8.00).abs() < 1e-6, "TP = entry - 2R for a short, got {tp}");
+    }
+
+    // Auto TP must never clobber a TP the user (or a prior auto-TP pass)
+    // already placed.
+    #[test]
+    fn auto_tp_does_not_overwrite_existing_tp() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.00), Some(20.00), // user's own TP
+        );
+        let mut cfgs = HashMap::new();
+        cfgs.insert("strat".to_string(), StrategyRiskConfig {
+            auto_tp_enabled: true, auto_tp_r: 2.0, ..Default::default()
+        });
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty());
+        assert_eq!(book.positions.get("AAA").unwrap().take_profit, Some(20.00));
+    }
+
+    // Auto BE must pin the SL to entry only once the R-multiple reaches the
+    // configured threshold, and never again once it has fired — a user who
+    // widens the SL back out afterward is in full manual control from then on.
+    #[test]
+    fn auto_be_moves_sl_to_entry_once_r_reached_then_never_again() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.00), None, // risk = 1.00/share
+        );
+        let mut cfgs = HashMap::new();
+        cfgs.insert("strat".to_string(), StrategyRiskConfig {
+            auto_be_enabled: true, auto_be_r: 1.0, ..Default::default()
+        });
+
+        // R = 0.5 (below the 1.0R threshold) — must not move yet.
+        book.positions_with_pnl(&prices("AAA", 10.49, 10.51));
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty());
+        assert_eq!(book.positions.get("AAA").unwrap().stop_loss, Some(9.00));
+
+        // R = 1.0 (at the threshold) — SL must snap to breakeven (entry).
+        book.positions_with_pnl(&prices("AAA", 10.99, 11.01));
+        let touched = book.apply_auto_risk_management(&cfgs);
+        assert_eq!(touched, vec!["AAA".to_string()]);
+        let pos = book.positions.get("AAA").unwrap();
+        assert_eq!(pos.stop_loss, Some(10.00));
+        assert!(pos.auto_be_applied);
+
+        // User manually widens the SL back out — auto BE already had its one
+        // shot and must not snap it back.
+        book.positions.get_mut("AAA").unwrap().stop_loss = Some(9.50);
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty(),
+            "auto BE must not refire after its one shot");
+        assert_eq!(book.positions.get("AAA").unwrap().stop_loss, Some(9.50));
+    }
+
+    // Auto BE must never DEMOTE a stop the user (or a trail) already moved past
+    // breakeven — it may only catch a still-risky SL up to entry, never pull a
+    // better one back down to it.
+    #[test]
+    fn auto_be_does_not_demote_a_better_manual_stop() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.00), None,
+        );
+        // User manually trails the SL to 10.20 — already better than breakeven.
+        book.positions.get_mut("AAA").unwrap().stop_loss = Some(10.20);
+
+        let mut cfgs = HashMap::new();
+        cfgs.insert("strat".to_string(), StrategyRiskConfig {
+            auto_be_enabled: true, auto_be_r: 1.0, ..Default::default()
+        });
+        // R comfortably above threshold off the current (better) SL.
+        book.positions_with_pnl(&prices("AAA", 10.99, 11.01));
+
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty(),
+            "auto BE must not fire when the SL is already past breakeven");
+        assert_eq!(book.positions.get("AAA").unwrap().stop_loss, Some(10.20),
+            "the user's better stop must survive untouched");
+    }
+
+    // Disabled flags and an unrecognised strategy id must both no-op rather
+    // than panic (a position's strategy might not carry a Settings ▸ Stratégies
+    // entry at all, e.g. a manually-searched ticker).
+    #[test]
+    fn auto_risk_management_noop_when_disabled_or_unknown_strategy() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.00), None,
+        );
+
+        // No config at all for "strat".
+        assert!(book.apply_auto_risk_management(&HashMap::new()).is_empty());
+
+        // Config present but both auto flags at their (disabled) default.
+        let mut cfgs = HashMap::new();
+        cfgs.insert("strat".to_string(), StrategyRiskConfig::default());
+        assert!(book.apply_auto_risk_management(&cfgs).is_empty());
+        assert!(book.positions.get("AAA").unwrap().take_profit.is_none());
     }
 }
