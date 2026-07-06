@@ -134,6 +134,7 @@ pub struct ReplayDeps {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub config: Arc<RwLock<AppConfig>>,
     pub secrets: Arc<RwLock<Secrets>>,
+    pub internal_book: Arc<RwLock<crate::internal_trading::InternalBook>>,
     pub live_feed_running: Arc<AtomicBool>,
     pub news_feed_running: Arc<AtomicBool>,
     /// Receiver used to emit market-tick events for displayed symbols.
@@ -170,8 +171,10 @@ pub fn start(
     }
     NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "date invalide".to_string())?;
     // In flat-files mode the data comes from disk, so missing Alpaca keys is fine
-    // (the API may be gone). `load_day` then errors clearly on any day not yet
-    // downloaded. In API mode the keys remain mandatory.
+    // (the API may be gone). `load_day` then falls back to a daily-bars-only
+    // session (`data::load_day_from_daily_cache`) for a day with no per-day
+    // minute flat file, and only errors clearly when there's no local daily bar
+    // for it either. In API mode the keys remain mandatory.
     let flat_mode = deps.config.read().unwrap().data_source.is_flat_files();
     let (key, secret) = {
         let s = deps.secrets.read().unwrap();
@@ -480,6 +483,7 @@ async fn engine(
         deps.config.clone(),
         deps.secrets.clone(),
         deps.db.clone(),
+        deps.internal_book.clone(),
         deps.live_feed_running.clone(),
         deps.focus_rx_restart.clone(),
         deps.app.clone(),

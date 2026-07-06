@@ -240,15 +240,19 @@ export function ReplayToolbar() {
               "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
               status?.source === "tape"
                 ? "bg-emerald-500/20 text-emerald-300"
+                : status?.source === "daily"
+                ? "bg-amber-500/20 text-amber-300"
                 : "bg-sky-500/20 text-sky-300"
             )}
             title={
               status?.source === "tape"
                 ? "Trades réels enregistrés (granularité fine)"
+                : status?.source === "daily"
+                ? "Aucune donnée intraday (ni fichier plat minute, ni clés Alpaca) — barre daily unique simulée sur la séance"
                 : "Barres 1 min synthétisées (pas de tape pour ce jour)"
             }
           >
-            {status?.source === "tape" ? "TAPE" : "MINUTES"}
+            {status?.source === "tape" ? "TAPE" : status?.source === "daily" ? "DAILY" : "MINUTES"}
           </span>
           <EditableTime
             simTime={status?.sim_time ?? null}

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::Utc;
 use serde::Serialize;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::chart_state::{ChartState, ZoneTradeContext};
 use crate::config::{self, AppConfig};
@@ -740,13 +740,14 @@ pub fn stop_mock_market_feed(state: tauri::State<'_, AppState>) -> Result<(), St
 /// and the launch-time auto-start in `lib.rs`. Must be called from within a
 /// tokio runtime context. Returns the US Stocks universe size.
 pub fn spawn_live_feed(
-    market:      Arc<RwLock<MarketState>>,
-    config:      Arc<RwLock<AppConfig>>,
-    secrets:     Arc<RwLock<Secrets>>,
-    db:          Arc<Mutex<rusqlite::Connection>>,
-    running:     Arc<std::sync::atomic::AtomicBool>,
-    focus_rx:    tokio::sync::watch::Receiver<Vec<String>>,
-    app:         tauri::AppHandle,
+    market:        Arc<RwLock<MarketState>>,
+    config:        Arc<RwLock<AppConfig>>,
+    secrets:       Arc<RwLock<Secrets>>,
+    db:            Arc<Mutex<rusqlite::Connection>>,
+    internal_book: Arc<RwLock<InternalBook>>,
+    running:       Arc<std::sync::atomic::AtomicBool>,
+    focus_rx:      tokio::sync::watch::Receiver<Vec<String>>,
+    app:           tauri::AppHandle,
 ) -> Result<usize, String> {
     if running.load(Ordering::Relaxed) {
         return Ok(0);
@@ -804,7 +805,8 @@ pub fn spawn_live_feed(
     running.store(true, Ordering::Relaxed);
     tokio::spawn(async move {
         crate::alpaca::stream::run(
-            market, db, feed, key, secret, warn_ms, critical_ms, running, focus_rx, app,
+            market, db, internal_book, feed, key, secret, warn_ms, critical_ms,
+            running, focus_rx, app,
         )
         .await;
     });
@@ -821,6 +823,7 @@ pub async fn start_live_feed(
         state.config.clone(),
         state.secrets.clone(),
         state.db.clone(),
+        state.internal_book.clone(),
         state.live_feed_running.clone(),
         state.focus_symbols_tx.subscribe(),
         app,
@@ -2217,13 +2220,20 @@ fn sync_fill(
 /// first), (2) re-arms the bracket orders for symbols that just filled,
 /// (3) refreshes live PnL + MAE/MFE watermarks, (4) applies each position's
 /// strategy auto-BE / auto-TP settings off that refreshed PnL and mirrors any
-/// change into the chart's SL/TP lines, then (5) mirrors each new fill to
-/// TradeTally. So fills happen at a steady cadence whether or not any panel is
-/// open, and the getters are pure reads. There is exactly one instance of this
-/// loop for the whole app — live and Market Replay both feed the same
-/// `MarketState` it reads, so a replay session gets identical fills, brackets
-/// and auto-BE/TP behaviour as live trading, off the very same Settings ▸
-/// Stratégies config.
+/// change into the chart's SL/TP lines — steps 1-4 repeat against the SAME
+/// drained window until a round changes nothing, so a fresh entry's bracket (or
+/// an auto-BE/TP adjustment), which doesn't exist as a pending order until that
+/// round runs, still gets tested against the rest of the window it was armed
+/// in, rather than only from the next poll onward (see the loop body; this is
+/// what keeps a resting SL/TP from silently riding through a window that both
+/// opens and moves past it — the common case once an accelerated Market Replay
+/// window spans many seconds to a minute of price instead of live's ~500ms) —
+/// then (5) mirrors each new fill to TradeTally. So fills happen at a steady
+/// cadence whether or not any panel is open, and the getters are pure reads.
+/// There is exactly one instance of this loop for the whole app — live and
+/// Market Replay both feed the same `MarketState` it reads, so a replay session
+/// gets identical fills, brackets and auto-BE/TP behaviour as live trading, off
+/// the very same Settings ▸ Stratégies config.
 pub fn spawn_trading_loop(
     running:       Arc<std::sync::atomic::AtomicBool>,
     market:        Arc<RwLock<MarketState>>,
@@ -2246,25 +2256,54 @@ pub fn spawn_trading_loop(
             let prices  = all_market_prices(&market);
             let (new_fills, risk_updates) = {
                 let mut book = internal_book.write().unwrap();
-                let nf = book.try_fill_pending(&windows);
-                // Reconcile bracket orders for any symbol that just filled (entry →
-                // arm SL/TP; exit → clear leftovers).
-                for f in &nf {
-                    book.sync_bracket_orders(&f.symbol);
-                }
-                // Refresh live PnL + MAE/MFE watermarks even when no panel polls.
-                let _ = book.positions_with_pnl(&prices);
 
-                // Auto BE / auto TP off the R-multiple just refreshed above, then
-                // re-arm brackets for whatever changed.
-                let touched = book.apply_auto_risk_management(&strategy_risk.read().unwrap());
-                for sym in &touched {
-                    book.sync_bracket_orders(sym);
+                // Re-check the SAME window across rounds until one produces no
+                // change. A fresh entry's bracket (SL/TP) — and an auto-BE/TP
+                // adjustment — don't exist as pending orders until
+                // `sync_bracket_orders`/`apply_auto_risk_management` run just
+                // below; without looping, any further price move still inside
+                // THIS window would never be tested against them, leaving the
+                // position unprotected until the next poll's window. Live's
+                // ~500ms window makes that gap negligible, but an accelerated
+                // replay window can span many seconds to minutes of price (the
+                // real-time trading-loop poll can't keep up with a fast-forwarded
+                // sim clock — see `clock::scaled_sleep`'s floor), which is why a
+                // resting SL/TP could look like it "didn't fire" in fast replay.
+                // Terminates: each round either changes nothing (stop) or moves a
+                // pending order to a terminal state / trips a one-shot auto-risk
+                // flag — both finite per symbol.
+                let mut new_fills: Vec<Fill> = vec![];
+                let mut all_touched: HashSet<String> = HashSet::new();
+                loop {
+                    let nf = book.try_fill_pending(&windows);
+                    // Reconcile bracket orders for any symbol that just filled
+                    // (entry → arm SL/TP; exit → clear leftovers).
+                    for f in &nf {
+                        book.sync_bracket_orders(&f.symbol);
+                    }
+                    let filled_any = !nf.is_empty();
+                    new_fills.extend(nf);
+
+                    // Refresh live PnL + MAE/MFE watermarks even when no panel polls.
+                    let _ = book.positions_with_pnl(&prices);
+
+                    // Auto BE / auto TP off the R-multiple just refreshed above,
+                    // then re-arm brackets for whatever changed.
+                    let touched = book.apply_auto_risk_management(&strategy_risk.read().unwrap());
+                    for sym in &touched {
+                        book.sync_bracket_orders(sym);
+                    }
+                    let risk_changed = !touched.is_empty();
+                    all_touched.extend(touched);
+
+                    if !filled_any && !risk_changed {
+                        break;
+                    }
                 }
-                let updates: Vec<(String, Option<f64>, Option<f64>)> = touched.iter()
+                let updates: Vec<(String, Option<f64>, Option<f64>)> = all_touched.iter()
                     .filter_map(|sym| book.positions.get(sym).map(|p| (sym.clone(), p.stop_loss, p.take_profit)))
                     .collect();
-                (nf, updates)
+                (new_fills, updates)
             };
             for f in &new_fills {
                 sync_fill(&internal_book, &db, &config, &chart, f);
@@ -2528,6 +2567,7 @@ pub async fn replay_start(
         db:                state.db.clone(),
         config:            state.config.clone(),
         secrets:           state.secrets.clone(),
+        internal_book:     state.internal_book.clone(),
         live_feed_running: state.live_feed_running.clone(),
         news_feed_running: state.news_feed_running.clone(),
         focus_rx:          state.focus_symbols_tx.subscribe(),

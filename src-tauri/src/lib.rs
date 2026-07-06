@@ -242,6 +242,7 @@ pub fn run() {
             {
                 let market            = state.market.clone();
                 let startup           = state.startup.clone();
+                let internal_book     = state.internal_book.clone();
                 let live_feed_running = state.live_feed_running.clone();
                 let focus_rx          = state.focus_symbols_tx.subscribe();
                 let app_handle        = app.handle().clone();
@@ -267,7 +268,7 @@ pub fn run() {
                         // API boot: Alpaca-centric pipeline, then connect the live
                         // WebSocket + premarket news feed so real-time data flows.
                         startup::run_pipeline(db.clone(), config.clone(), secrets.clone(), startup).await;
-                        match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, live_feed_running, focus_rx, app_handle) {
+                        match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, internal_book, live_feed_running, focus_rx, app_handle) {
                             Ok(n)  => eprintln!("[tagdash] live feed: {n} US-stock universe ready"),
                             Err(e) => eprintln!("[tagdash] live feed not started: {e}"),
                         }

@@ -86,8 +86,12 @@ export default function App() {
   // tick-streams these (trades+quotes) on top of the broad wildcard surveillance
   // tier so visible charts update tick-by-tick. Taking the full union means
   // switching tabs never tears down a subscription (no data gap); a symbol is
-  // only dropped when its zone is released. There is no "universe" toggle
-  // anymore: the broad tier always covers the whole US market via `*`.
+  // only dropped from THIS displayed-set once its zone is released — the
+  // backend separately keeps any symbol with a pending order or open position
+  // tick-streamed regardless (see `strict_watch_symbols` in alpaca/stream.rs),
+  // so releasing a ticker never degrades its resting limit/SL/TP to 1-minute
+  // bar granularity. There is no "universe" toggle anymore: the broad tier
+  // always covers the whole US market via `*`.
   const tabs     = useLayoutStore((s) => s.tabs);
   const focusKey = useMemo(() => {
     const syms = new Set<string>();

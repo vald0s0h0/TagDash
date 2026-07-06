@@ -415,9 +415,25 @@ impl InternalBook {
             cands.push(Candidate { oid: oid.clone(), order: order.clone(), fill_price, rank });
         }
 
-        // Within a symbol, fill the path-first leg before its OCO sibling.
+        // Within a symbol, fill the path-first leg before its OCO sibling. `rank`
+        // alone only disambiguates the two legs of ONE bracket (SL vs TP always
+        // touch opposite sides, so they always land on different ranks). Two
+        // UNRELATED orders on the same symbol that both trigger via the same side
+        // in one window (e.g. a resting add-on entry limit and a different
+        // position's stop, both hit on the window's low) tie on `(symbol, rank)`
+        // — without a further key, `sort_by`'s stability falls back to `cands`'
+        // collection order, which came from iterating `self.orders: HashMap`, a
+        // randomly-seeded hasher. That made which one fired first (and therefore
+        // the resulting position/PnL) depend on process-start hash randomization
+        // rather than the market data — reproducibly replaying the same day could
+        // yield different fills run to run. `created_at` (then `oid` as a final
+        // tiebreak for orders created in the same instant) makes the order
+        // deterministic: whichever order was resting first resolves first.
         cands.sort_by(|a, b| {
-            a.order.symbol.cmp(&b.order.symbol).then(a.rank.cmp(&b.rank))
+            a.order.symbol.cmp(&b.order.symbol)
+                .then(a.rank.cmp(&b.rank))
+                .then(a.order.created_at.cmp(&b.order.created_at))
+                .then(a.oid.cmp(&b.oid))
         });
 
         let mut new_fills = vec![];
@@ -819,6 +835,50 @@ mod tests {
         assert!(book.positions.get("AAA").is_none(), "position should be flat after TP");
     }
 
+    // A fresh entry's bracket (SL/TP) only becomes a real pending order once
+    // `sync_bracket_orders` runs — it does NOT exist yet at the moment the entry
+    // itself fills. If the caller only calls `try_fill_pending` ONCE per window
+    // (as the trading loop used to), a window that both fills the entry AND
+    // moves past where the SL will be — one call, no re-check — leaves the
+    // position completely unprotected for that span: exactly the "accelerated
+    // Market Replay window covers many seconds, my stop doesn't fire" report.
+    // The fix (`commands::spawn_trading_loop`) re-runs `try_fill_pending`
+    // against the SAME window after `sync_bracket_orders`, in a loop, until a
+    // round changes nothing. This test pins the building block that loop relies
+    // on: one pass alone misses the SL; a second pass against the identical
+    // window catches it.
+    #[test]
+    fn bracket_armed_after_entry_must_be_rechecked_against_same_window() {
+        let mut book = InternalBook::new();
+        book.create_limit_order(
+            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.50), None,
+        );
+
+        // One merged window (as an accelerated replay poll can produce): opens
+        // at 10.50, dips to 9.40 (through both the 10.00 entry AND the
+        // not-yet-armed 9.50 SL), then recovers to 9.60 by the time this window
+        // is drained.
+        let w = window("AAA", 10.50, 10.50, 9.40, 9.60, true);
+
+        // Round 1: only the entry is a real pending order yet.
+        let fills = book.try_fill_pending(&w);
+        assert_eq!(fills.len(), 1, "entry should fill");
+        assert!((fills[0].fill_price - 10.00).abs() < 1e-6);
+        assert!(book.positions.get("AAA").is_some(),
+            "position open after entry, SL not armed yet — this is the gap: without a \
+             second pass, the 9.40 low that already happened in this same window is lost");
+
+        book.sync_bracket_orders("AAA");
+
+        // Round 2: re-checking the SAME window must catch the SL, which the
+        // window already traversed.
+        let fills2 = book.try_fill_pending(&w);
+        assert_eq!(fills2.len(), 1, "SL must fire on the re-check, not be missed");
+        assert!((fills2[0].fill_price - 9.50).abs() < 1e-6, "SL leg, fill at stop");
+        assert!(book.positions.get("AAA").is_none(), "flat after the SL catches up");
+    }
+
     // Pending LIMIT entry + dragging the TP line afterwards: the resting entry
     // order should reflect the latest TP so the bracket is right once it fills.
     #[test]
@@ -956,6 +1016,47 @@ mod tests {
         assert!((fills[0].fill_price - 11.00).abs() < 1e-6, "TP leg, fill at limit");
         assert!(book.positions.get("AAA").is_none(), "flat after TP");
         assert!(book.get_pending_orders().is_empty(), "SL sibling cancelled");
+    }
+
+    // Two UNRELATED pending orders on the same symbol (no OCO relationship) that
+    // both trigger via the same side in one window must resolve in a fixed,
+    // reproducible order — the order resting the longest first — regardless of
+    // which one HashMap iteration happens to visit first. Before the
+    // `created_at`/`oid` tiebreak, `(symbol, rank)` tied for both (same touch
+    // side ⇒ same rank), so `sort_by`'s stability fell through to `self.orders`'
+    // randomly-seeded HashMap order: replaying the identical day twice could
+    // fill these in a different order — and so reach a different position/PnL —
+    // purely from process-start hash randomization, not the market data.
+    #[test]
+    fn same_side_ties_between_unrelated_orders_resolve_by_created_at() {
+        let mut book = InternalBook::new();
+        let t0 = crate::time::now();
+
+        let older = InternalOrder {
+            order_id: "older".into(), trade_id: None, zone_id: "z1".into(),
+            symbol: "AAA".into(), side: Side::Short, order_type: OrderType::Stop,
+            limit_price: None, stop_price: Some(9.50), quantity: 100,
+            stop_loss: None, take_profit: None, status: OrderStatus::Pending,
+            oco_group: None, reduce_only: false, created_at: t0,
+        };
+        let newer = InternalOrder {
+            order_id: "newer".into(), trade_id: None, zone_id: "z1".into(),
+            symbol: "AAA".into(), side: Side::Long, order_type: OrderType::Limit,
+            limit_price: Some(9.60), stop_price: None, quantity: 100,
+            stop_loss: None, take_profit: None, status: OrderStatus::Pending,
+            oco_group: None, reduce_only: false, created_at: t0 + chrono::Duration::seconds(1),
+        };
+        // Inserted "newer" first: a naive implementation keyed off insertion/
+        // iteration order would have a chance to get this backwards. The fix
+        // must not care.
+        book.orders.insert(newer.order_id.clone(), newer);
+        book.orders.insert(older.order_id.clone(), older);
+
+        let fills = book.try_fill_pending(&window("AAA", 10.00, 10.00, 9.40, 9.45, true));
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].order_id, "older",
+            "the order resting since t0 must resolve before the one placed a second later");
+        assert_eq!(fills[1].order_id, "newer");
     }
 
     // A symbol that didn't print this poll (absent from the windows) must NOT

@@ -1118,6 +1118,41 @@ pub fn latest_volumes(conn: &Connection, before_date: &str) -> Result<Vec<(Strin
     rows.collect()
 }
 
+/// Every symbol's OHLCV bar dated exactly `date`, plus its previous close (the
+/// latest close strictly before `date`, `None` when there isn't one cached). Used
+/// by Market Replay's daily-bars-only fallback (`replay::data::load_day_from_daily_cache`)
+/// when no intraday flat file is downloaded for the day and no Alpaca credentials
+/// are configured — the only data available offline is whatever `flat_files::daily`
+/// (the whole-market cumulative daily file) already covers.
+pub fn daily_bars_on(
+    conn: &Connection,
+    date: &str,
+) -> Result<Vec<(String, f64, f64, f64, f64, i64, Option<f64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.symbol, d.open, d.high, d.low, d.close, d.volume,
+                (SELECT p.close FROM daily_cache p
+                 WHERE p.symbol = d.symbol AND p.date < ?1
+                 ORDER BY p.date DESC LIMIT 1) AS prev_close
+         FROM daily_cache d
+         WHERE d.date = ?1
+           AND d.open IS NOT NULL AND d.high IS NOT NULL
+           AND d.low IS NOT NULL AND d.close IS NOT NULL
+           AND d.volume IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![date], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<f64>>(6)?,
+        ))
+    })?;
+    rows.collect()
+}
+
 /// Most recent bar date (YYYY-MM-DD) cached across all symbols, or None when the
 /// daily cache is empty. Used to fetch only the missing days on later startups.
 pub fn latest_bar_date(conn: &Connection) -> Result<Option<String>> {
@@ -1535,5 +1570,33 @@ mod scoring_tests {
         assert_eq!(cap, None);
         assert_eq!(need, None);
         assert_eq!(si, None);
+    }
+
+    // `daily_bars_on` backs Market Replay's daily-bars-only fallback
+    // (`replay::data::load_day_from_daily_cache`): it must return the exact bar
+    // dated `date`, paired with the previous cached close, and must ignore rows
+    // on OTHER dates (including ones AFTER `date` — the Market Replay leak guard).
+    #[test]
+    fn daily_bars_on_pairs_bar_with_previous_close() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::local_db::schema::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO daily_cache (symbol,date,open,high,low,close,volume,updated_at) VALUES
+                 ('AAA','2026-06-01',10,11,9,10.5,100000,'now'),
+                 ('AAA','2026-06-02',10.5,12,10,11.5,200000,'now'),
+                 ('AAA','2026-06-03',20,21,19,20.5,50000,'now'), -- after `date`: must not leak
+                 ('BBB','2026-06-02',5,5.5,4.5,5.2,80000,'now');", // no prior close cached
+        )
+        .unwrap();
+
+        let rows = daily_bars_on(&conn, "2026-06-02").unwrap();
+        let aaa = rows.iter().find(|r| r.0 == "AAA").expect("AAA present");
+        assert_eq!((aaa.1, aaa.2, aaa.3, aaa.4, aaa.5), (10.5, 12.0, 10.0, 11.5, 200000));
+        assert_eq!(aaa.6, Some(10.5), "previous close = the 06-01 bar, not the future 06-03 one");
+
+        let bbb = rows.iter().find(|r| r.0 == "BBB").expect("BBB present");
+        assert_eq!(bbb.6, None, "no cached bar before 06-02 for BBB");
+
+        assert!(daily_bars_on(&conn, "2026-06-04").unwrap().is_empty(), "no bar on an uncovered date");
     }
 }

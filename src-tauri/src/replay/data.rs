@@ -54,7 +54,9 @@ pub struct DayData {
     pub events: Vec<TimedEvent>,
     /// Previous trading day's close per symbol (change% seed).
     pub prev_closes: HashMap<String, f64>,
-    /// "tape" when the premarket came from the local trade tape, else "minutes".
+    /// "tape" (real recorded trades) | "minutes" (synthetic from 1-min bars) |
+    /// "daily" (synthetic from the day's own OHLCV bar only — no intraday flat
+    /// file and no Alpaca credentials, see `load_day_from_daily_cache`).
     pub source: &'static str,
     pub symbols: usize,
 }
@@ -483,6 +485,47 @@ pub(crate) fn slices_of(bar: &MinBar) -> Vec<(i64, f64, u64, u64)> {
         .collect()
 }
 
+// ─── Synthetic path from a single DAILY bar (no intraday data available) ───────
+
+/// Decompose one full trading day's OHLCV into `SLICES_PER_MIN` synthetic
+/// prints, spread evenly across the regular session (`session_start_ms` →
+/// `session_end_ms`) rather than across one minute — the same plausible
+/// O→L→H→C / O→H→L→C path as `slices_of`, but at daily-bar fidelity: nothing
+/// finer than the day's own open/high/low/close is known. Used only by
+/// `load_day_from_daily_cache`, when neither an intraday flat file nor Alpaca
+/// credentials are available for the replayed day. Unlike `slices_of`, points
+/// are never dropped for zero volume — the open/close anchors must survive
+/// regardless of how the day's real volume happens to divide across them, since
+/// this IS the whole price path for the day.
+fn daily_path_slices(
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: i64,
+    session_start_ms: i64,
+    session_end_ms: i64,
+) -> Vec<(i64, f64, u64, u64)> {
+    let path: [f64; SLICES_PER_MIN as usize] = if close >= open {
+        [open, (open + low) / 2.0, low, (low + high) / 2.0, high, close]
+    } else {
+        [open, (open + high) / 2.0, high, (high + low) / 2.0, low, close]
+    };
+    let n = SLICES_PER_MIN as u64;
+    let vol = volume.max(0) as u64;
+    let base_vol = vol / n;
+    let rem_vol = vol % n;
+    let step_ms = (session_end_ms - session_start_ms) / (SLICES_PER_MIN - 1).max(1);
+    path.iter()
+        .enumerate()
+        .map(|(i, &price)| {
+            let iu = i as u64;
+            let vol_i = base_vol + u64::from(iu < rem_vol);
+            (session_start_ms + (i as i64) * step_ms, price, vol_i, 1u64)
+        })
+        .collect()
+}
+
 // ─── Day loading ────────────────────────────────────────────────────────────────
 
 /// Load everything needed to replay `day` (YYYY-MM-DD, an ET trading date).
@@ -508,13 +551,23 @@ pub async fn load_day(
         progress(1.0);
         return Ok(dd);
     }
-    // No flat file and no API credentials ⇒ flat-files mode without this day
-    // downloaded. Give a clear, actionable error instead of an opaque auth failure.
+    // No per-day minute flat file and no API credentials ⇒ flat-files mode
+    // without this day's intraday data downloaded. Rather than refusing to
+    // replay outright, fall back to whatever `flat_files::daily` (a much
+    // lighter, whole-market cumulative download) already covers: a
+    // daily-bars-only session (see `load_day_from_daily_cache`) — coarse, but
+    // enough for a daily-bar-only strategy like Panic Mean Reversion and for
+    // basic order-fill testing against the day's real OHLC range. Only when
+    // there's no local daily bar for this day EITHER do we give up with a
+    // clear, actionable error instead of an opaque auth failure.
     if key.is_empty() || secret.is_empty() {
-        return Err(format!(
+        progress(0.1);
+        let dd = load_day_from_daily_cache(db, day, focus).map_err(|_| format!(
             "jour {day} non téléchargé — téléchargez-le via « Gestion Flat Files » \
-             (mode flat files actif)"
-        ));
+             (mode flat files actif ; aucune barre daily locale non plus pour ce jour)"
+        ))?;
+        progress(1.0);
+        return Ok(dd);
     }
 
     // ET wall-clock anchors of the day (DST-aware via crate::time).
@@ -660,6 +713,70 @@ pub async fn load_day(
     })
 }
 
+/// Build a degraded `DayData` for `day` from ONLY the local daily-bar cache — no
+/// intraday tick/minute/tape data at all. This is `load_day`'s fallback when
+/// flat-files mode has no per-day minute file downloaded for `day` and no Alpaca
+/// credentials are configured to fetch one live: rather than refusing to replay,
+/// it uses whatever `flat_files::daily` (a much lighter, whole-market cumulative
+/// download) already covers. Each active symbol's day is reduced to its one real
+/// OHLCV bar, walked as a synthetic path (`daily_path_slices`) across the regular
+/// session, so charts populate and resting orders still have a coarse,
+/// daily-bar-fidelity price path to fill against instead of none. No network.
+pub fn load_day_from_daily_cache(
+    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    day: &str,
+    focus: &[String],
+) -> Result<DayData, String> {
+    let nd = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map_err(|_| format!("invalid replay date: {day}"))?;
+    let noon = noon_utc(nd);
+    let session_start_ms = crate::time::et_clock_utc(noon, 9, 30).timestamp_millis();
+    let session_end_ms = crate::time::et_clock_utc(noon, 16, 0).timestamp_millis();
+
+    let rows = {
+        let conn = db.lock().unwrap();
+        crate::local_db::cache_repository::daily_bars_on(&conn, day).map_err(|e| e.to_string())?
+    };
+    if rows.is_empty() {
+        return Err(format!("aucune barre daily locale pour le {day}"));
+    }
+
+    let mut prev_closes: HashMap<String, f64> = HashMap::new();
+    let mut day_volume: HashMap<String, i64> = HashMap::new();
+    let mut bars: HashMap<String, (f64, f64, f64, f64, i64)> = HashMap::new();
+    for (sym, o, h, l, c, v, pc) in rows {
+        if let Some(pc) = pc {
+            prev_closes.insert(sym.clone(), pc);
+        }
+        day_volume.insert(sym.clone(), v);
+        bars.insert(sym, (o, h, l, c, v));
+    }
+
+    let active_vec = rank_active(&day_volume, focus);
+    if active_vec.is_empty() {
+        return Err(format!("aucune donnée de marché pour le {day} (jour non ouvré ?)"));
+    }
+
+    let mut events: Vec<TimedEvent> = Vec::new();
+    for sym in &active_vec {
+        let Some(&(o, h, l, c, v)) = bars.get(sym) else { continue };
+        for (ts_ms, price, size, prints) in
+            daily_path_slices(o, h, l, c, v, session_start_ms, session_end_ms)
+        {
+            events.push(TimedEvent { ts_ms, ev: Event::Trade { symbol: sym.clone(), price, size, prints } });
+            let half_spread = (price * 0.0003).max(0.005);
+            events.push(TimedEvent {
+                ts_ms,
+                ev: Event::Quote { symbol: sym.clone(), bid: price - half_spread, ask: price + half_spread },
+            });
+        }
+    }
+    events.sort_by_key(|e| e.ts_ms);
+    let symbols = active_vec.len();
+
+    Ok(DayData { events, prev_closes, source: "daily", symbols })
+}
+
 /// Split a daily-bars window into (previous close, this-day volume) per symbol.
 /// Shared by `load_day` (Alpaca path) and the flat-file downloader so both derive
 /// the change% seed and the activity filter identically.
@@ -758,6 +875,35 @@ mod tests {
     fn zero_volume_minute_yields_no_events() {
         let bar = mb(0, 0, 2.0, 2.0, 2.0, 2.0);
         assert!(slices_of(&bar).is_empty());
+    }
+
+    // `daily_path_slices` backs the daily-bars-only replay fallback: with no
+    // intraday data at all, this handful of points IS the whole simulated day, so
+    // (unlike `slices_of`) the open/close anchors must survive even on a
+    // low/zero-volume bar instead of being filtered away.
+    #[test]
+    fn daily_path_slices_keeps_anchors_on_zero_volume() {
+        let slices = daily_path_slices(2.0, 2.0, 2.0, 2.0, 0, 1_000, 2_000);
+        assert_eq!(slices.len(), SLICES_PER_MIN as usize);
+        assert_eq!(slices.first().unwrap().1, 2.0);
+        assert_eq!(slices.last().unwrap().1, 2.0);
+    }
+
+    #[test]
+    fn daily_path_slices_walks_the_day_range_and_preserves_volume() {
+        let slices = daily_path_slices(2.0, 2.5, 1.9, 2.4, 12_000, 0, 300_000);
+        let hi = slices.iter().map(|s| s.1).fold(f64::MIN, f64::max);
+        let lo = slices.iter().map(|s| s.1).fold(f64::MAX, f64::min);
+        assert_eq!(hi, 2.5);
+        assert_eq!(lo, 1.9);
+        assert_eq!(slices.first().unwrap().1, 2.0); // open first
+        assert_eq!(slices.last().unwrap().1, 2.4); // close last
+        let vol: u64 = slices.iter().map(|s| s.2).sum();
+        assert_eq!(vol, 12_000);
+        // Spread across the full [session_start, session_end] span, not bunched
+        // into one minute like the intraday slices.
+        assert_eq!(slices.first().unwrap().0, 0);
+        assert_eq!(slices.last().unwrap().0, 300_000);
     }
 
     #[test]

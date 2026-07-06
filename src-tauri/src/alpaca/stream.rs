@@ -8,9 +8,14 @@
 //   │   04:00–09:30 (premarket) → `trades`  (aggregated to 5s/10s candles for
 //   │                                         the scanner; keeps the 10s spike)
 //   │   09:30 →      (open/AH)   → `bars`    (1-minute bars; light enough at scale)
-//   └ focus tier (symbols displayed in chart zones) → `trades`+`quotes`, always,
-//       so a displayed chart is tick-by-tick. Each focus tick is pushed to the
-//       frontend via a throttled `market-tick` Tauri event.
+//   └ focus tier (symbols displayed in chart zones, UNION any symbol carrying a
+//       pending order or open position in the internal book) → `trades`+`quotes`,
+//       always, so a displayed chart — and any resting limit/SL/TP — is watched
+//       tick-by-tick. Each focus tick is pushed to the frontend via a throttled
+//       `market-tick` Tauri event. The order/position union matters because
+//       "Libérer" (releasing a zone) drops a symbol from the displayed set but
+//       must never degrade a still-pending order down to 1-minute-bar
+//       granularity — see `strict_watch_symbols`.
 //
 // There is no "universe" notion anymore: the broad tier subscribes with the `*`
 // wildcard (the whole US market) and each strategy filters in its own script.
@@ -34,6 +39,7 @@ use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+use crate::internal_trading::InternalBook;
 use crate::market_state::MarketState;
 
 /// Alpaca's wildcard token: subscribes a channel to every symbol in the market.
@@ -146,6 +152,7 @@ pub async fn run(
     // Kept for call-site stability; the broad tier no longer enumerates the
     // universe (it uses the `*` wildcard), so the DB handle is unused here.
     _db: Arc<Mutex<rusqlite::Connection>>,
+    internal_book: Arc<RwLock<InternalBook>>,
     feed: String,
     key: String,
     secret: String,
@@ -169,8 +176,8 @@ pub async fn run(
         match connect_async(&url).await {
             Ok((ws, _resp)) => {
                 let code = session(
-                    ws, &key, &secret, &market, warn_ms, critical_ms, &running,
-                    &mut focus_rx, &app,
+                    ws, &key, &secret, &market, &internal_book, warn_ms, critical_ms,
+                    &running, &mut focus_rx, &app,
                 )
                 .await;
                 market.write().unwrap().live_running = false;
@@ -209,6 +216,7 @@ async fn session(
     key: &str,
     secret: &str,
     market: &Arc<RwLock<MarketState>>,
+    internal_book: &Arc<RwLock<InternalBook>>,
     warn_ms: u32,
     critical_ms: u32,
     running: &Arc<AtomicBool>,
@@ -242,16 +250,18 @@ async fn session(
                 if changed.is_err() { continue; }
                 focus = clean_symbols(focus_rx.borrow_and_update().iter());
                 if authenticated
-                    && reconcile(&mut write, market, &focus, broad_mode_now(), &mut subs).await.is_err()
+                    && reconcile(&mut write, market, &watch_set(&focus, internal_book), broad_mode_now(), &mut subs).await.is_err()
                 {
                     return None;
                 }
             }
 
-            // Periodic broad-mode re-evaluation (catches the 09:30 switch).
+            // Periodic broad-mode re-evaluation (catches the 09:30 switch, and
+            // promotes/demotes symbols as orders/positions open and close on
+            // released tickers without waiting for a chart-focus change).
             _ = reeval.tick() => {
                 if authenticated
-                    && reconcile(&mut write, market, &focus, broad_mode_now(), &mut subs).await.is_err()
+                    && reconcile(&mut write, market, &watch_set(&focus, internal_book), broad_mode_now(), &mut subs).await.is_err()
                 {
                     return None;
                 }
@@ -281,7 +291,7 @@ async fn session(
                         "success" if m.msg.as_deref() == Some("authenticated") => {
                             authenticated = true;
                             market.write().unwrap().feed_authenticated();
-                            if reconcile(&mut write, market, &focus, broad_mode_now(), &mut subs).await.is_err() {
+                            if reconcile(&mut write, market, &watch_set(&focus, internal_book), broad_mode_now(), &mut subs).await.is_err() {
                                 return None;
                             }
                             eprintln!("[tagdash] live feed: authenticated, broad mode {}", broad_mode_now());
@@ -391,11 +401,34 @@ async fn session(
     }
 }
 
+/// Symbols that must stay tick-by-tick regardless of what's on screen: anything
+/// carrying a pending order or an open position in the internal book. Without
+/// this, releasing a ticker's chart zone (Libérer) drops it out of the focus
+/// tier and its resting limit/SL/TP is only re-evaluated once a minute (the
+/// broad tier's bar granularity) instead of against the real price path — which
+/// reads as the order firing "immediately" at a stale/gapped price instead of
+/// respecting the limit.
+fn strict_watch_symbols(internal_book: &RwLock<InternalBook>) -> HashSet<String> {
+    let book = internal_book.read().unwrap();
+    book.get_pending_orders().into_iter().map(|o| o.symbol)
+        .chain(book.positions.keys().cloned())
+        .collect()
+}
+
+/// The effective focus set to subscribe tick-by-tick: displayed chart symbols
+/// union `strict_watch_symbols`.
+fn watch_set(focus: &HashSet<String>, internal_book: &RwLock<InternalBook>) -> HashSet<String> {
+    let mut set = focus.clone();
+    set.extend(strict_watch_symbols(internal_book));
+    set
+}
+
 /// Reconcile the three channel subscriptions. The broad surveillance tier covers
 /// the whole US market via the `*` wildcard (one tiny message instead of ~13k
 /// enumerated symbols), so a single exotic symbol can no longer get the frame
-/// rejected with code 400. The focus tier (displayed symbols) is subscribed
-/// explicitly so charts stay tick-by-tick.
+/// rejected with code 400. The focus tier (displayed symbols, plus anything with
+/// a live order/position — see `watch_set`) is subscribed explicitly so it stays
+/// tick-by-tick.
 async fn reconcile(
     write: &mut WsWrite,
     market: &Arc<RwLock<MarketState>>,
@@ -518,4 +551,67 @@ fn parse_ts(ts: Option<&str>) -> DateTime<Utc> {
     ts.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Side;
+
+    fn book_with_pending_order(symbol: &str) -> InternalBook {
+        let mut book = InternalBook::new();
+        book.create_limit_order(
+            None, "z1".into(), symbol.into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.50), None,
+        );
+        book
+    }
+
+    #[test]
+    fn strict_watch_includes_pending_order_symbol() {
+        let book = RwLock::new(book_with_pending_order("AAA"));
+        assert!(strict_watch_symbols(&book).contains("AAA"));
+    }
+
+    #[test]
+    fn strict_watch_includes_open_position_symbol() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            None, "z1".into(), "BBB".into(), "strat".into(),
+            Side::Long, 100, 10.00, Some(9.50), None,
+        );
+        let book = RwLock::new(book);
+        assert!(strict_watch_symbols(&book).contains("BBB"));
+    }
+
+    #[test]
+    fn strict_watch_excludes_cancelled_order_symbol() {
+        let mut book = book_with_pending_order("CCC");
+        let order_id = book.get_pending_orders()[0].order_id.clone();
+        book.cancel_order(&order_id).unwrap();
+        let book = RwLock::new(book);
+        assert!(!strict_watch_symbols(&book).contains("CCC"));
+    }
+
+    // The exact bug reported: releasing a ticker (removing it from the
+    // displayed/focus set) must not drop it out of the effective watch set
+    // while an order is still pending on it — otherwise it degrades to
+    // 1-minute-bar monitoring and the limit fires against a stale/gapped
+    // price instead of the real path.
+    #[test]
+    fn watch_set_keeps_released_ticker_with_pending_order() {
+        let book = RwLock::new(book_with_pending_order("DDD"));
+        let focus: HashSet<String> = HashSet::new(); // ticker released: not displayed
+        assert!(
+            watch_set(&focus, &book).contains("DDD"),
+            "a released ticker with a pending order must stay tick-watched"
+        );
+    }
+
+    #[test]
+    fn watch_set_drops_symbol_once_flat_and_undisplayed() {
+        let book = RwLock::new(InternalBook::new()); // no orders, no positions
+        let focus: HashSet<String> = HashSet::new();
+        assert!(watch_set(&focus, &book).is_empty());
+    }
 }
