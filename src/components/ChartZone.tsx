@@ -1,3 +1,4 @@
+import { notifyError } from "@/stores/notificationStore";
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from "react";
 import { toCanvas as domToCanvas } from "html-to-image";
 import {
@@ -32,7 +33,7 @@ import {
   registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
 import { registerZoneGamepad, getChartControl } from "@/lib/gamepadBus";
-import { useStrategyCards, useStrategies } from "@/queries/useScanner";
+import { useStrategyCards, useStrategies, usePanicLlmScores } from "@/queries/useScanner";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
 import { nyFilenameStamp } from "@/lib/nyTime";
@@ -48,7 +49,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   PRIORITY_STYLES, TIMEFRAMES,
-  ChartInfoBar, StrategyInfoOverlay, MicroInfoOverlay, HodDriveInfoOverlay, TBtn, Sep, EmptyZone,
+  ChartInfoBar, StrategyInfoOverlay, MicroInfoOverlay, HodDriveInfoOverlay,
+  PanicReportOverlay, TBtn, Sep, EmptyZone,
 } from "./chartZoneParts";
 
 // Micro Pullback gets the rich on-chart risk overlay (on its sub-minute pane);
@@ -57,6 +59,10 @@ const MICRO_PULLBACK_ID = "micro_pullback";
 // HOD Drive gets its own KPI overlay + HOD/LOD points + green-series crosses on its
 // timeframe (right/interactive) pane.
 const HOD_DRIVE_ID = "hod_drive";
+// Panic Mean Reversion gets the Panic Score report on its DAILY (left) pane, where
+// the multi-day move that put the ticker on the watchlist is visible — the report
+// explains that move, so the two belong side by side.
+const PANIC_MEAN_REVERSION_ID = "panic_mean_reversion";
 
 // Mood emojis offered by the toolbar (euphoric / angry / panicked / in the clouds).
 const EMOJIS: { glyph: string; title: string }[] = [
@@ -192,6 +198,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // generic field overlay on the left-most pane.
   const isMicro = zone.strategy_id === MICRO_PULLBACK_ID;
   const isHod   = zone.strategy_id === HOD_DRIVE_ID;
+  const isPanic = zone.strategy_id === PANIC_MEAN_REVERSION_ID;
   // Micro Pullback + HOD Drive draw their overlay on the interactive (right) pane;
   // every other strategy keeps the generic field overlay on the left-most pane.
   const overlayPaneIdx = isMicro || isHod ? interactiveIdx : 0;
@@ -356,6 +363,14 @@ export function ChartZone({ zone }: ChartZoneProps) {
     refetchInterval: 3000,
   });
 
+  // ── Panic Score report for this ticker (daily-pane overlay) ──────────────────
+  // Read from the day's stored analysis rather than recomputed: the run is
+  // button-triggered and its result is the definitive ranking, so the pane must show
+  // exactly what was scored. Day- and mode-scoped server-side, so a replay's report
+  // never appears in live mode. `undefined` (not yet analysed) collapses to null.
+  const { bySymbol: panicScores } = usePanicLlmScores();
+  const panicScore = zone.symbol ? panicScores[zone.symbol] ?? null : null;
+
   // ── HOD Drive draft (suggested) trade levels ──────────────────────────────────
   // Initialized once when gates_pass flips true; local state not re-synced on each
   // poll so the user's drag adjustments stick. Cleared when the symbol changes or
@@ -383,6 +398,29 @@ export function ChartZone({ zone }: ChartZoneProps) {
     const reward = draft.tp - draft.entry;
     return reward / risk;
   }, [draft]);
+
+  // Levels the inverted trade will actually be built from: a user-placed SL/TP
+  // always wins over the script's draft (same invariant the order buttons and the
+  // confirm flow follow), the draft supplies whichever leg the user hasn't set.
+  const invertLevels = useMemo(() => {
+    if (!draft) return null;
+    return {
+      entry: draft.entry,
+      sl:    context?.stop_loss   ?? draft.sl,
+      tp:    context?.take_profit ?? draft.tp,
+    };
+  }, [draft, context?.stop_loss, context?.take_profit]);
+
+  // R:R of the mirrored (short) trade: the same prices with their roles swapped —
+  // the TP becomes the stop, the SL becomes the target — so the ratio is draftRr's
+  // reciprocal. Null unless both legs sit on the right side of the entry.
+  const invertedRr = useMemo(() => {
+    if (!invertLevels) return null;
+    const risk   = invertLevels.tp - invertLevels.entry; // short stop sits at the TP
+    const reward = invertLevels.entry - invertLevels.sl; // short target sits at the SL
+    if (risk <= 0 || reward <= 0) return null;
+    return reward / risk;
+  }, [invertLevels]);
 
   // ── Recent single-ticker headlines (Alpaca news REST) for the Micro overlay ─
   // Fetched as soon as the ticker is displayed; refreshed periodically to pick up
@@ -689,9 +727,36 @@ export function ChartZone({ zone }: ChartZoneProps) {
       await api.createInternalLimitOrderPercent(zone.zone_id, 100, draft.entry);
       setDraft(null);
     } catch (e) {
-      console.error("confirm HOD Drive failed:", e);
+      notifyError(e, "Confirmation HOD Drive");
     }
   }, [draft, zone.zone_id, zone.symbol, zone.strategy_id, hasSl, hasTp, chartStore]);
+
+  // ── Invert the HOD Drive suggested trade (short the same levels) ───────────
+  // Keeps the prices exactly where they are but swaps their roles: the TP becomes
+  // the stop, the SL becomes the target. With the SL above the entry the backend
+  // infers a short — sell limit at the entry (fills on the way up), buy stop for
+  // the SL, buy limit for the TP — and sizes it off the (entry → new SL) distance,
+  // so the position still respects the strategy's max-risk setting.
+  // Unlike the confirm flow, both levels are always written: the roles swap, so
+  // leaving an existing level in place would arm the trade in the wrong direction.
+  const handleInvertHod = useCallback(async () => {
+    if (!invertLevels || !zone.symbol) return;
+    const { entry, sl, tp } = invertLevels;
+    const strat = zone.strategy_id ?? "";
+    try {
+      // 1. SL = the TP level — above the entry, so it drives both side and sizing.
+      let ctx = await api.updateZoneSl(zone.zone_id, zone.symbol, strat, tp);
+      chartStore.setContext(zone.zone_id, ctx);
+      // 2. TP = the SL level — below the entry.
+      ctx = await api.updateZoneTp(zone.zone_id, zone.symbol, strat, sl);
+      chartStore.setContext(zone.zone_id, ctx);
+      // 3. Sell limit at the entry price (100% risk).
+      await api.createInternalLimitOrderPercent(zone.zone_id, 100, entry);
+      setDraft(null);
+    } catch (e) {
+      notifyError(e, "Inversion HOD Drive");
+    }
+  }, [invertLevels, zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
 
   // ── Delete a user price line from its on-chart ✕ ───────────────────────────
   // SL/TP clear by setting the level to null (also drops the bracket order);
@@ -857,7 +922,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
         chartStore.setPendingLimitPercent(zone.zone_id, current === percent ? null : percent);
       }
     } catch (e) {
-      console.error("order failed:", e);
+      notifyError(e, "Ordre");
     }
   }, [zone.zone_id, hasSl, orderMode, chartStore]);
 
@@ -869,7 +934,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     try {
       await api.createInternalLimitOrderPercent(zone.zone_id, pct, price);
     } catch (e) {
-      console.error("limit order failed:", e);
+      notifyError(e, "Ordre limite");
     }
   }, [zone.zone_id, chartStore]);
 
@@ -879,7 +944,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     try {
       await api.closeInternalPosition(zone.symbol, zone.zone_id);
     } catch (e) {
-      console.error("close position failed:", e);
+      notifyError(e, "Clôture");
     }
   }, [zone.symbol, zone.zone_id, hasPosition]);
 
@@ -1053,7 +1118,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       );
       await api.updateZoneSl(zone.zone_id, sym, strat, null);
       chartStore.setContext(zone.zone_id, await api.updateZoneTp(zone.zone_id, sym, strat, null));
-    } catch (e) { console.error("remove orders failed:", e); }
+    } catch (e) { notifyError(e, "Annulation des ordres"); }
   }, [zone.zone_id, zone.symbol, zone.strategy_id, chartStore]);
 
   const removeOrdersAndAlarms = useCallback(async () => {
@@ -1088,6 +1153,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       case "order_100":  handleOrder(100); break;
       case "close":      handleClose(); break;
       case "confirm_hod": handleConfirmHod(); break;
+      case "invert_hod":  handleInvertHod(); break;
       case "run_llm":
         if (card?.llm && zone.symbol && zone.strategy_id) {
           api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
@@ -1100,7 +1166,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
     }
   }, [handleRelease, toggleMode, captureStatus, handleCapture, openJournal,
       chartStore, zone.zone_id, zone.symbol, zone.strategy_id, orderMode,
-      handleOrder, handleClose, handleConfirmHod, card]);
+      handleOrder, handleClose, handleConfirmHod, handleInvertHod, card]);
 
   useEffect(() => registerZoneHotkeys(zone.zone_id, runAction), [zone.zone_id, runAction]);
 
@@ -1121,6 +1187,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       order:   (pct) => handleOrder(pct),
       close:   handleClose,
       confirmHod: handleConfirmHod,
+      invertHod:  handleInvertHod,
       capture: () => { if (captureStatus === "idle") handleCapture(); },
       journalAudio: toggleAudioNote,
       release: handleRelease,
@@ -1129,7 +1196,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       symbol:     () => zone.symbol,
     });
   }, [zone.zone_id, zone.symbol, cycleFocus, cursorPlace, removeOrders,
-      removeOrdersAndAlarms, handleOrder, handleClose, handleConfirmHod, handleCapture, captureStatus, handleRelease, toggleAudioNote]);
+      removeOrdersAndAlarms, handleOrder, handleClose, handleConfirmHod, handleInvertHod, handleCapture, captureStatus, handleRelease, toggleAudioNote]);
 
   // ── Empty zone ─────────────────────────────────────────────────────────────
   if (!zone.symbol) {
@@ -1649,7 +1716,17 @@ export function ChartZone({ zone }: ChartZoneProps) {
                         overlay={hodOverlay ?? null}
                         draftRr={draftRr}
                         onConfirm={handleConfirmHod}
+                        invertRr={invertedRr}
+                        onInvert={handleInvertHod}
                       />
+                    ) : isPanic && panicScore ? (
+                      // The Panic Score report REPLACES the generic field overlay
+                      // once an analysis exists: both want the daily pane's top-left,
+                      // and the report already carries the score/cap/float context
+                      // those fields showed. Before any run, the generic overlay is
+                      // still what renders (the `panicScore` guard), so the pane is
+                      // never emptier than it was.
+                      <PanicReportOverlay score={panicScore} />
                     ) : (
                       <StrategyInfoOverlay
                         card={card}

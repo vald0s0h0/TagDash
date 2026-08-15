@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import { AlarmClock, Bell, BriefcaseBusiness, ClipboardCheck, ListOrdered, Radar } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useUiStore } from "@/stores/uiStore";
@@ -6,7 +6,7 @@ import { useActiveAlerts, useScreenerMatches, useStartScanner } from "@/queries/
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertStatusStore } from "@/stores/alertStatusStore";
 import { ScannerAlerts } from "@/components/ScannerAlerts";
-import { ScreenerPanel } from "@/components/ScreenerPanel";
+import { PanicScoreButton, ScreenerPanel, visibleMatches } from "@/components/ScreenerPanel";
 import { PositionsPanel } from "@/components/PositionsPanel";
 import { OrdersPanel } from "@/components/OrdersPanel";
 import { AlarmsPanel } from "@/components/AlarmsPanel";
@@ -18,22 +18,28 @@ function SectionHeader({
   icon: Icon,
   title,
   count,
+  action,
 }: {
   icon: typeof Bell;
   title: string;
   count?: number;
+  /** Optional control rendered immediately to the LEFT of the count badge. */
+  action?: ReactNode;
 }) {
   return (
     <div className="flex items-center justify-between border-b border-border px-3 py-2 text-xs uppercase tracking-wider text-muted-foreground">
-      <div className="flex items-center gap-2">
-        <Icon className="h-3.5 w-3.5" />
-        <span>{title}</span>
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate">{title}</span>
       </div>
-      {typeof count === "number" && (
-        <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] text-foreground tabular-nums">
-          {count}
-        </span>
-      )}
+      <div className="flex shrink-0 items-center gap-1.5">
+        {action}
+        {typeof count === "number" && (
+          <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] text-foreground tabular-nums">
+            {count}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -45,6 +51,7 @@ export function Sidebar() {
   const alerts       = alertsQuery.data ?? [];
   const placeAlert   = useLayoutStore((s) => s.placeAlert);
   const setSelectedTicker = useUiStore((s) => s.setSelectedTicker);
+  const dismissedScreener = useUiStore((s) => s.dismissedScreener);
   // Symbol shown in the active session's (single) chart — drives the release →
   // open-next behaviour below.
   const activeZoneSymbol = useLayoutStore(
@@ -54,6 +61,12 @@ export function Sidebar() {
   const isPreOpen     = active === "pre_open";
   const screenerQuery = useScreenerMatches();
   const screener      = screenerQuery.data ?? [];
+  // What the panel actually renders — the header count and the Panic Score button's
+  // target list both read this, so they cannot drift apart.
+  const visibleScreener = useMemo(
+    () => visibleMatches(screener, dismissedScreener),
+    [screener, dismissedScreener],
+  );
 
   const { data: positions = [] } = useQuery({
     queryKey: ["internal_positions"],
@@ -146,7 +159,15 @@ export function Sidebar() {
           <SectionHeader
             icon={Radar}
             title="Screener · pre-open"
-            count={screener.length}
+            /* Count what is actually rendered: the raw list still contains the
+               rows the user dismissed today. Same helper as the button's target
+               list, so the badge and the analysis can never disagree. */
+            count={visibleScreener.length}
+            /* The Panic Score launcher sits to the LEFT of the count. It only ever
+               analyses the visible rows — dismissing a ticker excludes it. */
+            action={
+              <PanicScoreButton symbols={visibleScreener.map((m) => m.symbol)} />
+            }
           />
           <div className="flex-1 overflow-y-auto">
             <ScreenerPanel matches={screener} />

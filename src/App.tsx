@@ -9,6 +9,7 @@ import { Dashboard } from "@/components/dashboard/Dashboard";
 import { TradeTally } from "@/components/TradeTally";
 import { GamepadOverlays } from "@/components/GamepadOverlays";
 import { useUiStore } from "@/stores/uiStore";
+import { Notifications } from "@/components/Notifications";
 import { useUpdaterStore } from "@/stores/updaterStore";
 import { useDashboardStore } from "@/stores/dashboardStore";
 import { useLayoutStore } from "@/stores/layoutStore";
@@ -52,12 +53,12 @@ export default function App() {
     api.getScreenerDismissals().then(setDismissedScreener).catch(() => {});
   }, [setDismissedScreener]);
 
-  // In flat-files mode there is no live feed, so open the Market Replay transport
-  // bar by default — replay is the only way to drive data from the stored days.
+  // Offline there is no live feed, so open the Market Replay transport bar by
+  // default — replay is the only way to drive data from the stored days.
   useEffect(() => {
     api.getLocalConfig()
       .then((cfg) => {
-        if (cfg?.data_source?.mode === "flat_files") {
+        if (cfg?.data_source?.offline) {
           useUiStore.setState({ replayOpen: true });
         }
       })
@@ -137,6 +138,8 @@ export default function App() {
       </div>
       {/* Controller overlays: auto-tag picker, flash error, R2 armed-layer hint. */}
       <GamepadOverlays />
+      {/* Transient order/broker notices — corner stack, never a modal. */}
+      <Notifications />
     </div>
   );
 }

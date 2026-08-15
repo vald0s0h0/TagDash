@@ -1,6 +1,7 @@
 pub mod alpaca;
-pub mod chart_state;
+pub mod broker;
 pub mod chart_payloads;
+pub mod chart_state;
 pub mod commands;
 pub mod company_intel;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod market_state;
 pub mod massive;
 pub mod micro_pullback;
 pub mod notify;
+pub mod panic_llm;
 pub mod panic_watchlist;
 pub mod perfect_pullback;
 pub mod replay;
@@ -25,31 +27,36 @@ pub mod scanner;
 pub mod scoring;
 pub mod screenshot;
 pub mod sec_api;
+pub mod sec_shares;
 pub mod startup;
 pub mod state;
-pub mod stt;
 pub mod strategies;
+pub mod stt;
 pub mod time;
 pub mod tradetally;
 pub mod types;
 pub mod universe;
+pub mod websearch;
 
-use std::sync::{
-    atomic::AtomicBool,
-    Arc, Mutex, RwLock,
-};
 use state::AppState;
+use std::sync::{atomic::AtomicBool, Arc, Mutex, RwLock};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // ── Load config + secrets ─────────────────────────────────────────────
     let (app_dir, cfg) = config::load();
-    let secrets = config::secrets::load(&app_dir);
+    let secrets = {
+        let mut s = config::secrets::load(&app_dir);
+        // Market data rides on the selected account's key pair — resolve it before
+        // anything reads `alpaca_key`, which the startup pipeline does immediately.
+        s.resolve_market_data(cfg.broker.is_live());
+        s
+    };
 
     // ── Open SQLite + run migrations ──────────────────────────────────────
-    let db = local_db::open_and_migrate(&app_dir)
-        .expect("[tagdash] failed to open SQLite database");
+    let db =
+        local_db::open_and_migrate(&app_dir).expect("[tagdash] failed to open SQLite database");
 
     // ── Seed initial log ──────────────────────────────────────────────────
     let _ = local_db::insert_log(&db, "info", "TagDash started");
@@ -61,7 +68,8 @@ pub fn run() {
             .map(|s| (s.id().to_string(), s.enabled()))
             .collect();
         if let Some(json) = local_db::cache_repository::get_app_meta(&db, "strategy_overrides") {
-            if let Ok(over) = serde_json::from_str::<std::collections::HashMap<String, bool>>(&json) {
+            if let Ok(over) = serde_json::from_str::<std::collections::HashMap<String, bool>>(&json)
+            {
                 for (id, on) in over {
                     if m.contains_key(&id) {
                         m.insert(id, on);
@@ -77,20 +85,31 @@ pub fn run() {
     // Migration: if the stored JSON parses as the old HashMap<String, f64>, convert
     // each f64 to a StrategyRiskConfig with defaults so existing risk-$ settings survive.
     let strategy_risk: std::collections::HashMap<String, types::StrategyRiskConfig> = {
-        let mut m: std::collections::HashMap<String, types::StrategyRiskConfig> = strategies::registry::all_strategies()
-            .iter()
-            .map(|s| (s.id().to_string(), s.risk_config()))
-            .collect();
-        if let Some(json) = local_db::cache_repository::get_app_meta(&db, "strategy_risk_overrides") {
+        let mut m: std::collections::HashMap<String, types::StrategyRiskConfig> =
+            strategies::registry::all_strategies()
+                .iter()
+                .map(|s| (s.id().to_string(), s.risk_config()))
+                .collect();
+        if let Some(json) = local_db::cache_repository::get_app_meta(&db, "strategy_risk_overrides")
+        {
             // Try new format first (full StrategyRiskConfig per strategy).
-            if let Ok(over) = serde_json::from_str::<std::collections::HashMap<String, types::StrategyRiskConfig>>(&json) {
+            if let Ok(over) = serde_json::from_str::<
+                std::collections::HashMap<String, types::StrategyRiskConfig>,
+            >(&json)
+            {
                 for (id, cfg) in over {
-                    if m.contains_key(&id) { m.insert(id, cfg); }
+                    if m.contains_key(&id) {
+                        m.insert(id, cfg);
+                    }
                 }
             // Migrate old format (f64 = max_risk_dollars only).
-            } else if let Ok(old) = serde_json::from_str::<std::collections::HashMap<String, f64>>(&json) {
+            } else if let Ok(old) =
+                serde_json::from_str::<std::collections::HashMap<String, f64>>(&json)
+            {
                 for (id, dollars) in old {
-                    if let Some(cfg) = m.get_mut(&id) { cfg.max_risk_dollars = dollars; }
+                    if let Some(cfg) = m.get_mut(&id) {
+                        cfg.max_risk_dollars = dollars;
+                    }
                 }
             }
         }
@@ -129,41 +148,37 @@ pub fn run() {
     // struct so it can borrow `app_dir` before the field shorthand below moves it.
     let stt_shared = Arc::new(stt::SttShared::new(app_dir.clone()));
 
-    // Initial startup state carries the step list for the active data-source mode
-    // (the flat-files pipeline shows different steps). Computed before the struct so
-    // it reads `cfg.data_source` before `cfg` is moved into the `config` field.
-    let startup_state = startup::StartupState::for_mode(&cfg.data_source);
-
     let app_state = AppState {
         app_dir,
-        config:            Arc::new(RwLock::new(cfg)),
-        secrets:           Arc::new(RwLock::new(secrets)),
-        db:                Arc::new(Mutex::new(db)),
-        startup:           Arc::new(RwLock::new(startup_state)),
-        market:            Arc::new(RwLock::new(market_state::MarketState::new())),
-        mock_feed_running: Arc::new(AtomicBool::new(false)),
+        config: Arc::new(RwLock::new(cfg)),
+        secrets: Arc::new(RwLock::new(secrets)),
+        db: Arc::new(Mutex::new(db)),
+        startup: Arc::new(RwLock::new(startup::StartupState::default())),
+        market: Arc::new(RwLock::new(market_state::MarketState::new())),
+        broker: Arc::new(broker::BrokerEngine::new()),
         live_feed_running: Arc::new(AtomicBool::new(false)),
         news_feed_running: Arc::new(AtomicBool::new(false)),
-        scanner_running:   Arc::new(AtomicBool::new(false)),
+        scanner_running: Arc::new(AtomicBool::new(false)),
         perfect_pullback_running: Arc::new(AtomicBool::new(false)),
         hod_drive_running: Arc::new(AtomicBool::new(false)),
         market_attention_running: Arc::new(AtomicBool::new(false)),
         micro_pullback_running: Arc::new(AtomicBool::new(false)),
         panic_watchlist_running: Arc::new(AtomicBool::new(false)),
         trading_loop_running: Arc::new(AtomicBool::new(false)),
-        strategy_enabled:  Arc::new(RwLock::new(strategy_enabled)),
-        strategy_risk:     Arc::new(RwLock::new(strategy_risk)),
-        active_alerts:     Arc::new(RwLock::new(Vec::new())),
-        alert_history:     Arc::new(RwLock::new(Vec::new())),
-        screener:          Arc::new(RwLock::new(Vec::new())),
-        attention:         Arc::new(RwLock::new(Vec::new())),
-        chart:             Arc::new(RwLock::new(chart_state)),
-        internal_book:     Arc::new(RwLock::new(internal_book)),
-        enrichments:       Arc::new(RwLock::new(std::collections::HashMap::new())),
+        strategy_enabled: Arc::new(RwLock::new(strategy_enabled)),
+        strategy_risk: Arc::new(RwLock::new(strategy_risk)),
+        active_alerts: Arc::new(RwLock::new(Vec::new())),
+        alert_history: Arc::new(RwLock::new(Vec::new())),
+        screener: Arc::new(RwLock::new(Vec::new())),
+        attention: Arc::new(RwLock::new(Vec::new())),
+        chart: Arc::new(RwLock::new(chart_state)),
+        internal_book: Arc::new(RwLock::new(internal_book)),
+        enrichments: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        panic_run: Arc::new(RwLock::new(panic_llm::state::PanicRunState::default())),
         focus_symbols_tx,
-        replay:            Arc::new(replay::ReplayShared::default()),
-        flat_files:        Arc::new(flat_files::FlatFilesShared::default()),
-        stt:               stt_shared,
+        replay: Arc::new(replay::ReplayShared::default()),
+        flat_files: Arc::new(flat_files::FlatFilesShared::default()),
+        stt: stt_shared,
     };
 
     // ── Start Tauri ───────────────────────────────────────────────────────
@@ -186,11 +201,12 @@ pub fn run() {
             // registered at all, so development is never interrupted (the frontend
             // also guards with import.meta.env.DEV).
             #[cfg(all(desktop, not(debug_assertions)))]
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
 
             let state = app.state::<AppState>();
-            let db      = state.db.clone();
-            let config  = state.config.clone();
+            let db = state.db.clone();
+            let config = state.config.clone();
             let secrets = state.secrets.clone();
 
             // Seed bundled default mood images / phrases / backgrounds into the
@@ -203,13 +219,15 @@ pub fn run() {
                         == Some("1")
                 };
                 if !seeded {
-                    if let Ok(res) =
-                        app.path().resolve("resources/defaults", tauri::path::BaseDirectory::Resource)
+                    if let Ok(res) = app
+                        .path()
+                        .resolve("resources/defaults", tauri::path::BaseDirectory::Resource)
                     {
                         dashboard::seed_default_assets(&res, &state.app_dir);
                     }
                     let g = db.lock().unwrap();
-                    let _ = local_db::cache_repository::set_app_meta(&g, "default_assets_seeded", "1");
+                    let _ =
+                        local_db::cache_repository::set_app_meta(&g, "default_assets_seeded", "1");
                 }
             }
 
@@ -235,47 +253,58 @@ pub fn run() {
                 });
             }
 
-            // 2. Production boot: build the universe, then connect the Alpaca live
-            //    WebSocket so real-time data flows automatically at launch.
-            //    (The mock feed is no longer auto-started — it stays available as a
-            //    manual dev command but is disabled in production.)
+            // 2. Build the universe, then connect the Alpaca live WebSocket so
+            //    real-time data flows automatically at launch.
             {
-                let market            = state.market.clone();
-                let startup           = state.startup.clone();
-                let internal_book     = state.internal_book.clone();
+                let market = state.market.clone();
+                let startup = state.startup.clone();
+                let internal_book = state.internal_book.clone();
+                let broker_mirror = state.broker.mirror.clone();
                 let live_feed_running = state.live_feed_running.clone();
-                let focus_rx          = state.focus_symbols_tx.subscribe();
-                let app_handle        = app.handle().clone();
+                let focus_rx = state.focus_symbols_tx.subscribe();
+                let app_handle = app.handle().clone();
                 let news_feed_running = state.news_feed_running.clone();
-                let app_dir          = state.app_dir.clone();
+                let app_dir = state.app_dir.clone();
                 // Dedicated handles for the company-intel collection job (kept as
                 // its own clones so it can run after the pipeline without fighting
                 // the moves above).
-                let ci_db      = db.clone();
-                let ci_config  = config.clone();
+                let ci_db = db.clone();
+                let ci_config = config.clone();
                 let ci_secrets = secrets.clone();
                 tauri::async_runtime::spawn(async move {
-                    let is_flat = config.read().unwrap().data_source.is_flat_files();
-                    if is_flat {
-                        // Flat-files boot: dedicated pipeline (no Alpaca — universe +
-                        // daily history from disk, FMP/Massive/SEC for gaps). The user
-                        // picks a day from the calendar modal before any replay starts.
-                        startup::run_pipeline_flat_files(
-                            db.clone(), config.clone(), secrets.clone(), startup, app_dir.clone(),
-                        )
-                        .await;
-                    } else {
-                        // API boot: Alpaca-centric pipeline, then connect the live
-                        // WebSocket + premarket news feed so real-time data flows.
-                        startup::run_pipeline(db.clone(), config.clone(), secrets.clone(), startup).await;
-                        match commands::spawn_live_feed(market.clone(), config, secrets.clone(), db, internal_book, live_feed_running, focus_rx, app_handle) {
-                            Ok(n)  => eprintln!("[tagdash] live feed: {n} US-stock universe ready"),
-                            Err(e) => eprintln!("[tagdash] live feed not started: {e}"),
-                        }
-                        // Premarket news investor — independent of the data feed.
-                        if let Err(e) = commands::spawn_news_feed(market, secrets, news_feed_running) {
-                            eprintln!("[tagdash] news feed not started: {e}");
-                        }
+                    // ONE pipeline. Flat files and Alpaca are complementary sources, not
+                    // rival modes: the on-disk daily history loads first (free, offline,
+                    // usually deeper), then the API tops it up where it can. Each step
+                    // reports itself skipped when its provider is unreachable.
+                    startup::run_pipeline(
+                        db.clone(),
+                        config.clone(),
+                        secrets.clone(),
+                        startup,
+                        app_dir.clone(),
+                    )
+                    .await;
+                    // The live feed is the one thing that genuinely cannot degrade: it
+                    // needs credentials and a network. `spawn_live_feed` refuses on its
+                    // own when offline or unconfigured, so there is no branch here —
+                    // just a message saying which it was.
+                    match commands::spawn_live_feed(
+                        market.clone(),
+                        config,
+                        secrets.clone(),
+                        db,
+                        internal_book,
+                        broker_mirror,
+                        live_feed_running,
+                        focus_rx,
+                        app_handle,
+                    ) {
+                        Ok(n) => eprintln!("[tagdash] live feed: {n} US-stock universe ready"),
+                        Err(e) => eprintln!("[tagdash] live feed not started: {e}"),
+                    }
+                    // Premarket news investor — independent of the data feed.
+                    if let Err(e) = commands::spawn_news_feed(market, secrets, news_feed_running) {
+                        eprintln!("[tagdash] news feed not started: {e}");
                     }
                     // Company-intelligence collection (short interest, financials,
                     // dilution filings, ownership). Runs ONCE here, after the
@@ -290,9 +319,31 @@ pub fn run() {
                     {
                         let today = crate::time::et_date(crate::time::now());
                         let conn = rs_db.lock().unwrap();
-                        let _ = crate::local_db::cache_repository::recompute_risk_scores(&conn, &today);
+                        let _ =
+                            crate::local_db::cache_repository::recompute_risk_scores(&conn, &today);
                     }
                 });
+            }
+
+            // 2b. Broker truth-keeper. Idle while the internal TagDash broker is
+            //     selected; the moment the user switches to Alpaca it connects the
+            //     trade-updates stream and starts reconciling orders/positions from
+            //     the venue. Runs for the life of the app so switching accounts in
+            //     Settings takes effect without a restart.
+            {
+                let engine = state.broker.clone();
+                let cfg = state.config.clone();
+                let sec = state.secrets.clone();
+                // The journal turns venue executions into TradeTally events, so it
+                // needs the DB (the outbound queue) and the chart contexts (the setup
+                // name a trade is filed under).
+                let deps = broker::alpaca_stream::JournalDeps {
+                    journal: engine.journal.clone(),
+                    db: state.db.clone(),
+                    chart: state.chart.clone(),
+                    protection: engine.protection.clone(),
+                };
+                broker::spawn(engine, cfg, sec, deps);
             }
 
             // 3. Market Attention Gate engine (direction-agnostic ticker selection):
@@ -302,10 +353,10 @@ pub fn run() {
             //    an alert / never trades; idles outside its window.
             {
                 let ma_running = state.market_attention_running.clone();
-                let market     = state.market.clone();
-                let db         = state.db.clone();
-                let secrets    = state.secrets.clone();
-                let attention  = state.attention.clone();
+                let market = state.market.clone();
+                let db = state.db.clone();
+                let secrets = state.secrets.clone();
+                let attention = state.attention.clone();
                 ma_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 market_attention::MarketAttentionEngine::start(
                     ma_running, market, db, secrets, attention,
@@ -318,16 +369,22 @@ pub fn run() {
             //     pullback (gate 2). Auto-started; idles outside the regular session
             //     and honours the Settings toggle.
             {
-                let pp_running       = state.perfect_pullback_running.clone();
-                let market           = state.market.clone();
-                let db               = state.db.clone();
-                let active_alerts    = state.active_alerts.clone();
-                let alert_history    = state.alert_history.clone();
+                let pp_running = state.perfect_pullback_running.clone();
+                let market = state.market.clone();
+                let db = state.db.clone();
+                let active_alerts = state.active_alerts.clone();
+                let alert_history = state.alert_history.clone();
                 let strategy_enabled = state.strategy_enabled.clone();
-                let attention        = state.attention.clone();
+                let attention = state.attention.clone();
                 pp_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 perfect_pullback::PerfectPullbackEngine::start(
-                    pp_running, market, db, active_alerts, alert_history, strategy_enabled, attention,
+                    pp_running,
+                    market,
+                    db,
+                    active_alerts,
+                    alert_history,
+                    strategy_enabled,
+                    attention,
                 );
             }
 
@@ -338,14 +395,18 @@ pub fn run() {
             //     regular session / each timeframe's active window and honours the
             //     Settings toggle.
             {
-                let hd_running       = state.hod_drive_running.clone();
-                let market           = state.market.clone();
-                let active_alerts    = state.active_alerts.clone();
-                let alert_history    = state.alert_history.clone();
+                let hd_running = state.hod_drive_running.clone();
+                let market = state.market.clone();
+                let active_alerts = state.active_alerts.clone();
+                let alert_history = state.alert_history.clone();
                 let strategy_enabled = state.strategy_enabled.clone();
                 hd_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 hod_drive::HodDriveEngine::start(
-                    hd_running, market, active_alerts, alert_history, strategy_enabled,
+                    hd_running,
+                    market,
+                    active_alerts,
+                    alert_history,
+                    strategy_enabled,
                 );
             }
 
@@ -355,16 +416,22 @@ pub fn run() {
             //    one locked alert per ticker. Auto-started; idles outside premarket and
             //    honours the Settings toggle.
             {
-                let mp_running       = state.micro_pullback_running.clone();
-                let market           = state.market.clone();
-                let db               = state.db.clone();
-                let secrets          = state.secrets.clone();
-                let active_alerts    = state.active_alerts.clone();
-                let alert_history    = state.alert_history.clone();
+                let mp_running = state.micro_pullback_running.clone();
+                let market = state.market.clone();
+                let db = state.db.clone();
+                let secrets = state.secrets.clone();
+                let active_alerts = state.active_alerts.clone();
+                let alert_history = state.alert_history.clone();
                 let strategy_enabled = state.strategy_enabled.clone();
                 mp_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 micro_pullback::MicroPullbackEngine::start(
-                    mp_running, market, db, secrets, active_alerts, alert_history, strategy_enabled,
+                    mp_running,
+                    market,
+                    db,
+                    secrets,
+                    active_alerts,
+                    alert_history,
+                    strategy_enabled,
                 );
             }
 
@@ -374,24 +441,40 @@ pub fn run() {
             //     Runs immediately on a late launch; reuses a list already built today.
             {
                 let pw_running = state.panic_watchlist_running.clone();
-                let db         = state.db.clone();
-                let secrets    = state.secrets.clone();
+                let pw_app_dir = state.app_dir.clone();
+                let db = state.db.clone();
+                let secrets = state.secrets.clone();
                 pw_running.store(true, std::sync::atomic::Ordering::Relaxed);
-                panic_watchlist::PanicWatchlistEngine::start(pw_running, db, secrets);
+                panic_watchlist::PanicWatchlistEngine::start(pw_running, pw_app_dir, db, secrets);
             }
 
             // 4. Internal trading loop: drives the order book (pending limit/stop
             //    fills, bracket SL/TP, TradeTally mirroring) off market data on a
             //    fixed cadence, instead of as a side effect of UI position polls.
             {
-                let running       = state.trading_loop_running.clone();
-                let market        = state.market.clone();
+                let running = state.trading_loop_running.clone();
+                let market = state.market.clone();
                 let internal_book = state.internal_book.clone();
-                let db            = state.db.clone();
-                let config        = state.config.clone();
-                let chart         = state.chart.clone();
+                let db = state.db.clone();
+                let config = state.config.clone();
+                let chart = state.chart.clone();
                 let strategy_risk = state.strategy_risk.clone();
-                commands::spawn_trading_loop(running, market, internal_book, db, config, chart, strategy_risk);
+                // Also feeds MAE/MFE watermarks to the broker journal when Alpaca is
+                // the active broker — those are price excursions, not fills, so no
+                // venue reports them.
+                let broker_engine = state.broker.clone();
+                let secrets = state.secrets.clone();
+                commands::spawn_trading_loop(
+                    running,
+                    market,
+                    internal_book,
+                    db,
+                    config,
+                    secrets,
+                    chart,
+                    strategy_risk,
+                    broker_engine,
+                );
             }
 
             // 5. On-demand "capacité à diluer" collector: a background worker that
@@ -400,7 +483,9 @@ pub fn run() {
             //    Never blocks the scanner; interim until a real background worker exists.
             if let Some(rx) = crate::company_intel::ondemand::take_channel() {
                 let (db, config) = (state.db.clone(), state.config.clone());
-                tauri::async_runtime::spawn(crate::company_intel::ondemand::run_worker(db, config, rx));
+                tauri::async_runtime::spawn(crate::company_intel::ondemand::run_worker(
+                    db, config, rx,
+                ));
             }
 
             // 6. Speech-to-Text worker: the single background task that drains the
@@ -455,20 +540,27 @@ pub fn run() {
             commands::get_alarms_for_symbol,
             commands::get_all_alarms,
             commands::delete_alarm,
-            // Dev
-            commands::get_mock_alerts,
             // Startup pipeline
             commands::run_startup_pipeline,
             commands::get_startup_status,
             commands::get_streamable_universe,
             // Live market feed
-            commands::start_mock_market_feed,
-            commands::stop_mock_market_feed,
             commands::start_live_feed,
             commands::stop_live_feed,
             commands::start_news_feed,
             commands::stop_news_feed,
             commands::set_focus_symbols,
+            // ── Broker (account selection + Alpaca trading) ──
+            commands::broker::get_broker_selection,
+            commands::broker::set_broker_selection,
+            commands::broker::get_broker_mirror,
+            commands::broker::get_broker_account,
+            commands::broker::broker_submit_order,
+            commands::broker::broker_cancel_order,
+            commands::broker::broker_replace_order,
+            commands::broker::broker_close_position,
+            commands::broker::get_shortability,
+            commands::broker::get_non_shortable_symbols,
             commands::get_market_snapshot,
             commands::get_ticker_bars,
             commands::load_chart_bars,
@@ -486,16 +578,28 @@ pub fn run() {
             commands::start_alert_enrichment,
             commands::run_alert_llm,
             commands::get_alert_enrichment,
+            // Panic Score — LLM ranking of the visible pre-open watchlist
+            commands::run_panic_llm_analysis,
+            commands::get_panic_llm_run,
+            commands::get_panic_llm_scores,
+            commands::has_web_search_provider,
             commands::get_active_alerts,
             commands::get_alert_history,
             commands::get_screener_matches,
             commands::get_market_attention,
             commands::dismiss_screener,
             commands::get_screener_dismissals,
+            commands::pin_screener,
+            commands::unpin_screener,
+            commands::get_screener_pins,
+            commands::set_screener_rating,
+            commands::get_screener_ratings,
             commands::start_scanner,
             commands::stop_scanner,
             commands::get_mean_reversion_scores,
             commands::force_recompute_scores,
+            commands::refresh_sec_shares,
+            commands::sec_shares_coverage,
             commands::get_card_info,
             commands::get_hod_drive_overlay,
             commands::get_ticker_news,

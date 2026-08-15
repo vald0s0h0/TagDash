@@ -1,9 +1,8 @@
-import { Activity, Play, Square } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { Activity } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { useMarketSnapshot, useMockFeed } from "@/queries/useMarket";
+import { useMarketSnapshot } from "@/queries/useMarket";
 import type { LatencyLevel, TickerLiveState } from "@/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -86,9 +85,8 @@ function TickerRow({ t }: { t: TickerLiveState }) {
 
 export function LiveFeedPanel() {
   const { data: snapshot } = useMarketSnapshot();
-  const { start, stop }    = useMockFeed();
 
-  const isRunning = snapshot?.mock_running ?? false;
+  const isRunning = snapshot?.live_running ?? false;
   const tickers   = Object.values(snapshot?.tickers ?? {}).sort((a, b) =>
     a.symbol.localeCompare(b.symbol)
   );
@@ -117,36 +115,12 @@ export function LiveFeedPanel() {
           )}
         </div>
 
-        <div className="flex items-center gap-3">
-          {snapshot && (
-            <LatencyBadge
-              ms={snapshot.latency.websocket_to_ui_ms}
-              level={snapshot.latency.level}
-            />
-          )}
-          {isRunning ? (
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 px-2 text-[11px]"
-              onClick={() => stop.mutate()}
-              disabled={stop.isPending}
-            >
-              <Square className="mr-1 h-3 w-3 fill-current" />
-              Stop
-            </Button>
-          ) : (
-            <Button
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              onClick={() => start.mutate()}
-              disabled={start.isPending}
-            >
-              <Play className="mr-1 h-3 w-3 fill-current" />
-              Start mock feed
-            </Button>
-          )}
-        </div>
+        {snapshot && (
+          <LatencyBadge
+            ms={snapshot.latency.websocket_to_ui_ms}
+            level={snapshot.latency.level}
+          />
+        )}
       </div>
 
       {/* Ticker table (only shown when tickers exist) */}
@@ -179,7 +153,7 @@ export function LiveFeedPanel() {
       {/* Empty-state placeholder */}
       {!isRunning && tickers.length === 0 && (
         <div className="px-4 pb-3 text-[11px] text-muted-foreground">
-          Click "Start mock feed" to generate live data.
+          Le flux Alpaca n’est pas connecté.
         </div>
       )}
     </div>

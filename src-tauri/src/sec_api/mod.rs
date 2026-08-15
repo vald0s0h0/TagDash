@@ -160,32 +160,6 @@ fn clone_into_company(raw: &RawCompany) -> Option<SecCompany> {
     .into_company()
 }
 
-/// Mock metadata for the FMP/Massive mock symbols, so dev mode shows country +
-/// industry without network access.
-pub fn mock_companies() -> HashMap<String, SecCompany> {
-    let rows = [
-        ("ABCD", "U.S.A", "3711", "Consumer Cyclical"),
-        ("WXYZ", "China", "7372", "Technology"),
-        ("MNOP", "Canada", "1040", "Basic Materials"),
-        ("QRST", "U.S.A", "2836", "Healthcare"),
-        ("EFGH", "Israel", "3674", "Technology"),
-    ];
-    rows.iter()
-        .map(|(sym, country, sic, sector)| {
-            (
-                sym.to_string(),
-                SecCompany {
-                    symbol: sym.to_string(),
-                    country: Some(country.to_string()),
-                    sic: Some(sic.to_string()),
-                    industry: sic_codes::sic_to_industry(sic).map(str::to_string),
-                    sector: Some(sector.to_string()),
-                },
-            )
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

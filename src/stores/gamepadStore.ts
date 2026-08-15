@@ -24,7 +24,7 @@ export type GamepadActionId =
   | "cursor_sl" | "cursor_alarm" | "cursor_tp" | "remove_orders"
   // Armed layer — R2 held (digital)
   | "r2_modifier" | "order_25" | "order_50" | "order_100" | "close_position"
-  | "confirm_hod"
+  | "confirm_hod" | "invert_hod"
   // Journal / TradeTally (digital)
   | "capture" | "share_tag" | "journal_audio"
   // Replay (digital, global — not tied to a zone)
@@ -73,6 +73,7 @@ export const GAMEPAD_ACTIONS: GamepadActionDef[] = [
   { id: "order_100",     label: "Position 100 %", group: "Position armée", kind: "digital", armed: true },
   { id: "close_position", label: "Clôturer la position", group: "Position armée", kind: "digital", armed: true },
   { id: "confirm_hod",   label: "Confirmer HOD Drive",   group: "Position armée", kind: "digital", armed: true },
+  { id: "invert_hod",    label: "Inverser HOD Drive (short)", group: "Position armée", kind: "digital", armed: true },
 
   // Journal / TradeTally
   { id: "capture",       label: "Capture TradeTally",          group: "Journal / TradeTally", kind: "digital" },
@@ -121,6 +122,12 @@ const AXIS_LABELS: Record<number, string> = {
   2: "Stick droit ↔",  3: "Stick droit ↕",
 };
 
+/** Every command maps to a binding or to `undefined` (= left for the user to
+ *  assign). Spelling the key out with an explicit `undefined` rather than making
+ *  it optional keeps DEFAULT_BINDINGS exhaustive: adding a command still fails to
+ *  compile until it's listed, deliberately unbound or not. */
+export type GamepadBindings = Record<GamepadActionId, GamepadBinding | undefined>;
+
 export function bindingLabel(b: GamepadBinding | undefined): string {
   if (!b) return "non assigné";
   return b.kind === "button"
@@ -136,7 +143,7 @@ export function bindingLabel(b: GamepadBinding | undefined): string {
 // needed while aiming/firing a trade, mirroring how A/B/X/Y double up below).
 // PS names map to Xbox: L1=LB L2=LT R1=RB R2=RT.
 
-export const DEFAULT_BINDINGS: Record<GamepadActionId, GamepadBinding> = {
+export const DEFAULT_BINDINGS: GamepadBindings = {
   // Navigation
   ticker_prev:    { kind: "button", index: 12 }, // D-pad ↑
   ticker_next:    { kind: "button", index: 13 }, // D-pad ↓
@@ -158,6 +165,10 @@ export const DEFAULT_BINDINGS: Record<GamepadActionId, GamepadBinding> = {
   order_100:      { kind: "button", index: 3 },  // Y
   close_position: { kind: "button", index: 2 },  // X
   confirm_hod:    { kind: "button", index: 15 }, // D-pad → (armed twin of share_tag)
+  // Deliberately unbound: the free armed-layer buttons all double as something
+  // else, and firing a short by accident is the worst possible misbind — the user
+  // picks the button themselves in Settings ▸ Hotkeys ▸ Xbox.
+  invert_hod:     undefined,
 
   // Journal / TradeTally
   capture:       { kind: "button", index: 8 },  // View / Back
@@ -177,7 +188,7 @@ export const DEFAULT_BINDINGS: Record<GamepadActionId, GamepadBinding> = {
 
 interface GamepadState {
   enabled: boolean;
-  bindings: Record<GamepadActionId, GamepadBinding>;
+  bindings: GamepadBindings;
   /** Stick speed multipliers (0.2 = slow … 3 = fast). */
   leftSensitivity:  number; // zoom (left stick)
   rightSensitivity: number; // cursor (right stick)
@@ -186,7 +197,8 @@ interface GamepadState {
   invertCursor:    boolean;
 
   setEnabled:      (v: boolean) => void;
-  setBinding:      (id: GamepadActionId, b: GamepadBinding) => void;
+  /** `undefined` clears the binding (the ✕ on a command that ships unbound). */
+  setBinding:      (id: GamepadActionId, b: GamepadBinding | undefined) => void;
   setLeftSensitivity:  (v: number) => void;
   setRightSensitivity: (v: number) => void;
   setInvertZoomTime:  (v: boolean) => void;

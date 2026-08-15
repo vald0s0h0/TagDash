@@ -129,6 +129,25 @@ pub struct ScreenerMatch {
     pub score:         Option<f64>,
     /// Short label for the score, e.g. "BB 97" / "PR 95". None when no score.
     pub score_label:   Option<String>,
+    /// Panic Score 0..100 from the LLM analysis (`crate::panic_llm`). None until the
+    /// user runs the analysis, or for a ticker that surfaced after the last run.
+    /// The final ordering blends quantitative extension and the confidence-aware
+    /// contextual rank; analysis presence itself is neutral.
+    pub llm_panic_score: Option<f64>,
+    /// The one-sentence explanation from the same analysis, for the card's tooltip.
+    pub llm_one_liner:   Option<String>,
+    /// faible | moyenne | forte — reversibility, for the card's badge colour.
+    pub llm_reversibility: Option<String>,
+    /// Confidence-aware contextual ranking (0..100), distinct from raw reversibility.
+    pub llm_ranking_score: Option<f64>,
+    pub llm_confidence_score: Option<f64>,
+    /// eligible | review | veto.
+    pub llm_eligibility: Option<String>,
+    /// extending | exhausting | reversing | unknown (informational only).
+    pub llm_timing_state: Option<String>,
+    /// long | short, derived from the extension direction.
+    pub llm_trade_direction: Option<String>,
+    pub llm_veto_reason: Option<String>,
     pub updated_at:    DateTime<Utc>,
 }
 
@@ -492,7 +511,7 @@ pub struct StrategyContext {
     pub change_day_pct: Option<f64>,
     /// Relative volume vs average. None if avg volume not yet loaded.
     pub rvol:           Option<f64>,
-    /// Float shares from FMP/cache. None in mock mode.
+    /// Float shares from FMP/cache. None when unavailable.
     pub float_shares:   Option<u64>,
 }
 

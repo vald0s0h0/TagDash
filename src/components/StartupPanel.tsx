@@ -10,7 +10,6 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -219,11 +218,6 @@ export function StartupPanel() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {startupData?.mock_mode && (
-            <Badge variant="outline" className="text-amber-400 border-amber-700 text-[10px]">
-              MOCK MODE
-            </Badge>
-          )}
           {startupData?.completed && (
             <Button
               size="sm"

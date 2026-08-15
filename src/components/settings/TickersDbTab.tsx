@@ -3,7 +3,7 @@
 // fixed-size Settings content pane (the table scrolls internally, both axes).
 
 import { useEffect, useMemo, useState } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, ChevronsUpDown, RefreshCw, Search } from "lucide-react";
 import { api } from "@/lib/tauri";
 import type { TickerTableRow } from "@/types";
@@ -217,6 +217,41 @@ function formatCell(kind: Kind, value: unknown): React.ReactNode {
 
 type SortState = { key: keyof TickerTableRow; dir: "asc" | "desc" } | null;
 
+/** Refresh shares-outstanding from SEC EDGAR (free, keyless) and show how many
+ *  symbols end up with a market cap. Feeds the size buckets of the Panic Mean
+ *  Reversion watchlist, so no size category can crowd the others out. Quarterly is
+ *  plenty — the SEC only publishes new figures once a quarter. */
+function SecSharesButton() {
+  const qc = useQueryClient();
+  const coverage = useQuery({
+    queryKey: ["sec_shares_coverage"],
+    queryFn: api.secSharesCoverage,
+    staleTime: 60_000,
+  });
+  const refresh = useMutation({
+    mutationFn: api.refreshSecShares,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["sec_shares_coverage"] }),
+  });
+
+  return (
+    <button
+      onClick={() => refresh.mutate()}
+      disabled={refresh.isPending}
+      title="Télécharge les actions en circulation depuis SEC EDGAR (gratuit, sans clé, ~5 requêtes). Sert au calcul de capitalisation et aux paliers de taille du screener Panic. À relancer une fois par trimestre."
+      className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground disabled:opacity-50"
+    >
+      <RefreshCw className={cn("h-3.5 w-3.5", refresh.isPending && "animate-spin")} />
+      {refresh.isPending ? "SEC…" : "Capitalisations SEC"}
+      {coverage.data != null && (
+        <span className="tabular-nums text-muted-foreground/70">
+          ({coverage.data.toLocaleString("fr-FR")})
+        </span>
+      )}
+      {refresh.isError && <span className="text-red-400">échec</span>}
+    </button>
+  );
+}
+
 export function TickersDbTab() {
   // Backend-driven search (debounced) — only a bounded extract is ever loaded.
   const [search, setSearch] = useState("");
@@ -296,6 +331,8 @@ export function TickersDbTab() {
         >
           <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Rafraîchir
         </button>
+
+        <SecSharesButton />
 
         <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">
           {debounced

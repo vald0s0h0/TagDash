@@ -4,24 +4,25 @@
 // zone→symbol map lets the zone_id-based commands (orders, screenshots, close)
 // resolve the zone's current ticker without changing their signatures.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneTradeContext {
     /// Kept for the frontend type; now mirrors `symbol` (context is per-ticker).
-    pub zone_id:     String,
-    pub symbol:      String,
+    pub zone_id: String,
+    pub symbol: String,
     pub strategy_id: String,
-    pub trade_id:    Option<String>,
-    pub stop_loss:   Option<f64>,
+    pub trade_id: Option<String>,
+    pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
     /// True once the trade has closed (position flat). The tradeID is kept so
     /// the journal/screenshots can still be filled in, but the next SL/TP placed
     /// on the chart starts a brand-new trade (new tradeID).
-    pub closed:      bool,
+    pub closed: bool,
 }
 
+#[derive(Clone)]
 pub struct ChartState {
     /// Trade context per ticker (symbol).
     contexts: HashMap<String, ZoneTradeContext>,
@@ -32,32 +33,36 @@ pub struct ChartState {
 
 impl ChartState {
     pub fn new() -> Self {
-        Self { contexts: HashMap::new(), zone_symbol: HashMap::new() }
+        Self {
+            contexts: HashMap::new(),
+            zone_symbol: HashMap::new(),
+        }
     }
 
     fn entry(&mut self, symbol: &str, strategy_id: &str) -> &mut ZoneTradeContext {
         self.contexts
             .entry(symbol.to_string())
             .or_insert_with(|| ZoneTradeContext {
-                zone_id:     symbol.to_string(),
-                symbol:      symbol.to_string(),
+                zone_id: symbol.to_string(),
+                symbol: symbol.to_string(),
                 strategy_id: strategy_id.to_string(),
-                trade_id:    None,
-                stop_loss:   None,
+                trade_id: None,
+                stop_loss: None,
                 take_profit: None,
-                closed:      false,
+                closed: false,
             })
     }
 
     fn gen_trade_id(symbol: &str, strategy_id: &str) -> String {
-        let ts    = crate::time::now().format("%y%m%d%H%M%S").to_string();
+        let ts = crate::time::now().format("%y%m%d%H%M%S").to_string();
         let strat = strategy_id.to_uppercase().replace('-', "_");
         format!("{}-{}-{}", ts, symbol.to_uppercase(), strat)
     }
 
     /// Record which ticker a zone currently shows (so zone_id lookups resolve it).
     fn track_zone(&mut self, zone_id: &str, symbol: &str) {
-        self.zone_symbol.insert(zone_id.to_string(), symbol.to_string());
+        self.zone_symbol
+            .insert(zone_id.to_string(), symbol.to_string());
     }
 
     /// Context for a ticker (by symbol).
@@ -81,6 +86,14 @@ impl ChartState {
         }
     }
 
+    /// Replace all trading contexts while preserving the live zone→symbol layout.
+    /// Market Replay uses this to isolate simulated SL/TP/trade ids, then restore the
+    /// live contexts on exit without forcing the frontend to rebuild its zones.
+    pub fn replace_contexts(&mut self, ctxs: Vec<ZoneTradeContext>) {
+        self.contexts.clear();
+        self.import_contexts(ctxs);
+    }
+
     /// Context of the ticker a zone currently shows (zone_id → symbol → context).
     /// Used by the in-zone order / screenshot / close commands, which only carry a
     /// zone_id. Returns None when the zone holds no (known) ticker yet.
@@ -100,8 +113,8 @@ impl ChartState {
     /// Returns existing tradeID or generates a new one (per ticker).
     pub fn create_or_get_trade_id(
         &mut self,
-        zone_id:     &str,
-        symbol:      &str,
+        zone_id: &str,
+        symbol: &str,
         strategy_id: &str,
     ) -> String {
         self.track_zone(zone_id, symbol);
@@ -115,17 +128,17 @@ impl ChartState {
     /// Sets SL; auto-generates tradeID on first non-null price.
     pub fn update_sl(
         &mut self,
-        zone_id:     &str,
-        symbol:      &str,
+        zone_id: &str,
+        symbol: &str,
         strategy_id: &str,
-        price:       Option<f64>,
+        price: Option<f64>,
     ) -> ZoneTradeContext {
         self.track_zone(zone_id, symbol);
         let z = self.entry(symbol, strategy_id);
         // A previously-closed trade: placing a fresh SL starts a NEW trade.
         if price.is_some() && z.closed {
             z.trade_id = None;
-            z.closed   = false;
+            z.closed = false;
         }
         z.stop_loss = price;
         if price.is_some() && z.trade_id.is_none() {
@@ -137,17 +150,17 @@ impl ChartState {
     /// Sets TP; auto-generates tradeID on first non-null price.
     pub fn update_tp(
         &mut self,
-        zone_id:     &str,
-        symbol:      &str,
+        zone_id: &str,
+        symbol: &str,
         strategy_id: &str,
-        price:       Option<f64>,
+        price: Option<f64>,
     ) -> ZoneTradeContext {
         self.track_zone(zone_id, symbol);
         let z = self.entry(symbol, strategy_id);
         // A previously-closed trade: placing a fresh TP starts a NEW trade.
         if price.is_some() && z.closed {
             z.trade_id = None;
-            z.closed   = false;
+            z.closed = false;
         }
         z.take_profit = price;
         if price.is_some() && z.trade_id.is_none() {
@@ -170,7 +183,7 @@ impl ChartState {
     /// (shouldn't happen: an open position always has one).
     pub fn sync_levels(&mut self, symbol: &str, stop_loss: Option<f64>, take_profit: Option<f64>) {
         if let Some(c) = self.contexts.get_mut(symbol) {
-            c.stop_loss   = stop_loss;
+            c.stop_loss = stop_loss;
             c.take_profit = take_profit;
         }
     }
@@ -187,9 +200,9 @@ impl ChartState {
             .find(|(_, c)| c.trade_id.as_deref() == Some(trade_id))
             .map(|(s, _)| s.clone())?;
         if let Some(c) = self.contexts.get_mut(&symbol) {
-            c.stop_loss   = None;
+            c.stop_loss = None;
             c.take_profit = None;
-            c.closed      = true;
+            c.closed = true;
         }
         Some(symbol)
     }

@@ -86,7 +86,6 @@ SQLite et TradeTally ne doivent jamais bloquer cette chaîne.
 
 - `get_app_status()` — version, backend, latence
 - `get_config()` — configuration runtime
-- `get_mock_alerts()` — alertes mockées pour valider le bridge
 
 ## Pas en V1
 

@@ -50,6 +50,8 @@ export interface ZoneGamepad {
   order: (percent: 25 | 50 | 100) => void;
   close: () => void;
   confirmHod?: () => void;
+  /** HOD Drive, mirrored: same levels, roles swapped, taken short. */
+  invertHod?: () => void;
   /** TradeTally capture (View button). */
   capture: () => void;
   /** Open the voice-dictation modal for the zone's current trade (Menu button). */

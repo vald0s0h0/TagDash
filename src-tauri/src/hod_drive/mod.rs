@@ -630,14 +630,9 @@ impl HodDriveEngine {
                 // connected (`live_running`) — including during a Market Replay if the
                 // live API is still attached. With no live feed it is SKIPPED entirely
                 // (gates 1-3 fire directly).
-                let (mock, live_active) = {
-                    let ms = market.read().unwrap();
-                    (ms.mock_running, ms.live_running)
-                };
-                let in_session = mock || {
-                    let m = crate::time::et_minutes(now);
-                    m >= SESSION_START_MIN && m < SESSION_END_MIN
-                };
+                let live_active = market.read().unwrap().live_running;
+                let m = crate::time::et_minutes(now);
+                let in_session = m >= SESSION_START_MIN && m < SESSION_END_MIN;
                 if !in_session {
                     crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
                     continue;
@@ -648,7 +643,7 @@ impl HodDriveEngine {
                 let session_open = crate::time::et_session_open_utc(now);
                 let active_until = session_open + ChronoDuration::seconds(cfg.active_secs);
                 // Past the active window for every symbol → nothing to do.
-                if !mock && now > active_until {
+                if now > active_until {
                     crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
                     continue;
                 }
@@ -693,7 +688,7 @@ impl HodDriveEngine {
                     st.last_seen = bars.last().map(|b| b.time);
 
                     if let Some(fire) =
-                        step(cfg, st, &inp, &bars, session_open, active_until, now, mock, live_active)
+                        step(cfg, st, &inp, &bars, session_open, active_until, now, live_active)
                     {
                         fires.push(fire);
                     }
@@ -729,14 +724,13 @@ fn step(
     session_open: DateTime<Utc>,
     active_until: DateTime<Utc>,
     now:          DateTime<Utc>,
-    mock:         bool,
     live_active:  bool,
 ) -> Option<AlertSignal> {
     // Active window: ≥ 3 closed bars AND within active_duration since the open.
     if bars.len() < cfg.min_closed_bars {
         return None;
     }
-    if !mock && now > active_until {
+    if now > active_until {
         return None;
     }
     let _ = session_open;
@@ -808,8 +802,7 @@ fn step(
             // over 5s isn't available from minute bars in V1, so it's not gated here.
             let dvol_5s =
                 inp.volume_day.saturating_sub(st.pending_vol_day) as f64 * inp.price;
-            let liquidity_ok = spread_ok
-                && (dvol_5s >= cfg.min_dollar_volume_5s || mock);
+            let liquidity_ok = spread_ok && dvol_5s >= cfg.min_dollar_volume_5s;
 
             st.pending_bar = None;
             st.pending_since = None;

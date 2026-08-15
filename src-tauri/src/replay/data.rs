@@ -102,7 +102,7 @@ pub(crate) struct MinBar {
 /// entry in the universe table (digits, unit/when-issued suffixes…) gets the
 /// whole request rejected with `400 invalid symbol`. Equity symbols are
 /// upper-case letters with an optional `.`/`-` class separator; anything else
-/// (e.g. "YZCDE2") is dropped before the request.
+/// (e.g. "TEST2") is dropped before the request.
 fn is_rest_symbol(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 10
@@ -911,7 +911,7 @@ mod tests {
         assert!(is_rest_symbol("AAPL"));
         assert!(is_rest_symbol("BRK.A"));
         assert!(is_rest_symbol("ABR-PD"));
-        assert!(!is_rest_symbol("YZCDE2")); // digit → Alpaca 400
+        assert!(!is_rest_symbol("TEST2")); // digit → Alpaca 400
         assert!(!is_rest_symbol("brk.a"));
         assert!(!is_rest_symbol(""));
         assert!(!is_rest_symbol(".AAPL"));
@@ -919,8 +919,8 @@ mod tests {
 
     #[test]
     fn invalid_symbol_extraction() {
-        let body = r#"{"message":"invalid symbol: YZCDE2"}"#;
-        assert_eq!(invalid_symbol_of(body).as_deref(), Some("YZCDE2"));
+        let body = r#"{"message":"invalid symbol: TEST2"}"#;
+        assert_eq!(invalid_symbol_of(body).as_deref(), Some("TEST2"));
         assert_eq!(invalid_symbol_of("other error"), None);
     }
 }

@@ -63,7 +63,88 @@ export interface ScreenerMatch {
   score:         number | null;
   /** Short label for the score, e.g. "BB 97" / "PR 95"; null when no score. */
   score_label:   string | null;
+  /** Raw reversibility score 0..100 from the contextual analysis. The final order
+   *  blends extension with `llm_ranking_score`; analysis presence is neutral. */
+  llm_panic_score:   number | null;
+  /** The one-sentence explanation from the same analysis. */
+  llm_one_liner:     string | null;
+  /** "faible" | "moyenne" | "forte" — reversibility. */
+  llm_reversibility: string | null;
+  llm_ranking_score: number | null;
+  llm_confidence_score: number | null;
+  /** eligible | review | veto */
+  llm_eligibility: string | null;
+  /** extending | exhausting | reversing | unknown; informational only. */
+  llm_timing_state: string | null;
+  /** long | short */
+  llm_trade_direction: string | null;
+  llm_veto_reason: string | null;
   updated_at:    string;
+}
+
+// ─── Panic Score (LLM analysis of the pre-open watchlist) ──────────────────────
+
+/** Progress of a Panic Score run (mirrors PanicRunState in panic_llm/state.rs). */
+export interface PanicRunState {
+  phase:       "idle" | "collecting" | "scoring" | "calibrating" | "done" | "error";
+  running:     boolean;
+  day:         string;
+  simulated:   boolean;
+  total:       number;
+  done:        number;
+  /** Symbols whose scoring call failed; the run still completes for the rest. */
+  failed:      string[];
+  /** Set when the run as a whole could not proceed (no key, no visible tickers). */
+  error:       string | null;
+  /** True when the calibration pass adjusted at least one score. */
+  calibrated:  boolean;
+  started_at:  string | null;
+  finished_at: string | null;
+}
+
+/** One ticker's LLM reading (mirrors PanicLlmScore in panic_llm_repository.rs). */
+export interface PanicLlmScore {
+  symbol:             string;
+  day:                string;
+  simulated:          boolean;
+  /** 0..100 post-calibration — raw contextual reversibility. */
+  panic_score:        number | null;
+  /** 0..100 as first returned for this ticker alone, before calibration. */
+  panic_score_raw:    number | null;
+  confidence_score:   number | null;
+  catalyst_strength:  number | null;
+  catalyst_label:     string | null;
+  catalyst_type:      string | null;
+  /** "faible" | "moyenne" | "forte" */
+  reversibility:      string | null;
+  one_liner:          string | null;
+  key_drivers:        string[];
+  forced_flow:        string | null;
+  euphoria:           string | null;
+  normalization_prob: number | null;
+  /** JSON blob: feed used, missing fields, look-ahead fields. */
+  data_quality:       string | null;
+  web_used:           boolean;
+  web_provider:       string | null;
+  adjustment_reason:  string | null;
+  rubric_version:     string | null;
+  model:              string | null;
+  created_at:         string | null;
+  ranking_score:      number | null;
+  trade_direction:    string | null;
+  timing_state:       string | null;
+  fundamental_veto:   boolean;
+  veto_reason:        string | null;
+  eligibility:        string | null;
+  catalyst_direction: string | null;
+}
+
+/** Decoded `data_quality` blob. Every field optional — it is stored as free JSON. */
+export interface PanicDataQuality {
+  feed?:      string;
+  iex_only?:  string[];
+  missing?:   string[];
+  lookahead?: string[];
 }
 
 /** One ticker on the Market Attention top list (mirrors AttentionEntry in
@@ -441,9 +522,14 @@ export interface AppConfig {
   tradetally: { api_base_url: string };
   /** User-defined journal tags (replaces TradeTally-fetched tags). */
   journal: { tags: string[] };
-  /** Where market data comes from: live Alpaca API or on-disk flat files. In
-   *  flat-files mode there is no real-time feed — Market Replay only. */
-  data_source: { mode: "api" | "flat_files" };
+  /** Data-source policy. Flat files and the Alpaca API are not modes but
+   *  complementary sources: on-disk history is read first and the API fills the
+   *  gaps. `offline` is the single switch — never touch the network, so flat files
+   *  only and no live feed. */
+  data_source: { offline: boolean };
+  /** Where orders go. Independent of `data_source` AND of the market-data plan:
+   *  a free IEX subscription can trade every ticker on a real account. */
+  broker: { broker: "tagdash" | "alpaca"; environment: "paper" | "live" };
   /** Offline Speech-to-Text dictée pipeline (whisper.cpp). */
   stt: SttConfig;
 }
@@ -555,13 +641,23 @@ export interface AppStatus {
 // ─── Secrets (status only — never values) ────────────────────────────────────
 
 export interface SecretsStatus {
+  /** Market-data credentials (bars, live stream, subscription probe). */
   alpaca_key: boolean;
   alpaca_secret: boolean;
+  /** Trading credentials — one pair per account, not interchangeable. */
+  alpaca_paper_key: boolean;
+  alpaca_paper_secret: boolean;
+  alpaca_live_key: boolean;
+  alpaca_live_secret: boolean;
   fmp_api_key: boolean;
   massive_api_key: boolean;
   sec_api_key: boolean;
   claude_api_key: boolean;
   deepseek_api_key: boolean;
+  /** Open-web search for the Panic Score context cascade. One of the two suffices;
+   *  Tavily wins when both are set. Never called during a Market Replay. */
+  tavily_api_key: boolean;
+  brave_api_key: boolean;
   tradetally_token: boolean;
   tradetally_email: boolean;
   tradetally_password: boolean;
@@ -665,7 +761,6 @@ export interface UniverseStats {
 export interface StartupState {
   steps: StartupStep[];
   stats: UniverseStats;
-  mock_mode: boolean;
   warnings: string[];
   completed: boolean;
 }
@@ -818,9 +913,12 @@ export interface TradeExecutions {
   long: boolean;      // green (long) / red (short) triangles
   closed: boolean;    // position flat → line coloured by pnl
   pnl: number;        // realized cash P&L when closed
-  /** Launch-time SL (immutable). Drawn as a thin segment for the trade's
+  /** Launch-time SL (immutable). Drawn as a thin red segment for the trade's
    *  duration; null when no SL was set at entry. */
   original_sl: number | null;
+  /** Launch-time TP (immutable). Same thin segment in green; null when no TP
+   *  was set at entry. */
+  original_tp: number | null;
   fills: ExecFill[];
 }
 
@@ -891,7 +989,6 @@ export interface TickerLiveState {
 export interface MarketSnapshot {
   tickers: Record<string, TickerLiveState>;
   latency: LatencyStatus;
-  mock_running: boolean;
   live_running: boolean;
 }
 
@@ -900,6 +997,10 @@ export interface MarketSnapshot {
 export interface FeedDiagnostics {
   state: string; // idle|connecting|authenticating|authenticated|subscribed|streaming|error|reconnecting|stopped
   feed: string;
+  /** Subscription detected at connect time: "sip" (paid) | "iex" (free). */
+  plan?: string;
+  /** Max streamable symbols for that plan; 0 = unlimited. Free tier is 30. */
+  symbol_limit?: number;
   broad_mode: string; // "trades" (premarket) | "bars" (open)
   subscribed_symbols: number; // broad-tier symbol count
   focus_symbols: number;      // tick-streamed (displayed) symbols
@@ -1028,4 +1129,90 @@ export interface TickerTableRow {
   filings_count: number;
   news_count: number;
   intel_updated_at: string | null;
+}
+
+// ─── Broker ──────────────────────────────────────────────────────────────────
+
+/** The active account, and the one flag the UI keys its real-money warnings on. */
+export interface BrokerSelection {
+  broker: "tagdash" | "alpaca";
+  environment: "paper" | "live";
+  account_id: string;
+  /** True ⇒ fills spend REAL money. */
+  is_live: boolean;
+  credentials_ready: boolean;
+}
+
+export type BrokerOrderStatus = "open" | "held" | "filled" | "closed";
+
+/** One order as the BROKER holds it — never a locally-computed view. */
+export interface BrokerOrder {
+  id: string;
+  client_order_id: string;
+  symbol: string;
+  side: string;
+  order_type: string;
+  time_in_force: string;
+  quantity: number;
+  filled_quantity: number;
+  limit_price: number | null;
+  stop_price: number | null;
+  /** The executed average price. Authoritative — not what we asked for. */
+  filled_avg_price: number | null;
+  status: BrokerOrderStatus;
+  raw_status: string;
+  parent_id: string | null;
+  submitted_at: string | null;
+  filled_at: string | null;
+  canceled_at: string | null;
+  reject_reason: string | null;
+}
+
+/** One position as the broker holds it. Quantity is signed; negative is short. */
+export interface BrokerPosition {
+  symbol: string;
+  quantity: number;
+  avg_entry_price: number;
+  market_price: number | null;
+  market_value: number | null;
+  cost_basis: number | null;
+  unrealized_pnl: number | null;
+  unrealized_pnl_pct: number | null;
+}
+
+export interface BrokerAccount {
+  id: string;
+  broker: "tagdash" | "alpaca";
+  environment: "paper" | "live";
+  status: string;
+  currency: string;
+  cash: number | null;
+  equity: number | null;
+  buying_power: number | null;
+  trading_blocked: boolean;
+  account_blocked: boolean;
+  /** The holder's own "suspend trading" switch in Alpaca's dashboard. Alpaca refuses
+   *  every new order with code 40310000 while it is on. */
+  trade_suspended_by_user: boolean;
+  pattern_day_trader: boolean;
+  daytrade_count: number | null;
+}
+
+/** The venue's current view, as last observed. */
+export interface BrokerMirror {
+  account: BrokerAccount | null;
+  orders: Record<string, BrokerOrder>;
+  positions: Record<string, BrokerPosition>;
+  last_reconcile: string | null;
+  last_event: string | null;
+  stream_connected: boolean;
+  last_error: string | null;
+}
+
+/** Whether a symbol may be sold short, per the venue. */
+export interface Shortability {
+  symbol: string;
+  shortable: boolean;
+  easy_to_borrow: boolean;
+  from_cache: boolean;
 }

@@ -15,7 +15,7 @@ export type HotkeyActionId =
   | "release" | "sl" | "tp" | "alarm" | "line" | "text"
   | "capture" | "journal"
   | "order_mode" | "order_25" | "order_50" | "order_100" | "close"
-  | "confirm_hod"
+  | "confirm_hod" | "invert_hod"
   | "run_llm"
   | "tf_5s" | "tf_10s" | "tf_1m" | "tf_2m" | "tf_5m" | "tf_15m" | "tf_daily"
   // Replay (global — not tied to a chart zone, special-cased in useHotkeys)
@@ -45,6 +45,7 @@ export const HOTKEY_ACTIONS: HotkeyActionDef[] = [
   { id: "order_100",  label: "Ordre 100 %",             group: "Ordres" },
   { id: "close",       label: "Clôturer la position",    group: "Ordres" },
   { id: "confirm_hod", label: "Confirmer HOD Drive",     group: "Ordres" },
+  { id: "invert_hod",  label: "Inverser HOD Drive (short)", group: "Ordres" },
 
   { id: "run_llm",    label: "Lancer l'analyse IA",     group: "Analyse" },
 

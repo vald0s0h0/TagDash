@@ -3,10 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{
-    atomic::AtomicBool,
-    Arc, Mutex, RwLock,
-};
+use std::sync::{atomic::AtomicBool, Arc, Mutex, RwLock};
 
 use tokio::sync::watch;
 
@@ -30,8 +27,10 @@ pub struct AppState {
     pub startup: Arc<RwLock<StartupState>>,
     /// RAM source of truth for all live market data.
     pub market: Arc<RwLock<MarketState>>,
-    /// Controls the background mock feed task lifecycle.
-    pub mock_feed_running: Arc<AtomicBool>,
+    /// Broker engine. Holds the SERVER-side view of orders/positions when the
+    /// active broker is Alpaca (see `crate::broker`); empty for the internal
+    /// TagDash broker, which keeps its book in `internal_book`.
+    pub broker: Arc<crate::broker::BrokerEngine>,
     /// Controls the Alpaca live WebSocket feed task lifecycle.
     pub live_feed_running: Arc<AtomicBool>,
     /// Controls the Alpaca news WebSocket feed task lifecycle (premarket news
@@ -89,6 +88,10 @@ pub struct AppState {
     /// Progressive per-symbol alert enrichment (float, country, classification,
     /// split, news, LLM reads), filled async when an alert is shown in a zone.
     pub enrichments: Arc<RwLock<HashMap<String, AlertEnrichment>>>,
+    /// Progress of the current (or last) Panic Score LLM run over the visible
+    /// pre-open watchlist — see `crate::panic_llm`. Button-triggered only; nothing
+    /// schedules it, so this stays `Idle` unless the user asks for an analysis.
+    pub panic_run: crate::panic_llm::RunState,
     /// Market Replay shared handle: status polled by the toolbar + command
     /// channel to the (single) replay engine task. The simulated clock itself is
     /// global (see `replay::clock` / `time::now`).

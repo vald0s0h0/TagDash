@@ -230,6 +230,52 @@ pub fn get_recent_filings(conn: &Connection, symbol: &str, limit: u32) -> Result
     rows.collect()
 }
 
+/// Recent filings whose `filing_date` is on or before `day` — the leak guard for the
+/// Panic Score payload during a Market Replay.
+///
+/// `company_filings` accumulates whatever the SEC feed has served, which in a replay
+/// includes filings from AFTER the replayed session. Handing those to the model would
+/// be a textbook look-ahead: an S-3 filed a week later would "explain" a move that had
+/// not happened yet. Inert in live mode (nothing is filed in the future), so callers
+/// can use this unconditionally instead of branching on the clock.
+///
+/// A NULL `filing_date` is excluded rather than kept: an undated filing cannot be
+/// proven to predate `day`, and silently including it would defeat the whole guard.
+pub fn get_recent_filings_before(
+    conn: &Connection,
+    symbol: &str,
+    day: &str,
+    limit: u32,
+) -> Result<Vec<SecFiling>> {
+    let mut stmt = conn.prepare(
+        "SELECT accession_number, symbol, cik, form_type, filing_date, report_date,
+                primary_document, document_url, description, category,
+                detected_atm, detected_resale, detected_warrants, offering_amount
+         FROM company_filings
+         WHERE symbol=?1 AND filing_date IS NOT NULL AND filing_date <= ?2
+         ORDER BY filing_date DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![symbol, day, limit], |r| {
+        Ok(SecFiling {
+            accession_number: r.get(0)?,
+            symbol: r.get(1)?,
+            cik: r.get(2)?,
+            form_type: r.get(3)?,
+            filing_date: r.get(4)?,
+            report_date: r.get(5)?,
+            primary_document: r.get(6)?,
+            document_url: r.get(7)?,
+            description: r.get(8)?,
+            category: r.get(9)?,
+            detected_atm: r.get::<_, i64>(10)? != 0,
+            detected_resale: r.get::<_, i64>(11)? != 0,
+            detected_warrants: r.get::<_, i64>(12)? != 0,
+            offering_amount: r.get(13)?,
+        })
+    })?;
+    rows.collect()
+}
+
 // ─── Read-back (UI) + TTL helpers ──────────────────────────────────────────────
 
 /// Read the full normalized record + recent filings for one symbol.

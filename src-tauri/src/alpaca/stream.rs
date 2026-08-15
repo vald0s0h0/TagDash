@@ -21,6 +21,24 @@
 // wildcard (the whole US market) and each strategy filters in its own script.
 // The wildcard also sidesteps the code-400 "invalid syntax" rejection that an
 // enumerated 13k-symbol list could trigger on a single exotic ticker.
+//
+// ALL OF THE ABOVE DESCRIBES THE PAID (SIP) PLAN. `alpaca::plan::probe` asks Alpaca
+// which subscription the key holds before this module connects, and the free (IEX)
+// plan gets a different shape entirely: no broad tier, and a hard budget of 30
+// SUBSCRIPTIONS. That unit is the trap — Alpaca counts (symbol × channel) pairs, not
+// distinct symbols, so 20 names on trades+quotes+bars is 60 and the venue answers
+// `code=405 "symbol limit exceeded"` after acking only the first channel.
+//
+// The budget is therefore SPLIT, never replicated: `bars` is dropped (the aggregator
+// builds candles from trades anyway), `quotes` are reserved for names an order could
+// be sent on, and `trades` take the rest. Priority inside each is
+// `capped_watch_list`: orders and positions first, then the charts on screen, then
+// the day's Panic Mean Reversion watchlist and pins. Dismissing a row frees its slot
+// on the next reconcile pass, via the same subscribe/unsubscribe diff
+// (`sync_channel`) that has always driven the focus tier.
+//
+// None of this touches Market Replay: the stream never runs under a simulated clock,
+// and replayed history comes from flat files + REST.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -39,6 +57,8 @@ use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+use crate::alpaca::plan::Plan;
+use crate::broker::BrokerMirror;
 use crate::internal_trading::InternalBook;
 use crate::market_state::MarketState;
 
@@ -59,9 +79,8 @@ const BROAD_REEVAL: Duration = Duration::from_secs(30);
 /// Min interval between pushed ticks per focus symbol (coalesce to the latest).
 const TICK_THROTTLE: Duration = Duration::from_millis(100);
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = SplitSink<Ws, Message>;
 
 /// Deserialize a field that is a number in some message types but a non-number
@@ -131,9 +150,9 @@ struct StreamMsg {
 #[derive(Debug, Clone, Serialize)]
 struct TickEvent {
     symbol: String,
-    price:  f64,
+    price: f64,
     /// Unix seconds (matches lightweight-charts time).
-    ts:     i64,
+    ts: i64,
 }
 
 /// Current subscriptions on the socket, per channel.
@@ -141,7 +160,7 @@ struct TickEvent {
 struct Subs {
     trades: HashSet<String>,
     quotes: HashSet<String>,
-    bars:   HashSet<String>,
+    bars: HashSet<String>,
 }
 
 /// Run the live feed until `running` is cleared. Reconnects on transient drops;
@@ -149,11 +168,13 @@ struct Subs {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     market: Arc<RwLock<MarketState>>,
-    // Kept for call-site stability; the broad tier no longer enumerates the
-    // universe (it uses the `*` wildcard), so the DB handle is unused here.
-    _db: Arc<Mutex<rusqlite::Connection>>,
+    // Read on the free plan to spend its 30 slots on the day's watchlist; unused on
+    // SIP, where the broad tier is the `*` wildcard.
+    db: Arc<Mutex<rusqlite::Connection>>,
     internal_book: Arc<RwLock<InternalBook>>,
+    broker_mirror: Arc<RwLock<BrokerMirror>>,
     feed: String,
+    plan: Plan,
     key: String,
     secret: String,
     warn_ms: u32,
@@ -163,10 +184,18 @@ pub async fn run(
     app: AppHandle,
 ) {
     let url = format!("wss://stream.data.alpaca.markets/v2/{feed}");
-    eprintln!("[tagdash] live feed: connecting to {url}");
+    eprintln!(
+        "[tagdash] live feed: connecting to {url} (abonnement {}, {})",
+        plan.as_str(),
+        match plan.symbol_limit() {
+            Some(n) => format!("{n} symboles max"),
+            None => "sans limite de symboles".to_string(),
+        },
+    );
     {
         let mut ms = market.write().unwrap();
         ms.feed_set_feed(&feed);
+        ms.feed_set_plan(plan.as_str(), plan.symbol_limit().unwrap_or(0));
         ms.feed_state("connecting");
     }
 
@@ -176,8 +205,19 @@ pub async fn run(
         match connect_async(&url).await {
             Ok((ws, _resp)) => {
                 let code = session(
-                    ws, &key, &secret, &market, &internal_book, warn_ms, critical_ms,
-                    &running, &mut focus_rx, &app,
+                    ws,
+                    &key,
+                    &secret,
+                    &market,
+                    &db,
+                    &internal_book,
+                    &broker_mirror,
+                    plan,
+                    warn_ms,
+                    critical_ms,
+                    &running,
+                    &mut focus_rx,
+                    &app,
                 )
                 .await;
                 market.write().unwrap().live_running = false;
@@ -192,7 +232,10 @@ pub async fn run(
             }
             Err(e) => {
                 eprintln!("[tagdash] live feed: connect failed: {e}");
-                market.write().unwrap().feed_error(0, Some(format!("connect failed: {e}")));
+                market
+                    .write()
+                    .unwrap()
+                    .feed_error(0, Some(format!("connect failed: {e}")));
             }
         }
 
@@ -216,7 +259,10 @@ async fn session(
     key: &str,
     secret: &str,
     market: &Arc<RwLock<MarketState>>,
+    db: &Arc<Mutex<rusqlite::Connection>>,
     internal_book: &Arc<RwLock<InternalBook>>,
+    broker_mirror: &Arc<RwLock<BrokerMirror>>,
+    plan: Plan,
     warn_ms: u32,
     critical_ms: u32,
     running: &Arc<AtomicBool>,
@@ -250,7 +296,7 @@ async fn session(
                 if changed.is_err() { continue; }
                 focus = clean_symbols(focus_rx.borrow_and_update().iter());
                 if authenticated
-                    && reconcile(&mut write, market, &watch_set(&focus, internal_book), broad_mode_now(), &mut subs).await.is_err()
+                    && reconcile(&mut write, market, db, internal_book, broker_mirror, &focus, plan, broad_mode_now(), &mut subs).await.is_err()
                 {
                     return None;
                 }
@@ -261,7 +307,7 @@ async fn session(
             // released tickers without waiting for a chart-focus change).
             _ = reeval.tick() => {
                 if authenticated
-                    && reconcile(&mut write, market, &watch_set(&focus, internal_book), broad_mode_now(), &mut subs).await.is_err()
+                    && reconcile(&mut write, market, db, internal_book, broker_mirror, &focus, plan, broad_mode_now(), &mut subs).await.is_err()
                 {
                     return None;
                 }
@@ -291,7 +337,7 @@ async fn session(
                         "success" if m.msg.as_deref() == Some("authenticated") => {
                             authenticated = true;
                             market.write().unwrap().feed_authenticated();
-                            if reconcile(&mut write, market, &watch_set(&focus, internal_book), broad_mode_now(), &mut subs).await.is_err() {
+                            if reconcile(&mut write, market, db, internal_book, broker_mirror, &focus, plan, broad_mode_now(), &mut subs).await.is_err() {
                                 return None;
                             }
                             eprintln!("[tagdash] live feed: authenticated, broad mode {}", broad_mode_now());
@@ -408,55 +454,250 @@ async fn session(
 /// broad tier's bar granularity) instead of against the real price path — which
 /// reads as the order firing "immediately" at a stale/gapped price instead of
 /// respecting the limit.
-fn strict_watch_symbols(internal_book: &RwLock<InternalBook>) -> HashSet<String> {
+fn strict_watch_symbols(
+    internal_book: &RwLock<InternalBook>,
+    broker_mirror: &RwLock<BrokerMirror>,
+) -> HashSet<String> {
     let book = internal_book.read().unwrap();
-    book.get_pending_orders().into_iter().map(|o| o.symbol)
+    let mut symbols: HashSet<String> = book
+        .get_pending_orders()
+        .into_iter()
+        .map(|o| o.symbol)
         .chain(book.positions.keys().cloned())
-        .collect()
+        .collect();
+    drop(book);
+    let broker = broker_mirror.read().unwrap();
+    symbols.extend(broker.positions.keys().cloned());
+    symbols.extend(
+        broker
+            .orders
+            .values()
+            .filter(|o| o.status.is_live())
+            .map(|o| o.symbol.clone()),
+    );
+    symbols
 }
 
 /// The effective focus set to subscribe tick-by-tick: displayed chart symbols
 /// union `strict_watch_symbols`.
-fn watch_set(focus: &HashSet<String>, internal_book: &RwLock<InternalBook>) -> HashSet<String> {
+fn watch_set(
+    focus: &HashSet<String>,
+    internal_book: &RwLock<InternalBook>,
+    broker_mirror: &RwLock<BrokerMirror>,
+) -> HashSet<String> {
     let mut set = focus.clone();
-    set.extend(strict_watch_symbols(internal_book));
+    set.extend(strict_watch_symbols(internal_book, broker_mirror));
     set
 }
 
-/// Reconcile the three channel subscriptions. The broad surveillance tier covers
-/// the whole US market via the `*` wildcard (one tiny message instead of ~13k
-/// enumerated symbols), so a single exotic symbol can no longer get the frame
-/// rejected with code 400. The focus tier (displayed symbols, plus anything with
-/// a live order/position — see `watch_set`) is subscribed explicitly so it stays
-/// tick-by-tick.
+/// The symbols a capped plan spends its slots on, most important first.
+///
+/// The free plan streams `IEX_SYMBOL_LIMIT` symbols and no more, so this is a budget
+/// and the order is the whole design:
+///
+///   1. anything carrying a pending order or an open position — real money, never
+///      traded away for a screener row;
+///   2. the charts actually on screen;
+///   3. the day's Panic Mean Reversion watchlist plus the user's pins, which is what
+///      the budget exists for: with no wildcard the scanner discovers nothing, so
+///      the remaining slots must go to names already chosen by the strategy.
+///
+/// Dismissed rows are excluded, which is what makes the ✕ in the pre-open panel
+/// actually free a slot — `sync_channel` then sends the unsubscribe on the next pass.
+///
+/// Truncation is reported: over-budget at step 1 means orders themselves don't fit,
+/// and silently dropping one would leave a live SL unwatched.
+fn capped_watch_list(
+    focus: &HashSet<String>,
+    internal_book: &RwLock<InternalBook>,
+    broker_mirror: &RwLock<BrokerMirror>,
+    db: &Mutex<rusqlite::Connection>,
+    limit: usize,
+) -> HashSet<String> {
+    let strict = strict_list(internal_book, broker_mirror);
+    let focus = focus_list(focus);
+
+    // Watchlist fill — only worth a DB round trip if slots could remain.
+    let mut fill: Vec<String> = Vec::new();
+    if strict.len() + focus.len() < limit {
+        let day = crate::time::et_date(crate::time::now());
+        let (pins, scores, dismissed) = {
+            let conn = db.lock().unwrap();
+            (
+                crate::local_db::screener_repository::pins(&conn, false),
+                crate::local_db::scoring_repository::get_top(&conn, &day, limit as u32)
+                    .unwrap_or_default(),
+                crate::local_db::screener_repository::dismissals(&conn, &day),
+            )
+        };
+        let dismissed: HashSet<String> = dismissed.into_iter().collect();
+        // Pins first: an explicit "keep watching this" outranks today's ranking.
+        fill = pins
+            .into_iter()
+            .chain(scores.into_iter().map(|r| r.symbol))
+            .filter(|s| !dismissed.contains(s))
+            .collect();
+    }
+
+    if strict.len() > limit {
+        eprintln!(
+            "[tagdash] live feed: {} ordres/positions pour {limit} places — \
+             au-delà de la limite du plan gratuit, {} ne seront pas suivis en direct",
+            strict.len(),
+            strict.len() - limit,
+        );
+    }
+    budget([&strict, &focus, &fill], limit)
+}
+
+/// How many of a capped plan's slots are reserved for `quotes`.
+///
+/// A third. Quotes are only useful where an order might be sent, and that is a
+/// handful of names at a time — the reservation exists to stop a screen full of
+/// charts from eating the budget the watchlist needs for trades. Since `budget`
+/// takes only what exists, four open charts spend four slots, not ten.
+fn quote_slots(limit: usize) -> usize {
+    (limit / 3).max(1)
+}
+
+/// Symbols carrying a position or a live order, as an ordered list.
+fn strict_list(
+    internal_book: &RwLock<InternalBook>,
+    broker_mirror: &RwLock<BrokerMirror>,
+) -> Vec<String> {
+    strict_watch_symbols(internal_book, broker_mirror)
+        .into_iter()
+        .collect()
+}
+
+fn focus_list(focus: &HashSet<String>) -> Vec<String> {
+    focus.iter().cloned().collect()
+}
+
+/// Spend `limit` slots across priority tiers, best first.
+///
+/// Normalises to Alpaca's upper-case form, drops blanks, keeps the first occurrence
+/// of a repeat (so a symbol that is both held and on screen costs one slot), and
+/// truncates the tail. Pure, so the priority rule is testable without a socket or a
+/// database — which matters, because getting the order wrong silently trades a live
+/// stop-loss for a screener row.
+fn budget(tiers: [&[String]; 3], limit: usize) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::with_capacity(limit);
+    for tier in tiers {
+        for sym in tier {
+            if out.len() >= limit {
+                return out;
+            }
+            let s = sym.trim().to_uppercase();
+            if !s.is_empty() {
+                out.insert(s);
+            }
+        }
+    }
+    out
+}
+
+/// Reconcile the three channel subscriptions.
+///
+/// On SIP the broad surveillance tier covers the whole US market via the `*`
+/// wildcard (one tiny message instead of ~13k enumerated symbols), so a single
+/// exotic symbol can no longer get the frame rejected with code 400. The focus tier
+/// (displayed symbols, plus anything with a live order/position — see `watch_set`)
+/// is subscribed explicitly so it stays tick-by-tick.
+///
+/// On the free plan there is no broad tier at all. The wildcard is both over the
+/// 30-symbol cap and pointless — IEX prints are too thin a slice of the tape to
+/// discover a mover — so ONE budgeted set (see `capped_watch_list`) is subscribed on
+/// every channel. Every symbol therefore arrives tick-by-tick, which is what Panic
+/// Mean Reversion needs; what is lost is discovery, which the free plan could not do
+/// anyway.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile(
     write: &mut WsWrite,
     market: &Arc<RwLock<MarketState>>,
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    internal_book: &Arc<RwLock<InternalBook>>,
+    broker_mirror: &Arc<RwLock<BrokerMirror>>,
     focus: &HashSet<String>,
+    plan: Plan,
     broad_mode: &str,
     current: &mut Subs,
 ) -> Result<(), WsError> {
-    let wildcard: HashSet<String> = std::iter::once(WILDCARD.to_string()).collect();
+    let watch = watch_set(focus, internal_book, broker_mirror);
 
     // Desired sets per channel.
-    let (trades_d, quotes_d, bars_d): (HashSet<String>, HashSet<String>, HashSet<String>) =
-        if broad_mode == "trades" {
+    let (trades_d, quotes_d, bars_d, broad_count): (
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+        usize,
+    ) = match plan.symbol_limit() {
+        // Capped plan: the budget is SPLIT across channels, not replicated on each.
+        //
+        // Alpaca counts (symbol × channel) SUBSCRIPTIONS, not distinct symbols —
+        // measured, not assumed: subscribing the same 20 names to trades, quotes and
+        // bars sent 60 against a 30 budget and the venue answered
+        // `code=405 "symbol limit exceeded"`, after acking only the trades. So:
+        //
+        //   • `bars` is dropped entirely. The aggregator already builds candles from
+        //     trades, so a bars subscription buys nothing here and costs real slots.
+        //   • `quotes` go only to names an order could actually be sent on (charts on
+        //     screen, plus anything carrying a position or order): bid/ask matters at
+        //     execution, not for surveillance.
+        //   • `trades` take everything left, so the whole watchlist stays
+        //     tick-by-tick — which is what Panic Mean Reversion needs.
+        Some(limit) => {
+            let quotes = budget(
+                [
+                    &strict_list(internal_book, broker_mirror),
+                    &focus_list(focus),
+                    &[],
+                ],
+                quote_slots(limit),
+            );
+            let trades = capped_watch_list(
+                focus,
+                internal_book,
+                broker_mirror,
+                db,
+                limit.saturating_sub(quotes.len()),
+            );
+            let spent = trades.len() + quotes.len();
+            debug_assert!(spent <= limit, "budget dépassé : {spent} > {limit}");
+            (trades, quotes, HashSet::new(), spent)
+        }
+        None if broad_mode == "trades" => {
             // Premarket: every trade (the wildcard already covers the focus
             // symbols' trades, which drive the tick events); quotes for focus.
-            (wildcard, focus.clone(), HashSet::new())
-        } else {
+            (
+                std::iter::once(WILDCARD.to_string()).collect(),
+                watch.clone(),
+                HashSet::new(),
+                0,
+            )
+        }
+        None => {
             // Open: every 1-min bar (focus symbols' bars are ignored in the data
             // pass); trades+quotes for focus → tick-by-tick charts.
-            (focus.clone(), focus.clone(), wildcard)
-        };
+            (
+                watch.clone(),
+                watch.clone(),
+                std::iter::once(WILDCARD.to_string()).collect(),
+                0,
+            )
+        }
+    };
 
     sync_channel(write, market, "trades", &mut current.trades, &trades_d).await?;
     sync_channel(write, market, "quotes", &mut current.quotes, &quotes_d).await?;
-    sync_channel(write, market, "bars",   &mut current.bars,   &bars_d).await?;
+    sync_channel(write, market, "bars", &mut current.bars, &bars_d).await?;
 
-    // Broad tier is the whole market (wildcard); report 0 as the enumerated count
-    // — the panel renders this as "tout le marché (✱)".
-    market.write().unwrap().feed_reconcile(broad_mode, 0, focus.len());
+    // On SIP the broad tier is the whole market, reported as 0 — the panel renders
+    // that as "tout le marché (✱)". On a capped plan the count IS the budget spent.
+    market
+        .write()
+        .unwrap()
+        .feed_reconcile(broad_mode, broad_count, watch.len());
     Ok(())
 }
 
@@ -470,7 +711,7 @@ async fn sync_channel(
     desired: &HashSet<String>,
 ) -> Result<(), WsError> {
     let to_remove: Vec<String> = current.difference(desired).cloned().collect();
-    let to_add:    Vec<String> = desired.difference(current).cloned().collect();
+    let to_add: Vec<String> = desired.difference(current).cloned().collect();
     if !to_remove.is_empty() {
         send_channel(write, market, "unsubscribe", channel, &to_remove).await?;
     }
@@ -503,9 +744,17 @@ async fn send_channel(
         let label = if chunk.iter().any(|s| s == WILDCARD) {
             format!("{action} {channel} (✱ tout le marché)")
         } else {
-            format!("{action} {channel} msg {}/{} ({} symbols)", i + 1, total, chunk.len())
+            format!(
+                "{action} {channel} msg {}/{} ({} symbols)",
+                i + 1,
+                total,
+                chunk.len()
+            )
         };
-        eprintln!("[tagdash] live feed: → {label} (e.g. {:?})", &chunk[..chunk.len().min(3)]);
+        eprintln!(
+            "[tagdash] live feed: → {label} (e.g. {:?})",
+            &chunk[..chunk.len().min(3)]
+        );
         market.write().unwrap().feed_set_last_subscribe(&label);
         write.send(Message::Text(payload)).await?;
     }
@@ -561,8 +810,15 @@ mod tests {
     fn book_with_pending_order(symbol: &str) -> InternalBook {
         let mut book = InternalBook::new();
         book.create_limit_order(
-            None, "z1".into(), symbol.into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.50), None,
+            None,
+            "z1".into(),
+            symbol.into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.50),
+            None,
         );
         book
     }
@@ -570,18 +826,27 @@ mod tests {
     #[test]
     fn strict_watch_includes_pending_order_symbol() {
         let book = RwLock::new(book_with_pending_order("AAA"));
-        assert!(strict_watch_symbols(&book).contains("AAA"));
+        let broker = RwLock::new(BrokerMirror::default());
+        assert!(strict_watch_symbols(&book, &broker).contains("AAA"));
     }
 
     #[test]
     fn strict_watch_includes_open_position_symbol() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            None, "z1".into(), "BBB".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.50), None,
+            None,
+            "z1".into(),
+            "BBB".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.50),
+            None,
         );
         let book = RwLock::new(book);
-        assert!(strict_watch_symbols(&book).contains("BBB"));
+        let broker = RwLock::new(BrokerMirror::default());
+        assert!(strict_watch_symbols(&book, &broker).contains("BBB"));
     }
 
     #[test]
@@ -590,7 +855,8 @@ mod tests {
         let order_id = book.get_pending_orders()[0].order_id.clone();
         book.cancel_order(&order_id).unwrap();
         let book = RwLock::new(book);
-        assert!(!strict_watch_symbols(&book).contains("CCC"));
+        let broker = RwLock::new(BrokerMirror::default());
+        assert!(!strict_watch_symbols(&book, &broker).contains("CCC"));
     }
 
     // The exact bug reported: releasing a ticker (removing it from the
@@ -601,9 +867,10 @@ mod tests {
     #[test]
     fn watch_set_keeps_released_ticker_with_pending_order() {
         let book = RwLock::new(book_with_pending_order("DDD"));
+        let broker = RwLock::new(BrokerMirror::default());
         let focus: HashSet<String> = HashSet::new(); // ticker released: not displayed
         assert!(
-            watch_set(&focus, &book).contains("DDD"),
+            watch_set(&focus, &book, &broker).contains("DDD"),
             "a released ticker with a pending order must stay tick-watched"
         );
     }
@@ -611,7 +878,152 @@ mod tests {
     #[test]
     fn watch_set_drops_symbol_once_flat_and_undisplayed() {
         let book = RwLock::new(InternalBook::new()); // no orders, no positions
+        let broker = RwLock::new(BrokerMirror::default());
         let focus: HashSet<String> = HashSet::new();
-        assert!(watch_set(&focus, &book).is_empty());
+        assert!(watch_set(&focus, &book, &broker).is_empty());
+    }
+
+    #[test]
+    fn alpaca_position_is_always_tick_watched() {
+        let book = RwLock::new(InternalBook::new());
+        let mut mirror = BrokerMirror::default();
+        mirror.positions.insert(
+            "ALPA".into(),
+            crate::broker::BrokerPosition {
+                symbol: "ALPA".into(),
+                quantity: 10.0,
+                avg_entry_price: 5.0,
+                market_price: None,
+                market_value: None,
+                cost_basis: None,
+                unrealized_pnl: None,
+                unrealized_pnl_pct: None,
+            },
+        );
+        let broker = RwLock::new(mirror);
+        assert!(strict_watch_symbols(&book, &broker).contains("ALPA"));
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The whole point of the budget: when the free plan's slots run out, an open
+    /// position keeps its stream and a screener row loses it — never the reverse.
+    #[test]
+    fn orders_and_positions_outrank_everything_else() {
+        let held = v(&["HELD1", "HELD2"]);
+        let on_screen = v(&["CHART1", "CHART2"]);
+        let watchlist = v(&["PMR1", "PMR2", "PMR3"]);
+
+        let got = budget([&held, &on_screen, &watchlist], 3);
+        assert_eq!(got.len(), 3);
+        assert!(
+            got.contains("HELD1") && got.contains("HELD2"),
+            "money at risk stays: {got:?}"
+        );
+        assert!(got.contains("CHART1"), "then the charts on screen");
+        assert!(!got.contains("PMR1"), "the watchlist yields the last slot");
+    }
+
+    /// A symbol that is both held and displayed must not burn two of the thirty.
+    #[test]
+    fn a_symbol_in_several_tiers_costs_one_slot() {
+        let held = v(&["AAA"]);
+        let on_screen = v(&["aaa", " AAA "]); // lower case / padded — same ticker
+        let watchlist = v(&["BBB"]);
+        let got = budget([&held, &on_screen, &watchlist], 2);
+        assert_eq!(got, ["AAA", "BBB"].iter().map(|s| s.to_string()).collect());
+    }
+
+    /// Alpaca matches tickers exactly: a stray space or lower-case letter yields
+    /// zero ticks with no error at all, so normalisation is not cosmetic.
+    #[test]
+    fn symbols_are_normalised_and_blanks_dropped() {
+        let messy = v(&["  tsla ", "", "   ", "Nvda"]);
+        let empty: Vec<String> = Vec::new();
+        let got = budget([&messy, &empty, &empty], 10);
+        assert_eq!(
+            got,
+            ["TSLA", "NVDA"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn a_budget_that_fits_keeps_everything_and_a_zero_budget_keeps_nothing() {
+        let a = v(&["AAA"]);
+        let b = v(&["BBB"]);
+        let c = v(&["CCC"]);
+        assert_eq!(budget([&a, &b, &c], 10).len(), 3);
+        assert!(budget([&a, &b, &c], 0).is_empty());
+    }
+
+    /// The paid plan has no cap, so the wildcard stays available; the free plan must
+    /// never ask for it — Alpaca would reject the frame AND it discovers nothing.
+    #[test]
+    fn only_the_paid_plan_may_stream_the_whole_market() {
+        assert!(Plan::Sip.allows_wildcard() && Plan::Sip.symbol_limit().is_none());
+        assert!(!Plan::Iex.allows_wildcard());
+        assert_eq!(
+            Plan::Iex.symbol_limit(),
+            Some(crate::alpaca::plan::IEX_SYMBOL_LIMIT)
+        );
+    }
+
+    /// THE regression this file exists to prevent. Alpaca counts (symbol × channel)
+    /// pairs: the first shipped version put the same 20 names on trades, quotes AND
+    /// bars — 60 against a 30 budget — and the venue killed the session with
+    /// `code=405 "symbol limit exceeded"`, so no data arrived at all.
+    #[test]
+    fn the_capped_budget_counts_subscriptions_not_distinct_symbols() {
+        let limit = crate::alpaca::plan::IEX_SYMBOL_LIMIT;
+        let names: Vec<String> = (0..50).map(|i| format!("SYM{i}")).collect();
+
+        let quotes = budget([&names, &[], &[]], quote_slots(limit));
+        let trades = budget([&names, &[], &[]], limit - quotes.len());
+
+        assert!(
+            trades.len() + quotes.len() <= limit,
+            "{} trades + {} quotes dépasse {limit}",
+            trades.len(),
+            quotes.len(),
+        );
+        assert!(
+            !trades.is_empty() && !quotes.is_empty(),
+            "les deux canaux servent"
+        );
+    }
+
+    /// Quotes are reserved, not greedy: a screen full of charts must not starve the
+    /// watchlist of its trades subscriptions.
+    #[test]
+    fn quotes_never_eat_more_than_their_reservation() {
+        let limit = 30;
+        let many_charts: Vec<String> = (0..40).map(|i| format!("CHART{i}")).collect();
+        let quotes = budget([&many_charts, &[], &[]], quote_slots(limit));
+        assert_eq!(quotes.len(), 10, "un tiers de 30");
+        assert_eq!(
+            limit - quotes.len(),
+            20,
+            "il reste 20 places pour les trades"
+        );
+    }
+
+    /// …and it takes only what exists: four open charts cost four slots, not ten.
+    #[test]
+    fn a_small_focus_set_leaves_the_rest_to_trades() {
+        let limit = 30;
+        let charts: Vec<String> = (0..4).map(|i| format!("CHART{i}")).collect();
+        let quotes = budget([&charts, &[], &[]], quote_slots(limit));
+        assert_eq!(quotes.len(), 4);
+        assert_eq!(limit - quotes.len(), 26);
+    }
+
+    /// A one-slot plan must still produce a valid split rather than dividing to zero.
+    #[test]
+    fn a_tiny_budget_still_reserves_one_quote_slot() {
+        assert_eq!(quote_slots(1), 1);
+        assert_eq!(quote_slots(2), 1);
+        assert_eq!(quote_slots(0), 1);
     }
 }

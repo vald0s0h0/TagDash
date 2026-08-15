@@ -18,7 +18,9 @@ interface UiState {
   openModal:         Modal;
   selectedTicker:    string | null;
   /** Symbols the user dismissed from the pre-open screener. Persisted per trading
-   *  day (DB) so dismissals survive a restart and reset the next day. */
+   *  day (DB) so dismissals survive a restart and reset the next day.
+   *  (Pins are NOT here: they are not day-scoped and they differ between live and
+   *  Market Replay, so they are polled from the DB — see `useScreenerPins`.) */
   dismissedScreener: string[];
   /** Market Replay toolbar visibility (toggled from the LeftRail menu; the
    *  toolbar only renders when this is on). */

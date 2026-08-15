@@ -73,14 +73,6 @@ pub async fn fetch_tags(token: &str, base_url: &str) -> Result<Vec<String>, Stri
     Err(format!("unrecognised tags response: {}", &text[..text.len().min(200)]))
 }
 
-pub fn mock_tags() -> Vec<String> {
-    vec![
-        "frd".into(), "news".into(), "low_float".into(), "hod_break".into(),
-        "rvol_spike".into(), "gap_up".into(), "short_squeeze".into(), "catalyst".into(),
-        "halt_resume".into(), "reversal".into(), "momentum".into(), "pre_news".into(),
-    ]
-}
-
 // ─── Queue event enqueue helpers ─────────────────────────────────────────────
 
 fn new_event_id() -> String {

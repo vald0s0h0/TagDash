@@ -3,7 +3,6 @@
 /// No DB access on the hot path — every write is a plain HashMap mutation.
 pub mod aggregators;
 pub mod latency;
-pub mod mock_feed;
 pub mod ring_buffer;
 
 use std::collections::{HashMap, VecDeque};
@@ -11,9 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{LatencyLevel, LatencyStatus, NewsHeadline, NewsRef};
 use self::aggregators::{Bar, CandleAggregator, Timeframe};
 use self::ring_buffer::RingBuffer;
+use crate::types::{LatencyLevel, LatencyStatus, NewsHeadline, NewsRef};
 
 const RING_CAP: usize = 600;
 
@@ -37,19 +36,19 @@ const TRADE_COUNT_RETAIN_SECS: i64 = 180;
 /// Per-ticker live state — serialized and sent to the frontend via get_market_snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TickerLiveState {
-    pub symbol:         String,
-    pub last_price:     Option<f64>,
-    pub bid:            Option<f64>,
-    pub ask:            Option<f64>,
-    pub spread:         Option<f64>,
-    pub volume_day:     u64,
-    pub vwap:           Option<f64>,
-    pub high_day:       Option<f64>,
-    pub low_day:        Option<f64>,
+    pub symbol: String,
+    pub last_price: Option<f64>,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub spread: Option<f64>,
+    pub volume_day: u64,
+    pub vwap: Option<f64>,
+    pub high_day: Option<f64>,
+    pub low_day: Option<f64>,
     pub previous_close: Option<f64>,
     pub change_day_pct: Option<f64>,
-    pub latency_ui_ms:  Option<u32>,
-    pub updated_at:     DateTime<Utc>,
+    pub latency_ui_ms: Option<u32>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl TickerLiveState {
@@ -57,19 +56,19 @@ impl TickerLiveState {
     /// empty). Used by the ingestion paths the first time a symbol is seen.
     fn new(symbol: &str, now: DateTime<Utc>) -> Self {
         Self {
-            symbol:         symbol.to_string(),
-            last_price:     None,
-            bid:            None,
-            ask:            None,
-            spread:         None,
-            volume_day:     0,
-            vwap:           None,
-            high_day:       None,
-            low_day:        None,
+            symbol: symbol.to_string(),
+            last_price: None,
+            bid: None,
+            ask: None,
+            spread: None,
+            volume_day: 0,
+            vwap: None,
+            high_day: None,
+            low_day: None,
             previous_close: None,
             change_day_pct: None,
-            latency_ui_ms:  None,
-            updated_at:     now,
+            latency_ui_ms: None,
+            updated_at: now,
         }
     }
 }
@@ -77,9 +76,8 @@ impl TickerLiveState {
 /// Snapshot returned by get_market_snapshot (polled ~300 ms while feed is active).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketSnapshot {
-    pub tickers:      HashMap<String, TickerLiveState>,
-    pub latency:      LatencyStatus,
-    pub mock_running: bool,
+    pub tickers: HashMap<String, TickerLiveState>,
+    pub latency: LatencyStatus,
     /// True while the Alpaca live WebSocket feed is connected.
     pub live_running: bool,
 }
@@ -91,57 +89,67 @@ pub struct MarketSnapshot {
 pub struct FeedDiagnostics {
     /// idle | connecting | authenticating | authenticated | subscribed |
     /// streaming | error | reconnecting | stopped
-    pub state:              String,
-    pub feed:               String,         // iex | sip | delayed_sip
+    pub state: String,
+    pub feed: String, // iex | sip | delayed_sip
+    /// Market-data subscription detected at connect time: "sip" (paid) | "iex"
+    /// (free). Decides whether the broad tier may use the `*` wildcard.
+    #[serde(default)]
+    pub plan: String,
+    /// Max symbols this plan will stream, 0 when unlimited. The free plan allows 30,
+    /// which the stream spends on orders → displayed charts → the day's watchlist.
+    #[serde(default)]
+    pub symbol_limit: usize,
     /// Broad-tier channel for the whole universe: "trades" (premarket) | "bars" (open).
-    pub broad_mode:         String,
-    pub subscribed_symbols: usize,           // broad-tier symbol count
+    pub broad_mode: String,
+    pub subscribed_symbols: usize, // broad-tier symbol count
     /// Symbols currently tick-streamed (trades+quotes) because they're displayed.
-    pub focus_symbols:      usize,
+    pub focus_symbols: usize,
     /// Tickers dropped before subscribe because they aren't valid Alpaca symbols
     /// (a single malformed entry makes Alpaca reject the whole frame, code 400).
     pub invalid_symbols_dropped: usize,
-    pub trades_received:    u64,
-    pub quotes_received:    u64,
-    pub bars_received:      u64,
-    pub last_message_at:    Option<DateTime<Utc>>,
-    pub last_error_code:    Option<i64>,
-    pub last_error_msg:     Option<String>,
+    pub trades_received: u64,
+    pub quotes_received: u64,
+    pub bars_received: u64,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub last_error_code: Option<i64>,
+    pub last_error_msg: Option<String>,
     /// The most recent subscribe/unsubscribe message sent (channel + chunk index
     /// + size). When an error follows, this reveals exactly which message Alpaca
     /// rejected — e.g. the symbol count at which a subscription cap is hit.
-    pub last_subscribe:     String,
+    pub last_subscribe: String,
     /// What Alpaca actually confirms is subscribed, echoed back in its
     /// `subscription` control message (per-channel symbol counts + a sample).
     /// The ground truth: if the focus trades/quotes don't appear here, our
     /// subscribe didn't register the symbols (e.g. malformed/empty), even
     /// though no error was returned.
-    pub subscription_ack:   String,
-    pub reconnects:         u32,
-    pub connected_at:       Option<DateTime<Utc>>,
-    pub updated_at:         DateTime<Utc>,
+    pub subscription_ack: String,
+    pub reconnects: u32,
+    pub connected_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Default for FeedDiagnostics {
     fn default() -> Self {
         Self {
-            state:              "idle".into(),
-            feed:               String::new(),
-            broad_mode:         String::new(),
+            state: "idle".into(),
+            feed: String::new(),
+            plan: String::new(),
+            symbol_limit: 0,
+            broad_mode: String::new(),
             subscribed_symbols: 0,
-            focus_symbols:      0,
+            focus_symbols: 0,
             invalid_symbols_dropped: 0,
-            trades_received:    0,
-            quotes_received:    0,
-            bars_received:      0,
-            last_message_at:    None,
-            last_error_code:    None,
-            last_error_msg:     None,
-            last_subscribe:     String::new(),
-            subscription_ack:   String::new(),
-            reconnects:         0,
-            connected_at:       None,
-            updated_at:         Utc::now(),
+            trades_received: 0,
+            quotes_received: 0,
+            bars_received: 0,
+            last_message_at: None,
+            last_error_code: None,
+            last_error_msg: None,
+            last_subscribe: String::new(),
+            subscription_ack: String::new(),
+            reconnects: 0,
+            connected_at: None,
+            updated_at: Utc::now(),
         }
     }
 }
@@ -153,35 +161,35 @@ impl Default for FeedDiagnostics {
 pub struct NewsDiagnostics {
     /// idle | waiting_premarket | connecting | authenticated | subscribed |
     /// streaming | error | stopped
-    pub state:             String,
+    pub state: String,
     /// True while inside the premarket window (the feed only streams then).
-    pub in_premarket:      bool,
-    pub news_received:     u64,
+    pub in_premarket: bool,
+    pub news_received: u64,
     pub symbols_with_news: usize,
-    pub last_news_at:      Option<DateTime<Utc>>,
-    pub last_headline:     Option<String>,
-    pub last_symbols:      Vec<String>,
-    pub last_error:        Option<String>,
-    pub connected_at:      Option<DateTime<Utc>>,
-    pub updated_at:        DateTime<Utc>,
+    pub last_news_at: Option<DateTime<Utc>>,
+    pub last_headline: Option<String>,
+    pub last_symbols: Vec<String>,
+    pub last_error: Option<String>,
+    pub connected_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
     /// Newest-first flat log of recent headlines for the debug panel.
-    pub recent:            Vec<NewsHeadline>,
+    pub recent: Vec<NewsHeadline>,
 }
 
 impl Default for NewsDiagnostics {
     fn default() -> Self {
         Self {
-            state:             "idle".into(),
-            in_premarket:      false,
-            news_received:     0,
+            state: "idle".into(),
+            in_premarket: false,
+            news_received: 0,
             symbols_with_news: 0,
-            last_news_at:      None,
-            last_headline:     None,
-            last_symbols:      Vec::new(),
-            last_error:        None,
-            connected_at:      None,
-            updated_at:        Utc::now(),
-            recent:            Vec::new(),
+            last_news_at: None,
+            last_headline: None,
+            last_symbols: Vec::new(),
+            last_error: None,
+            connected_at: None,
+            updated_at: Utc::now(),
+            recent: Vec::new(),
         }
     }
 }
@@ -229,31 +237,45 @@ impl TradeCounter {
 /// the order they were reached in (used for the SL/TP tie-break in `FillWindow`).
 #[derive(Debug, Clone, Copy)]
 struct FillAccum {
-    first:    f64,
-    high:     f64,
-    low:      f64,
-    last:     f64,
-    seq:      u64,
-    low_seq:  u64,
+    first: f64,
+    high: f64,
+    low: f64,
+    last: f64,
+    seq: u64,
+    low_seq: u64,
     high_seq: u64,
 }
 
 impl FillAccum {
     fn new(price: f64) -> Self {
-        Self { first: price, high: price, low: price, last: price, seq: 0, low_seq: 0, high_seq: 0 }
+        Self {
+            first: price,
+            high: price,
+            low: price,
+            last: price,
+            seq: 0,
+            low_seq: 0,
+            high_seq: 0,
+        }
     }
     fn record(&mut self, price: f64) {
         self.seq += 1;
         self.last = price;
-        if price < self.low  { self.low  = price; self.low_seq  = self.seq; }
-        if price > self.high { self.high = price; self.high_seq = self.seq; }
+        if price < self.low {
+            self.low = price;
+            self.low_seq = self.seq;
+        }
+        if price > self.high {
+            self.high = price;
+            self.high_seq = self.seq;
+        }
     }
     fn finish(self) -> crate::types::FillWindow {
         crate::types::FillWindow {
             first: self.first,
-            high:  self.high,
-            low:   self.low,
-            last:  self.last,
+            high: self.high,
+            low: self.low,
+            last: self.last,
             // `<=` so a flat window (low_seq == high_seq == 0) resolves to the
             // adverse/low side — the conservative worst-case fill assumption.
             low_first: self.low_seq <= self.high_seq,
@@ -263,65 +285,69 @@ impl FillAccum {
 
 /// Full in-process market state (not serialized — internal use only).
 pub struct MarketState {
-    pub tickers:      HashMap<String, TickerLiveState>,
+    pub tickers: HashMap<String, TickerLiveState>,
     /// Per-ticker, per-timeframe candle aggregators (in-progress bars).
-    aggregators:      HashMap<String, HashMap<Timeframe, CandleAggregator>>,
+    aggregators: HashMap<String, HashMap<Timeframe, CandleAggregator>>,
     /// Per-ticker, per-timeframe ring buffers of closed bars.
-    pub bars:         HashMap<String, HashMap<Timeframe, RingBuffer<Bar>>>,
-    pub latency:      LatencyStatus,
-    pub mock_running: bool,
+    pub bars: HashMap<String, HashMap<Timeframe, RingBuffer<Bar>>>,
+    pub latency: LatencyStatus,
     /// True while the Alpaca live WebSocket feed is connected.
     pub live_running: bool,
     /// Live health of the Alpaca WebSocket feed (diagnostics panel).
-    pub feed:         FeedDiagnostics,
+    pub feed: FeedDiagnostics,
     /// VWAP accumulators: (price×vol sum, vol sum) per symbol.
-    vwap_acc:         HashMap<String, (f64, f64)>,
+    vwap_acc: HashMap<String, (f64, f64)>,
     /// Per-symbol rolling trade-print counters (trade acceleration measure).
-    trade_counts:     HashMap<String, TradeCounter>,
+    trade_counts: HashMap<String, TradeCounter>,
     /// Per-symbol price path since the internal book last drained it, consumed by
     /// the trading loop to fill resting orders against the full micro-bar.
-    fill_windows:     HashMap<String, FillAccum>,
+    fill_windows: HashMap<String, FillAccum>,
     /// Provisional premarket DAILY candle per symbol (04:00–09:30 ET, today). Built
     /// from premarket prints + an Alpaca premarket seed; `get_bars` surfaces it as
     /// today's daily candle during premarket and it is dropped at the 09:30 open so
     /// the regular-session daily aggregator takes over (the regular daily candle
     /// never mixes premarket prints, matching Alpaca's own daily bars).
-    premarket_daily:  HashMap<String, Bar>,
+    premarket_daily: HashMap<String, Bar>,
     /// Live news headlines keyed by upper-cased symbol (correlation engine).
-    news_by_symbol:   HashMap<String, Vec<NewsHeadline>>,
+    news_by_symbol: HashMap<String, Vec<NewsHeadline>>,
     /// Flat newest-first log of recent headlines (debug panel).
-    news_log:         VecDeque<NewsHeadline>,
+    news_log: VecDeque<NewsHeadline>,
     /// Live health of the Alpaca news WebSocket feed (news debug panel).
-    pub news_feed:    NewsDiagnostics,
+    pub news_feed: NewsDiagnostics,
 }
 
 impl MarketState {
     pub fn new() -> Self {
         Self {
-            tickers:      HashMap::new(),
-            aggregators:  HashMap::new(),
-            bars:         HashMap::new(),
+            tickers: HashMap::new(),
+            aggregators: HashMap::new(),
+            bars: HashMap::new(),
             latency: LatencyStatus {
                 websocket_to_ui_ms: 0,
-                level:              LatencyLevel::Normal,
-                measured_at:        Utc::now(),
+                level: LatencyLevel::Normal,
+                measured_at: Utc::now(),
             },
-            mock_running: false,
             live_running: false,
-            feed:         FeedDiagnostics::default(),
-            vwap_acc:     HashMap::new(),
-            trade_counts:   HashMap::new(),
-            fill_windows:   HashMap::new(),
+            feed: FeedDiagnostics::default(),
+            vwap_acc: HashMap::new(),
+            trade_counts: HashMap::new(),
+            fill_windows: HashMap::new(),
             premarket_daily: HashMap::new(),
             news_by_symbol: HashMap::new(),
-            news_log:       VecDeque::new(),
-            news_feed:      NewsDiagnostics::default(),
+            news_log: VecDeque::new(),
+            news_feed: NewsDiagnostics::default(),
         }
     }
 
     // ── Feed diagnostics updates (called by the live-stream task) ──────────────
     pub fn feed_set_feed(&mut self, feed: &str) {
         self.feed.feed = feed.to_string();
+    }
+    /// Record the subscription the connect-time probe detected. `limit` is 0 when the
+    /// plan streams an unlimited number of symbols.
+    pub fn feed_set_plan(&mut self, plan: &str, limit: usize) {
+        self.feed.plan = plan.to_string();
+        self.feed.symbol_limit = limit;
     }
     pub fn feed_state(&mut self, state: &str) {
         self.feed.state = state.to_string();
@@ -368,7 +394,7 @@ impl MarketState {
     pub fn feed_record_data(&mut self, trades: u64, quotes: u64, bars: u64, now: DateTime<Utc>) {
         self.feed.trades_received += trades;
         self.feed.quotes_received += quotes;
-        self.feed.bars_received  += bars;
+        self.feed.bars_received += bars;
         self.feed.last_message_at = Some(now);
         if self.feed.state != "streaming" {
             self.feed.state = "streaming".to_string();
@@ -379,7 +405,10 @@ impl MarketState {
     /// Seed the previous (daily) close for a symbol so live `change_day_pct`
     /// is meaningful from the first trade. Creates the ticker if needed.
     pub fn set_previous_close(&mut self, symbol: &str, prev_close: f64, now: DateTime<Utc>) {
-        let state = self.tickers.entry(symbol.to_string()).or_insert_with(|| TickerLiveState::new(symbol, now));
+        let state = self
+            .tickers
+            .entry(symbol.to_string())
+            .or_insert_with(|| TickerLiveState::new(symbol, now));
         state.previous_close = Some(prev_close);
     }
 
@@ -402,15 +431,24 @@ impl MarketState {
     /// Hot path — only HashMap reads/writes, no allocations beyond the first tick per ticker.
     pub fn on_trade(
         &mut self,
-        symbol:       &str,
-        price:        f64,
-        size:         u64,
-        event_time:   DateTime<Utc>,
-        now:          DateTime<Utc>,
-        warn_ms:      u32,
-        critical_ms:  u32,
+        symbol: &str,
+        price: f64,
+        size: u64,
+        event_time: DateTime<Utc>,
+        now: DateTime<Utc>,
+        warn_ms: u32,
+        critical_ms: u32,
     ) {
-        self.ingest_trade(symbol, price, size, 1, event_time, now, warn_ms, critical_ms);
+        self.ingest_trade(
+            symbol,
+            price,
+            size,
+            1,
+            event_time,
+            now,
+            warn_ms,
+            critical_ms,
+        );
     }
 
     /// Market Replay ingestion: identical to `on_trade` but the print may stand
@@ -419,26 +457,35 @@ impl MarketState {
     /// instant (latency is meaningless in replay and reads as ~0).
     pub fn on_replay_trade(
         &mut self,
-        symbol:     &str,
-        price:      f64,
-        size:       u64,
-        prints:     u64,
+        symbol: &str,
+        price: f64,
+        size: u64,
+        prints: u64,
         event_time: DateTime<Utc>,
     ) {
-        self.ingest_trade(symbol, price, size, prints.max(1), event_time, event_time, 1_000, 2_000);
+        self.ingest_trade(
+            symbol,
+            price,
+            size,
+            prints.max(1),
+            event_time,
+            event_time,
+            1_000,
+            2_000,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
     fn ingest_trade(
         &mut self,
-        symbol:       &str,
-        price:        f64,
-        size:         u64,
-        prints:       u64,
-        event_time:   DateTime<Utc>,
-        now:          DateTime<Utc>,
-        warn_ms:      u32,
-        critical_ms:  u32,
+        symbol: &str,
+        price: f64,
+        size: u64,
+        prints: u64,
+        event_time: DateTime<Utc>,
+        now: DateTime<Utc>,
+        warn_ms: u32,
+        critical_ms: u32,
     ) {
         self.ensure_ticker_buffers(symbol);
 
@@ -450,28 +497,42 @@ impl MarketState {
         // Use get_mut first to avoid a String allocation when the key exists (hot path).
         let acc = match self.vwap_acc.get_mut(symbol) {
             Some(a) => a,
-            None => self.vwap_acc.entry(symbol.to_string()).or_insert((0.0, 0.0)),
+            None => self
+                .vwap_acc
+                .entry(symbol.to_string())
+                .or_insert((0.0, 0.0)),
         };
         acc.0 += price * size as f64;
         acc.1 += size as f64;
-        let new_vwap = if acc.1 > 0.0 { Some(acc.0 / acc.1) } else { None };
+        let new_vwap = if acc.1 > 0.0 {
+            Some(acc.0 / acc.1)
+        } else {
+            None
+        };
 
         // Read previous close before the mutable borrow of tickers
         let prev_close = self.tickers.get(symbol).and_then(|s| s.previous_close);
         let change_pct = prev_close.and_then(|pc| {
-            if pc > 0.0 { Some((price - pc) / pc * 100.0) } else { None }
+            if pc > 0.0 {
+                Some((price - pc) / pc * 100.0)
+            } else {
+                None
+            }
         });
 
         let state = match self.tickers.get_mut(symbol) {
             Some(s) => s,
-            None => self.tickers.entry(symbol.to_string()).or_insert_with(|| TickerLiveState::new(symbol, now)),
+            None => self
+                .tickers
+                .entry(symbol.to_string())
+                .or_insert_with(|| TickerLiveState::new(symbol, now)),
         };
 
-        state.last_price    = Some(price);
-        state.volume_day   += size;
-        state.high_day      = Some(state.high_day.map_or(price, |h| h.max(price)));
-        state.low_day       = Some(state.low_day.map_or(price, |l| l.min(price)));
-        state.vwap          = new_vwap;
+        state.last_price = Some(price);
+        state.volume_day += size;
+        state.high_day = Some(state.high_day.map_or(price, |h| h.max(price)));
+        state.low_day = Some(state.low_day.map_or(price, |l| l.min(price)));
+        state.vwap = new_vwap;
         state.latency_ui_ms = Some(latency_ms);
         if let Some(cp) = change_pct {
             state.change_day_pct = Some(cp);
@@ -508,21 +569,36 @@ impl MarketState {
             let stamp = crate::time::et_midnight_utc(event_time);
             let bar = match self.premarket_daily.get_mut(symbol) {
                 Some(b) => b,
-                None => self.premarket_daily.entry(symbol.to_string()).or_insert_with(|| Bar {
-                    time: stamp, open: price, high: price, low: price, close: price,
-                    volume: 0, vwap: None, trade_count: Some(0),
-                }),
+                None => self
+                    .premarket_daily
+                    .entry(symbol.to_string())
+                    .or_insert_with(|| Bar {
+                        time: stamp,
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: 0,
+                        vwap: None,
+                        trade_count: Some(0),
+                    }),
             };
             // A bar left over from a previous day → restart it for today.
             if ny_date(bar.time) != ny_date(event_time) {
                 *bar = Bar {
-                    time: stamp, open: price, high: price, low: price, close: price,
-                    volume: 0, vwap: None, trade_count: Some(0),
+                    time: stamp,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: 0,
+                    vwap: None,
+                    trade_count: Some(0),
                 };
             }
-            bar.high   = bar.high.max(price);
-            bar.low    = bar.low.min(price);
-            bar.close  = price;
+            bar.high = bar.high.max(price);
+            bar.low = bar.low.min(price);
+            bar.close = price;
             bar.volume += size;
             bar.trade_count = Some(bar.trade_count.unwrap_or(0) + prints);
         } else {
@@ -534,14 +610,17 @@ impl MarketState {
         if let Some(tc) = self.trade_counts.get_mut(symbol) {
             tc.record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
         } else {
-            self.trade_counts.entry(symbol.to_string()).or_default()
+            self.trade_counts
+                .entry(symbol.to_string())
+                .or_default()
                 .record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
         }
 
         if let Some(w) = self.fill_windows.get_mut(symbol) {
             w.record(price);
         } else {
-            self.fill_windows.insert(symbol.to_string(), FillAccum::new(price));
+            self.fill_windows
+                .insert(symbol.to_string(), FillAccum::new(price));
         }
     }
 
@@ -572,14 +651,16 @@ impl MarketState {
                     *b = seed;
                     return;
                 }
-                b.open   = seed.open;
-                b.high   = b.high.max(seed.high);
-                b.low    = b.low.min(seed.low);
+                b.open = seed.open;
+                b.high = b.high.max(seed.high);
+                b.low = b.low.min(seed.low);
                 b.volume = b.volume.max(seed.volume);
-                b.vwap   = seed.vwap.or(b.vwap);
+                b.vwap = seed.vwap.or(b.vwap);
                 // b.close kept: a live tick is fresher than Alpaca's last minute bar.
             }
-            Entry::Vacant(v) => { v.insert(seed); }
+            Entry::Vacant(v) => {
+                v.insert(seed);
+            }
         }
     }
 
@@ -618,7 +699,12 @@ impl MarketState {
             return None;
         }
         let cutoff = now - chrono::Duration::seconds(secs);
-        Some(bars.iter().filter(|b| b.time >= cutoff).map(|b| b.volume as i64).sum())
+        Some(
+            bars.iter()
+                .filter(|b| b.time >= cutoff)
+                .map(|b| b.volume as i64)
+                .sum(),
+        )
     }
 
     // ── News investor (Alpaca news WebSocket, premarket) ───────────────────────
@@ -663,17 +749,15 @@ impl MarketState {
     /// ±window match against the price-event time; `window_secs` is passed wide
     /// enough (≈2× the correlation window) to also cover a headline that lands
     /// after a recent price event.
-    pub fn recent_news(
-        &self,
-        symbol: &str,
-        now: DateTime<Utc>,
-        window_secs: i64,
-    ) -> Vec<NewsRef> {
+    pub fn recent_news(&self, symbol: &str, now: DateTime<Utc>, window_secs: i64) -> Vec<NewsRef> {
         match self.news_by_symbol.get(symbol) {
             Some(list) => list
                 .iter()
                 .filter(|n| (now - n.received_at).num_seconds().abs() <= window_secs)
-                .map(|n| NewsRef { at: n.received_at, headline: n.headline.clone() })
+                .map(|n| NewsRef {
+                    at: n.received_at,
+                    headline: n.headline.clone(),
+                })
                 .collect(),
             None => Vec::new(),
         }
@@ -736,9 +820,12 @@ impl MarketState {
 
     /// Process one quote update (bid/ask).
     pub fn on_quote(&mut self, symbol: &str, bid: f64, ask: f64, now: DateTime<Utc>) {
-        let state = self.tickers.entry(symbol.to_string()).or_insert_with(|| TickerLiveState::new(symbol, now));
-        state.bid    = Some(bid);
-        state.ask    = Some(ask);
+        let state = self
+            .tickers
+            .entry(symbol.to_string())
+            .or_insert_with(|| TickerLiveState::new(symbol, now));
+        state.bid = Some(bid);
+        state.ask = Some(ask);
         state.spread = Some((ask - bid).max(0.0));
         state.updated_at = now;
     }
@@ -746,9 +833,8 @@ impl MarketState {
     /// Clone all live states into a serialisable snapshot for the frontend.
     pub fn snapshot(&self) -> MarketSnapshot {
         MarketSnapshot {
-            tickers:      self.tickers.clone(),
-            latency:      self.latency.clone(),
-            mock_running: self.mock_running,
+            tickers: self.tickers.clone(),
+            latency: self.latency.clone(),
             live_running: self.live_running,
         }
     }
@@ -792,7 +878,9 @@ impl MarketState {
             // premarket "day shown twice" bug). Keying by NY date collapses them.
             let mut by_day: std::collections::BTreeMap<NaiveDate, Bar> =
                 std::collections::BTreeMap::new();
-            for b in raw { by_day.insert(ny_date(b.time), b); }
+            for b in raw {
+                by_day.insert(ny_date(b.time), b);
+            }
 
             if let Some(forming) = daily_forming {
                 // The forming daily candle is bucketed on the NY trading day, so
@@ -806,14 +894,16 @@ impl MarketState {
                         // live values so the current candle moves with each trade
                         // (latest close + any new high/low); Alpaca's open is kept.
                         Some(existing) => {
-                            existing.high  = existing.high.max(forming.high);
-                            existing.low   = existing.low.min(forming.low);
+                            existing.high = existing.high.max(forming.high);
+                            existing.low = existing.low.min(forming.low);
                             existing.close = forming.close;
                         }
                         // (b) No bar for today yet (Alpaca lag early in the session) →
                         // append the live candle AS today's bar (already correctly
                         // stamped); Alpaca's later bar, at the same stamp, replaces it.
-                        None => { by_day.insert(today, forming); }
+                        None => {
+                            by_day.insert(today, forming);
+                        }
                     }
                 }
             }
@@ -826,7 +916,9 @@ impl MarketState {
         // `load_chart_bars`, then the final closed bar pushed by the
         // aggregator/stream — which would otherwise make `setData` reject the series.
         let mut by_time: std::collections::BTreeMap<i64, Bar> = std::collections::BTreeMap::new();
-        for b in raw { by_time.insert(b.time.timestamp(), b); }
+        for b in raw {
+            by_time.insert(b.time.timestamp(), b);
+        }
         let mut bars: Vec<Bar> = by_time.into_values().collect();
 
         if let Some(forming) = forming {
@@ -846,49 +938,79 @@ impl MarketState {
     #[allow(clippy::too_many_arguments)]
     pub fn on_bar(
         &mut self,
-        symbol:    &str,
-        bar_time:  DateTime<Utc>,
-        open:      f64,
-        high:      f64,
-        low:       f64,
-        close:     f64,
-        volume:    u64,
-        vw:        f64,
-        n:         Option<u64>,
-        now:       DateTime<Utc>,
+        symbol: &str,
+        bar_time: DateTime<Utc>,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: u64,
+        vw: f64,
+        n: Option<u64>,
+        now: DateTime<Utc>,
     ) {
         self.ensure_ticker_buffers(symbol);
 
         let prev_close = self.tickers.get(symbol).and_then(|s| s.previous_close);
-        let change_pct = prev_close.and_then(|pc| if pc > 0.0 { Some((close - pc) / pc * 100.0) } else { None });
+        let change_pct = prev_close.and_then(|pc| {
+            if pc > 0.0 {
+                Some((close - pc) / pc * 100.0)
+            } else {
+                None
+            }
+        });
 
         // Accumulate session VWAP from the bar's volume-weighted price.
-        let acc = self.vwap_acc.entry(symbol.to_string()).or_insert((0.0, 0.0));
+        let acc = self
+            .vwap_acc
+            .entry(symbol.to_string())
+            .or_insert((0.0, 0.0));
         acc.0 += vw * volume as f64;
         acc.1 += volume as f64;
-        let new_vwap = if acc.1 > 0.0 { Some(acc.0 / acc.1) } else { None };
+        let new_vwap = if acc.1 > 0.0 {
+            Some(acc.0 / acc.1)
+        } else {
+            None
+        };
 
-        let state = self.tickers.entry(symbol.to_string()).or_insert_with(|| TickerLiveState::new(symbol, now));
-        state.last_price  = Some(close);
+        let state = self
+            .tickers
+            .entry(symbol.to_string())
+            .or_insert_with(|| TickerLiveState::new(symbol, now));
+        state.last_price = Some(close);
         state.volume_day += volume;
-        state.high_day    = Some(state.high_day.map_or(high, |h| h.max(high)));
-        state.low_day     = Some(state.low_day.map_or(low, |l| l.min(low)));
-        state.vwap        = new_vwap;
+        state.high_day = Some(state.high_day.map_or(high, |h| h.max(high)));
+        state.low_day = Some(state.low_day.map_or(low, |l| l.min(low)));
+        state.vwap = new_vwap;
         if let Some(cp) = change_pct {
             state.change_day_pct = Some(cp);
         }
         state.updated_at = now;
 
         // Push the closed minute bar to the M1 ring buffer (chart history).
-        if let Some(rb) = self.bars.get_mut(symbol).and_then(|m| m.get_mut(&Timeframe::M1)) {
-            rb.push(Bar { time: bar_time, open, high, low, close, volume, vwap: Some(vw), trade_count: n });
+        if let Some(rb) = self
+            .bars
+            .get_mut(symbol)
+            .and_then(|m| m.get_mut(&Timeframe::M1))
+        {
+            rb.push(Bar {
+                time: bar_time,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                vwap: Some(vw),
+                trade_count: n,
+            });
         }
 
         // Feed the fill window so resting orders are still serviced for symbols the
         // live broad tier only streams as minute bars (no trade ticks) during the
         // regular session. Walk the bar along a plausible intrabar path so the
         // SL/TP extreme order (`low_first`) is set: green O→L→H→C, red O→H→L→C.
-        let acc = self.fill_windows
+        let acc = self
+            .fill_windows
             .entry(symbol.to_string())
             .or_insert_with(|| FillAccum::new(open));
         if close >= open {
@@ -938,13 +1060,22 @@ impl MarketState {
         let merged: Vec<Bar> = if tf == Timeframe::Daily {
             let mut by_day: std::collections::BTreeMap<NaiveDate, Bar> =
                 std::collections::BTreeMap::new();
-            for b in existing { by_day.insert(ny_date(b.time), b); }
-            for b in history  { by_day.insert(ny_date(b.time), b); }
+            for b in existing {
+                by_day.insert(ny_date(b.time), b);
+            }
+            for b in history {
+                by_day.insert(ny_date(b.time), b);
+            }
             by_day.into_values().collect()
         } else {
-            let mut by_time: std::collections::BTreeMap<i64, Bar> = std::collections::BTreeMap::new();
-            for b in existing { by_time.insert(b.time.timestamp(), b); }
-            for b in history  { by_time.insert(b.time.timestamp(), b); }
+            let mut by_time: std::collections::BTreeMap<i64, Bar> =
+                std::collections::BTreeMap::new();
+            for b in existing {
+                by_time.insert(b.time.timestamp(), b);
+            }
+            for b in history {
+                by_time.insert(b.time.timestamp(), b);
+            }
             by_time.into_values().collect()
         };
 
@@ -965,10 +1096,11 @@ impl MarketState {
             .map(|rb| rb.as_vec())
             .unwrap_or_default();
         let mut by_time: std::collections::BTreeMap<i64, Bar> = std::collections::BTreeMap::new();
-        for b in raw { by_time.insert(b.time.timestamp(), b); }
+        for b in raw {
+            by_time.insert(b.time.timestamp(), b);
+        }
         by_time.into_values().collect()
     }
-
 }
 
 impl Default for MarketState {
@@ -982,7 +1114,9 @@ mod tests {
     use super::*;
 
     fn t(s: i64) -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, 1_700_000_000 + s, 0).single().unwrap()
+        chrono::TimeZone::timestamp_opt(&Utc, 1_700_000_000 + s, 0)
+            .single()
+            .unwrap()
     }
 
     // Trades accumulate into a per-symbol window (range + extreme order) that the
@@ -1028,14 +1162,16 @@ mod tests {
         // global-clock test can never leak its simulated time into other tests.
         struct ClockGuard;
         impl Drop for ClockGuard {
-            fn drop(&mut self) { clock::deactivate(); }
+            fn drop(&mut self) {
+                clock::deactivate();
+            }
         }
 
         let parse = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
         // Monday 2026-06-15, EDT (UTC−4): 07:00 / 08:00 ET premarket, 10:00 ET open.
-        let pm1  = parse("2026-06-15T11:00:00Z"); // 07:00 ET
-        let pm2  = parse("2026-06-15T12:00:00Z"); // 08:00 ET
-        let reg  = parse("2026-06-15T14:00:00Z"); // 10:00 ET (regular session)
+        let pm1 = parse("2026-06-15T11:00:00Z"); // 07:00 ET
+        let pm2 = parse("2026-06-15T12:00:00Z"); // 08:00 ET
+        let reg = parse("2026-06-15T14:00:00Z"); // 10:00 ET (regular session)
 
         clock::activate(pm2); // app clock sits inside premarket
         let _guard = ClockGuard;
@@ -1069,7 +1205,18 @@ mod tests {
     fn minute_bar_feeds_window_with_path_order() {
         let mut ms = MarketState::new();
         // Red bar O=10 H=10.5 L=9.0 C=9.2 → path O→H→L→C, low after high.
-        ms.on_bar("BBB", t(0), 10.0, 10.5, 9.0, 9.2, 1_000, 9.7, Some(10), t(0));
+        ms.on_bar(
+            "BBB",
+            t(0),
+            10.0,
+            10.5,
+            9.0,
+            9.2,
+            1_000,
+            9.7,
+            Some(10),
+            t(0),
+        );
         let w = ms.drain_fill_windows();
         let bbb = w.get("BBB").expect("window for BBB");
         assert_eq!(bbb.first, 10.0);

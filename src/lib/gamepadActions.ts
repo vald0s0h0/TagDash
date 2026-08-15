@@ -1,12 +1,12 @@
 import {
-  GAMEPAD_ACTIONS, type GamepadActionId, type GamepadBinding,
+  GAMEPAD_ACTIONS, type GamepadActionId, type GamepadBinding, type GamepadBindings,
 } from "@/stores/gamepadStore";
 
 // Pure (React-free) helpers shared by the gamepad loop. Stateful dispatch
 // (navigation, zone calls, query data) lives in useGamepad where the React data
 // is available; this file is just the binding/axis math so it stays testable.
 
-type Bindings = Record<GamepadActionId, GamepadBinding>;
+type Bindings = GamepadBindings;
 
 /** Choose the actual game controller among ALL devices navigator.getGamepads()
  *  exposes. Other HID gear (3Dconnexion SpaceMouse, flight gear, …) also shows up

@@ -113,6 +113,14 @@ pub fn is_premarket(instant: DateTime<Utc>) -> bool {
     (240..570).contains(&et_minutes(instant)) // 04:00 (240) .. 09:30 (570)
 }
 
+/// Conventional equity premarket/after-hours window: 04:00–09:30 and 16:00–20:00 ET.
+/// Alpaca also offers a separate 20:00–04:00 BOATS/overnight session, but TagDash's
+/// current SIP/IEX stream does not ingest that feed; never pretend its local stops
+/// can monitor prices they cannot see.
+pub fn is_premarket_or_afterhours(instant: DateTime<Utc>) -> bool {
+    matches!(et_minutes(instant), 240..570 | 960..1200)
+}
+
 /// Market session at `instant`, from ET wall time. Boundaries are unchanged from
 /// the previous `scanner::current_session`:
 ///   • 04:00–09:29 premarket · 09:30–09:49 pre-open · 09:50–15:59 open · else AH.
@@ -151,8 +159,14 @@ mod tests {
 
     #[test]
     fn nth_sunday_resolves_2026() {
-        assert_eq!(nth_sunday_utc(2026, 3, 2, 7).unwrap(), utc("2026-03-08T07:00:00Z"));
-        assert_eq!(nth_sunday_utc(2026, 11, 1, 6).unwrap(), utc("2026-11-01T06:00:00Z"));
+        assert_eq!(
+            nth_sunday_utc(2026, 3, 2, 7).unwrap(),
+            utc("2026-03-08T07:00:00Z")
+        );
+        assert_eq!(
+            nth_sunday_utc(2026, 11, 1, 6).unwrap(),
+            utc("2026-11-01T06:00:00Z")
+        );
     }
 
     #[test]
@@ -162,7 +176,7 @@ mod tests {
         assert_eq!(session_at(utc("2026-06-08T13:30:00Z")), Session::PreOpen); // 09:30 ET
         assert_eq!(session_at(utc("2026-06-08T13:50:00Z")), Session::Open); // 09:50 ET
         assert_eq!(session_at(utc("2026-06-08T20:30:00Z")), Session::Afterhours); // 16:30 ET
-        // EST: the same wall-clock sessions hold one UTC hour later.
+                                                                                  // EST: the same wall-clock sessions hold one UTC hour later.
         assert_eq!(session_at(utc("2026-01-15T14:30:00Z")), Session::PreOpen); // 09:30 ET
         assert_eq!(session_at(utc("2026-01-15T14:50:00Z")), Session::Open); // 09:50 ET
     }
@@ -175,8 +189,14 @@ mod tests {
 
     #[test]
     fn session_open_utc_is_dst_aware() {
-        assert_eq!(et_session_open_utc(utc("2026-06-08T12:00:00Z")), utc("2026-06-08T13:30:00Z"));
-        assert_eq!(et_session_open_utc(utc("2026-01-15T12:00:00Z")), utc("2026-01-15T14:30:00Z"));
+        assert_eq!(
+            et_session_open_utc(utc("2026-06-08T12:00:00Z")),
+            utc("2026-06-08T13:30:00Z")
+        );
+        assert_eq!(
+            et_session_open_utc(utc("2026-01-15T12:00:00Z")),
+            utc("2026-01-15T14:30:00Z")
+        );
     }
 
     #[test]
@@ -194,8 +214,17 @@ mod tests {
     #[test]
     fn regular_session_excludes_extended_hours() {
         assert!(!is_regular_session(utc("2026-06-15T12:00:00Z"))); // 08:00 ET premarket
-        assert!(is_regular_session(utc("2026-06-15T13:30:00Z")));  // 09:30 ET open
-        assert!(is_regular_session(utc("2026-06-15T19:59:00Z")));  // 15:59 ET
+        assert!(is_regular_session(utc("2026-06-15T13:30:00Z"))); // 09:30 ET open
+        assert!(is_regular_session(utc("2026-06-15T19:59:00Z"))); // 15:59 ET
         assert!(!is_regular_session(utc("2026-06-15T20:00:00Z"))); // 16:00 ET close → AH
+    }
+
+    #[test]
+    fn premarket_and_afterhours_exclude_the_separate_overnight_feed() {
+        assert!(!is_premarket_or_afterhours(utc("2026-06-15T07:59:00Z"))); // 03:59 ET
+        assert!(is_premarket_or_afterhours(utc("2026-06-15T08:00:00Z"))); // 04:00 ET
+        assert!(!is_premarket_or_afterhours(utc("2026-06-15T13:30:00Z"))); // 09:30 ET
+        assert!(is_premarket_or_afterhours(utc("2026-06-15T20:00:00Z"))); // 16:00 ET
+        assert!(!is_premarket_or_afterhours(utc("2026-06-16T00:00:00Z"))); // 20:00 ET
     }
 }

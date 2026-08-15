@@ -18,6 +18,7 @@ import {
   Receipt,
   RefreshCw,
   ScrollText,
+  ServerCog,
   Table2,
   Tag,
   X,
@@ -45,6 +46,7 @@ import {
   setRecordingActive, type Binding, type HotkeyActionDef, type HotkeyGroup,
 } from "@/stores/hotkeyStore";
 import { GamepadSettings } from "@/components/GamepadSettings";
+import { BrokerTab } from "@/components/settings/BrokerTab";
 import { DataSourceTab } from "@/components/settings/DataSourceTab";
 import { TickersDbTab } from "@/components/settings/TickersDbTab";
 import { TradesDbTab } from "@/components/settings/TradesDbTab";
@@ -106,13 +108,27 @@ interface Props {
 /** Editable API-key fields shown in Settings → API Keys (order = display order). The
  *  tradetally_* keys are rendered in a dedicated "TradeTally" subsection below the rest. */
 const SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
-  { key: "alpaca_key",          label: "Alpaca key" },
-  { key: "alpaca_secret",       label: "Alpaca secret" },
   { key: "massive_api_key",     label: "Massive API key (float)" },
   { key: "sec_api_key",         label: "sec-api.io key (pays · industrie)" },
   { key: "fmp_api_key",         label: "FMP API key (fallback)" },
   { key: "claude_api_key",      label: "Claude API key" },
-  { key: "deepseek_api_key",    label: "Deepseek API key (news / dilution)" },
+  { key: "deepseek_api_key",    label: "Deepseek API key (news / dilution / panic score)" },
+  // Web search — the last resort of the Panic Score context cascade (Alpaca news →
+  // Massive news → web), used only when no structured source explains a move. ONE of
+  // the two is enough; Tavily wins if both are set. Never called during a replay.
+  { key: "tavily_api_key",      label: "Tavily API key (recherche web · panic score)" },
+  { key: "brave_api_key",       label: "Brave Search API key (alternative à Tavily)" },
+];
+
+/** Alpaca credentials — one pair per account, and that is the whole story: the same
+ *  pair authenticates the Trading API and the Market Data API. TagDash asks for no
+ *  separate "market-data key" because Alpaca issues none. The two pairs stay apart
+ *  from each other because a paper key is rejected by the live host, and vice versa. */
+const ALPACA_ACCOUNT_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
+  { key: "alpaca_paper_key",    label: "Compte paper (démo) — key" },
+  { key: "alpaca_paper_secret", label: "Compte paper (démo) — secret" },
+  { key: "alpaca_live_key",     label: "Compte RÉEL — key" },
+  { key: "alpaca_live_secret",  label: "Compte RÉEL — secret" },
 ];
 
 const TRADETALLY_SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
@@ -676,7 +692,7 @@ function AppearanceTab() {
 // ─── Sidebar: tabs grouped by category ──────────────────────────────────────
 
 type TabId =
-  | "trading" | "strategies"
+  | "broker" | "trading" | "strategies"
   | "apparence" | "keyboard" | "gamepad" | "notifs"
   | "data-source" | "latency" | "feed-diagnostics" | "news-debug"
   | "tickers-db" | "trades-db" | "dictee" | "tags"
@@ -689,6 +705,7 @@ const TAB_GROUPS: TabGroup[] = [
   {
     label: "Trading",
     tabs: [
+      { id: "broker",     label: "Broker",     icon: ServerCog },
       { id: "trading",    label: "Trading",    icon: LineChart },
       { id: "strategies", label: "Stratégies", icon: ListChecks },
     ],
@@ -750,7 +767,13 @@ export function SettingsModal({ open, onClose }: Props) {
 
   function saveSecrets() {
     const updates: SecretsUpdate = {};
-    for (const { key } of [...SECRET_FIELDS, ...TRADETALLY_SECRET_FIELDS]) {
+    // Every rendered group must be listed here — a field that is displayed but
+    // absent from this loop silently discards whatever the user typed into it.
+    for (const { key } of [
+      ...ALPACA_ACCOUNT_FIELDS,
+      ...SECRET_FIELDS,
+      ...TRADETALLY_SECRET_FIELDS,
+    ]) {
       const v = secretInputs[key]?.trim();
       if (v) updates[key] = v;
     }
@@ -841,6 +864,11 @@ export function SettingsModal({ open, onClose }: Props) {
 
             {/* Content pane — scrolls independently of the sidebar. */}
             <div className="min-w-0 flex-1 overflow-y-auto p-4">
+              {/* ── Broker: where orders go, and against which account ── */}
+              <TabsContent value="broker" className="mt-0">
+                <BrokerTab />
+              </TabsContent>
+
               {/* ── Trading ── */}
               <TabsContent value="trading" className="mt-0 space-y-3">
                 <Field
@@ -1191,6 +1219,34 @@ export function SettingsModal({ open, onClose }: Props) {
                   . Un champ laissé vide conserve la clé existante. Les valeurs ne sont
                   jamais relues par l'interface (seul l'état configuré/non est affiché).
                 </p>
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                  Alpaca — comptes
+                </div>
+                <p className="mb-2 text-[11px] text-muted-foreground">
+                  Une seule paire de clés par compte Alpaca, qui sert{" "}
+                  <strong>à la fois au trading et aux données de marché</strong> — Alpaca
+                  ne délivre pas de clé « données » séparée. Le compte sélectionné dans{" "}
+                  <strong>Réglages → Broker</strong> fournit donc aussi le flux de
+                  marché. Les deux paires restent distinctes entre elles : une clé paper
+                  est refusée par l'hôte réel, et l'inverse.
+                </p>
+                <div className="space-y-0.5">
+                  {ALPACA_ACCOUNT_FIELDS.map((f) => (
+                    <SecretField
+                      key={f.key}
+                      label={f.label}
+                      type={f.type}
+                      configured={secrets?.[f.key] ?? false}
+                      value={secretInputs[f.key] ?? ""}
+                      onChange={(v) => setSecretInputs((s) => ({ ...s, [f.key]: v }))}
+                    />
+                  ))}
+                </div>
+
+                <Separator className="my-3" />
+                <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                  Enrichissement
+                </div>
                 <div className="space-y-0.5">
                   {SECRET_FIELDS.map((f) => (
                     <SecretField

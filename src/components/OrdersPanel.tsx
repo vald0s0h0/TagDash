@@ -1,3 +1,4 @@
+import { notifyError } from "@/stores/notificationStore";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreVertical, X } from "lucide-react";
@@ -34,7 +35,7 @@ function OrderRow({ order, onTickerClick }: { order: InternalOrder; onTickerClic
       await api.cancelInternalOrder(order.order_id);
       qc.invalidateQueries({ queryKey: ["internal_orders"] });
     } catch (e) {
-      console.error("cancel failed:", e);
+      notifyError(e, "Annulation");
     } finally {
       setBusy(false);
     }

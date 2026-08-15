@@ -319,9 +319,7 @@ impl MicroPullbackEngine {
 
                 // App clock: simulated instant during a Market Replay.
                 let now = crate::time::now();
-                let mock = market.read().unwrap().mock_running;
-                let in_window = mock || in_premarket(now);
-                if !in_window {
+                if !in_premarket(now) {
                     if !machines.is_empty() || !seeds.is_empty() {
                         machines.clear();
                         seeds.clear();
@@ -381,12 +379,11 @@ impl MicroPullbackEngine {
                 // ── 1-minute backfill: seed the baseline for active young names that
                 // don't yet have a full live window. Only once enough premarket
                 // history exists to backfill (≥ baseline window into the session),
-                // never in mock, each symbol attempted at most once, paced.
+                // each symbol attempted at most once, paced.
                 // Never during a Market Replay either: the replay feed injects the
                 // whole session from 04:00, so the live rings already hold the full
                 // baseline — and a REST seed would be redundant.
-                let seed_window_open = !mock
-                    && !crate::replay::clock::is_active()
+                let seed_window_open = !crate::replay::clock::is_active()
                     && crate::time::et_minutes(now)
                         >= PREMARKET_START_MIN + (BASELINE_WINDOW_SECS / 60) as u32;
                 let seed_due = last_seed_attempt

@@ -57,8 +57,14 @@ pub fn upsert_fundamental(conn: &Connection, f: &FundamentalCache) -> Result<()>
              atr=excluded.atr,
              updated_at=excluded.updated_at",
         params![
-            f.symbol, f.float_shares, f.outstanding_shares, f.free_float,
-            f.prev_close, f.avg_volume, f.atr, f.updated_at,
+            f.symbol,
+            f.float_shares,
+            f.outstanding_shares,
+            f.free_float,
+            f.prev_close,
+            f.avg_volume,
+            f.atr,
+            f.updated_at,
         ],
     )?;
     Ok(())
@@ -92,15 +98,15 @@ pub fn get_fundamental(conn: &Connection, symbol: &str) -> Result<Option<Fundame
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RiskScores {
     /// Pump & dump behaviour (0..100, 100 = worst).
-    pub pump_dump_score:        Option<f64>,
+    pub pump_dump_score: Option<f64>,
     /// Historical dilution percentile (0..100, 100 = worst).
-    pub dilution_score:         Option<f64>,
+    pub dilution_score: Option<f64>,
     /// Capacity to dilute (0..100, 100 = worst).
     pub dilution_capacity_score: Option<f64>,
     /// Need to dilute (0..100, 100 = worst).
-    pub dilution_need_score:    Option<f64>,
+    pub dilution_need_score: Option<f64>,
     /// Short-interest score (0..100, 100 = worst / most squeezy).
-    pub short_interest_score:   Option<f64>,
+    pub short_interest_score: Option<f64>,
 }
 
 /// Read the per-ticker behavioural / risk scores. Returns all-`None` when the
@@ -113,11 +119,41 @@ pub fn get_risk_scores(conn: &Connection, symbol: &str) -> Result<RiskScores> {
     )?;
     let mut rows = stmt.query_map(params![symbol], |row| {
         Ok(RiskScores {
-            pump_dump_score:         row.get(0)?,
-            dilution_score:          row.get(1)?,
+            pump_dump_score: row.get(0)?,
+            dilution_score: row.get(1)?,
             dilution_capacity_score: row.get(2)?,
-            dilution_need_score:     row.get(3)?,
-            short_interest_score:    row.get(4)?,
+            dilution_need_score: row.get(3)?,
+            short_interest_score: row.get(4)?,
+        })
+    })?;
+    Ok(rows.next().transpose()?.unwrap_or_default())
+}
+
+/// The few `fundamentals_cache` display columns that no other typed getter exposes:
+/// the 12-month dilution percentage and the split roll-ups. Read by the Panic Score
+/// payload builder, which needs them per ticker without paying for the wide
+/// `get_tickers_table` join.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DilutionAndSplits {
+    /// Split-adjusted shares-outstanding change over ~12 months, in percent.
+    pub dilution_pct_12m: Option<f64>,
+    pub last_split_date: Option<String>,
+    pub last_split_label: Option<String>,
+    pub split_count_1y: Option<i64>,
+}
+
+/// All-`None` when the symbol has no `fundamentals_cache` row yet.
+pub fn get_dilution_and_splits(conn: &Connection, symbol: &str) -> Result<DilutionAndSplits> {
+    let mut stmt = conn.prepare(
+        "SELECT dilution_pct_12m, last_split_date, last_split_label, split_count_1y
+         FROM fundamentals_cache WHERE symbol=?1",
+    )?;
+    let mut rows = stmt.query_map(params![symbol], |row| {
+        Ok(DilutionAndSplits {
+            dilution_pct_12m: row.get(0)?,
+            last_split_date: row.get(1)?,
+            last_split_label: row.get(2)?,
+            split_count_1y: row.get(3)?,
         })
     })?;
     Ok(rows.next().transpose()?.unwrap_or_default())
@@ -217,8 +253,7 @@ pub fn recompute_multiday_changes(conn: &Connection) -> Result<usize> {
                  change_6d_pct=excluded.change_6d_pct,
                  updated_at=excluded.updated_at",
             params![
-                symbol, changes[0], changes[1], changes[2],
-                changes[3], changes[4], changes[5],
+                symbol, changes[0], changes[1], changes[2], changes[3], changes[4], changes[5],
             ],
         )?;
         updated += 1;
@@ -239,7 +274,10 @@ pub fn multiday_changes(conn: &Connection, symbol: &str) -> Result<Option<MultiD
         for (i, slot) in changes.iter_mut().enumerate() {
             *slot = row.get::<_, Option<f64>>(i)?;
         }
-        Ok(MultiDayChange { symbol: symbol.to_string(), changes })
+        Ok(MultiDayChange {
+            symbol: symbol.to_string(),
+            changes,
+        })
     })?;
     rows.next().transpose()
 }
@@ -247,11 +285,9 @@ pub fn multiday_changes(conn: &Connection, symbol: &str) -> Result<Option<MultiD
 /// Most recent `updated_at` across the fundamentals cache (RFC3339-ish string),
 /// used to throttle the FMP full-universe load to once per calendar day.
 pub fn fundamentals_last_date(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT MAX(updated_at) FROM fundamentals_cache",
-        [],
-        |r| r.get::<_, Option<String>>(0),
-    )
+    conn.query_row("SELECT MAX(updated_at) FROM fundamentals_cache", [], |r| {
+        r.get::<_, Option<String>>(0)
+    })
     .ok()
     .flatten()
 }
@@ -282,7 +318,12 @@ pub fn recompute_atr_prev_close(conn: &Connection) -> Result<usize> {
              ) WHERE rn <= ?1 ORDER BY symbol ASC, date ASC",
         )?;
         let mapped = stmt.query_map([WINDOW], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
         })?;
         mapped.collect::<Result<Vec<_>>>()?
     };
@@ -401,7 +442,11 @@ pub fn percentile_rank(mut values: Vec<(String, f64)>) -> Vec<(String, f64)> {
             j += 1;
         }
         // Number strictly less than this run = i; share that percentile across ties.
-        let pct = if n <= 1 { 0.0 } else { i as f64 / (n - 1) as f64 * 100.0 };
+        let pct = if n <= 1 {
+            0.0
+        } else {
+            i as f64 / (n - 1) as f64 * 100.0
+        };
         for v in &values[i..j] {
             out.push((v.0.clone(), pct));
         }
@@ -476,7 +521,10 @@ pub fn recompute_pump_dump_scores(conn: &Connection) -> Result<usize> {
 
 /// Upsert a batch of historical shares-outstanding snapshots (SEC XBRL frames).
 /// `rows` = (symbol, period_end YYYY-MM-DD, shares_outstanding).
-pub fn upsert_dilution_snapshots(conn: &Connection, rows: &[(String, String, f64)]) -> Result<usize> {
+pub fn upsert_dilution_snapshots(
+    conn: &Connection,
+    rows: &[(String, String, f64)],
+) -> Result<usize> {
     conn.execute_batch("BEGIN")?;
     let mut n = 0usize;
     for (symbol, period_end, shares) in rows {
@@ -524,7 +572,9 @@ pub fn recompute_dilution_scores(conn: &Connection, today: &str) -> Result<usize
             "SELECT symbol, outstanding_shares FROM fundamentals_cache
              WHERE outstanding_shares IS NOT NULL AND outstanding_shares > 0",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as f64)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as f64))
+        })?;
         rows.collect::<Result<Vec<_>>>()?.into_iter().collect()
     };
 
@@ -536,7 +586,11 @@ pub fn recompute_dilution_scores(conn: &Connection, today: &str) -> Result<usize
              ORDER BY symbol ASC, period_end ASC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
         })?;
         for row in rows {
             let (sym, end, sh) = row?;
@@ -553,7 +607,12 @@ pub fn recompute_dilution_scores(conn: &Connection, today: &str) -> Result<usize
              ORDER BY symbol ASC, ex_date ASC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
         })?;
         for row in rows {
             let (sym, ex, from, to) = row?;
@@ -579,18 +638,17 @@ pub fn recompute_dilution_scores(conn: &Connection, today: &str) -> Result<usize
     let mut past_adj_map: HashMap<String, f64> = HashMap::new();
     for (sym, series) in &snaps {
         // pick the most recent snapshot inside the [ref_oldest, ref_newest] window.
-        let Some((ref_end, ref_shares)) = series
-            .iter()
-            .rev()
-            .find(|(end, _)| end.as_str() >= ref_oldest.as_str() && end.as_str() <= ref_newest.as_str())
-        else {
+        let Some((ref_end, ref_shares)) = series.iter().rev().find(|(end, _)| {
+            end.as_str() >= ref_oldest.as_str() && end.as_str() <= ref_newest.as_str()
+        }) else {
             continue;
         };
         // current shares (today's basis): prefer Massive's current outstanding, else
         // the latest snapshot rescaled for any split that went ex after it.
-        let now = shares_now.get(sym).copied().or_else(|| {
-            series.last().map(|(end, s)| *s * factor_after(sym, end))
-        });
+        let now = shares_now
+            .get(sym)
+            .copied()
+            .or_else(|| series.last().map(|(end, s)| *s * factor_after(sym, end)));
         let Some(now) = now else { continue };
 
         // past shares rescaled to today's basis: ref shares × splits after ref_end.
@@ -628,7 +686,11 @@ pub fn recompute_dilution_scores(conn: &Connection, today: &str) -> Result<usize
 /// input on parse failure.
 fn shift_days(date: &str, days: i64) -> String {
     chrono::NaiveDate::parse_from_str(&date[..date.len().min(10)], "%Y-%m-%d")
-        .map(|d| (d + chrono::Duration::days(days)).format("%Y-%m-%d").to_string())
+        .map(|d| {
+            (d + chrono::Duration::days(days))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_else(|_| date.to_string())
 }
 
@@ -665,7 +727,11 @@ pub fn replace_ticker_splits(conn: &Connection, rows: &[SplitRow]) -> Result<usi
 /// Stored split events for one symbol since `since_date` (YYYY-MM-DD), ex_date
 /// DESC: `(ex_date, label)`. Offline source for the daily chart's split markers in
 /// flat-files mode (the live path hits Alpaca corporate-actions).
-pub fn splits_for_symbol(conn: &Connection, symbol: &str, since_date: &str) -> Result<Vec<(String, String)>> {
+pub fn splits_for_symbol(
+    conn: &Connection,
+    symbol: &str,
+    since_date: &str,
+) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT ex_date, label FROM ticker_splits
          WHERE symbol = ?1 AND ex_date >= ?2 ORDER BY ex_date DESC",
@@ -695,7 +761,12 @@ pub fn recompute_split_rollups(conn: &Connection, one_year_ago: &str) -> Result<
              FROM ticker_splits t GROUP BY symbol",
         )?;
         let rows = stmt.query_map(params![one_year_ago], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
         })?;
         rows.collect::<Result<Vec<_>>>()?
     };
@@ -1045,8 +1116,16 @@ pub fn recompute_capacity_for_symbol(conn: &Connection, symbol: &str, today: &st
         })
         .unwrap_or((false, false, false, None));
     let score = dilution_capacity_score(
-        collected, has_shelf, form.as_deref(), date.as_deref(),
-        atm, resale, warrants, offering, market_cap, today,
+        collected,
+        has_shelf,
+        form.as_deref(),
+        date.as_deref(),
+        atm,
+        resale,
+        warrants,
+        offering,
+        market_cap,
+        today,
     );
     conn.execute(
         "INSERT INTO fundamentals_cache (symbol, dilution_capacity_score, updated_at)
@@ -1081,7 +1160,16 @@ pub fn upsert_daily_bar(conn: &Connection, bar: &DailyBar) -> Result<()> {
              open=excluded.open, high=excluded.high, low=excluded.low,
              close=excluded.close, volume=excluded.volume,
              updated_at=excluded.updated_at",
-        params![bar.symbol, bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.updated_at],
+        params![
+            bar.symbol,
+            bar.date,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            bar.updated_at
+        ],
     )?;
     Ok(())
 }
@@ -1094,7 +1182,9 @@ pub fn latest_closes(conn: &Connection) -> Result<Vec<(String, f64)>> {
          WHERE d.date = (SELECT MAX(x.date) FROM daily_cache x WHERE x.symbol = d.symbol)
            AND d.close IS NOT NULL",
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
     rows.collect()
 }
 
@@ -1173,7 +1263,9 @@ pub fn earliest_bar_date(conn: &Connection) -> Result<Option<String>> {
 
 /// Count of distinct symbols that have at least one cached daily bar.
 pub fn symbols_with_bars(conn: &Connection) -> Result<i64> {
-    conn.query_row("SELECT COUNT(DISTINCT symbol) FROM daily_cache", [], |r| r.get(0))
+    conn.query_row("SELECT COUNT(DISTINCT symbol) FROM daily_cache", [], |r| {
+        r.get(0)
+    })
 }
 
 /// Delete every cached daily bar for one symbol. Used when a split invalidates
@@ -1187,7 +1279,10 @@ pub fn delete_symbol_bars(conn: &Connection, symbol: &str) -> Result<usize> {
 /// Drop bars older than `cutoff_date` (YYYY-MM-DD) to bound the cache to the
 /// recent window we actually use (~50 trading days).
 pub fn prune_before(conn: &Connection, cutoff_date: &str) -> Result<usize> {
-    let n = conn.execute("DELETE FROM daily_cache WHERE date < ?1", params![cutoff_date])?;
+    let n = conn.execute(
+        "DELETE FROM daily_cache WHERE date < ?1",
+        params![cutoff_date],
+    )?;
     Ok(n)
 }
 
@@ -1281,6 +1376,28 @@ pub fn ohlcv_ascending(
         ))
     })?;
     rows.collect()
+}
+
+/// The `limit` most recent trading days strictly BEFORE `before_date`, ascending.
+///
+/// The daily cache doubles as the market calendar here: a date exists in it iff at
+/// least one symbol printed a daily bar that session, so holidays and weekends drop
+/// out on their own — no exchange-calendar table to keep in sync. Used to decide
+/// which per-day intraday files an execution pane needs behind the current session.
+/// Empty on a cache that hasn't been filled yet; callers degrade to the single day
+/// they already have.
+pub fn trading_days_before(
+    conn: &Connection,
+    before_date: &str,
+    limit: u32,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT date FROM daily_cache WHERE date < ?1 ORDER BY date DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![before_date, limit], |row| row.get::<_, String>(0))?;
+    let mut days: Vec<String> = rows.collect::<Result<_>>()?;
+    days.reverse(); // DESC → ascending
+    Ok(days)
 }
 
 /// Most recent `limit` daily bars dated strictly BEFORE `before_date`
@@ -1426,10 +1543,32 @@ mod scoring_tests {
     #[test]
     fn capacity_unknown_when_not_collected() {
         // No SEC dilution section collected → unknown (None), not 0.
-        let s = dilution_capacity_score(false, false, None, None, false, false, false, None, None, "2026-06-17");
+        let s = dilution_capacity_score(
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            "2026-06-17",
+        );
         assert_eq!(s, None);
         // Collected but nothing found → low capacity = 0, not None.
-        let s = dilution_capacity_score(true, false, None, None, false, false, false, None, None, "2026-06-17");
+        let s = dilution_capacity_score(
+            true,
+            false,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            "2026-06-17",
+        );
         assert_eq!(s, Some(0.0));
     }
 
@@ -1438,18 +1577,40 @@ mod scoring_tests {
         // Recent 424B5 (+35) + shelf (+20) + ATM (+20) + offering 40% of mkt cap (+20)
         // = 95, ×1.2 recency (filed today) → clamped to 100.
         let s = dilution_capacity_score(
-            true, true, Some("424B5"), Some("2026-06-15"),
-            true, false, false, Some(40_000_000.0), Some(100_000_000.0), "2026-06-17",
+            true,
+            true,
+            Some("424B5"),
+            Some("2026-06-15"),
+            true,
+            false,
+            false,
+            Some(40_000_000.0),
+            Some(100_000_000.0),
+            "2026-06-17",
         )
         .unwrap();
-        assert!(s >= 95.0, "fresh ATM prospectus should be very high, got {s}");
+        assert!(
+            s >= 95.0,
+            "fresh ATM prospectus should be very high, got {s}"
+        );
         // The same filing aged >1y collapses via the 0.25 recency multiplier.
         let old = dilution_capacity_score(
-            true, true, Some("424B5"), Some("2024-01-01"),
-            true, false, false, Some(40_000_000.0), Some(100_000_000.0), "2026-06-17",
+            true,
+            true,
+            Some("424B5"),
+            Some("2024-01-01"),
+            true,
+            false,
+            false,
+            Some(40_000_000.0),
+            Some(100_000_000.0),
+            "2026-06-17",
         )
         .unwrap();
-        assert!(old < s && old > 0.0, "aged filing should score lower, got {old}");
+        assert!(
+            old < s && old > 0.0,
+            "aged filing should score lower, got {old}"
+        );
     }
 
     #[test]
@@ -1461,13 +1622,25 @@ mod scoring_tests {
         // Loss TTM (+20) + loss last Q (+10) + 4 neg quarters (+25) + negative OCF
         // (+20) + <2q runway (+25) → ≥100.
         let s = dilution_need_score(
-            true, Some(-1.0), Some(-4.0), Some(4), Some(-8_000_000.0), Some(1_000_000.0), Some(50_000_000.0),
+            true,
+            Some(-1.0),
+            Some(-4.0),
+            Some(4),
+            Some(-8_000_000.0),
+            Some(1_000_000.0),
+            Some(50_000_000.0),
         )
         .unwrap();
         assert!(s >= 90.0, "distressed burner should be very high, got {s}");
         // Profitable, cash-rich → 0.
         let healthy = dilution_need_score(
-            true, Some(5.0), Some(20.0), Some(0), Some(15_000_000.0), Some(500_000_000.0), Some(1_000_000_000.0),
+            true,
+            Some(5.0),
+            Some(20.0),
+            Some(0),
+            Some(15_000_000.0),
+            Some(500_000_000.0),
+            Some(1_000_000_000.0),
         )
         .unwrap();
         assert_eq!(healthy, 0.0);
@@ -1483,7 +1656,10 @@ mod scoring_tests {
         assert_eq!(low, 0.0);
         // Missing float → only days-to-cover contributes (≤30), not None.
         let dtc_only = short_interest_score(None, None, Some(7.0)).unwrap();
-        assert!((dtc_only - 30.0).abs() < 1e-6, "dtc-only → 30, got {dtc_only}");
+        assert!(
+            (dtc_only - 30.0).abs() < 1e-6,
+            "dtc-only → 30, got {dtc_only}"
+        );
         // Nothing usable → None.
         assert_eq!(short_interest_score(None, None, None), None);
     }
@@ -1591,12 +1767,22 @@ mod scoring_tests {
 
         let rows = daily_bars_on(&conn, "2026-06-02").unwrap();
         let aaa = rows.iter().find(|r| r.0 == "AAA").expect("AAA present");
-        assert_eq!((aaa.1, aaa.2, aaa.3, aaa.4, aaa.5), (10.5, 12.0, 10.0, 11.5, 200000));
-        assert_eq!(aaa.6, Some(10.5), "previous close = the 06-01 bar, not the future 06-03 one");
+        assert_eq!(
+            (aaa.1, aaa.2, aaa.3, aaa.4, aaa.5),
+            (10.5, 12.0, 10.0, 11.5, 200000)
+        );
+        assert_eq!(
+            aaa.6,
+            Some(10.5),
+            "previous close = the 06-01 bar, not the future 06-03 one"
+        );
 
         let bbb = rows.iter().find(|r| r.0 == "BBB").expect("BBB present");
         assert_eq!(bbb.6, None, "no cached bar before 06-02 for BBB");
 
-        assert!(daily_bars_on(&conn, "2026-06-04").unwrap().is_empty(), "no bar on an uncovered date");
+        assert!(
+            daily_bars_on(&conn, "2026-06-04").unwrap().is_empty(),
+            "no bar on an uncovered date"
+        );
     }
 }

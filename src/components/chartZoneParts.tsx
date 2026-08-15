@@ -4,12 +4,42 @@
 // ChartZone focused on orchestration.
 
 import { useEffect, useState } from "react";
-import { LoaderCircle, Sparkles } from "lucide-react";
+import { Ban, LoaderCircle, Sparkles } from "lucide-react";
 import type {
   AlertEnrichment, CardInfo, CardNews, HodDriveOverlay, InfoField, StrategyCard,
-  TickerLiveState, Timeframe, ZoneAssignment,
+  PanicDataQuality, PanicLlmScore, TickerLiveState, Timeframe, ZoneAssignment,
 } from "@/types";
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/tauri";
+
+/** Whether `symbol` may be sold short, per the broker. `null` while unknown.
+ *
+ *  Cached per symbol for the lifetime of the module: the answer comes from the
+ *  venue's asset list and changes at most a few times a day, so re-asking on every
+ *  chart mount would spend a request per zone per render for a near-constant. */
+const shortabilityCache = new Map<string, boolean>();
+
+function useShortability(symbol: string | null | undefined): boolean | null {
+  const [ok, setOk] = useState<boolean | null>(
+    symbol ? shortabilityCache.get(symbol) ?? null : null,
+  );
+  useEffect(() => {
+    if (!symbol) { setOk(null); return; }
+    const cached = shortabilityCache.get(symbol);
+    if (cached !== undefined) { setOk(cached); return; }
+    let alive = true;
+    api.getShortability(symbol)
+      .then((s) => {
+        shortabilityCache.set(symbol, s.shortable);
+        if (alive) setOk(s.shortable);
+      })
+      // Unknown stays unknown: a failed lookup must not render as "non shortable"
+      // and talk the user out of a valid trade.
+      .catch(() => alive && setOk(null));
+    return () => { alive = false; };
+  }, [symbol]);
+  return ok;
+}
 
 // ─── Priority colours ─────────────────────────────────────────────────────────
 
@@ -192,6 +222,11 @@ export function ChartInfoBar({
   currentBarVolume: number | null;
   onRunLlm: () => void;
 }) {
+  // Shortability, straight from the venue's asset list. Shown ONLY when the answer
+  // is "no": a badge on every long-only name would be noise, whereas the one case
+  // that matters is discovering mid-setup that the short cannot be sent.
+  const shortable = useShortability(zone.symbol);
+
   const bbz = cardInfo?.bbz ?? null;
   // BBZ colours by stretch: amber past ±2σ, red past ±3σ.
   const bbzCls = bbz == null ? "" : Math.abs(bbz) >= 3
@@ -212,6 +247,15 @@ export function ChartInfoBar({
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 px-2 pt-1">
       <StrategyBadge strategyId={zone.strategy_id} name={zone.strategy_name} />
+
+      {shortable === false && (
+        <span
+          title="Alpaca ne prête pas ce titre — un ordre short serait refusé"
+          className="flex items-center gap-1 rounded border border-red-600/50 bg-red-950/40 px-1.5 py-0.5 text-[10px] font-medium text-red-300"
+        >
+          <Ban className="h-3 w-3" /> Non shortable
+        </span>
+      )}
 
       {/* Bollinger Z of the live price (daily basis) */}
       <BarChip label="BBZ">
@@ -352,6 +396,188 @@ export function StrategyInfoOverlay({
         );
       })}
     </div>
+  );
+}
+
+// ─── Panic Score report (daily pane, Panic Mean Reversion) ────────────────────
+
+/** Same five-band ramp as the screener card, kept here so the report and the card
+ *  read as one system. High = unjustified move = attractive mean-reversion setup. */
+function reportTone(score: number): { ring: string; text: string } {
+  if (score >= 81) return { ring: "ring-fuchsia-500/60", text: "text-fuchsia-200" };
+  if (score >= 61) return { ring: "ring-rose-500/50", text: "text-rose-200" };
+  if (score >= 41) return { ring: "ring-amber-500/50", text: "text-amber-200" };
+  if (score >= 21) return { ring: "ring-sky-500/40", text: "text-sky-200" };
+  return { ring: "ring-slate-500/40", text: "text-slate-300" };
+}
+
+function bandLabel(score: number): string {
+  if (score >= 81) return "panique / euphorie pure";
+  if (score >= 61) return "catalyseur faible, flux dominant";
+  if (score >= 41) return "ambigu";
+  if (score >= 21) return "catalyseur solide, exécution excessive";
+  return "repricing justifié";
+}
+
+/** The LLM's report for the displayed ticker, drawn on the DAILY pane.
+ *
+ *  Information hierarchy is deliberate and top-down, because the trader reads this in
+ *  the seconds before deciding:
+ *    1. the panic score, biggest thing on the pane — it is the verdict;
+ *    2. the one-sentence explanation — why it moves and how reversible that looks;
+ *    3. catalyst strength / confidence / normalisation probability — the qualifiers;
+ *    4. the factual drivers as chips — the evidence behind the number;
+ *    5. provenance in small print — feed, replay flag, web use, rubric version.
+ *
+ *  Point 5 is not decoration: a score built on IEX-only volume with no news source
+ *  deserves less weight than one built on SIP plus a filing, and the only honest way
+ *  to convey that is to show it. */
+export function PanicReportOverlay({ score }: { score: PanicLlmScore | null }) {
+  if (!score || score.panic_score == null) return null;
+  const s = score.panic_score;
+  const tone = reportTone(s);
+
+  const quality: PanicDataQuality = (() => {
+    if (!score.data_quality) return {};
+    try {
+      return JSON.parse(score.data_quality) as PanicDataQuality;
+    } catch {
+      return {};
+    }
+  })();
+
+  const provenance = [
+    quality.feed ? `feed ${quality.feed.toUpperCase()}` : null,
+    score.simulated ? "replay (sans web)" : null,
+    score.web_used ? `web ${score.web_provider ?? ""}`.trim() : null,
+    quality.missing?.length ? `${quality.missing.length} champ(s) absent(s)` : null,
+    quality.lookahead?.length ? "instantanés actuels" : null,
+    score.rubric_version ?? null,
+  ].filter(Boolean) as string[];
+
+  return (
+    <div
+      data-capture-overlay
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex max-w-[78%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
+    >
+      {/* 1 — the verdict */}
+      <div className="flex items-baseline gap-2">
+        <span
+          className={cn(
+            "rounded px-2 py-0.5 text-[26px] font-bold leading-none tabular-nums ring-1",
+            tone.ring,
+            tone.text,
+          )}
+        >
+          {s.toFixed(0)}
+        </span>
+        <div className="flex flex-col">
+          <span className="text-[9px] uppercase leading-none tracking-wide text-muted-foreground/60">
+            Panic score
+          </span>
+          <span className={cn("text-[11px] font-medium leading-tight", tone.text)}>
+            {bandLabel(s)}
+          </span>
+        </div>
+        {score.reversibility && (
+          <span className="ml-1 self-center rounded bg-white/10 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-foreground/80">
+            retour {score.reversibility}
+          </span>
+        )}
+      </div>
+
+      {/* 2 — why */}
+      {score.one_liner && (
+        <p className="max-w-[52ch] text-[11px] leading-snug text-foreground/90">
+          {score.one_liner}
+        </p>
+      )}
+
+      {/* 3 — the qualifiers */}
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] tabular-nums">
+        <ReportStat label="Catalyseur" value={score.catalyst_strength} suffix="/100" />
+        <ReportStat label="Confiance" value={score.confidence_score} suffix="/100" />
+        <ReportStat label="Normalisation" value={score.normalization_prob} suffix="%" />
+        <ReportStat label="Classement" value={score.ranking_score} suffix="/100" />
+        {score.catalyst_label && (
+          <span className="text-foreground/70">{score.catalyst_label}</span>
+        )}
+      </div>
+
+      {(score.trade_direction || score.eligibility || score.timing_state) && (
+        <div className="flex flex-wrap gap-1 text-[9px] font-semibold uppercase">
+          {score.trade_direction && <span>{score.trade_direction}</span>}
+          {score.eligibility && <span>· {score.eligibility}</span>}
+          {score.timing_state && <span>· phase {score.timing_state}</span>}
+          {score.fundamental_veto && score.veto_reason && (
+            <span className="normal-case text-red-300">· veto : {score.veto_reason}</span>
+          )}
+        </div>
+      )}
+
+      {/* 4 — the evidence */}
+      {score.key_drivers.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {score.key_drivers.map((d) => (
+            <span
+              key={d}
+              className="rounded bg-white/10 px-1.5 py-0.5 text-[9px] leading-none text-foreground/80"
+            >
+              {d}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Forced flow / euphoria — the strategy's two behavioural reads. */}
+      {(score.forced_flow || score.euphoria) && (
+        <div className="flex flex-col gap-0.5 text-[10px] leading-snug text-muted-foreground">
+          {score.forced_flow && <span>⇉ {score.forced_flow}</span>}
+          {score.euphoria && <span>◎ {score.euphoria}</span>}
+        </div>
+      )}
+
+      {/* 5 — provenance, plus any calibration note so an adjusted score is never
+              silently different from what the model first said. */}
+      {provenance.length > 0 && (
+        <span className="text-[8px] leading-tight text-muted-foreground/50">
+          {provenance.join(" · ")}
+        </span>
+      )}
+      {score.adjustment_reason && score.panic_score_raw != null && (
+        <span className="text-[8px] leading-tight text-amber-300/60">
+          calibré {score.panic_score_raw.toFixed(0)} → {s.toFixed(0)} · {score.adjustment_reason}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** One qualifier cell. Renders an em dash rather than hiding when the model omitted
+ *  the field, so the report's shape does not shift between tickers. */
+function ReportStat({
+  label,
+  value,
+  suffix,
+}: {
+  label: string;
+  value: number | null;
+  suffix: string;
+}) {
+  return (
+    <span className="flex items-center gap-1">
+      <span className="text-[8px] uppercase tracking-wide text-muted-foreground/50">
+        {label}
+      </span>
+      {value != null ? (
+        <span className="text-foreground/85">
+          {value.toFixed(0)}
+          {suffix}
+        </span>
+      ) : (
+        <span className="text-muted-foreground/30">—</span>
+      )}
+    </span>
   );
 }
 
@@ -604,10 +830,13 @@ export function MicroInfoOverlay({
  *  All from the live `get_hod_drive_overlay` recompute; greys a row when its value
  *  isn't available yet. The HOD/LOD points + green-series crosses are drawn on the
  *  candles themselves (chart markers), not here. */
-export function HodDriveInfoOverlay({ overlay, draftRr, onConfirm }: {
+export function HodDriveInfoOverlay({ overlay, draftRr, onConfirm, invertRr, onInvert }: {
   overlay: HodDriveOverlay | null;
   draftRr?: number | null;
   onConfirm?: () => void;
+  /** R:R of the mirrored (short) trade — the reciprocal of `draftRr`. */
+  invertRr?: number | null;
+  onInvert?: () => void;
 }) {
   const share  = overlay?.series_share ?? null;          // 0..1
   const pbVol  = overlay?.pullback_volume ?? null;       // shares
@@ -684,18 +913,33 @@ export function HodDriveInfoOverlay({ overlay, draftRr, onConfirm }: {
         value={mOpen != null ? (mOpen ? "Ouvert" : "Fermé") : null}
         tone={mOpen === true ? "blue" : "red"}
       />
-      {draftRr != null && onConfirm && (
+      {((draftRr != null && onConfirm) || (invertRr != null && onInvert)) && (
         <>
           <div className="h-px w-full bg-white/10" />
-          <button
-            onClick={onConfirm}
-            className={cn(
-              "pointer-events-auto w-full rounded bg-amber-600/70 px-2 py-1 text-[10px] font-semibold",
-              "text-white transition-colors hover:bg-amber-500/80 active:bg-amber-400/80",
-            )}
-          >
-            Confirmer — {draftRr.toFixed(1)}R
-          </button>
+          {draftRr != null && onConfirm && (
+            <button
+              onClick={onConfirm}
+              className={cn(
+                "pointer-events-auto w-full rounded bg-amber-600/70 px-2 py-1 text-[10px] font-semibold",
+                "text-white transition-colors hover:bg-amber-500/80 active:bg-amber-400/80",
+              )}
+            >
+              Confirmer — {draftRr.toFixed(1)}R
+            </button>
+          )}
+          {/* Mirror trade: same suggested prices, roles swapped (TP→SL, SL→TP),
+              taken short. Rose = the overlay's "red" tone (see FILL_CLS). */}
+          {invertRr != null && onInvert && (
+            <button
+              onClick={onInvert}
+              className={cn(
+                "pointer-events-auto w-full rounded bg-rose-600/70 px-2 py-1 text-[10px] font-semibold",
+                "text-white transition-colors hover:bg-rose-500/80 active:bg-rose-400/80",
+              )}
+            >
+              Inverser — {invertRr.toFixed(1)}R
+            </button>
+          )}
         </>
       )}
     </div>

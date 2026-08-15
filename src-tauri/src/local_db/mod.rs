@@ -4,6 +4,7 @@
 
 pub mod alarm_repository;
 pub mod book_repository;
+pub mod broker_state_repository;
 pub mod bug_repository;
 pub mod cache_repository;
 pub mod company_intel_repository;
@@ -13,8 +14,10 @@ pub mod drawing_repository;
 pub mod execution_repository;
 pub mod journal_repository;
 pub mod llm_repository;
+pub mod panic_llm_repository;
 pub mod schema;
 pub mod scoring_repository;
+pub mod screener_repository;
 pub mod tags_repository;
 pub mod tradetally_queue_repository;
 pub mod universe_repository;
@@ -47,8 +50,9 @@ pub struct LocalLogEntry {
 /// Open (or create) the database and apply all migrations.
 pub fn open_and_migrate(app_dir: &Path) -> Result<Connection> {
     let db_path = app_dir.join("tagdash.db");
-    let conn = Connection::open(&db_path)?;
+    let mut conn = Connection::open(&db_path)?;
     schema::migrate(&conn)?;
+    universe_repository::purge_legacy_seed_data(&mut conn)?;
     Ok(conn)
 }
 

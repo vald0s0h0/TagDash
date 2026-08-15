@@ -1,6 +1,5 @@
 // HTTP client for the TradeTally REST API.
 // All methods return quickly and never block the live scanner path.
-// Mock mode simulates success/failure without network I/O.
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -10,32 +9,20 @@ pub struct TtClient {
     inner:     Client,
     base_url:  String,
     token:     String,
-    mock_mode: bool,
-    mock_fail: bool,
-    mock_delay_ms: u64,
     // Session login (email/password) — only for screenshot upload.
     email:     Option<String>,
     password:  Option<String>,
 }
 
 impl TtClient {
-    pub fn new(base_url: String, token: String, mock_mode: bool) -> Self {
+    pub fn new(base_url: String, token: String) -> Self {
         Self {
             inner: crate::http::client(),
             base_url,
             token,
-            mock_mode,
-            mock_fail: false,
-            mock_delay_ms: 0,
             email: None,
             password: None,
         }
-    }
-
-    pub fn with_mock_options(mut self, fail: bool, delay_ms: u64) -> Self {
-        self.mock_fail = fail;
-        self.mock_delay_ms = delay_ms;
-        self
     }
 
     pub fn with_session_creds(mut self, email: Option<String>, password: Option<String>) -> Self {
@@ -54,17 +41,6 @@ impl TtClient {
         format!("Bearer {}", self.token)
     }
 
-    async fn mock_response(&self) -> Result<Value, String> {
-        if self.mock_delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(self.mock_delay_ms)).await;
-        }
-        if self.mock_fail {
-            return Err("mock: forced failure".into());
-        }
-        let mock_id = format!("mock-{}", chrono::Utc::now().timestamp_millis());
-        Ok(json!({ "id": mock_id, "status": "ok" }))
-    }
-
     async fn handle_resp(&self, resp: reqwest::Response) -> Result<Value, String> {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -81,9 +57,6 @@ impl TtClient {
     // ── Public verbs ─────────────────────────────────────────────────────────
 
     pub async fn post_json(&self, endpoint: &str, body: &Value) -> Result<Value, String> {
-        if self.mock_mode {
-            return self.mock_response().await;
-        }
         let resp = self.inner
             .post(self.url(endpoint))
             .header("Authorization", self.auth_header())
@@ -97,9 +70,6 @@ impl TtClient {
     }
 
     pub async fn patch_json(&self, endpoint: &str, body: &Value) -> Result<Value, String> {
-        if self.mock_mode {
-            return self.mock_response().await;
-        }
         let resp = self.inner
             .patch(self.url(endpoint))
             .header("Authorization", self.auth_header())
@@ -113,9 +83,6 @@ impl TtClient {
     }
 
     pub async fn put_json(&self, endpoint: &str, body: &Value) -> Result<Value, String> {
-        if self.mock_mode {
-            return self.mock_response().await;
-        }
         let resp = self.inner
             .put(self.url(endpoint))
             .header("Authorization", self.auth_header())
@@ -129,11 +96,8 @@ impl TtClient {
     }
 
     /// GET a JSON resource (Bearer token). Used by the dashboard to page through
-    /// `/api/v1/trades`. In mock mode returns an empty payload so the sync is a no-op.
+    /// `/api/v1/trades`.
     pub async fn get_json(&self, endpoint: &str) -> Result<Value, String> {
-        if self.mock_mode {
-            return Ok(json!({ "trades": [] }));
-        }
         let resp = self.inner
             .get(self.url(endpoint))
             .header("Authorization", self.auth_header())
@@ -155,9 +119,6 @@ impl TtClient {
         title: &str,
         content: &str,
     ) -> Result<(), String> {
-        if self.mock_mode {
-            return self.mock_response().await.map(|_| ());
-        }
         let endpoint = "/api/diary";
         let body = json!({
             "entryDate": entry_date,
@@ -242,13 +203,6 @@ impl TtClient {
     /// then POSTs the PNG as multipart field `images` (matches the server's
     /// `upload.array('images', 10)`). `image_endpoint` is already {TT_ID}-resolved.
     pub async fn upload_images_session(&self, image_endpoint: &str, file_path: &str) -> Result<(), String> {
-        if self.mock_mode {
-            if self.mock_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(self.mock_delay_ms)).await;
-            }
-            return if self.mock_fail { Err("mock: forced failure".into()) } else { Ok(()) };
-        }
-
         // 1) Log in to obtain a JWT (top-level `token` field).
         let jwt = self.login_jwt().await?;
 

@@ -77,7 +77,8 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
     const colorSell  = t.sell;
     const lineProfit = hexToRgba(t.profit, 0.75);
     const lineLoss   = hexToRgba(t.loss, 0.75);
-    const sl0Color   = hexToRgba(t.loss, 0.4); // launch-time SL: discreet dashed
+    const sl0Color   = hexToRgba(t.loss, 0.4);   // launch-time SL: discreet dashed red
+    const tp0Color   = hexToRgba(t.profit, 0.4); // launch-time TP: same, in green
 
     target.useBitmapCoordinateSpace((scope) => {
       const ctx = scope.context;
@@ -99,21 +100,29 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
           pts.push({ x: xc * hr, y: yc * vr, increase: f.increase, buy: f.buy });
         }
 
-        // Original-SL segment: a thin dashed line at the launch-time SL spanning
-        // the trade's duration (first fill → last fill, or → right edge while the
-        // trade is still open). Drawn first so triangles/lines sit on top.
-        if (trade.original_sl != null && trade.fills.length > 0 && barTimes.length > 0) {
+        // Original-SL / original-TP segments: thin dashed lines at the launch-time
+        // levels spanning the trade's duration (first fill → last fill, or → right
+        // edge while the trade is still open). Drawn first so triangles/lines sit
+        // on top. Both share the trade's x-range, so it is computed once.
+        if (trade.fills.length > 0 && barTimes.length > 0
+            && (trade.original_sl != null || trade.original_tp != null)) {
           const startSec = snapToBar(barTimes, toSecNum(trade.fills[0].time));
           const endSec = trade.closed
             ? snapToBar(barTimes, toSecNum(trade.fills[trade.fills.length - 1].time))
             : barTimes[barTimes.length - 1];
-          const y0 = series.priceToCoordinate(trade.original_sl);
-          if (startSec != null && endSec != null && y0 != null) {
-            const x1 = ts.timeToCoordinate(startSec as Time);
-            const x2 = ts.timeToCoordinate(endSec as Time);
-            if (x1 != null && x2 != null) {
+          const x1 = startSec != null ? ts.timeToCoordinate(startSec as Time) : null;
+          const x2 = endSec   != null ? ts.timeToCoordinate(endSec   as Time) : null;
+          if (x1 != null && x2 != null) {
+            const levels: [number | null, string][] = [
+              [trade.original_sl, sl0Color],
+              [trade.original_tp, tp0Color],
+            ];
+            for (const [price, color] of levels) {
+              if (price == null) continue;
+              const y0 = series.priceToCoordinate(price);
+              if (y0 == null) continue;
               ctx.save();
-              ctx.strokeStyle = sl0Color;
+              ctx.strokeStyle = color;
               ctx.lineWidth = Math.max(1, Math.floor(vr));
               ctx.setLineDash([4 * hr, 4 * hr]);
               ctx.beginPath();

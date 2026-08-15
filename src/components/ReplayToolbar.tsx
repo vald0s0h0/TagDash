@@ -180,6 +180,18 @@ export function ReplayToolbar() {
         Replay
       </span>
 
+      {/* A replay is always simulated, whatever broker is selected. Said here rather
+          than left implicit: with Alpaca armed, the natural assumption is that the
+          buy button still reaches the venue — it does not, and it must not. */}
+      {active && (
+        <span
+          title="Un replay est toujours simulé : aucun ordre n'est envoyé au broker, quel que soit le broker sélectionné."
+          className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300/90"
+        >
+          Ordres simulés
+        </span>
+      )}
+
       {!active && (
         <>
           <button

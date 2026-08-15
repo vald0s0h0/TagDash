@@ -60,7 +60,9 @@ function GamepadRow({
           onClick={onClear}
           disabled={recording}
           className="text-muted-foreground hover:text-red-400 disabled:opacity-20"
-          title="Réassigner par défaut"
+          // Commands that ship unbound have no default to go back to — for those
+          // the ✕ simply clears the button the user assigned.
+          title={DEFAULT_BINDINGS[action.id] ? "Réassigner par défaut" : "Effacer l'assignation"}
         >
           <X className="h-3 w-3" />
         </button>

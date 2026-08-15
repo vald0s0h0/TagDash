@@ -1,6 +1,10 @@
-// Settings → Flux de données → Source de données. Ported from the former FlatFilesModal —
-// download, browse and share offline market-data days, plus the API ↔ Flat files toggle
-// (now defined here only — it used to be duplicated in Settings → API Keys).
+// Settings → Flux de données → Source de données. Download, browse and share offline
+// market-data days, plus the offline switch.
+//
+// There is no API ↔ Flat files mode any more: the two are complementary sources and
+// every read resolves to whoever can answer — on-disk history first, the API to fill
+// the gaps, the live feed for the present. The only switch left is "hors ligne",
+// which means "never touch the network", not "use another code path".
 //
 // Three datasets live side by side, each with its own download logic + calendar:
 //   • Trade  — real trades + quotes inside the [alert−1min, +10min] windows where a
@@ -85,9 +89,10 @@ function formatBytes(n: number): string {
 export function DataSourceTab() {
   const { data: config } = useLocalConfig();
   const update = useUpdateLocalConfig();
-  const mode = config?.data_source?.mode ?? "api";
+  const offline = config?.data_source?.offline ?? false;
 
-  // Switching data source changes the startup pipeline → prompt for a restart.
+  // Reads pick the new policy up immediately, but the live feed and the startup
+  // pipeline both ran at launch — so coming back online needs a restart.
   const [showRestart, setShowRestart] = useState(false);
 
   // Active sub-tab (dataset).
@@ -143,10 +148,10 @@ export function DataSourceTab() {
   const running = status?.running ?? false;
   const meta = KIND_META[tab];
 
-  const setMode = (next: "api" | "flat_files") => {
-    if (!config || next === mode) return;
+  const setOffline = (next: boolean) => {
+    if (!config || next === offline) return;
     update.mutate(
-      { ...config, data_source: { mode: next } },
+      { ...config, data_source: { offline: next } },
       { onSuccess: () => setShowRestart(true) },
     );
   };
@@ -186,36 +191,42 @@ export function DataSourceTab() {
   return (
     <>
       <div className="space-y-4">
-        {/* ── Data source toggle ── */}
+        {/* ── Network policy ── */}
         <div className="rounded-md border border-border p-3">
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0">
               <div className="text-sm font-medium">Source de données</div>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                {mode === "flat_files"
-                  ? "Flat files — aucune donnée temps réel. Market Replay uniquement (ouvert par défaut au démarrage)."
-                  : "API Alpaca — données temps réel (trading en direct possible)."}
+                {offline
+                  ? "Hors ligne — flat files uniquement. Aucune requête réseau, aucun flux temps réel : Market Replay seulement, et les journées non téléchargées restent vides."
+                  : "API Alpaca + flat files. L'historique local est lu en premier, l'API comble les trous, le flux temps réel alimente la séance en cours."}
               </p>
             </div>
             <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
-              {(["api", "flat_files"] as const).map((m) => (
+              {([false, true] as const).map((v) => (
                 <button
-                  key={m}
-                  onClick={() => setMode(m)}
+                  key={String(v)}
+                  onClick={() => setOffline(v)}
                   disabled={update.isPending}
                   className={cn(
                     "flex items-center gap-1.5 px-3 py-1.5 text-xs transition-colors",
-                    mode === m
+                    offline === v
                       ? "bg-accent text-foreground"
                       : "text-muted-foreground hover:bg-accent/50",
                   )}
                 >
-                  {m === "api" ? <Radio className="h-3.5 w-3.5" /> : <Database className="h-3.5 w-3.5" />}
-                  {m === "api" ? "API" : "Flat files"}
+                  {v ? <Database className="h-3.5 w-3.5" /> : <Radio className="h-3.5 w-3.5" />}
+                  {v ? "Hors ligne" : "API"}
                 </button>
               ))}
             </div>
           </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            Le mode « Hors ligne » sert à deux choses : travailler sans connexion (ou sans clé
+            Alpaca), et garantir la reproductibilité d'un backtest — avec le réseau actif, le
+            comblement des trous dépend de la connexion, donc deux passes sur la même période
+            ne sont pas strictement comparables.
+          </p>
         </div>
 
         {/* ── Sub-tabs: Trade / Minute / Daily ── */}

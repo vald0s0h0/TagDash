@@ -1,7 +1,7 @@
-// Shown after the data-source mode (API ↔ Flat files) is changed. The startup
-// pipeline differs between the two modes (flat-files mode skips Alpaca, loads the
-// daily history from disk and parks the latest day in Market Replay), so the app
-// must restart to apply the new sequence. Offers an immediate relaunch or "later".
+// Shown after the offline switch is toggled. Chart and history reads pick the new
+// policy up on their next call, but the live feed and the startup pipeline both ran
+// at launch — so applying it fully (reconnecting the feed, re-running the network
+// steps) needs a restart. Offers an immediate relaunch or "later".
 
 import { RefreshCw } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -40,9 +40,10 @@ export function RestartRequiredDialog({ open, onClose }: Props) {
           </DialogTitle>
         </DialogHeader>
         <p className="text-sm text-muted-foreground">
-          Le changement de source de données modifie la séquence de démarrage
-          (startup pipeline). Redémarre TagDash pour l'appliquer — en mode flat
-          files les flux temps réel sont remplacés par le Market Replay hors-ligne.
+          Les graphiques appliquent la nouvelle politique immédiatement, mais le flux
+          temps réel et le pipeline de démarrage ont déjà tourné au lancement.
+          Redémarre TagDash pour reconnecter le flux (ou le couper) et relancer les
+          étapes réseau.
         </p>
         <div className="mt-2 flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={onClose}>

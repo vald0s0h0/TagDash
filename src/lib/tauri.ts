@@ -51,6 +51,12 @@ import type {
   TradeExecutions,
   TradeLifecycle,
   ZoneTradeContext,
+  BrokerAccount,
+  BrokerMirror,
+  BrokerSelection,
+  Shortability,
+  PanicRunState,
+  PanicLlmScore,
 } from "@/types";
 
 export const api = {
@@ -139,17 +145,12 @@ export const api = {
   getAllAlarms: () => invoke<AlarmView[]>("get_all_alarms"),
   deleteAlarm:  (id: string) => invoke<void>("delete_alarm", { id }),
 
-  // Dev / mock alerts
-  getMockAlerts: () => invoke<AlertSignal[]>("get_mock_alerts"),
-
   // Startup pipeline
   runStartupPipeline:    () => invoke<void>("run_startup_pipeline"),
   getStartupStatus:      () => invoke<StartupState>("get_startup_status"),
   getStreamableUniverse: () => invoke<StreamableSymbol[]>("get_streamable_universe"),
 
   // Live market feed
-  startMockMarketFeed: () => invoke<void>("start_mock_market_feed"),
-  stopMockMarketFeed:  () => invoke<void>("stop_mock_market_feed"),
   startLiveFeed:       () => invoke<void>("start_live_feed"),
   stopLiveFeed:        () => invoke<void>("stop_live_feed"),
   startNewsFeed:       () => invoke<void>("start_news_feed"),
@@ -219,8 +220,26 @@ export const api = {
   // Pre-open screener dismissals, persisted per trading day.
   dismissScreener: (symbol: string) => invoke<void>("dismiss_screener", { symbol }),
   getScreenerDismissals: () => invoke<string[]>("get_screener_dismissals"),
+  // Shares outstanding from SEC EDGAR (free, keyless) → market cap → the size
+  // buckets of the Panic screener. Quarterly refresh is enough.
+  refreshSecShares:   () => invoke<number>("refresh_sec_shares"),
+  secSharesCoverage:  () => invoke<number>("sec_shares_coverage"),
+  // Pre-open screener pins. NOT day-scoped: a pin keeps the ticker on the list on
+  // the following days until removed. Stored separately for live vs Market Replay.
+  pinScreener:   (symbol: string) => invoke<void>("pin_screener", { symbol }),
+  unpinScreener: (symbol: string) => invoke<void>("unpin_screener", { symbol }),
+  getScreenerPins: () => invoke<string[]>("get_screener_pins"),
   startScanner:    () => invoke<void>("start_scanner"),
   stopScanner:     () => invoke<void>("stop_scanner"),
+
+  // Panic Score — LLM ranking of the VISIBLE pre-open watchlist. The symbol list is
+  // passed in deliberately: the backend's screener list still holds the rows the user
+  // dismissed today, and re-deriving it would spend a model call per discarded name.
+  runPanicLlmAnalysis: (symbols: string[]) =>
+    invoke<void>("run_panic_llm_analysis", { symbols }),
+  getPanicLlmRun:      () => invoke<PanicRunState>("get_panic_llm_run"),
+  getPanicLlmScores:   () => invoke<PanicLlmScore[]>("get_panic_llm_scores"),
+  hasWebSearchProvider: () => invoke<boolean>("has_web_search_provider"),
 
   // Chart / zone trade context
   getZoneTradeContext: (zone_id: string, symbol: string) =>
@@ -234,17 +253,21 @@ export const api = {
   clearZoneContext: (zone_id: string) =>
     invoke<void>("clear_zone_context", { zone_id }),
 
-  // Internal trading engine
+  // Order entry. Routed by the ACTIVE broker: internal simulator, or straight to
+  // Alpaca when Alpaca is selected. These return nothing on purpose — with a real
+  // venue there is no result to return synchronously (a market order is filled by
+  // the venue, not here), so the outcome arrives through the positions/orders
+  // queries. A rejection surfaces as a rejected promise → notification.
   createInternalOrderPercent: (zone_id: string, percent: number) =>
-    invoke<InternalOrder>("create_internal_order_percent", { zone_id, percent }),
+    invoke<void>("create_internal_order_percent", { zone_id, percent }),
   createInternalLimitOrderPercent: (zone_id: string, percent: number, limit_price: number) =>
-    invoke<InternalOrder>("create_internal_limit_order_percent", { zone_id, percent, limit_price }),
+    invoke<void>("create_internal_limit_order_percent", { zone_id, percent, limit_price }),
   createInternalMarketOrderPercent: (zone_id: string, percent: number) =>
-    invoke<Fill>("create_internal_market_order_percent", { zone_id, percent }),
+    invoke<void>("create_internal_market_order_percent", { zone_id, percent }),
   cancelInternalOrder: (order_id: string) =>
     invoke<void>("cancel_internal_order", { order_id }),
   closeInternalPosition: (symbol: string, zone_id: string) =>
-    invoke<Fill>("close_internal_position", { symbol, zone_id }),
+    invoke<void>("close_internal_position", { symbol, zone_id }),
   getInternalPositions: () =>
     invoke<Position[]>("get_internal_positions"),
   getInternalOrders: () =>
@@ -289,6 +312,24 @@ export const api = {
   flatFilesDownload: (kind: FlatFilesKind, start_day: string, end_day: string) =>
     invoke<void>("flat_files_download", { kind, start_day, end_day }),
   flatFilesCancel:      () => invoke<void>("flat_files_cancel"),
+  // Broker — account selection + the venue's own view of orders/positions.
+  getScreenerRatings: () => invoke<Record<string, number>>("get_screener_ratings"),
+  setScreenerRating:  (symbol: string, rating: number) =>
+    invoke<void>("set_screener_rating", { symbol, rating }),
+
+  getBrokerSelection: () => invoke<BrokerSelection>("get_broker_selection"),
+  setBrokerSelection: (broker_id: string, environment: string) =>
+    invoke<BrokerSelection>("set_broker_selection", { broker_id, environment }),
+  getBrokerMirror:    () => invoke<BrokerMirror>("get_broker_mirror"),
+  getBrokerAccount:   () => invoke<BrokerAccount | null>("get_broker_account"),
+  brokerCancelOrder:  (order_id: string) =>
+    invoke<void>("broker_cancel_order", { order_id }),
+  brokerClosePosition: (symbol: string) =>
+    invoke<void>("broker_close_position", { symbol }),
+  getShortability:    (symbol: string) =>
+    invoke<Shortability>("get_shortability", { symbol }),
+  getNonShortableSymbols: () => invoke<string[]>("get_non_shortable_symbols"),
+
   getFlatFilesStatus:   () => invoke<FlatFilesStatus>("get_flat_files_status"),
   getFlatFilesCalendar: (kind: FlatFilesKind) =>
     invoke<FlatFileDay[]>("get_flat_files_calendar", { kind }),

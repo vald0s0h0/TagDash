@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 pub mod news;
+pub mod reference;
 pub mod short_interest;
 pub mod splits;
 
@@ -146,7 +147,11 @@ pub async fn fetch_float(api_key: &str, ticker: &str) -> Result<Option<MassiveFl
         return Err(format!("Massive HTTP {}", resp.status()));
     }
     let parsed: FloatResponse = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(parsed.results.into_iter().filter_map(RawFloat::into_float).next())
+    Ok(parsed
+        .results
+        .into_iter()
+        .filter_map(RawFloat::into_float)
+        .next())
 }
 
 /// One symbol's float as it stood on (or just before) a requested past date.
@@ -200,12 +205,20 @@ pub async fn fetch_float_asof(
 /// Choose the float row effective on/before `day` (most recent such), else the latest
 /// row available (flagged non-historical). Pure so it is unit-testable.
 fn pick_asof(rows: Vec<RawAsOf>, day: &str) -> Option<AsOfFloat> {
-    let rows: Vec<RawAsOf> = rows.into_iter().filter(|r| r.free_float.is_some()).collect();
+    let rows: Vec<RawAsOf> = rows
+        .into_iter()
+        .filter(|r| r.free_float.is_some())
+        .collect();
     // Historical candidates: effective_date present and ≤ day. Lexicographic compare is
     // valid for zero-padded YYYY-MM-DD.
     let best_hist = rows
         .iter()
-        .filter(|r| r.effective_date.as_deref().map(|e| e <= day).unwrap_or(false))
+        .filter(|r| {
+            r.effective_date
+                .as_deref()
+                .map(|e| e <= day)
+                .unwrap_or(false)
+        })
         .max_by(|a, b| a.effective_date.cmp(&b.effective_date));
     if let Some(r) = best_hist {
         return Some(AsOfFloat {
@@ -215,25 +228,13 @@ fn pick_asof(rows: Vec<RawAsOf>, day: &str) -> Option<AsOfFloat> {
         });
     }
     // Fallback: the latest row Massive returned.
-    rows.into_iter().max_by(|a, b| a.effective_date.cmp(&b.effective_date)).map(|r| AsOfFloat {
-        float_shares: r.free_float.unwrap(),
-        effective_date: r.effective_date,
-        historical: false,
-    })
-}
-
-/// Mock float data — mirrors the FMP mock set so dev/mock mode behaves the same
-/// whichever provider is wired in.
-pub fn mock_float_all() -> Vec<MassiveFloat> {
-    crate::fmp::mock_shares_float_all()
-        .into_iter()
-        .map(|f| MassiveFloat {
-            symbol: f.symbol,
-            float_shares: f.float_shares,
-            outstanding_shares: f.outstanding_shares,
-            free_float: f.free_float,
+    rows.into_iter()
+        .max_by(|a, b| a.effective_date.cmp(&b.effective_date))
+        .map(|r| AsOfFloat {
+            float_shares: r.free_float.unwrap(),
+            effective_date: r.effective_date,
+            historical: false,
         })
-        .collect()
 }
 
 #[cfg(test)]
@@ -251,8 +252,11 @@ mod tests {
             ]
         }"#;
         let parsed: FloatResponse = serde_json::from_str(body).unwrap();
-        let floats: Vec<MassiveFloat> =
-            parsed.results.into_iter().filter_map(RawFloat::into_float).collect();
+        let floats: Vec<MassiveFloat> = parsed
+            .results
+            .into_iter()
+            .filter_map(RawFloat::into_float)
+            .collect();
         assert_eq!(floats.len(), 2);
         assert_eq!(floats[0].symbol, "AAPL");
         assert_eq!(floats[0].float_shares, 13_515_457_484.0);
@@ -265,15 +269,21 @@ mod tests {
     #[test]
     fn with_key_handles_existing_query() {
         assert_eq!(with_key("https://x/float", "K"), "https://x/float?apiKey=K");
-        assert_eq!(with_key("https://x/float?cursor=AB", "K"), "https://x/float?cursor=AB&apiKey=K");
+        assert_eq!(
+            with_key("https://x/float?cursor=AB", "K"),
+            "https://x/float?cursor=AB&apiKey=K"
+        );
     }
 
     #[test]
     fn missing_free_float_is_skipped() {
         let body = r#"{"status":"OK","results":[{"ticker":"X","free_float_percent":50.0}]}"#;
         let parsed: FloatResponse = serde_json::from_str(body).unwrap();
-        let floats: Vec<MassiveFloat> =
-            parsed.results.into_iter().filter_map(RawFloat::into_float).collect();
+        let floats: Vec<MassiveFloat> = parsed
+            .results
+            .into_iter()
+            .filter_map(RawFloat::into_float)
+            .collect();
         assert!(floats.is_empty());
     }
 
@@ -309,8 +319,11 @@ mod tests {
             {"free_float":3950100,"effective_date":"2026-01-29","free_float_percent":20.5}
         ]}"#;
         let parsed: FloatResponse = serde_json::from_str(body).unwrap();
-        let floats: Vec<MassiveFloat> =
-            parsed.results.into_iter().filter_map(RawFloat::into_float).collect();
+        let floats: Vec<MassiveFloat> = parsed
+            .results
+            .into_iter()
+            .filter_map(RawFloat::into_float)
+            .collect();
         assert_eq!(floats.len(), 1);
         assert_eq!(floats[0].symbol, "RGA");
     }
@@ -322,7 +335,10 @@ mod tests {
     #[ignore = "hits live Massive API; set MASSIVE_API_KEY"]
     async fn live_massive_float() {
         let key = std::env::var("MASSIVE_API_KEY").expect("set MASSIVE_API_KEY");
-        let one = fetch_float(&key, "AAPL").await.unwrap().expect("AAPL float");
+        let one = fetch_float(&key, "AAPL")
+            .await
+            .unwrap()
+            .expect("AAPL float");
         eprintln!("AAPL: {one:?}");
         assert!(one.float_shares > 0.0);
 

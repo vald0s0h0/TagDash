@@ -11,8 +11,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    Fill, FillWindow, InternalOrder, OrderStatus, OrderType, Position, RiskSizingResult,
-    Side, Trade, TradeLifecycle,
+    Fill, FillWindow, InternalOrder, OrderStatus, OrderType, Position, RiskSizingResult, Side,
+    Trade, TradeLifecycle,
 };
 
 // ─── ID helpers ──────────────────────────────────────────────────────────────
@@ -25,23 +25,23 @@ fn gen_id() -> String {
 /// Max adverse / favorable excursion in dollars (positive magnitudes), given the
 /// position side, average entry, share count, and the high/low price watermarks
 /// observed while open. Returns `(mae, mfe)`.
-fn excursions(side: Side, entry: f64, qty: f64, high: f64, low: f64) -> (f64, f64) {
-    let up   = (high - entry).max(0.0) * qty; // gain if long / loss if short
-    let down = (entry - low).max(0.0)  * qty; // loss if long / gain if short
+pub(crate) fn excursions(side: Side, entry: f64, qty: f64, high: f64, low: f64) -> (f64, f64) {
+    let up = (high - entry).max(0.0) * qty; // gain if long / loss if short
+    let down = (entry - low).max(0.0) * qty; // loss if long / gain if short
     match side {
-        Side::Long  => (down, up), // adverse = drop below entry, favorable = rise
+        Side::Long => (down, up), // adverse = drop below entry, favorable = rise
         Side::Short => (up, down),
     }
 }
 
 // ─── InternalBook ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct InternalBook {
-    pub trades:    HashMap<String, Trade>,
-    pub orders:    HashMap<String, InternalOrder>,
+    pub trades: HashMap<String, Trade>,
+    pub orders: HashMap<String, InternalOrder>,
     pub positions: HashMap<String, Position>, // keyed by symbol
-    pub fills:     Vec<Fill>,
+    pub fills: Vec<Fill>,
 }
 
 impl InternalBook {
@@ -69,26 +69,35 @@ impl InternalBook {
     /// just-closed trade is still queryable until the next restart.
     pub fn persistable_snapshot(&self) -> InternalBook {
         use std::collections::HashSet;
-        let open_trades: HashSet<&str> = self.trades.values()
+        let open_trades: HashSet<&str> = self
+            .trades
+            .values()
             .filter(|t| t.closed_at.is_none())
             .map(|t| t.trade_id.as_str())
             .collect();
 
         InternalBook {
             positions: self.positions.clone(),
-            trades: self.trades.values()
+            trades: self
+                .trades
+                .values()
                 .filter(|t| t.closed_at.is_none())
                 .map(|t| (t.trade_id.clone(), t.clone()))
                 .collect(),
-            fills: self.fills.iter()
+            fills: self
+                .fills
+                .iter()
                 .filter(|f| open_trades.contains(f.trade_id.as_str()))
                 .cloned()
                 .collect(),
-            orders: self.orders.iter()
+            orders: self
+                .orders
+                .iter()
                 .filter(|(_, o)| o.status != OrderStatus::Cancelled)
                 .filter(|(_, o)| {
                     o.status == OrderStatus::Pending
-                        || o.trade_id.as_deref()
+                        || o.trade_id
+                            .as_deref()
                             .map(|t| open_trades.contains(t))
                             .unwrap_or(false)
                 })
@@ -101,10 +110,10 @@ impl InternalBook {
 
     pub fn compute_risk_sizing(
         entry_price: f64,
-        stop_loss:   f64,
-        max_risk:    f64,
-        min_size:    u32,
-        max_size:    u32,
+        stop_loss: f64,
+        max_risk: f64,
+        min_size: u32,
+        max_size: u32,
     ) -> RiskSizingResult {
         risk::compute(entry_price, stop_loss, max_risk, min_size, max_size)
     }
@@ -113,18 +122,18 @@ impl InternalBook {
 
     pub fn create_limit_order(
         &mut self,
-        trade_id:    Option<String>,
-        zone_id:     String,
-        symbol:      String,
+        trade_id: Option<String>,
+        zone_id: String,
+        symbol: String,
         strategy_id: String,
-        side:        Side,
-        quantity:    i64,
+        side: Side,
+        quantity: i64,
         limit_price: f64,
-        stop_loss:   Option<f64>,
+        stop_loss: Option<f64>,
         take_profit: Option<f64>,
     ) -> InternalOrder {
         let order_id = gen_id();
-        let now      = crate::time::now();
+        let now = crate::time::now();
 
         // OCO indicator: both SL and TP configured
         let oco_group = if stop_loss.is_some() && take_profit.is_some() {
@@ -136,21 +145,21 @@ impl InternalBook {
         // Ensure a Trade record exists for this tradeID
         if let Some(ref tid) = trade_id {
             self.trades.entry(tid.clone()).or_insert_with(|| Trade {
-                trade_id:    tid.clone(),
-                symbol:      symbol.clone(),
+                trade_id: tid.clone(),
+                symbol: symbol.clone(),
                 strategy_id: strategy_id.clone(),
-                side:        Some(side),
+                side: Some(side),
                 stop_loss,
                 take_profit,
-                opened_at:   None,
-                closed_at:   None,
+                opened_at: None,
+                closed_at: None,
                 entry_price: None,
-                quantity:    None,
-                notes:       None,
-                confidence:  None,
-                tags:        vec![],
-                mae:         None,
-                mfe:         None,
+                quantity: None,
+                notes: None,
+                confidence: None,
+                tags: vec![],
+                mae: None,
+                mfe: None,
             });
         }
 
@@ -160,16 +169,16 @@ impl InternalBook {
             zone_id,
             symbol,
             side,
-            order_type:  OrderType::Limit,
+            order_type: OrderType::Limit,
             limit_price: Some(limit_price),
-            stop_price:  None,
+            stop_price: None,
             quantity,
             stop_loss,
             take_profit,
-            status:      OrderStatus::Pending,
+            status: OrderStatus::Pending,
             oco_group,
             reduce_only: false,
-            created_at:  now,
+            created_at: now,
         };
 
         self.orders.insert(order_id, order.clone());
@@ -180,19 +189,19 @@ impl InternalBook {
 
     pub fn execute_market_fill(
         &mut self,
-        trade_id:    Option<String>,
-        zone_id:     String,
-        symbol:      String,
+        trade_id: Option<String>,
+        zone_id: String,
+        symbol: String,
         strategy_id: String,
-        side:        Side,
-        quantity:    i64,
-        fill_price:  f64,
-        stop_loss:   Option<f64>,
+        side: Side,
+        quantity: i64,
+        fill_price: f64,
+        stop_loss: Option<f64>,
         take_profit: Option<f64>,
     ) -> Fill {
         let order_id = gen_id();
-        let fill_id  = gen_id();
-        let now      = crate::time::now();
+        let fill_id = gen_id();
+        let now = crate::time::now();
 
         let effective_tid = trade_id.clone().unwrap_or_else(|| {
             format!(
@@ -204,23 +213,26 @@ impl InternalBook {
         });
 
         // Ensure trade record exists
-        let trade = self.trades.entry(effective_tid.clone()).or_insert_with(|| Trade {
-            trade_id:    effective_tid.clone(),
-            symbol:      symbol.clone(),
-            strategy_id: strategy_id.clone(),
-            side:        Some(side),
-            stop_loss,
-            take_profit,
-            opened_at:   Some(now),
-            closed_at:   None,
-            entry_price: Some(fill_price),
-            quantity:    Some(quantity),
-            notes:       None,
-            confidence:  None,
-            tags:        vec![],
-            mae:         None,
-            mfe:         None,
-        });
+        let trade = self
+            .trades
+            .entry(effective_tid.clone())
+            .or_insert_with(|| Trade {
+                trade_id: effective_tid.clone(),
+                symbol: symbol.clone(),
+                strategy_id: strategy_id.clone(),
+                side: Some(side),
+                stop_loss,
+                take_profit,
+                opened_at: Some(now),
+                closed_at: None,
+                entry_price: Some(fill_price),
+                quantity: Some(quantity),
+                notes: None,
+                confidence: None,
+                tags: vec![],
+                mae: None,
+                mfe: None,
+            });
         if trade.opened_at.is_none() {
             trade.opened_at = Some(now);
         }
@@ -229,40 +241,51 @@ impl InternalBook {
         }
 
         // Filled order record
-        self.orders.insert(order_id.clone(), InternalOrder {
-            order_id:    order_id.clone(),
-            trade_id:    Some(effective_tid.clone()),
-            zone_id:     zone_id.clone(),
-            symbol:      symbol.clone(),
-            side,
-            order_type:  OrderType::Market,
-            limit_price: None,
-            stop_price:  None,
-            quantity,
-            stop_loss,
-            take_profit,
-            status:      OrderStatus::Filled,
-            oco_group:   None,
-            reduce_only: false,
-            created_at:  now,
-        });
+        self.orders.insert(
+            order_id.clone(),
+            InternalOrder {
+                order_id: order_id.clone(),
+                trade_id: Some(effective_tid.clone()),
+                zone_id: zone_id.clone(),
+                symbol: symbol.clone(),
+                side,
+                order_type: OrderType::Market,
+                limit_price: None,
+                stop_price: None,
+                quantity,
+                stop_loss,
+                take_profit,
+                status: OrderStatus::Filled,
+                oco_group: None,
+                reduce_only: false,
+                created_at: now,
+            },
+        );
 
         let fill = Fill {
-            fill_id:    fill_id.clone(),
+            fill_id: fill_id.clone(),
             order_id,
-            trade_id:   effective_tid.clone(),
-            symbol:     symbol.clone(),
+            trade_id: effective_tid.clone(),
+            symbol: symbol.clone(),
             side,
             quantity,
             fill_price,
-            filled_at:  now,
+            filled_at: now,
         };
         self.fills.push(fill.clone());
 
         // Apply to position
         self.apply_fill(
-            &symbol, &effective_tid, &zone_id, &strategy_id,
-            side, quantity, fill_price, stop_loss, take_profit, now,
+            &symbol,
+            &effective_tid,
+            &zone_id,
+            &strategy_id,
+            side,
+            quantity,
+            fill_price,
+            stop_loss,
+            take_profit,
+            now,
         );
 
         fill
@@ -272,20 +295,20 @@ impl InternalBook {
 
     fn apply_fill(
         &mut self,
-        symbol:      &str,
-        trade_id:    &str,
-        zone_id:     &str,
+        symbol: &str,
+        trade_id: &str,
+        zone_id: &str,
         strategy_id: &str,
-        side:        Side,
-        quantity:    i64,
-        fill_price:  f64,
-        stop_loss:   Option<f64>,
+        side: Side,
+        quantity: i64,
+        fill_price: f64,
+        stop_loss: Option<f64>,
         take_profit: Option<f64>,
-        now:         DateTime<Utc>,
+        now: DateTime<Utc>,
     ) {
         // Signed qty: Long = +qty, Short = -qty
         let signed = match side {
-            Side::Long  =>  quantity.abs(),
+            Side::Long => quantity.abs(),
             Side::Short => -quantity.abs(),
         };
 
@@ -294,7 +317,7 @@ impl InternalBook {
             // the MAE/MFE watermarks (an exit fill, e.g. an SL hit, is often the
             // extreme).
             pos.high_water = pos.high_water.max(fill_price);
-            pos.low_water  = pos.low_water.min(fill_price);
+            pos.low_water = pos.low_water.min(fill_price);
 
             let old_qty = pos.quantity;
             let new_qty = old_qty + signed;
@@ -302,8 +325,11 @@ impl InternalBook {
             if new_qty == 0 {
                 // Position gone flat — capture MAE/MFE then close the trade.
                 let (mae, mfe) = excursions(
-                    pos.side, pos.avg_entry_price, old_qty.unsigned_abs() as f64,
-                    pos.high_water, pos.low_water,
+                    pos.side,
+                    pos.avg_entry_price,
+                    old_qty.unsigned_abs() as f64,
+                    pos.high_water,
+                    pos.low_water,
                 );
                 if let Some(t) = self.trades.get_mut(trade_id) {
                     t.closed_at = Some(now);
@@ -314,36 +340,51 @@ impl InternalBook {
                 return;
             }
 
-            // Averaging in (same direction) → weighted avg entry
-            if old_qty.signum() == new_qty.signum() {
+            // Only an ADD in the same direction changes average entry. A partial
+            // reduction keeps the original cost basis; including the exit proceeds
+            // in the weighted average would produce nonsense (e.g. long 100 @ 10,
+            // sell 50 @ 11 => 31 instead of 10). If the fill crosses through flat,
+            // the residual position is a new exposure opened at this fill price.
+            if old_qty.signum() == signed.signum() {
                 let old_cost = pos.avg_entry_price * old_qty.abs() as f64;
                 let new_cost = fill_price * signed.unsigned_abs() as f64;
                 pos.avg_entry_price = (old_cost + new_cost) / new_qty.abs() as f64;
+            } else if old_qty.signum() != new_qty.signum() {
+                pos.avg_entry_price = fill_price;
+                pos.high_water = fill_price;
+                pos.low_water = fill_price;
             }
             pos.quantity = new_qty;
-            pos.side     = if new_qty > 0 { Side::Long } else { Side::Short };
-            if stop_loss.is_some()   { pos.stop_loss   = stop_loss; }
-            if take_profit.is_some() { pos.take_profit = take_profit; }
+            pos.side = if new_qty > 0 { Side::Long } else { Side::Short };
+            if stop_loss.is_some() {
+                pos.stop_loss = stop_loss;
+            }
+            if take_profit.is_some() {
+                pos.take_profit = take_profit;
+            }
         } else {
             // New position
-            self.positions.insert(symbol.to_string(), Position {
-                trade_id:        trade_id.to_string(),
-                zone_id:         zone_id.to_string(),
-                symbol:          symbol.to_string(),
-                strategy_id:     strategy_id.to_string(),
-                side:            if signed > 0 { Side::Long } else { Side::Short },
-                quantity:        signed,
-                avg_entry_price: fill_price,
-                stop_loss,
-                take_profit,
-                unrealized_pnl:  Some(0.0),
-                r_multiple:      None,
-                opened_at:       now,
-                high_water:      fill_price,
-                low_water:       fill_price,
-                auto_be_applied: false,
-                auto_tp_applied: false,
-            });
+            self.positions.insert(
+                symbol.to_string(),
+                Position {
+                    trade_id: trade_id.to_string(),
+                    zone_id: zone_id.to_string(),
+                    symbol: symbol.to_string(),
+                    strategy_id: strategy_id.to_string(),
+                    side: if signed > 0 { Side::Long } else { Side::Short },
+                    quantity: signed,
+                    avg_entry_price: fill_price,
+                    stop_loss,
+                    take_profit,
+                    unrealized_pnl: Some(0.0),
+                    r_multiple: None,
+                    opened_at: now,
+                    high_water: fill_price,
+                    low_water: fill_price,
+                    auto_be_applied: false,
+                    auto_tp_applied: false,
+                },
+            );
         }
     }
 
@@ -361,19 +402,16 @@ impl InternalBook {
     // A symbol absent from `windows` (no print this poll) is never actioned, so a
     // resting stop can't fire against a fabricated/zero price (e.g. just after a
     // replay day rolls over before the symbol's first new-day trade).
-    pub fn try_fill_pending(
-        &mut self,
-        windows: &HashMap<String, FillWindow>,
-    ) -> Vec<Fill> {
+    pub fn try_fill_pending(&mut self, windows: &HashMap<String, FillWindow>) -> Vec<Fill> {
         let now = crate::time::now();
 
         // A triggered order: its gap-aware fill price, and a per-symbol rank so
         // OCO siblings are processed in the order the price reached them.
         struct Candidate {
-            oid:        String,
-            order:      InternalOrder,
+            oid: String,
+            order: InternalOrder,
             fill_price: f64,
-            rank:       u8,
+            rank: u8,
         }
         let mut cands: Vec<Candidate> = vec![];
 
@@ -381,28 +419,34 @@ impl InternalBook {
             if order.status != OrderStatus::Pending {
                 continue;
             }
-            let Some(w) = windows.get(&order.symbol) else { continue };
+            let Some(w) = windows.get(&order.symbol) else {
+                continue;
+            };
 
             // (hit, touch_is_low, fill_price). `touch_is_low` = the price had to
             // reach the window LOW to trigger this order. `fill_price` fills at the
             // level, or at the window open when it gapped straight through it.
             let (hit, touch_is_low, fill_price) = match order.order_type {
                 OrderType::Limit => {
-                    let Some(limit) = order.limit_price else { continue };
+                    let Some(limit) = order.limit_price else {
+                        continue;
+                    };
                     match order.side {
                         // buy limit (long entry / short TP): fills on the low.
-                        Side::Long  => (w.low  <= limit, true,  w.first.min(limit)),
+                        Side::Long => (w.low <= limit, true, w.first.min(limit)),
                         // sell limit (short entry / long TP): fills on the high.
                         Side::Short => (w.high >= limit, false, w.first.max(limit)),
                     }
                 }
                 OrderType::Stop => {
-                    let Some(stop) = order.stop_price else { continue };
+                    let Some(stop) = order.stop_price else {
+                        continue;
+                    };
                     match order.side {
                         // sell stop (long SL): fills on the low.
-                        Side::Short => (w.low  <= stop, true,  w.first.min(stop)),
+                        Side::Short => (w.low <= stop, true, w.first.min(stop)),
                         // buy stop (short SL): fills on the high.
-                        Side::Long  => (w.high >= stop, false, w.first.max(stop)),
+                        Side::Long => (w.high >= stop, false, w.first.max(stop)),
                     }
                 }
                 OrderType::Market => continue,
@@ -412,7 +456,12 @@ impl InternalBook {
             }
             // The low-touch leg was reached first iff the low came first.
             let rank = u8::from(touch_is_low != w.low_first);
-            cands.push(Candidate { oid: oid.clone(), order: order.clone(), fill_price, rank });
+            cands.push(Candidate {
+                oid: oid.clone(),
+                order: order.clone(),
+                fill_price,
+                rank,
+            });
         }
 
         // Within a symbol, fill the path-first leg before its OCO sibling. `rank`
@@ -430,7 +479,9 @@ impl InternalBook {
         // tiebreak for orders created in the same instant) makes the order
         // deterministic: whichever order was resting first resolves first.
         cands.sort_by(|a, b| {
-            a.order.symbol.cmp(&b.order.symbol)
+            a.order
+                .symbol
+                .cmp(&b.order.symbol)
                 .then(a.rank.cmp(&b.rank))
                 .then(a.order.created_at.cmp(&b.order.created_at))
                 .then(a.oid.cmp(&b.oid))
@@ -438,7 +489,13 @@ impl InternalBook {
 
         let mut new_fills = vec![];
 
-        for Candidate { oid, order, fill_price, .. } in cands {
+        for Candidate {
+            oid,
+            order,
+            fill_price,
+            ..
+        } in cands
+        {
             // Skip if an OCO sibling that filled earlier in this same batch
             // already cancelled this order (prevents a double exit / phantom
             // position when SL and TP both trigger in one window).
@@ -467,27 +524,35 @@ impl InternalBook {
             let fill_id = gen_id();
             let effective_tid = order.trade_id.clone().unwrap_or_else(|| gen_id());
 
-            let strat_id = self.trades.get(&effective_tid)
+            let strat_id = self
+                .trades
+                .get(&effective_tid)
                 .map(|t| t.strategy_id.clone())
                 .unwrap_or_default();
 
             let fill = Fill {
                 fill_id,
-                order_id:   oid.clone(),
-                trade_id:   effective_tid.clone(),
-                symbol:     order.symbol.clone(),
-                side:       order.side,
-                quantity:   order.quantity,
+                order_id: oid.clone(),
+                trade_id: effective_tid.clone(),
+                symbol: order.symbol.clone(),
+                side: order.side,
+                quantity: order.quantity,
                 fill_price,
-                filled_at:  now,
+                filled_at: now,
             };
             self.fills.push(fill.clone());
 
             self.apply_fill(
-                &order.symbol, &effective_tid, &order.zone_id,
+                &order.symbol,
+                &effective_tid,
+                &order.zone_id,
                 &strat_id,
-                order.side, order.quantity, fill_price,
-                order.stop_loss, order.take_profit, now,
+                order.side,
+                order.quantity,
+                fill_price,
+                order.stop_loss,
+                order.take_profit,
+                now,
             );
 
             new_fills.push(fill);
@@ -505,7 +570,7 @@ impl InternalBook {
                 Ok(())
             }
             Some(_) => Err("order is not pending".into()),
-            None    => Err("order not found".into()),
+            None => Err("order not found".into()),
         }
     }
 
@@ -523,13 +588,17 @@ impl InternalBook {
             }
         }
 
-        let Some(pos) = self.positions.get(symbol).cloned() else { return };
+        let Some(pos) = self.positions.get(symbol).cloned() else {
+            return;
+        };
         let qty = pos.quantity.unsigned_abs() as i64;
-        if qty == 0 { return; }
+        if qty == 0 {
+            return;
+        }
 
         // Exit side is opposite the position direction.
         let exit_side = match pos.side {
-            Side::Long  => Side::Short,
+            Side::Long => Side::Short,
             Side::Short => Side::Long,
         };
         let oco = format!("bracket-{}", pos.trade_id);
@@ -539,45 +608,51 @@ impl InternalBook {
         // SL → protective stop (market exit on trigger).
         if let Some(sl) = pos.stop_loss {
             let oid = gen_id();
-            self.orders.insert(oid.clone(), InternalOrder {
-                order_id:    oid,
-                trade_id:    trade_id.clone(),
-                zone_id:     pos.zone_id.clone(),
-                symbol:      symbol.to_string(),
-                side:        exit_side,
-                order_type:  OrderType::Stop,
-                limit_price: None,
-                stop_price:  Some(sl),
-                quantity:    qty,
-                stop_loss:   None,
-                take_profit: None,
-                status:      OrderStatus::Pending,
-                oco_group:   Some(oco.clone()),
-                reduce_only: true,
-                created_at:  now,
-            });
+            self.orders.insert(
+                oid.clone(),
+                InternalOrder {
+                    order_id: oid,
+                    trade_id: trade_id.clone(),
+                    zone_id: pos.zone_id.clone(),
+                    symbol: symbol.to_string(),
+                    side: exit_side,
+                    order_type: OrderType::Stop,
+                    limit_price: None,
+                    stop_price: Some(sl),
+                    quantity: qty,
+                    stop_loss: None,
+                    take_profit: None,
+                    status: OrderStatus::Pending,
+                    oco_group: Some(oco.clone()),
+                    reduce_only: true,
+                    created_at: now,
+                },
+            );
         }
 
         // TP → limit exit.
         if let Some(tp) = pos.take_profit {
             let oid = gen_id();
-            self.orders.insert(oid.clone(), InternalOrder {
-                order_id:    oid,
-                trade_id:    trade_id.clone(),
-                zone_id:     pos.zone_id.clone(),
-                symbol:      symbol.to_string(),
-                side:        exit_side,
-                order_type:  OrderType::Limit,
-                limit_price: Some(tp),
-                stop_price:  None,
-                quantity:    qty,
-                stop_loss:   None,
-                take_profit: None,
-                status:      OrderStatus::Pending,
-                oco_group:   Some(oco),
-                reduce_only: true,
-                created_at:  now,
-            });
+            self.orders.insert(
+                oid.clone(),
+                InternalOrder {
+                    order_id: oid,
+                    trade_id: trade_id.clone(),
+                    zone_id: pos.zone_id.clone(),
+                    symbol: symbol.to_string(),
+                    side: exit_side,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(tp),
+                    stop_price: None,
+                    quantity: qty,
+                    stop_loss: None,
+                    take_profit: None,
+                    status: OrderStatus::Pending,
+                    oco_group: Some(oco),
+                    reduce_only: true,
+                    created_at: now,
+                },
+            );
         }
     }
 
@@ -598,17 +673,14 @@ impl InternalBook {
         // Propagate onto pending entry orders (not the reduce-only bracket exits,
         // which sync_bracket_orders owns and rebuilds from the position).
         for o in self.orders.values_mut() {
-            if o.symbol == symbol
-                && o.status == OrderStatus::Pending
-                && !o.reduce_only
-            {
-                o.stop_loss   = stop_loss;
+            if o.symbol == symbol && o.status == OrderStatus::Pending && !o.reduce_only {
+                o.stop_loss = stop_loss;
                 o.take_profit = take_profit;
             }
         }
 
         if let Some(pos) = self.positions.get_mut(symbol) {
-            pos.stop_loss   = stop_loss;
+            pos.stop_loss = stop_loss;
             pos.take_profit = take_profit;
             self.sync_bracket_orders(symbol);
         }
@@ -640,7 +712,9 @@ impl InternalBook {
     ) -> Vec<String> {
         let mut touched = vec![];
         for (symbol, pos) in self.positions.iter_mut() {
-            let Some(cfg) = configs.get(&pos.strategy_id) else { continue };
+            let Some(cfg) = configs.get(&pos.strategy_id) else {
+                continue;
+            };
             let mut changed = false;
 
             if cfg.auto_tp_enabled && !pos.auto_tp_applied && pos.take_profit.is_none() {
@@ -648,7 +722,7 @@ impl InternalBook {
                     let risk = (pos.avg_entry_price - sl).abs();
                     if risk > 1e-8 {
                         pos.take_profit = Some(match pos.side {
-                            Side::Long  => pos.avg_entry_price + cfg.auto_tp_r * risk,
+                            Side::Long => pos.avg_entry_price + cfg.auto_tp_r * risk,
                             Side::Short => pos.avg_entry_price - cfg.auto_tp_r * risk,
                         });
                         pos.auto_tp_applied = true;
@@ -659,7 +733,7 @@ impl InternalBook {
 
             if cfg.auto_be_enabled && !pos.auto_be_applied {
                 let sl_is_risky = pos.stop_loss.is_some_and(|sl| match pos.side {
-                    Side::Long  => sl < pos.avg_entry_price,
+                    Side::Long => sl < pos.avg_entry_price,
                     Side::Short => sl > pos.avg_entry_price,
                 });
                 if let Some(r) = pos.r_multiple {
@@ -682,20 +756,20 @@ impl InternalBook {
 
     pub fn close_position(
         &mut self,
-        symbol:      &str,
-        bid:         f64,
-        ask:         f64,
+        symbol: &str,
+        bid: f64,
+        ask: f64,
         strategy_id: String,
-        zone_id:     String,
+        zone_id: String,
     ) -> Option<Fill> {
         let pos = self.positions.get(symbol)?.clone();
 
         // Closing side is opposite of position side
         let closing_side = match pos.side {
-            Side::Long  => Side::Short,
+            Side::Long => Side::Short,
             Side::Short => Side::Long,
         };
-        let fp  = fills::price_for_side(closing_side, bid, ask);
+        let fp = fills::price_for_side(closing_side, bid, ask);
         let qty = pos.quantity.unsigned_abs() as i64;
 
         // Cancel all pending orders for this symbol
@@ -731,9 +805,9 @@ impl InternalBook {
                 let mid = (bid + ask) / 2.0;
                 // Track price extremes for MAE/MFE while the position is open.
                 pos.high_water = pos.high_water.max(mid);
-                pos.low_water  = pos.low_water.min(mid);
+                pos.low_water = pos.low_water.min(mid);
                 pos.unrealized_pnl = Some(match pos.side {
-                    Side::Long  => (mid - pos.avg_entry_price) * pos.quantity.abs() as f64,
+                    Side::Long => (mid - pos.avg_entry_price) * pos.quantity.abs() as f64,
                     Side::Short => (pos.avg_entry_price - mid) * pos.quantity.abs() as f64,
                 });
                 pos.r_multiple = pos.stop_loss.and_then(|sl| {
@@ -765,18 +839,29 @@ impl InternalBook {
 
     pub fn get_trade_lifecycle(&self, trade_id: &str) -> Option<TradeLifecycle> {
         let trade = self.trades.get(trade_id)?.clone();
-        let orders = self.orders.values()
+        let orders = self
+            .orders
+            .values()
             .filter(|o| o.trade_id.as_deref() == Some(trade_id))
             .cloned()
             .collect();
-        let fills = self.fills.iter()
+        let fills = self
+            .fills
+            .iter()
             .filter(|f| f.trade_id == trade_id)
             .cloned()
             .collect();
-        let position = self.positions.values()
+        let position = self
+            .positions
+            .values()
             .find(|p| p.trade_id == trade_id)
             .cloned();
-        Some(TradeLifecycle { trade, orders, fills, position })
+        Some(TradeLifecycle {
+            trade,
+            orders,
+            fills,
+            position,
+        })
     }
 }
 
@@ -794,10 +879,24 @@ mod tests {
     /// A full price-path window for one symbol (open, high, low, last + the order
     /// the extremes were reached in).
     fn window(
-        sym: &str, first: f64, high: f64, low: f64, last: f64, low_first: bool,
+        sym: &str,
+        first: f64,
+        high: f64,
+        low: f64,
+        last: f64,
+        low_first: bool,
     ) -> HashMap<String, FillWindow> {
         let mut m = HashMap::new();
-        m.insert(sym.to_string(), FillWindow { first, high, low, last, low_first });
+        m.insert(
+            sym.to_string(),
+            FillWindow {
+                first,
+                high,
+                low,
+                last,
+                low_first,
+            },
+        );
         m
     }
 
@@ -814,8 +913,15 @@ mod tests {
 
         // Enter long 100 @ 10.00, no TP yet.
         book.execute_market_fill(
-            Some("T1".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.50), None,
+            Some("T1".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.50),
+            None,
         );
         book.sync_bracket_orders("AAA");
 
@@ -823,7 +929,9 @@ mod tests {
         book.update_protective_levels("AAA", Some(9.50), Some(11.00));
 
         // A pending TP limit exit must now exist.
-        let tp_orders: Vec<_> = book.get_pending_orders().into_iter()
+        let tp_orders: Vec<_> = book
+            .get_pending_orders()
+            .into_iter()
             .filter(|o| o.order_type == OrderType::Limit && o.reduce_only)
             .collect();
         assert_eq!(tp_orders.len(), 1, "expected one resting TP limit order");
@@ -832,7 +940,75 @@ mod tests {
         // Price crosses the TP (high reaches 11.00) → must fill and flatten.
         let fills = book.try_fill_pending(&tick("AAA", 11.00));
         assert_eq!(fills.len(), 1, "TP should fill when high >= limit");
-        assert!(book.positions.get("AAA").is_none(), "position should be flat after TP");
+        assert!(
+            book.positions.get("AAA").is_none(),
+            "position should be flat after TP"
+        );
+    }
+
+    #[test]
+    fn partial_exit_keeps_the_original_average_entry() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T-PARTIAL".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            None,
+            None,
+        );
+        book.execute_market_fill(
+            Some("T-PARTIAL".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Short,
+            50,
+            11.00,
+            None,
+            None,
+        );
+
+        let pos = book.positions.get("AAA").expect("50 shares remain long");
+        assert_eq!(pos.quantity, 50);
+        assert!((pos.avg_entry_price - 10.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn crossing_through_flat_starts_the_residual_at_the_crossing_fill() {
+        let mut book = InternalBook::new();
+        book.execute_market_fill(
+            Some("T-FLIP".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            None,
+            None,
+        );
+        book.execute_market_fill(
+            Some("T-FLIP".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Short,
+            150,
+            11.00,
+            None,
+            None,
+        );
+
+        let pos = book.positions.get("AAA").expect("50 shares remain short");
+        assert_eq!(pos.quantity, -50);
+        assert_eq!(pos.side, Side::Short);
+        assert!((pos.avg_entry_price - 11.00).abs() < 1e-9);
+        assert!((pos.high_water - 11.00).abs() < 1e-9);
+        assert!((pos.low_water - 11.00).abs() < 1e-9);
     }
 
     // A fresh entry's bracket (SL/TP) only becomes a real pending order once
@@ -851,8 +1027,15 @@ mod tests {
     fn bracket_armed_after_entry_must_be_rechecked_against_same_window() {
         let mut book = InternalBook::new();
         book.create_limit_order(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.50), None,
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.50),
+            None,
         );
 
         // One merged window (as an accelerated replay poll can produce): opens
@@ -865,18 +1048,30 @@ mod tests {
         let fills = book.try_fill_pending(&w);
         assert_eq!(fills.len(), 1, "entry should fill");
         assert!((fills[0].fill_price - 10.00).abs() < 1e-6);
-        assert!(book.positions.get("AAA").is_some(),
+        assert!(
+            book.positions.get("AAA").is_some(),
             "position open after entry, SL not armed yet — this is the gap: without a \
-             second pass, the 9.40 low that already happened in this same window is lost");
+             second pass, the 9.40 low that already happened in this same window is lost"
+        );
 
         book.sync_bracket_orders("AAA");
 
         // Round 2: re-checking the SAME window must catch the SL, which the
         // window already traversed.
         let fills2 = book.try_fill_pending(&w);
-        assert_eq!(fills2.len(), 1, "SL must fire on the re-check, not be missed");
-        assert!((fills2[0].fill_price - 9.50).abs() < 1e-6, "SL leg, fill at stop");
-        assert!(book.positions.get("AAA").is_none(), "flat after the SL catches up");
+        assert_eq!(
+            fills2.len(),
+            1,
+            "SL must fire on the re-check, not be missed"
+        );
+        assert!(
+            (fills2[0].fill_price - 9.50).abs() < 1e-6,
+            "SL leg, fill at stop"
+        );
+        assert!(
+            book.positions.get("AAA").is_none(),
+            "flat after the SL catches up"
+        );
     }
 
     // Pending LIMIT entry + dragging the TP line afterwards: the resting entry
@@ -887,8 +1082,15 @@ mod tests {
 
         // Resting limit entry: long 100 @ 10.00, SL 9.50, no TP yet.
         book.create_limit_order(
-            Some("T2".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.50), None,
+            Some("T2".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.50),
+            None,
         );
 
         // User drags a TP line at 11.00 *before* the entry fills.
@@ -900,11 +1102,17 @@ mod tests {
         book.sync_bracket_orders("AAA");
 
         // The TP bracket must exist at the dragged level.
-        let tp_orders: Vec<_> = book.get_pending_orders().into_iter()
+        let tp_orders: Vec<_> = book
+            .get_pending_orders()
+            .into_iter()
             .filter(|o| o.order_type == OrderType::Limit && o.reduce_only)
             .collect();
         assert_eq!(tp_orders.len(), 1, "expected resting TP after entry fill");
-        assert_eq!(tp_orders[0].limit_price, Some(11.00), "TP must reflect dragged level");
+        assert_eq!(
+            tp_orders[0].limit_price,
+            Some(11.00),
+            "TP must reflect dragged level"
+        );
     }
 
     // An open position + its resting bracket must survive a JSON round-trip (the
@@ -915,16 +1123,30 @@ mod tests {
 
         // Closed trade: enter then exit AAA → goes flat.
         book.execute_market_fill(
-            Some("CLOSED".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, None, None,
+            Some("CLOSED".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            None,
+            None,
         );
         book.close_position("AAA", 10.50, 10.52, "strat".into(), "z1".into());
         assert!(book.positions.get("AAA").is_none());
 
         // Open trade: enter BBB with SL/TP → live position + bracket orders.
         book.execute_market_fill(
-            Some("OPEN".into()), "z2".into(), "BBB".into(), "strat".into(),
-            Side::Long, 50, 20.00, Some(19.00), Some(22.00),
+            Some("OPEN".into()),
+            "z2".into(),
+            "BBB".into(),
+            "strat".into(),
+            Side::Long,
+            50,
+            20.00,
+            Some(19.00),
+            Some(22.00),
         );
         book.sync_bracket_orders("BBB");
 
@@ -934,7 +1156,10 @@ mod tests {
         let restored: InternalBook = serde_json::from_str(&json).unwrap();
 
         // Open position preserved identically.
-        let pos = restored.positions.get("BBB").expect("open position restored");
+        let pos = restored
+            .positions
+            .get("BBB")
+            .expect("open position restored");
         assert_eq!(pos.quantity, 50);
         assert_eq!(pos.stop_loss, Some(19.00));
         assert_eq!(pos.take_profit, Some(22.00));
@@ -946,7 +1171,10 @@ mod tests {
         // Resting bracket exits (pending, reduce-only) restored; no cancelled churn.
         let pending: Vec<_> = restored.get_pending_orders();
         assert_eq!(pending.iter().filter(|o| o.reduce_only).count(), 2);
-        assert!(restored.orders.values().all(|o| o.status != OrderStatus::Cancelled));
+        assert!(restored
+            .orders
+            .values()
+            .all(|o| o.status != OrderStatus::Cancelled));
     }
 
     // A long that runs up then comes back to be stopped should record both the
@@ -957,15 +1185,22 @@ mod tests {
 
         // Long 100 @ 10.00, SL 9.50.
         book.execute_market_fill(
-            Some("T3".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.50), None,
+            Some("T3".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.50),
+            None,
         );
         book.sync_bracket_orders("AAA");
 
         // Price runs up to 11.00 (favorable) then down to 9.40 (adverse) → polls
         // move the watermarks.
         book.positions_with_pnl(&prices("AAA", 10.99, 11.01)); // mid 11.00
-        book.positions_with_pnl(&prices("AAA", 9.39, 9.41));   // mid 9.40 → SL hit
+        book.positions_with_pnl(&prices("AAA", 9.39, 9.41)); // mid 9.40 → SL hit
 
         // SL fills (gap-through: window opens at 9.39, below the 9.50 stop) and
         // flattens the position at the gapped price.
@@ -975,17 +1210,32 @@ mod tests {
         let trade = book.trades.get("T3").unwrap();
         assert!(trade.closed_at.is_some());
         // MFE = (11.00 - 10.00) * 100 = 100.0
-        assert!((trade.mfe.unwrap() - 100.0).abs() < 1e-6, "mfe={:?}", trade.mfe);
+        assert!(
+            (trade.mfe.unwrap() - 100.0).abs() < 1e-6,
+            "mfe={:?}",
+            trade.mfe
+        );
         // MAE = (10.00 - 9.39) * 100 = 61.0 (SL exit fill 9.39 is the low)
-        assert!((trade.mae.unwrap() - 61.0).abs() < 1e-6, "mae={:?}", trade.mae);
+        assert!(
+            (trade.mae.unwrap() - 61.0).abs() < 1e-6,
+            "mae={:?}",
+            trade.mae
+        );
     }
 
     /// Helper: a long with both an SL and a TP bracket armed.
     fn long_with_bracket(sl: f64, tp: f64) -> InternalBook {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(sl), Some(tp),
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(sl),
+            Some(tp),
         );
         book.sync_bracket_orders("AAA");
         book
@@ -1000,7 +1250,10 @@ mod tests {
         // Dipped to 9.40 (≤ SL) before spiking to 11.20 (≥ TP).
         let fills = book.try_fill_pending(&window("AAA", 10.00, 11.20, 9.40, 10.50, true));
         assert_eq!(fills.len(), 1, "exactly one bracket leg fills");
-        assert!((fills[0].fill_price - 9.50).abs() < 1e-6, "SL leg, fill at stop");
+        assert!(
+            (fills[0].fill_price - 9.50).abs() < 1e-6,
+            "SL leg, fill at stop"
+        );
         assert!(book.positions.get("AAA").is_none(), "flat after SL");
         // The TP sibling must be cancelled, not left resting.
         assert!(book.get_pending_orders().is_empty(), "TP sibling cancelled");
@@ -1013,7 +1266,10 @@ mod tests {
         // Spiked to 11.20 (≥ TP) before dropping to 9.40 (≤ SL).
         let fills = book.try_fill_pending(&window("AAA", 10.00, 11.20, 9.40, 10.50, false));
         assert_eq!(fills.len(), 1, "exactly one bracket leg fills");
-        assert!((fills[0].fill_price - 11.00).abs() < 1e-6, "TP leg, fill at limit");
+        assert!(
+            (fills[0].fill_price - 11.00).abs() < 1e-6,
+            "TP leg, fill at limit"
+        );
         assert!(book.positions.get("AAA").is_none(), "flat after TP");
         assert!(book.get_pending_orders().is_empty(), "SL sibling cancelled");
     }
@@ -1033,18 +1289,38 @@ mod tests {
         let t0 = crate::time::now();
 
         let older = InternalOrder {
-            order_id: "older".into(), trade_id: None, zone_id: "z1".into(),
-            symbol: "AAA".into(), side: Side::Short, order_type: OrderType::Stop,
-            limit_price: None, stop_price: Some(9.50), quantity: 100,
-            stop_loss: None, take_profit: None, status: OrderStatus::Pending,
-            oco_group: None, reduce_only: false, created_at: t0,
+            order_id: "older".into(),
+            trade_id: None,
+            zone_id: "z1".into(),
+            symbol: "AAA".into(),
+            side: Side::Short,
+            order_type: OrderType::Stop,
+            limit_price: None,
+            stop_price: Some(9.50),
+            quantity: 100,
+            stop_loss: None,
+            take_profit: None,
+            status: OrderStatus::Pending,
+            oco_group: None,
+            reduce_only: false,
+            created_at: t0,
         };
         let newer = InternalOrder {
-            order_id: "newer".into(), trade_id: None, zone_id: "z1".into(),
-            symbol: "AAA".into(), side: Side::Long, order_type: OrderType::Limit,
-            limit_price: Some(9.60), stop_price: None, quantity: 100,
-            stop_loss: None, take_profit: None, status: OrderStatus::Pending,
-            oco_group: None, reduce_only: false, created_at: t0 + chrono::Duration::seconds(1),
+            order_id: "newer".into(),
+            trade_id: None,
+            zone_id: "z1".into(),
+            symbol: "AAA".into(),
+            side: Side::Long,
+            order_type: OrderType::Limit,
+            limit_price: Some(9.60),
+            stop_price: None,
+            quantity: 100,
+            stop_loss: None,
+            take_profit: None,
+            status: OrderStatus::Pending,
+            oco_group: None,
+            reduce_only: false,
+            created_at: t0 + chrono::Duration::seconds(1),
         };
         // Inserted "newer" first: a naive implementation keyed off insertion/
         // iteration order would have a chance to get this backwards. The fix
@@ -1054,8 +1330,10 @@ mod tests {
 
         let fills = book.try_fill_pending(&window("AAA", 10.00, 10.00, 9.40, 9.45, true));
         assert_eq!(fills.len(), 2);
-        assert_eq!(fills[0].order_id, "older",
-            "the order resting since t0 must resolve before the one placed a second later");
+        assert_eq!(
+            fills[0].order_id, "older",
+            "the order resting since t0 must resolve before the one placed a second later"
+        );
         assert_eq!(fills[1].order_id, "newer");
     }
 
@@ -1080,7 +1358,10 @@ mod tests {
         // First new-day print is 8.00, a gap below the 9.50 stop.
         let fills = book.try_fill_pending(&tick("AAA", 8.00));
         assert_eq!(fills.len(), 1, "gapped stop fills");
-        assert!((fills[0].fill_price - 8.00).abs() < 1e-6, "fill at the gap open, not the stop");
+        assert!(
+            (fills[0].fill_price - 8.00).abs() < 1e-6,
+            "fill at the gap open, not the stop"
+        );
         assert!(book.positions.get("AAA").is_none(), "flat after gap stop");
     }
 
@@ -1090,13 +1371,24 @@ mod tests {
     fn intrabar_spike_through_tp_still_fills() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, None, Some(11.00),
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            None,
+            Some(11.00),
         );
         book.sync_bracket_orders("AAA");
         // Spiked to 11.50 (≥ TP) but the window closed back at 10.20 (< TP).
         let fills = book.try_fill_pending(&window("AAA", 10.00, 11.50, 9.95, 10.20, true));
-        assert_eq!(fills.len(), 1, "TP fills on the spike even though last < TP");
+        assert_eq!(
+            fills.len(),
+            1,
+            "TP fills on the spike even though last < TP"
+        );
         assert!((fills[0].fill_price - 11.00).abs() < 1e-6);
         assert!(book.positions.get("AAA").is_none(), "flat after TP");
     }
@@ -1108,18 +1400,33 @@ mod tests {
     fn auto_tp_places_once_and_does_not_respawn_after_delete() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.00), None, // risk = 1.00/share, no TP
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.00),
+            None, // risk = 1.00/share, no TP
         );
         let mut cfgs = HashMap::new();
-        cfgs.insert("strat".to_string(), StrategyRiskConfig {
-            auto_tp_enabled: true, auto_tp_r: 2.0, ..Default::default()
-        });
+        cfgs.insert(
+            "strat".to_string(),
+            StrategyRiskConfig {
+                auto_tp_enabled: true,
+                auto_tp_r: 2.0,
+                ..Default::default()
+            },
+        );
 
         let touched = book.apply_auto_risk_management(&cfgs);
         assert_eq!(touched, vec!["AAA".to_string()]);
         let pos = book.positions.get("AAA").unwrap();
-        assert!((pos.take_profit.unwrap() - 12.00).abs() < 1e-6, "TP = entry + 2R");
+        assert!(
+            (pos.take_profit.unwrap() - 12.00).abs() < 1e-6,
+            "TP = entry + 2R"
+        );
         assert!(pos.auto_tp_applied);
 
         // Same config, next tick: already applied — must not re-touch.
@@ -1128,8 +1435,10 @@ mod tests {
         // User deletes the auto-placed TP (e.g. dragged off chart) — must not
         // be silently reinstated by the next tick.
         book.positions.get_mut("AAA").unwrap().take_profit = None;
-        assert!(book.apply_auto_risk_management(&cfgs).is_empty(),
-            "auto TP must not respawn after a manual delete");
+        assert!(
+            book.apply_auto_risk_management(&cfgs).is_empty(),
+            "auto TP must not respawn after a manual delete"
+        );
         assert!(book.positions.get("AAA").unwrap().take_profit.is_none());
     }
 
@@ -1138,17 +1447,32 @@ mod tests {
     fn auto_tp_short_places_below_entry() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Short, 100, 10.00, Some(11.00), None, // risk = 1.00/share
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Short,
+            100,
+            10.00,
+            Some(11.00),
+            None, // risk = 1.00/share
         );
         let mut cfgs = HashMap::new();
-        cfgs.insert("strat".to_string(), StrategyRiskConfig {
-            auto_tp_enabled: true, auto_tp_r: 2.0, ..Default::default()
-        });
+        cfgs.insert(
+            "strat".to_string(),
+            StrategyRiskConfig {
+                auto_tp_enabled: true,
+                auto_tp_r: 2.0,
+                ..Default::default()
+            },
+        );
 
         book.apply_auto_risk_management(&cfgs);
         let tp = book.positions.get("AAA").unwrap().take_profit.unwrap();
-        assert!((tp - 8.00).abs() < 1e-6, "TP = entry - 2R for a short, got {tp}");
+        assert!(
+            (tp - 8.00).abs() < 1e-6,
+            "TP = entry - 2R for a short, got {tp}"
+        );
     }
 
     // Auto TP must never clobber a TP the user (or a prior auto-TP pass)
@@ -1157,13 +1481,25 @@ mod tests {
     fn auto_tp_does_not_overwrite_existing_tp() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.00), Some(20.00), // user's own TP
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.00),
+            Some(20.00), // user's own TP
         );
         let mut cfgs = HashMap::new();
-        cfgs.insert("strat".to_string(), StrategyRiskConfig {
-            auto_tp_enabled: true, auto_tp_r: 2.0, ..Default::default()
-        });
+        cfgs.insert(
+            "strat".to_string(),
+            StrategyRiskConfig {
+                auto_tp_enabled: true,
+                auto_tp_r: 2.0,
+                ..Default::default()
+            },
+        );
         assert!(book.apply_auto_risk_management(&cfgs).is_empty());
         assert_eq!(book.positions.get("AAA").unwrap().take_profit, Some(20.00));
     }
@@ -1175,13 +1511,25 @@ mod tests {
     fn auto_be_moves_sl_to_entry_once_r_reached_then_never_again() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.00), None, // risk = 1.00/share
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.00),
+            None, // risk = 1.00/share
         );
         let mut cfgs = HashMap::new();
-        cfgs.insert("strat".to_string(), StrategyRiskConfig {
-            auto_be_enabled: true, auto_be_r: 1.0, ..Default::default()
-        });
+        cfgs.insert(
+            "strat".to_string(),
+            StrategyRiskConfig {
+                auto_be_enabled: true,
+                auto_be_r: 1.0,
+                ..Default::default()
+            },
+        );
 
         // R = 0.5 (below the 1.0R threshold) — must not move yet.
         book.positions_with_pnl(&prices("AAA", 10.49, 10.51));
@@ -1199,8 +1547,10 @@ mod tests {
         // User manually widens the SL back out — auto BE already had its one
         // shot and must not snap it back.
         book.positions.get_mut("AAA").unwrap().stop_loss = Some(9.50);
-        assert!(book.apply_auto_risk_management(&cfgs).is_empty(),
-            "auto BE must not refire after its one shot");
+        assert!(
+            book.apply_auto_risk_management(&cfgs).is_empty(),
+            "auto BE must not refire after its one shot"
+        );
         assert_eq!(book.positions.get("AAA").unwrap().stop_loss, Some(9.50));
     }
 
@@ -1211,23 +1561,40 @@ mod tests {
     fn auto_be_does_not_demote_a_better_manual_stop() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.00), None,
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.00),
+            None,
         );
         // User manually trails the SL to 10.20 — already better than breakeven.
         book.positions.get_mut("AAA").unwrap().stop_loss = Some(10.20);
 
         let mut cfgs = HashMap::new();
-        cfgs.insert("strat".to_string(), StrategyRiskConfig {
-            auto_be_enabled: true, auto_be_r: 1.0, ..Default::default()
-        });
+        cfgs.insert(
+            "strat".to_string(),
+            StrategyRiskConfig {
+                auto_be_enabled: true,
+                auto_be_r: 1.0,
+                ..Default::default()
+            },
+        );
         // R comfortably above threshold off the current (better) SL.
         book.positions_with_pnl(&prices("AAA", 10.99, 11.01));
 
-        assert!(book.apply_auto_risk_management(&cfgs).is_empty(),
-            "auto BE must not fire when the SL is already past breakeven");
-        assert_eq!(book.positions.get("AAA").unwrap().stop_loss, Some(10.20),
-            "the user's better stop must survive untouched");
+        assert!(
+            book.apply_auto_risk_management(&cfgs).is_empty(),
+            "auto BE must not fire when the SL is already past breakeven"
+        );
+        assert_eq!(
+            book.positions.get("AAA").unwrap().stop_loss,
+            Some(10.20),
+            "the user's better stop must survive untouched"
+        );
     }
 
     // Disabled flags and an unrecognised strategy id must both no-op rather
@@ -1237,8 +1604,15 @@ mod tests {
     fn auto_risk_management_noop_when_disabled_or_unknown_strategy() {
         let mut book = InternalBook::new();
         book.execute_market_fill(
-            Some("T".into()), "z1".into(), "AAA".into(), "strat".into(),
-            Side::Long, 100, 10.00, Some(9.00), None,
+            Some("T".into()),
+            "z1".into(),
+            "AAA".into(),
+            "strat".into(),
+            Side::Long,
+            100,
+            10.00,
+            Some(9.00),
+            None,
         );
 
         // No config at all for "strat".

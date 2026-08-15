@@ -10,17 +10,17 @@ use crate::types::{Fill, Side};
 /// (+ for a long/buy, − for a short/sell).
 #[derive(Debug, Clone)]
 pub struct ExecutionRow {
-    pub trade_id:   String,
-    pub quantity:   i64,
+    pub trade_id: String,
+    pub quantity: i64,
     pub fill_price: f64,
-    pub filled_at:  String, // RFC3339
+    pub filled_at: String, // RFC3339
 }
 
 /// Persist a fill. Idempotent on `fill_id`. The stored quantity is signed from
 /// the fill's side so the position/P&L can be rebuilt without the Side enum.
 pub fn insert_fill(conn: &Connection, fill: &Fill) -> Result<()> {
     let signed = match fill.side {
-        Side::Long  =>  fill.quantity.abs(),
+        Side::Long => fill.quantity.abs(),
         Side::Short => -fill.quantity.abs(),
     };
     conn.execute(
@@ -38,13 +38,29 @@ pub fn insert_fill(conn: &Connection, fill: &Fill) -> Result<()> {
     Ok(())
 }
 
-/// Record the trade's ORIGINAL (launch-time) stop loss. Idempotent on trade_id:
-/// `INSERT OR IGNORE` keeps the very first value, so later SL modifications never
-/// overwrite the level the journal / R:R is based on.
+/// Record the trade's ORIGINAL (launch-time) stop loss. First write wins: the
+/// upsert only fills the column when it is still NULL, so later SL modifications
+/// never overwrite the level the journal / R:R is based on. The row itself may
+/// already exist (the TP stamp below shares it), hence the ON CONFLICT rather
+/// than a plain `INSERT OR IGNORE`.
 pub fn set_original_sl(conn: &Connection, trade_id: &str, symbol: &str, sl: f64) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO trade_levels (trade_id, symbol, original_sl) VALUES (?1, ?2, ?3)",
+        "INSERT INTO trade_levels (trade_id, symbol, original_sl) VALUES (?1, ?2, ?3)
+         ON CONFLICT(trade_id) DO UPDATE
+           SET original_sl = COALESCE(trade_levels.original_sl, excluded.original_sl)",
         params![trade_id, symbol, sl],
+    )?;
+    Ok(())
+}
+
+/// Record the trade's ORIGINAL (launch-time) take profit — same first-write-wins
+/// semantics as [`set_original_sl`], sharing the trade's `trade_levels` row.
+pub fn set_original_tp(conn: &Connection, trade_id: &str, symbol: &str, tp: f64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO trade_levels (trade_id, symbol, original_tp) VALUES (?1, ?2, ?3)
+         ON CONFLICT(trade_id) DO UPDATE
+           SET original_tp = COALESCE(trade_levels.original_tp, excluded.original_tp)",
+        params![trade_id, symbol, tp],
     )?;
     Ok(())
 }
@@ -59,6 +75,16 @@ pub fn original_sls_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<(S
     rows.collect()
 }
 
+/// Original take profit per trade for a symbol, as (trade_id, original_tp) pairs.
+pub fn original_tps_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT trade_id, original_tp FROM trade_levels
+         WHERE symbol = ?1 AND original_tp IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![symbol], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
 /// All executions for a symbol, oldest → newest.
 pub fn get_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<ExecutionRow>> {
     let mut stmt = conn.prepare(
@@ -67,10 +93,10 @@ pub fn get_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<ExecutionRo
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
         Ok(ExecutionRow {
-            trade_id:   row.get(0)?,
-            quantity:   row.get(1)?,
+            trade_id: row.get(0)?,
+            quantity: row.get(1)?,
             fill_price: row.get(2)?,
-            filled_at:  row.get(3)?,
+            filled_at: row.get(3)?,
         })
     })?;
     rows.collect()

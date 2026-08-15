@@ -126,19 +126,30 @@ export function FeedDiagnosticsTab() {
       <div className="rounded border border-border/40 px-3 py-1">
         <Row label="Flux" value={d.feed || "—"} />
         <Row
+          label="Abonnement"
+          value={
+            d.plan === "sip" ? "SIP (payant) — symboles illimités"
+            : d.plan === "iex" ? `IEX (gratuit) — ${d.symbol_limit ?? 30} abonnements max`
+            : "—"
+          }
+        />
+        <Row
           label="Mode large"
           value={
-            d.broad_mode === "trades" ? "trades (premarket)"
+            d.symbol_limit ? "aucun (plan plafonné)"
+            : d.broad_mode === "trades" ? "trades (premarket)"
             : d.broad_mode === "bars" ? "bougies 1-min (open)"
             : d.broad_mode || "—"
           }
         />
         <Row
-          label="Surveillance large"
+          label={d.symbol_limit ? "Abonnements (symbole × canal)" : "Surveillance large"}
           value={
-            d.subscribed_symbols > 0
-              ? d.subscribed_symbols.toLocaleString()
-              : "tout le marché (✱)"
+            d.symbol_limit
+              ? `${d.subscribed_symbols} / ${d.symbol_limit}`
+              : d.subscribed_symbols > 0
+                ? d.subscribed_symbols.toLocaleString()
+                : "tout le marché (✱)"
           }
         />
         <Row label="Dernier abonnement envoyé" value={d.last_subscribe || "—"} />

@@ -153,6 +153,7 @@ export function useGamepad(): void {
         case "order_100": zone?.order(100); break;
         case "close_position": zone?.close(); break;
         case "confirm_hod": zone?.confirmHod?.(); break;
+        case "invert_hod":  zone?.invertHod?.(); break;
         case "capture": if (zone?.hasTradeId()) zone.capture(); break;
         case "share_tag": shareTag(); break;
         case "journal_audio": if (zone?.hasTradeId()) zone.journalAudio(); break;

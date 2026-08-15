@@ -242,12 +242,8 @@ impl PerfectPullbackEngine {
                     watched_day = Some(today);
                 }
 
-                let mock = market.read().unwrap().mock_running;
-                let in_session = mock
-                    || {
-                        let m = et_minutes(now);
-                        m >= SESSION_START_MIN && m < SESSION_END_MIN
-                    };
+                let m = et_minutes(now);
+                let in_session = m >= SESSION_START_MIN && m < SESSION_END_MIN;
                 if !in_session {
                     crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
                     continue;

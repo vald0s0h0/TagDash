@@ -27,6 +27,7 @@
 // flat file holds the very same data the live replay path produces.
 
 pub mod daily;
+pub mod intraday;
 pub mod minute;
 pub mod trade;
 
@@ -51,6 +52,9 @@ pub enum Kind {
     Trade,
     Minute,
     Daily,
+    /// 1-minute bars filled on demand per (symbol, day), served at any intraday
+    /// timeframe — see `intraday`.
+    Intraday,
 }
 
 impl Kind {
@@ -59,6 +63,7 @@ impl Kind {
             "trade" => Some(Kind::Trade),
             "minute" => Some(Kind::Minute),
             "daily" => Some(Kind::Daily),
+            "intraday" => Some(Kind::Intraday),
             _ => None,
         }
     }
@@ -67,6 +72,7 @@ impl Kind {
             Kind::Trade => "trade",
             Kind::Minute => "minute",
             Kind::Daily => "daily",
+            Kind::Intraday => "intraday",
         }
     }
 }
@@ -122,7 +128,7 @@ static LAYOUT: Once = Once::new();
 /// from every public entry point.
 pub fn ensure_layout(app_dir: &Path) {
     LAYOUT.call_once(|| {
-        for k in [Kind::Trade, Kind::Minute, Kind::Daily] {
+        for k in [Kind::Trade, Kind::Minute, Kind::Daily, Kind::Intraday] {
             let _ = std::fs::create_dir_all(kind_dir(app_dir, k));
         }
         // Migrate legacy flat-*.db → minute/minute-*.db.
@@ -201,7 +207,10 @@ pub struct FlatFilesShared {
 
 impl Default for FlatFilesShared {
     fn default() -> Self {
-        Self { status: RwLock::new(FlatFilesStatus::default()), cancel: AtomicBool::new(false) }
+        Self {
+            status: RwLock::new(FlatFilesStatus::default()),
+            cancel: AtomicBool::new(false),
+        }
     }
 }
 
@@ -236,6 +245,7 @@ pub fn calendar(app_dir: &Path, kind: Kind) -> Vec<FlatFileDay> {
         Kind::Minute => minute::calendar(app_dir),
         Kind::Trade => trade::calendar(app_dir),
         Kind::Daily => daily::calendar(app_dir),
+        Kind::Intraday => intraday::calendar(app_dir),
     }
 }
 
@@ -264,8 +274,10 @@ pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::R
 }
 
 pub(crate) fn get_meta(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row("SELECT value FROM manifest WHERE key = ?1", [key], |r| r.get::<_, String>(0))
-        .ok()
+    conn.query_row("SELECT value FROM manifest WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
 }
 
 /// SQLite pragmas + a manifest table, shared by the per-day writers (minute/trade).
@@ -331,7 +343,11 @@ pub fn start_download(
         st.running = true;
         st.kind = kind.as_str().into();
         st.state = "running".into();
-        st.day_total = if kind == Kind::Daily { 1 } else { weekday_count(start, end) };
+        st.day_total = if kind == Kind::Daily {
+            1
+        } else {
+            weekday_count(start, end)
+        };
     }
     shared.cancel.store(false, Ordering::Relaxed);
 
@@ -339,13 +355,40 @@ pub fn start_download(
         let res = match kind {
             Kind::Daily => daily::run(&shared, &app_dir, &db, &key, &secret, start, end).await,
             Kind::Minute => {
-                run_per_day(&shared, &app_dir, &db, &key, &secret, &massive_key, start, end, Kind::Minute)
-                    .await
+                run_per_day(
+                    &shared,
+                    &app_dir,
+                    &db,
+                    &key,
+                    &secret,
+                    &massive_key,
+                    start,
+                    end,
+                    Kind::Minute,
+                )
+                .await
             }
             Kind::Trade => {
-                run_per_day(&shared, &app_dir, &db, &key, &secret, &massive_key, start, end, Kind::Trade)
-                    .await
+                run_per_day(
+                    &shared,
+                    &app_dir,
+                    &db,
+                    &key,
+                    &secret,
+                    &massive_key,
+                    start,
+                    end,
+                    Kind::Trade,
+                )
+                .await
             }
+            // Not a bulk dataset: 5-minute bars are fetched per (symbol, day) when a
+            // chart opens and in bulk for the day's watchlist — see `intraday`.
+            Kind::Intraday => Err(
+                "les barres intraday se téléchargent à la demande (ouverture d'un graphique \
+                 ou construction de la watchlist), pas par plage de dates"
+                    .to_string(),
+            ),
         };
         let mut st = shared.status.write().unwrap();
         st.running = false;
@@ -402,7 +445,7 @@ async fn run_per_day(
         let already = match kind {
             Kind::Minute => minute::has_day(app_dir, &day),
             Kind::Trade => trade::has_day(app_dir, &day),
-            Kind::Daily => false,
+            Kind::Daily | Kind::Intraday => false,
         };
         if already {
             let mut st = shared.status.write().unwrap();
@@ -416,7 +459,7 @@ async fn run_per_day(
                 Kind::Trade => {
                     trade::write_day(shared, app_dir, db, key, secret, massive_key, &day).await
                 }
-                Kind::Daily => unreachable!(),
+                Kind::Daily | Kind::Intraday => unreachable!("dispatched before run_per_day"),
             };
             match res {
                 Ok(_) => {

@@ -35,26 +35,22 @@ async fn drain_once(
     config:  &Arc<RwLock<AppConfig>>,
     secrets: &Arc<RwLock<Secrets>>,
 ) {
-    let (base_url, token, mock_mode, mock_fail, mock_delay, tt_email, tt_password) = {
+    let (base_url, token, tt_email, tt_password) = {
         let cfg = config.read().unwrap();
         let sec = secrets.read().unwrap();
         (
             cfg.tradetally.api_base_url.clone(),
             sec.tradetally_token.clone().unwrap_or_default(),
-            cfg.tradetally.mock_mode,
-            cfg.tradetally.mock_fail,
-            cfg.tradetally.mock_delay_ms,
             sec.tradetally_email.clone(),
             sec.tradetally_password.clone(),
         )
     };
 
-    if token.is_empty() && !mock_mode {
-        return; // No credentials and not in mock mode — skip
+    if token.is_empty() {
+        return;
     }
 
-    let client = TtClient::new(base_url, token, mock_mode)
-        .with_mock_options(mock_fail, mock_delay)
+    let client = TtClient::new(base_url, token)
         .with_session_creds(tt_email, tt_password);
 
     // Snapshot pending events (holds lock only briefly)

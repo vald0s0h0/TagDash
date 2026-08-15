@@ -1,3 +1,4 @@
+import { notifyError } from "@/stores/notificationStore";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CircleX, MoreVertical } from "lucide-react";
@@ -25,7 +26,7 @@ function PosRow({ pos, onTickerClick }: { pos: Position; onTickerClick?: (symbol
       await api.closeInternalPosition(pos.symbol, pos.zone_id);
       qc.invalidateQueries({ queryKey: ["internal_positions"] });
     } catch (e) {
-      console.error("close failed:", e);
+      notifyError(e, "Clôture");
     } finally {
       setBusy(false);
     }

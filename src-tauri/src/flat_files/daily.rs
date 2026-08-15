@@ -41,7 +41,9 @@ pub fn calendar(app_dir: &Path) -> Vec<FlatFileDay> {
     if !path.exists() {
         return Vec::new();
     }
-    let Ok(conn) = open_db(&path) else { return Vec::new() };
+    let Ok(conn) = open_db(&path) else {
+        return Vec::new();
+    };
     let mut out: Vec<FlatFileDay> = Vec::new();
     let Ok(mut stmt) =
         conn.prepare("SELECT date, COUNT(*) FROM daily_cache GROUP BY date ORDER BY date")
@@ -83,7 +85,8 @@ pub async fn run(
 
     let universe: Vec<String> = {
         let conn = db.lock().unwrap();
-        crate::local_db::universe_repository::get_active_symbols(&conn).map_err(|e| e.to_string())?
+        crate::local_db::universe_repository::get_active_symbols(&conn)
+            .map_err(|e| e.to_string())?
     };
     if universe.is_empty() {
         return Err("univers vide — lance d'abord le Startup Pipeline".into());
@@ -91,9 +94,9 @@ pub async fn run(
 
     let start_s = start.format("%Y-%m-%dT00:00:00Z").to_string();
     let end_s = end.format("%Y-%m-%dT23:59:59Z").to_string();
-    let bars = data::fetch_bars_window(
-        key, secret, &universe, "1Day", &start_s, &end_s, &|f| shared.set_progress(f * 0.9),
-    )
+    let bars = data::fetch_bars_window(key, secret, &universe, "1Day", &start_s, &end_s, &|f| {
+        shared.set_progress(f * 0.9)
+    })
     .await?;
     if shared.cancelled() {
         shared.status.write().unwrap().state = "cancelled".into();
@@ -128,7 +131,9 @@ pub async fn run(
         }
         tx.commit().map_err(|e| e.to_string())?;
         n_dates = conn
-            .query_row("SELECT COUNT(DISTINCT date) FROM daily_cache", [], |r| r.get(0))
+            .query_row("SELECT COUNT(DISTINCT date) FROM daily_cache", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
     }
     shared.set_progress(1.0);
@@ -140,6 +145,54 @@ pub async fn run(
 }
 
 // ─── Reading back into the app DB (offline daily source) ───────────────────────
+
+/// Symbols whose flat rows are at a STALE split scale and must not be imported.
+///
+/// Alpaca's `adjustment=split` rescales a symbol's entire series to the factor in
+/// force at the moment of the fetch. So rows downloaded into the cumulative file
+/// before a split sit at a different scale than anything the API returns after it.
+/// Mixing the two for one symbol splices a phantom gap of exactly the split ratio
+/// into `daily_cache` — and a phantom −90 % on a 1:10 is read by the panic score as
+/// a once-in-a-decade shock, putting a fabricated candidate at the top of the
+/// watchlist with nothing to warn you.
+///
+/// The test is per symbol: an ex-date at or after the day that symbol's flat rows
+/// were written means those rows predate the rescale. Such symbols are skipped
+/// entirely here and supplied by the daily step instead, at one current scale.
+/// Ties go to skipping — a same-day split is ambiguous and the API copy is free.
+///
+/// Empty (import everything) when splits were never fetched, which is the state of
+/// a first launch. That case is covered anyway: an empty cache forces the daily
+/// step's full backfill, which rewrites the whole window at one scale.
+fn stale_scale_symbols(src: &Connection, main: &Connection) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(mut stmt) =
+        main.prepare("SELECT symbol, MAX(ex_date) FROM ticker_splits GROUP BY symbol")
+    else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    }) else {
+        return out;
+    };
+    for (symbol, ex_date) in rows.flatten() {
+        let Some(ex_date) = ex_date else { continue };
+        let written: Option<String> = src
+            .query_row(
+                "SELECT MAX(updated_at) FROM daily_cache WHERE symbol = ?1",
+                [&symbol],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let Some(written) = written else { continue };
+        if ex_date.as_str() >= written.get(..10).unwrap_or("") {
+            out.insert(symbol);
+        }
+    }
+    out
+}
 
 /// Copy every daily bar from the cumulative flat file into the app's `daily_cache`
 /// (idempotent upsert by symbol+date). This is the offline daily source: once
@@ -156,6 +209,7 @@ pub fn load_into_cache(app_dir: &Path, main: &Connection) -> Result<usize, Strin
         return Ok(0);
     }
     let src = open_db(&path).map_err(|e| e.to_string())?;
+    let stale = stale_scale_symbols(&src, main);
     let mut stmt = src
         .prepare("SELECT symbol,date,open,high,low,close,volume FROM daily_cache")
         .map_err(|e| e.to_string())?;
@@ -192,6 +246,9 @@ pub fn load_into_cache(app_dir: &Path, main: &Connection) -> Result<usize, Strin
             .map_err(|e| e.to_string())?;
         for row in rows {
             let (sym, date, o, h, l, c, v) = row.map_err(|e| e.to_string())?;
+            if stale.contains(&sym) {
+                continue; // split since these rows were written — see `stale_scale_symbols`
+            }
             ins.execute(rusqlite::params![sym, date, o, h, l, c, v, now])
                 .map_err(|e| e.to_string())?;
             n += 1;
@@ -209,7 +266,9 @@ pub fn symbols(app_dir: &Path) -> Vec<String> {
     if !path.exists() {
         return Vec::new();
     }
-    let Ok(conn) = open_db(&path) else { return Vec::new() };
+    let Ok(conn) = open_db(&path) else {
+        return Vec::new();
+    };
     let mut out: Vec<String> = Vec::new();
     let Ok(mut stmt) = conn.prepare("SELECT DISTINCT symbol FROM daily_cache") else {
         return out;
@@ -220,4 +279,88 @@ pub fn symbols(app_dir: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flat file holding one symbol's rows, stamped `written` (RFC3339).
+    fn flat_with(symbol: &str, written: &str) -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE daily_cache (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL,
+                 open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+                 updated_at TEXT NOT NULL, PRIMARY KEY (symbol, date));",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO daily_cache VALUES (?1,'2026-01-05',1.0,1.0,1.0,1.0,100,?2)",
+            rusqlite::params![symbol, written],
+        )
+        .unwrap();
+        c
+    }
+
+    /// An app DB whose `ticker_splits` holds one ex-date for `symbol`.
+    fn main_with_split(symbol: Option<(&str, &str)>) -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE ticker_splits (symbol TEXT NOT NULL, ex_date TEXT NOT NULL);",
+        )
+        .unwrap();
+        if let Some((sym, ex_date)) = symbol {
+            c.execute(
+                "INSERT INTO ticker_splits VALUES (?1,?2)",
+                rusqlite::params![sym, ex_date],
+            )
+            .unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn rows_written_before_a_split_are_refused() {
+        // Downloaded in January, split in March → the stored prices are pre-split.
+        let src = flat_with("SPLT", "2026-01-06T12:00:00Z");
+        let main = main_with_split(Some(("SPLT", "2026-03-10")));
+        assert!(stale_scale_symbols(&src, &main).contains("SPLT"));
+    }
+
+    #[test]
+    fn rows_written_after_a_split_are_kept() {
+        // Re-downloaded in April, after the March split → already at the new scale.
+        let src = flat_with("SPLT", "2026-04-01T12:00:00Z");
+        let main = main_with_split(Some(("SPLT", "2026-03-10")));
+        assert!(stale_scale_symbols(&src, &main).is_empty());
+    }
+
+    #[test]
+    fn a_same_day_split_is_refused_because_the_order_is_unknowable() {
+        let src = flat_with("SPLT", "2026-03-10T12:00:00Z");
+        let main = main_with_split(Some(("SPLT", "2026-03-10")));
+        assert!(
+            stale_scale_symbols(&src, &main).contains("SPLT"),
+            "ties go to skipping — the API copy is free",
+        );
+    }
+
+    #[test]
+    fn a_symbol_that_never_split_is_kept() {
+        let src = flat_with("CALM", "2026-01-06T12:00:00Z");
+        let main = main_with_split(Some(("OTHER", "2026-03-10")));
+        assert!(stale_scale_symbols(&src, &main).is_empty());
+    }
+
+    /// First launch: splits were never fetched. Everything imports — the daily step's
+    /// full backfill rewrites the window at one scale anyway.
+    #[test]
+    fn no_split_data_at_all_imports_everything() {
+        let src = flat_with("SPLT", "2026-01-06T12:00:00Z");
+        assert!(stale_scale_symbols(&src, &main_with_split(None)).is_empty());
+        // Not even the table — the very first boot, before migrations of an old DB.
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(stale_scale_symbols(&src, &bare).is_empty());
+    }
 }

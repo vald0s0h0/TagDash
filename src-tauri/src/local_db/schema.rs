@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS universe_assets (
     symbol     TEXT PRIMARY KEY NOT NULL,
     name       TEXT,
     exchange   TEXT,
+    security_type TEXT,                  -- Massive reference code: CS, ETF, ETN…
     tradable   INTEGER NOT NULL DEFAULT 1,
     shortable  INTEGER NOT NULL DEFAULT 0,
     float_shares INTEGER,
@@ -113,6 +114,16 @@ CREATE TABLE IF NOT EXISTS tradetally_sync_queue (
 CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON tradetally_sync_queue(status);
 CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON tradetally_sync_queue(created_at DESC);
 
+-- Per-Alpaca-account runtime state. Open broker trades and extended-hours
+-- protection plans must survive process restarts and account switching: positions
+-- routinely stay open for several sessions/days.
+CREATE TABLE IF NOT EXISTS broker_runtime_state (
+    account_id      TEXT PRIMARY KEY NOT NULL,
+    journal_json    TEXT,
+    protection_json TEXT,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Scanner alert history (recent N alerts for replay / audit).
 CREATE TABLE IF NOT EXISTS alert_history (
     alert_id    TEXT PRIMARY KEY NOT NULL,
@@ -188,25 +199,107 @@ CREATE TABLE IF NOT EXISTS price_alarms (
 );
 CREATE INDEX IF NOT EXISTS idx_price_alarms_symbol ON price_alarms(symbol);
 
--- Daily mean-reversion scores per ticker (Panic Mean Reversion pre-open screener).
--- Panic Mean Reversion pre-open watchlist, rebuilt once per trading day at 09:00 ET
--- (see `crate::scoring::build_and_store` / `crate::panic_watchlist`). Each row is a
--- ticker retained by one of two rankings over a premarket-liquidity-filtered
--- universe: "BB" = cumulative soft-Bollinger area (BBZ excess beyond 1.7σ summed
--- over 6 days), "MA" = move since the last SMA20 contact normalised by ATR20. The
--- top 10 of each list are merged (a ticker kept once, in its better-ranked list);
--- display_score interleaves the lists 1-for-1 by rank for the screener ordering.
-CREATE TABLE IF NOT EXISTS panic_watchlist (
-    symbol        TEXT PRIMARY KEY NOT NULL,
-    list_kind     TEXT NOT NULL DEFAULT 'BB',   -- 'BB' | 'MA'
-    value         REAL NOT NULL DEFAULT 0,       -- BB area sum, or |move|/ATR20
-    direction     INTEGER NOT NULL DEFAULT 0,    -- +1 up / −1 down / 0
-    rank          INTEGER NOT NULL DEFAULT 0,    -- 1-based rank within its list
-    display_score REAL NOT NULL DEFAULT 0,       -- global interleaved ordering key
-    prev_volume   INTEGER,
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+-- Panic Mean Reversion pre-open watchlist, rebuilt once per trading DAY at 09:25 ET
+-- (see `crate::scoring::build_and_store` / `crate::panic_watchlist::ensure_day`).
+--
+-- Keyed by (day, symbol) — the day is what makes a Market Replay safe: a list built
+-- for the replayed date is invisible while the clock sits on any other date, so a
+-- build that finishes after the clock moved degrades to "shows nothing" instead of
+-- "shows the wrong day". It also lets the live list survive a replay of another day
+-- untouched (no rebuild on stop).
+--
+-- One row = a ticker whose extension cleared the absolute thresholds. Multiday and
+-- current-premarket shocks compete; the score is:
+--   sigma   = |return over N days| / (σ of daily returns over the 20 days BEFORE the
+--             window × √N)  — scale-free, so a $50M and a $50B name are comparable.
+--   atr_exp = mean true range over the window / ATR20 measured BEFORE the window
+--             — "the ATR was stable, now it has expanded".
+--   score   = sigma × sqrt(atr_exp) × bounded stability/flow quality.
+CREATE TABLE IF NOT EXISTS panic_watchlist_v2 (
+    day         TEXT    NOT NULL,          -- ET trading day the list was built FOR
+    symbol      TEXT    NOT NULL,
+    score       REAL    NOT NULL,          -- extension score incl. stability/flow quality
+    window_days INTEGER NOT NULL,          -- 0 = current PM; otherwise 2..5 days
+    direction   INTEGER NOT NULL,          -- +1 extended up / −1 extended down
+    sigma       REAL    NOT NULL,
+    atr_exp     REAL    NOT NULL,
+    cap_bin     TEXT,                      -- size bucket, NULL = unknown market cap
+    prev_volume INTEGER,
+    setup_kind  TEXT    NOT NULL DEFAULT 'multiday',
+    move_pct    REAL    NOT NULL DEFAULT 0,
+    stability_score REAL NOT NULL DEFAULT 0,
+    volume_expansion REAL,
+    directional_efficiency REAL,
+    consecutive_bars INTEGER,
+    updated_at  TEXT    NOT NULL,          -- REAL wall clock: write bookkeeping only
+    PRIMARY KEY (day, symbol)
 );
-CREATE INDEX IF NOT EXISTS idx_panic_watchlist_display ON panic_watchlist(display_score DESC);
+CREATE INDEX IF NOT EXISTS idx_panic_v2_rank ON panic_watchlist_v2(day, score DESC);
+
+-- One ledger row per day the watchlist build ran. Replaces the old in-memory
+-- "built_day" (which made the live list unrecoverable after replaying today's date)
+-- and the `app_config['panic_watchlist_date']` marker. `row_count = 0` is a RECORDED,
+-- VALID outcome: without it the builder wiped the table and re-ran the heavy job
+-- every 30s forever. `retryable` separates "no survivors" (final) from "inputs were
+-- missing" (retry). `simulated` + `generation` are how a replay artifact is detected.
+CREATE TABLE IF NOT EXISTS panic_watchlist_build (
+    day        TEXT PRIMARY KEY NOT NULL,
+    built_min  INTEGER NOT NULL,           -- ET minutes on the APP clock at completion
+    row_count  INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 1,
+    simulated  INTEGER NOT NULL DEFAULT 0, -- 1 = produced under a replay clock
+    generation INTEGER NOT NULL DEFAULT 0, -- replay::clock::generation() at build time
+    retryable  INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+-- Shares outstanding per SEC registrant, from the free XBRL `frames` API
+-- (dei:EntityCommonStockSharesOutstanding). One request returns the whole market for
+-- a quarter, so this is cheap to refresh. Kept per period_end rather than overwritten
+-- so market cap can be computed POINT-IN-TIME during a replay (pick the newest frame
+-- whose period_end is on or before the replayed day) — no look-ahead.
+-- Full ticker→CIK map from https://www.sec.gov/files/company_tickers.json (one
+-- request, whole market). Kept separately from `company_intel.cik`, which is only
+-- populated for symbols the intel job has already processed.
+CREATE TABLE IF NOT EXISTS sec_ticker_cik (
+    symbol     TEXT PRIMARY KEY NOT NULL,
+    cik        TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sec_ticker_cik_cik ON sec_ticker_cik(cik);
+
+CREATE TABLE IF NOT EXISTS sec_shares_outstanding (
+    cik        TEXT NOT NULL,              -- 10-digit zero-padded
+    period_end TEXT NOT NULL,              -- YYYY-MM-DD
+    shares     REAL NOT NULL,
+    frame      TEXT NOT NULL,              -- e.g. CY2026Q1I
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (cik, period_end)
+);
+
+-- Tickers the user PINNED in the pre-open screener. Unlike dismissals this is NOT
+-- day-scoped: a pin persists across days until the user removes it. `simulated`
+-- separates pins placed during a Market Replay from live ones so a backtest never
+-- pollutes the real watchlist (and vice versa).
+CREATE TABLE IF NOT EXISTS screener_pins (
+    symbol     TEXT NOT NULL,
+    simulated  INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, simulated)
+);
+
+-- User's own 1..3 rating of a pre-open ticker's potential. A private memo aid:
+-- nothing reads it but the card that draws it — no score, no filter, no ordering.
+-- Like a pin it has NO day column, so a rating placed today is still there next
+-- week; `simulated` keeps backtest ratings out of the live list. Rating 0 is not
+-- stored — clearing deletes the row.
+CREATE TABLE IF NOT EXISTS screener_ratings (
+    symbol     TEXT NOT NULL,
+    simulated  INTEGER NOT NULL DEFAULT 0,
+    rating     INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, simulated)
+);
 
 -- Persisted LLM analysis RESULTS per ticker (panic mean-reversion button read).
 -- Only the model's outputs are stored (context summary + reversion verdict), not
@@ -222,6 +315,56 @@ CREATE TABLE IF NOT EXISTS llm_analysis (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_analysis_symbol ON llm_analysis(symbol, created_at DESC);
 
+-- Panic Score V1: the LLM's read of each pre-open watchlist ticker (see
+-- `crate::panic_llm`). One row per (symbol, day, mode), written only when the user
+-- presses the analysis button — nothing here is ever produced automatically.
+--
+-- Scoped by `day` AND `simulated`, exactly like screener_pins / panic_watchlist_v2:
+-- an analysis run during a Market Replay must never surface in live mode, nor the
+-- reverse. Since the LLM ranking IS the definitive ranking, letting a backtest's
+-- scores leak into the live watchlist would silently reorder a real trading morning.
+--
+-- `panic_score_raw` keeps the per-ticker score BEFORE the calibration pass while
+-- `panic_score` holds the value actually used for ranking. Storing both is what makes
+-- calibration auditable: a large systematic gap between the two columns means the
+-- rubric is drifting and needs re-anchoring, and that is invisible if only the final
+-- score survives. `rubric_version` pins which barème produced the row, so scores from
+-- two different rubrics are never silently compared.
+CREATE TABLE IF NOT EXISTS panic_llm_scores (
+    symbol             TEXT NOT NULL,
+    day                TEXT NOT NULL,
+    simulated          INTEGER NOT NULL DEFAULT 0,
+    panic_score        REAL,
+    panic_score_raw    REAL,
+    confidence_score   REAL,
+    catalyst_strength  REAL,
+    catalyst_label     TEXT,
+    catalyst_type      TEXT,
+    reversibility      TEXT,
+    one_liner          TEXT,
+    key_drivers        TEXT,   -- JSON array of short strings
+    forced_flow        TEXT,
+    euphoria           TEXT,
+    normalization_prob REAL,
+    data_quality       TEXT,   -- JSON: feed, missing + look-ahead fields
+    web_used           INTEGER NOT NULL DEFAULT 0,
+    web_provider       TEXT,
+    adjustment_reason  TEXT,
+    rubric_version     TEXT,
+    model              TEXT,
+    ranking_score      REAL,
+    trade_direction    TEXT,
+    timing_state       TEXT,
+    fundamental_veto   INTEGER NOT NULL DEFAULT 0,
+    veto_reason        TEXT,
+    eligibility        TEXT,
+    catalyst_direction TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, day, simulated)
+);
+CREATE INDEX IF NOT EXISTS idx_panic_llm_day
+    ON panic_llm_scores(day, simulated, panic_score DESC);
+
 -- Trade executions (internal simulated fills), persisted per ticker so the chart
 -- can draw the entry/scale/exit triangles even days later / across restarts.
 -- `quantity` is the SIGNED share delta of the fill (+ buy/long, − sell/short),
@@ -236,14 +379,16 @@ CREATE TABLE IF NOT EXISTS executions (
 );
 CREATE INDEX IF NOT EXISTS idx_executions_symbol ON executions(symbol);
 
--- Original (launch-time) stop loss per trade. Recorded ONCE on the first fill and
--- never overwritten, so it survives later SL modifications — it's the level the
--- journal/R:R is based on. Drives the thin "original SL" segment drawn on every
--- chart of the symbol for the duration of the trade.
+-- Original (launch-time) stop loss / take profit per trade. Recorded ONCE on the
+-- first fill and never overwritten, so they survive later SL/TP modifications —
+-- they're the levels the journal/R:R is based on. Drive the thin "original SL"
+-- (red) and "original TP" (green) segments drawn on every chart of the symbol
+-- for the duration of the trade.
 CREATE TABLE IF NOT EXISTS trade_levels (
     trade_id    TEXT PRIMARY KEY NOT NULL,
     symbol      TEXT NOT NULL,
     original_sl REAL,
+    original_tp REAL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_trade_levels_symbol ON trade_levels(symbol);
@@ -445,6 +590,16 @@ const ALTERS: &[&str] = &[
     // the old composite-scoring table is obsolete. Dropped so a stale schema can't
     // linger. (Not strictly an ALTER, but the same idempotent-migration channel.)
     "DROP TABLE IF EXISTS mean_reversion_scores",
+    // Panic Mean Reversion again: the BB-area / SMA20-contact rankings measured
+    // DISTANCE, never speed, so a slow grind scored like a crash. Replaced by
+    // `panic_watchlist_v2` (sigma-spike × ATR-expansion, keyed by day). The old
+    // table is dropped here — its CREATE + CREATE INDEX were removed from
+    // MIGRATIONS in the same change, which is mandatory: MIGRATIONS runs FIRST and
+    // its errors abort startup, so a lingering `CREATE INDEX … ON panic_watchlist`
+    // would fail on the second launch once this DROP has run.
+    "DROP TABLE IF EXISTS panic_watchlist",
+    // The day marker moved into the `panic_watchlist_build` ledger.
+    "DELETE FROM app_config WHERE key='panic_watchlist_date'",
     // Multi-day close-to-close % change (1d/2d/4d/6d; 3d/5d predate this and are
     // already in the CREATE for older DBs).
     "ALTER TABLE fundamentals_cache ADD COLUMN change_1d_pct REAL",
@@ -464,6 +619,24 @@ const ALTERS: &[&str] = &[
     "ALTER TABLE fundamentals_cache ADD COLUMN dilution_capacity_score REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN dilution_need_score REAL",
     "ALTER TABLE fundamentals_cache ADD COLUMN short_interest_score REAL",
+    // Authoritative security classification from Massive reference tickers. Used by
+    // Panic Mean Reversion to exclude ETFs/ETNs/funds/preferreds without guessing
+    // from listing venue or issuer name.
+    "ALTER TABLE universe_assets ADD COLUMN security_type TEXT",
+    "ALTER TABLE panic_watchlist_v2 ADD COLUMN setup_kind TEXT NOT NULL DEFAULT 'multiday'",
+    "ALTER TABLE panic_watchlist_v2 ADD COLUMN move_pct REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE panic_watchlist_v2 ADD COLUMN stability_score REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE panic_watchlist_v2 ADD COLUMN volume_expansion REAL",
+    "ALTER TABLE panic_watchlist_v2 ADD COLUMN directional_efficiency REAL",
+    "ALTER TABLE panic_watchlist_v2 ADD COLUMN consecutive_bars INTEGER",
+    "ALTER TABLE panic_llm_scores ADD COLUMN ranking_score REAL",
+    "ALTER TABLE panic_llm_scores ADD COLUMN trade_direction TEXT",
+    "ALTER TABLE panic_llm_scores ADD COLUMN timing_state TEXT",
+    "ALTER TABLE panic_llm_scores ADD COLUMN fundamental_veto INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE panic_llm_scores ADD COLUMN veto_reason TEXT",
+    "ALTER TABLE panic_llm_scores ADD COLUMN eligibility TEXT",
+    "ALTER TABLE panic_llm_scores ADD COLUMN catalyst_direction TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_panic_llm_rank ON panic_llm_scores(day, simulated, fundamental_veto, ranking_score DESC)",
     // Editable drawings: per-timeframe scope + style columns (TradingView-like).
     "ALTER TABLE chart_drawings ADD COLUMN scope TEXT NOT NULL DEFAULT 'intraday'",
     "ALTER TABLE chart_drawings ADD COLUMN color TEXT",
@@ -471,6 +644,9 @@ const ALTERS: &[&str] = &[
     "ALTER TABLE chart_drawings ADD COLUMN width REAL",
     "ALTER TABLE chart_drawings ADD COLUMN line_style TEXT",
     "ALTER TABLE chart_drawings ADD COLUMN font_size REAL",
+    // Launch-time TP, added after the original-SL column (green counterpart of the
+    // original-SL chart segment).
+    "ALTER TABLE trade_levels ADD COLUMN original_tp REAL",
     "CREATE INDEX IF NOT EXISTS idx_executions_trade ON executions(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_screenshot_files_trade ON screenshot_files(trade_id)",
 ];
