@@ -12,7 +12,11 @@ pub enum IntelError {
     /// Network / transport error (DNS, connect, timeout). Retryable.
     Network(String),
     /// HTTP status the server returned. `retryable` flags 5xx / 429.
-    Http { status: u16, retryable: bool, body: String },
+    Http {
+        status: u16,
+        retryable: bool,
+        body: String,
+    },
     /// Response body couldn't be parsed into the expected shape.
     Parse(String),
     /// The provider responded fine but has no record for this ticker.
@@ -36,7 +40,11 @@ impl IntelError {
         // is exhausted (the rate-limiter already handles per-minute pacing) —
         // retrying just hammers the API for nothing.
         let retryable = (500..600).contains(&status);
-        IntelError::Http { status, retryable, body }
+        IntelError::Http {
+            status,
+            retryable,
+            body,
+        }
     }
 
     pub fn is_rate_limited(&self) -> bool {

@@ -45,7 +45,7 @@ pub use model::{CompanyIntel, TickerTableRow};
 
 use error::IntelError as E;
 use http::{Http, RetryPolicy};
-use providers::{fmp_fin, massive_si, sec_edgar};
+use providers::{fmp_fin, massive_company, massive_filings, massive_fin, massive_si, sec_edgar};
 use rate_limit::RateLimiter;
 
 /// Max recent dilution/ownership filings stored per ticker per run.
@@ -101,11 +101,17 @@ impl Providers {
 /// await).
 struct Keys {
     massive: Option<String>,
+    /// The Massive account is Starter or above. The free tier is ~5 requests/minute,
+    /// which a per-ticker financials call would exhaust instantly — so on Basic the
+    /// financials stay on SEC, whose budget is generous.
+    massive_paid: bool,
     fmp: Option<String>,
 }
 
 fn nonempty(o: &Option<String>) -> Option<String> {
-    o.as_deref().filter(|s| !s.trim().is_empty()).map(String::from)
+    o.as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────────
@@ -138,7 +144,24 @@ pub async fn refresh_company_intel_batch(
     let providers = Providers::new(&cfg);
     let keys = {
         let s = secrets.read().unwrap();
-        Keys { massive: nonempty(&s.massive_api_key), fmp: nonempty(&s.fmp_api_key) }
+        Keys {
+            massive: nonempty(&s.massive_api_key),
+            // The DETECTED tier, read from the same `app_meta` row the live feed
+            // probes into. The manual override in Settings → data source is
+            // deliberately not consulted: it exists to make the app treat a paid
+            // account as free for LIVE data (delay, wildcards), which says nothing
+            // about whether a REST reference call is affordable.
+            massive_paid: {
+                let g = db.lock().unwrap();
+                crate::local_db::cache_repository::get_app_meta(
+                    &g,
+                    crate::massive::plan::TIER_META_KEY,
+                )
+                .and_then(|v| crate::massive::plan::Tier::from_meta(&v))
+                    == Some(crate::massive::plan::Tier::Unlimited)
+            },
+            fmp: nonempty(&s.fmp_api_key),
+        }
     };
 
     // Resolve the ticker→CIK map only if at least one ticker has no cached CIK.
@@ -149,12 +172,20 @@ pub async fn refresh_company_intel_batch(
             .any(|t| repo::get_cik(&conn, t).filter(|c| !c.is_empty()).is_none())
     };
     let cik_map: HashMap<String, String> = if need_map {
-        match sec_edgar::fetch_ticker_cik_map(&providers.sec_http, &providers.sec_rl, &providers.policy)
-            .await
+        match sec_edgar::fetch_ticker_cik_map(
+            &providers.sec_http,
+            &providers.sec_rl,
+            &providers.policy,
+        )
+        .await
         {
             Ok(m) => m,
             Err(e) => {
-                log(&db, "warn", &format!("company_intel: ticker→CIK map unavailable: {e}"));
+                log(
+                    &db,
+                    "warn",
+                    &format!("company_intel: ticker→CIK map unavailable: {e}"),
+                );
                 HashMap::new()
             }
         }
@@ -164,7 +195,11 @@ pub async fn refresh_company_intel_batch(
 
     for symbol in &tickers {
         let (ok, rate_limited) = refresh_one(&db, &providers, &keys, &cik_map, symbol).await;
-        if ok { summary.succeeded += 1; } else { summary.with_errors += 1; }
+        if ok {
+            summary.succeeded += 1;
+        } else {
+            summary.with_errors += 1;
+        }
         summary.processed += 1;
         if rate_limited {
             let remaining = tickers.len() - summary.processed;
@@ -226,7 +261,11 @@ pub async fn run_collection_job(
         log(&db, "info", "company_intel: nothing stale to collect");
         return;
     }
-    log(&db, "info", &format!("company_intel: collecting {} ticker(s)", stale.len()));
+    log(
+        &db,
+        "info",
+        &format!("company_intel: collecting {} ticker(s)", stale.len()),
+    );
     let summary = refresh_company_intel_batch(db.clone(), cfg, secrets, stale).await;
     log(
         &db,
@@ -247,6 +286,7 @@ pub async fn run_collection_job(
 pub async fn collect_short_interest_bulk(
     db: Arc<Mutex<rusqlite::Connection>>,
     secrets: Arc<RwLock<Secrets>>,
+    unlimited: bool,
 ) -> Result<usize, String> {
     let key = {
         let s = secrets.read().unwrap();
@@ -263,7 +303,7 @@ pub async fn collect_short_interest_bulk(
             .collect()
     };
 
-    let rows = crate::massive::short_interest::fetch_short_interest_all(&key).await?;
+    let rows = crate::massive::short_interest::fetch_short_interest_all(&key, unlimited).await?;
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let conn = db.lock().unwrap();
@@ -311,7 +351,8 @@ fn build_financial_health(
             fh.net_income_ttm = Some(last4.iter().map(|(_, v)| v).sum());
         }
         if !last4.is_empty() {
-            fh.negative_quarters_last4 = Some(last4.iter().filter(|(_, v)| *v < 0.0).count() as i64);
+            fh.negative_quarters_last4 =
+                Some(last4.iter().filter(|(_, v)| *v < 0.0).count() as i64);
         }
     }
     if let Some((_, val)) = ocf {
@@ -371,7 +412,9 @@ pub async fn collect_sec_bulk(
         match sec_edgar::fetch_shares_outstanding_frame(&sec_http, &sec_rl, &policy, frame).await {
             Ok(entries) => {
                 for (cik, end, val) in entries {
-                    let Some(tickers) = cik_to_tickers.get(&cik) else { continue };
+                    let Some(tickers) = cik_to_tickers.get(&cik) else {
+                        continue;
+                    };
                     for t in tickers {
                         if in_universe(t) {
                             snapshot_rows.push((t.clone(), end.clone(), val));
@@ -379,24 +422,33 @@ pub async fn collect_sec_bulk(
                     }
                 }
             }
-            Err(e) => log(&db, "info", &format!("company_intel: shares frame {frame} skipped: {e}")),
+            Err(e) => log(
+                &db,
+                "info",
+                &format!("company_intel: shares frame {frame} skipped: {e}"),
+            ),
         }
     }
     let snapshots = {
         let conn = db.lock().unwrap();
-        cache_repository::upsert_dilution_snapshots(&conn, &snapshot_rows).map_err(|e| e.to_string())?
+        cache_repository::upsert_dilution_snapshots(&conn, &snapshot_rows)
+            .map_err(|e| e.to_string())?
     };
 
     // ── Financial health (besoin de diluer) ───────────────────────────────────
     // Helper: accumulate a concept's frames into a per-CIK collection.
     async fn collect_frames(
-        http: &Http, rl: &RateLimiter, policy: &RetryPolicy,
-        concept: &str, frames: &[String],
+        http: &Http,
+        rl: &RateLimiter,
+        policy: &RetryPolicy,
+        concept: &str,
+        frames: &[String],
     ) -> Vec<(String, String, f64)> {
         let mut out = Vec::new();
         for frame in frames {
             if let Ok(entries) =
-                sec_edgar::fetch_concept_frame(http, rl, policy, "us-gaap", concept, "USD", frame).await
+                sec_edgar::fetch_concept_frame(http, rl, policy, "us-gaap", concept, "USD", frame)
+                    .await
             {
                 out.extend(entries);
             }
@@ -414,7 +466,14 @@ pub async fn collect_sec_bulk(
 
     // Operating cash flow: 2 ANNUAL frames (newest first) → latest per CIK.
     let ocf_frames = sec_edgar::recent_annual_frames(today_nd, 2, 120);
-    let ocf_rows = collect_frames(&sec_http, &sec_rl, &policy, "NetCashProvidedByUsedInOperatingActivities", &ocf_frames).await;
+    let ocf_rows = collect_frames(
+        &sec_http,
+        &sec_rl,
+        &policy,
+        "NetCashProvidedByUsedInOperatingActivities",
+        &ocf_frames,
+    )
+    .await;
     let mut ocf_by_cik: HashMap<String, (String, f64)> = HashMap::new();
     for (cik, end, val) in ocf_rows {
         ocf_by_cik.entry(cik).or_insert((end, val)); // first seen = newest frame
@@ -423,7 +482,10 @@ pub async fn collect_sec_bulk(
     // Cash: 2 instant frames, primary concept then fallback, latest per CIK.
     let cash_frames = sec_edgar::recent_quarter_frames(today_nd, 2, 50, true);
     let mut cash_by_cik: HashMap<String, (String, f64)> = HashMap::new();
-    for concept in ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"] {
+    for concept in [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    ] {
         let rows = collect_frames(&sec_http, &sec_rl, &policy, concept, &cash_frames).await;
         for (cik, end, val) in rows {
             cash_by_cik.entry(cik).or_insert((end, val));
@@ -439,8 +501,14 @@ pub async fn collect_sec_bulk(
         ciks.extend(ocf_by_cik.keys());
         ciks.extend(cash_by_cik.keys());
         for cik in ciks {
-            let Some(tickers) = cik_to_tickers.get(cik) else { continue };
-            let fh = build_financial_health(ni_by_cik.get(cik), ocf_by_cik.get(cik), cash_by_cik.get(cik));
+            let Some(tickers) = cik_to_tickers.get(cik) else {
+                continue;
+            };
+            let fh = build_financial_health(
+                ni_by_cik.get(cik),
+                ocf_by_cik.get(cik),
+                cash_by_cik.get(cik),
+            );
             if fh.is_empty() {
                 continue;
             }
@@ -478,64 +546,290 @@ async fn refresh_one(
     // ── Section 1: short interest (Massive) ──────────────────────────────────
     if !rate_limited {
         if let Some(key) = &keys.massive {
-            match massive_si::fetch_short_interest(&p.massive_http, &p.massive_rl, &p.policy, key, symbol)
-                .await
+            match massive_si::fetch_short_interest(
+                &p.massive_http,
+                &p.massive_rl,
+                &p.policy,
+                key,
+                symbol,
+            )
+            .await
             {
-                Ok(si) => with_db(db, |c| { let _ = repo::upsert_short_interest(c, symbol, &si, "Massive", &now); }),
+                Ok(si) => with_db(db, |c| {
+                    let _ = repo::upsert_short_interest(c, symbol, &si, "Massive", &now);
+                }),
                 Err(E::NotFound) | Err(E::MissingKey) => {}
-                Err(ref e) if e.is_rate_limited() => { rate_limited = true; }
-                Err(e) => { errors.insert("short_interest".into(), e.to_string()); }
+                Err(ref e) if e.is_rate_limited() => {
+                    rate_limited = true;
+                }
+                Err(e) => {
+                    errors.insert("short_interest".into(), e.to_string());
+                }
             }
         }
     }
 
-    // ── Section 2: financial health (SEC Company Facts → FMP fallback) ────────
+    // ── Section 2: financial health (Massive → SEC Company Facts → FMP) ───────
+    // Massive first when the account is a paid tier: it returns the same figures
+    // pre-assembled by fiscal period in ONE request, where SEC's XBRL frames need
+    // several and answer with a whole market's data to extract one company's number.
+    // SEC stays as the fallback — it is free, needs no key, and is the source of
+    // record; and unlike the disclosures section (see below) BOTH sources genuinely
+    // carry these numbers.
     let mut fin_done = false;
-    if let Some(cik) = &cik {
-        match sec_edgar::fetch_financials(&p.sec_http, &p.sec_rl, &p.policy, cik).await {
+    if let Some(key) = keys.massive.as_deref().filter(|_| keys.massive_paid) {
+        match massive_fin::fetch_financials(&p.massive_http, &p.massive_rl, &p.policy, key, symbol)
+            .await
+        {
             Ok(fh) => {
-                with_db(db, |c| { let _ = repo::upsert_financials(c, symbol, &fh, "SEC Company Facts", &now); });
+                with_db(db, |c| {
+                    let _ = repo::upsert_financials(c, symbol, &fh, "Massive", &now);
+                });
                 fin_done = true;
             }
-            Err(E::NotFound) => {}
-            Err(e) => { errors.insert("financials".into(), e.to_string()); }
+            Err(E::NotFound) | Err(E::MissingKey) => {}
+            Err(ref e) if e.is_rate_limited() => {
+                rate_limited = true;
+            }
+            Err(e) => {
+                errors.insert("financials".into(), e.to_string());
+            }
+        }
+    }
+    if !fin_done {
+        if let Some(cik) = &cik {
+            match sec_edgar::fetch_financials(&p.sec_http, &p.sec_rl, &p.policy, cik).await {
+                Ok(fh) => {
+                    with_db(db, |c| {
+                        let _ = repo::upsert_financials(c, symbol, &fh, "SEC Company Facts", &now);
+                    });
+                    fin_done = true;
+                    errors.remove("financials");
+                }
+                Err(E::NotFound) => {}
+                Err(e) => {
+                    errors
+                        .entry("financials".into())
+                        .or_insert_with(|| e.to_string());
+                }
+            }
         }
     }
     if !fin_done && !rate_limited {
         if let Some(key) = &keys.fmp {
             match fmp_fin::fetch_financials(&p.fmp_http, &p.fmp_rl, &p.policy, key, symbol).await {
                 Ok(fh) => {
-                    with_db(db, |c| { let _ = repo::upsert_financials(c, symbol, &fh, "FMP", &now); });
+                    with_db(db, |c| {
+                        let _ = repo::upsert_financials(c, symbol, &fh, "FMP", &now);
+                    });
                     errors.remove("financials");
                 }
                 Err(E::NotFound) | Err(E::MissingKey) => {}
-                Err(ref e) if e.is_rate_limited() => { rate_limited = true; }
-                Err(e) => { errors.entry("financials".into()).or_insert_with(|| e.to_string()); }
+                Err(ref e) if e.is_rate_limited() => {
+                    rate_limited = true;
+                }
+                Err(e) => {
+                    errors
+                        .entry("financials".into())
+                        .or_insert_with(|| e.to_string());
+                }
             }
         }
     }
 
-    // ── Section 3: dilution / S-3 filings (SEC EDGAR) ─────────────────────────
-    if let Some(cik) = &cik {
-        match sec_edgar::fetch_recent_filings(&p.sec_http, &p.sec_rl, &p.policy, symbol, cik, FILINGS_CAP)
+    // ── Section 0: issuer identity — Massive first, EDGAR completes ───────────
+    // `company_meta` drives the two universe switches (hot industry, risk domicile)
+    // and the A+ setup points, so it has to be right before anything else is worth
+    // computing. Massive answers first, as asked; it supplies the SIC title for
+    // common stock and nothing at all for an ADR, and no domicile for anyone — so
+    // EDGAR's submissions feed fills the rest. EDGAR is free, keyless, and the same
+    // JSON is fetched again for the filings below.
+    //
+    // Existing values are never blanked: a field neither provider knows keeps
+    // whatever the (paid) startup pipeline previously wrote.
+    {
+        let previous = {
+            let conn = db.lock().unwrap();
+            crate::local_db::company_meta_repository::get_by_symbol(&conn, symbol)
+                .ok()
+                .flatten()
+        };
+        let mut meta = previous.unwrap_or_else(|| {
+            crate::local_db::company_meta_repository::CompanyMeta {
+                symbol: symbol.to_string(),
+                country: None,
+                sic: None,
+                industry: None,
+                sector: None,
+                updated_at: now.clone(),
+            }
+        });
+        let mut touched = false;
+
+        if let Some(key) = keys.massive.as_deref().filter(|_| keys.massive_paid) {
+            match massive_company::fetch_company(
+                &p.massive_http,
+                &p.massive_rl,
+                &p.policy,
+                key,
+                symbol,
+            )
             .await
-        {
-            Ok(filings) => {
-                with_db(db, |c| {
-                    for f in &filings {
-                        let _ = repo::upsert_filing(c, f);
+            {
+                Ok(c) => {
+                    if c.sic.is_some() {
+                        meta.sic = c.sic;
+                        touched = true;
                     }
-                });
-                let dil = sec_edgar::summarize_dilution(
-                    &p.sec_http, &p.sec_rl, &p.policy, &filings, SCAN_LATEST_DILUTION_DOC,
-                )
-                .await;
-                if !dil.is_empty() {
-                    with_db(db, |c| { let _ = repo::upsert_dilution(c, symbol, &dil, "SEC EDGAR", &now); });
+                    if c.industry.is_some() {
+                        meta.industry = c.industry;
+                        touched = true;
+                    }
+                    // The clean CS/ADRC discriminator, kept where the universe query
+                    // already reads it from.
+                    if let Some(t) = c.security_type {
+                        with_db(db, |conn| {
+                            let _ = universe_repository::update_security_types(
+                                conn,
+                                &[(symbol.to_string(), t)],
+                            );
+                        });
+                    }
+                }
+                Err(E::NotFound) | Err(E::MissingKey) => {}
+                Err(ref e) if e.is_rate_limited() => rate_limited = true,
+                Err(e) => {
+                    errors.insert("company_meta".into(), e.to_string());
                 }
             }
+        }
+
+        // EDGAR completes what Massive left empty — always the domicile, and
+        // everything for an ADR.
+        if meta.country.is_none() || meta.industry.is_none() {
+            if let Some(cik) = &cik {
+                match sec_edgar::fetch_company_profile(&p.sec_http, &p.sec_rl, &p.policy, cik).await
+                {
+                    Ok(profile) => {
+                        errors.remove("company_meta");
+                        if meta.sic.is_none() && profile.sic.is_some() {
+                            meta.sic = profile.sic;
+                            touched = true;
+                        }
+                        if meta.industry.is_none() && profile.industry.is_some() {
+                            meta.industry = profile.industry;
+                            touched = true;
+                        }
+                        if meta.country.is_none() && profile.country.is_some() {
+                            meta.country = profile.country;
+                            touched = true;
+                        }
+                    }
+                    Err(E::NotFound) => {}
+                    Err(e) => {
+                        errors
+                            .entry("company_meta".into())
+                            .or_insert_with(|| e.to_string());
+                    }
+                }
+            }
+        }
+
+        if touched {
+            meta.updated_at = now.clone();
+            with_db(db, |c| {
+                let _ = crate::local_db::company_meta_repository::upsert(c, &meta);
+            });
+        }
+    }
+
+    // ── Section 3: filings & disclosures (Massive first, EDGAR merged in) ─────
+    // Massive is queried first, as asked. It is a SUPPLEMENT, not a replacement, and
+    // the merge below is load-bearing: measured on 2026-08-22 its filings index
+    // carries only the XBRL-bearing periodic reports (10-K, 10-Q, some 8-K) and
+    // **none** of the dilution forms — `type=424B5` returns zero across the whole
+    // index, while EDGAR's own submissions JSON for JUNS lists 424B3, 424B4 and
+    // 424B5. A plain "Massive, else SEC" would therefore never reach SEC (Massive
+    // almost always answers) and the shelf / ATM / priced-offering read would die
+    // silently while every log line still looked healthy.
+    //
+    // Nothing is lost by keeping EDGAR: `data.sec.gov` is free, keyless and
+    // rate-generous. What costs credits is sec-api.io, which this section never uses.
+    let mut filings: Vec<model::SecFiling> = Vec::new();
+    let mut filings_source = "SEC EDGAR";
+    if let Some(key) = keys.massive.as_deref().filter(|_| keys.massive_paid) {
+        match massive_filings::fetch_recent_filings(
+            &p.massive_http,
+            &p.massive_rl,
+            &p.policy,
+            key,
+            symbol,
+            FILINGS_CAP,
+        )
+        .await
+        {
+            Ok(rows) => {
+                filings = rows;
+                filings_source = "Massive + SEC EDGAR";
+            }
+            Err(E::NotFound) | Err(E::MissingKey) => {}
+            Err(ref e) if e.is_rate_limited() => {
+                rate_limited = true;
+            }
+            Err(e) => {
+                errors.insert("filings".into(), e.to_string());
+            }
+        }
+    }
+    if let Some(cik) = &cik {
+        match sec_edgar::fetch_recent_filings(
+            &p.sec_http,
+            &p.sec_rl,
+            &p.policy,
+            symbol,
+            cik,
+            FILINGS_CAP,
+        )
+        .await
+        {
+            Ok(edgar) => {
+                errors.remove("filings");
+                // EDGAR wins on collision: it is the only side that carries the
+                // primary document, and therefore the only side whose keyword flags
+                // (`detected_atm`, `detected_resale`) mean anything.
+                let known: std::collections::HashSet<String> =
+                    edgar.iter().map(|f| f.accession_number.clone()).collect();
+                filings.retain(|f| !known.contains(&f.accession_number));
+                filings.extend(edgar);
+            }
             Err(E::NotFound) => {}
-            Err(e) => { errors.insert("dilution".into(), e.to_string()); }
+            Err(e) => {
+                errors
+                    .entry("dilution".into())
+                    .or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    if !filings.is_empty() {
+        filings.sort_by(|a, b| b.filing_date.cmp(&a.filing_date));
+        filings.truncate(FILINGS_CAP);
+        with_db(db, |c| {
+            for f in &filings {
+                let _ = repo::upsert_filing(c, f);
+            }
+        });
+        let dil = sec_edgar::summarize_dilution(
+            &p.sec_http,
+            &p.sec_rl,
+            &p.policy,
+            &filings,
+            SCAN_LATEST_DILUTION_DOC,
+        )
+        .await;
+        if !dil.is_empty() {
+            with_db(db, |c| {
+                let _ = repo::upsert_dilution(c, symbol, &dil, filings_source, &now);
+            });
         }
     }
 
@@ -543,13 +837,22 @@ async fn refresh_one(
     // Disabled (see ENABLE_HOLDERS_FTS): the efts endpoint 500s on this query.
     if ENABLE_HOLDERS_FTS {
         if let Some(cik) = &cik {
-            match sec_edgar::fetch_holders(&p.sec_http, &p.sec_rl, &p.policy, cik, HOLDERS_CAP).await {
+            match sec_edgar::fetch_holders(&p.sec_http, &p.sec_rl, &p.policy, cik, HOLDERS_CAP)
+                .await
+            {
                 Ok(holders) if !holders.is_empty() => {
-                    let own = model::OwnershipInfo { holders_5pct: holders, ..Default::default() };
-                    with_db(db, |c| { let _ = repo::upsert_ownership(c, symbol, &own, "SEC EDGAR", &now); });
+                    let own = model::OwnershipInfo {
+                        holders_5pct: holders,
+                        ..Default::default()
+                    };
+                    with_db(db, |c| {
+                        let _ = repo::upsert_ownership(c, symbol, &own, "SEC EDGAR", &now);
+                    });
                 }
                 Ok(_) | Err(E::NotFound) => {}
-                Err(e) => { errors.insert("ownership".into(), e.to_string()); }
+                Err(e) => {
+                    errors.insert("ownership".into(), e.to_string());
+                }
             }
         }
     }
@@ -560,7 +863,9 @@ async fn refresh_one(
     } else {
         serde_json::to_string(&errors).ok()
     };
-    with_db(db, |c| { let _ = repo::touch(c, symbol, &now, err_json.as_deref()); });
+    with_db(db, |c| {
+        let _ = repo::touch(c, symbol, &now, err_json.as_deref());
+    });
     (errors.is_empty(), rate_limited)
 }
 

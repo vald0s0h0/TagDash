@@ -25,8 +25,18 @@ use tokio::sync::mpsc;
 const FLUSH_MS: u64 = 750;
 
 enum Rec {
-    Trade { ts_ms: i64, symbol: String, price: f64, size: u64 },
-    Quote { ts_ms: i64, symbol: String, bid: f64, ask: f64 },
+    Trade {
+        ts_ms: i64,
+        symbol: String,
+        price: f64,
+        size: u64,
+    },
+    Quote {
+        ts_ms: i64,
+        symbol: String,
+        bid: f64,
+        ask: f64,
+    },
 }
 
 static TX: OnceLock<mpsc::UnboundedSender<Rec>> = OnceLock::new();
@@ -94,7 +104,9 @@ fn flush(app_dir: &Path, current: &mut Option<(String, Connection)>, batch: &mut
             Rec::Trade { ts_ms, .. } | Rec::Quote { ts_ms, .. } => *ts_ms,
         };
         let day = crate::time::et_date(
-            chrono::TimeZone::timestamp_millis_opt(&Utc, ts_ms).single().unwrap_or_else(Utc::now),
+            chrono::TimeZone::timestamp_millis_opt(&Utc, ts_ms)
+                .single()
+                .unwrap_or_else(Utc::now),
         );
         // Roll the file when the day changes.
         let roll = current.as_ref().map(|(d, _)| d != &day).unwrap_or(true);
@@ -115,11 +127,21 @@ fn flush(app_dir: &Path, current: &mut Option<(String, Connection)>, batch: &mut
         }
         if let Some((_, conn)) = current.as_ref() {
             let res = match &rec {
-                Rec::Trade { ts_ms, symbol, price, size } => conn.execute(
+                Rec::Trade {
+                    ts_ms,
+                    symbol,
+                    price,
+                    size,
+                } => conn.execute(
                     "INSERT INTO trades (ts, symbol, price, size) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![ts_ms, symbol, price, *size as i64],
                 ),
-                Rec::Quote { ts_ms, symbol, bid, ask } => conn.execute(
+                Rec::Quote {
+                    ts_ms,
+                    symbol,
+                    bid,
+                    ask,
+                } => conn.execute(
                     "INSERT INTO quotes (ts, symbol, bid, ask) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![ts_ms, symbol, bid, ask],
                 ),
@@ -190,7 +212,9 @@ pub fn record_quote(symbol: &str, bid: f64, ask: f64, event_time: DateTime<Utc>)
 
 /// Read a whole day's taped trades, time-ascending: (ts_ms, symbol, price, size).
 pub fn read_trades(app_dir: &Path, day: &str) -> Vec<(i64, String, f64, u64)> {
-    let Ok(conn) = Connection::open(tape_path(app_dir, day)) else { return Vec::new() };
+    let Ok(conn) = Connection::open(tape_path(app_dir, day)) else {
+        return Vec::new();
+    };
     let Ok(mut stmt) = conn.prepare("SELECT ts, symbol, price, size FROM trades ORDER BY ts ASC")
     else {
         return Vec::new();
@@ -209,7 +233,9 @@ pub fn read_trades(app_dir: &Path, day: &str) -> Vec<(i64, String, f64, u64)> {
 
 /// Read a whole day's taped quotes, time-ascending: (ts_ms, symbol, bid, ask).
 pub fn read_quotes(app_dir: &Path, day: &str) -> Vec<(i64, String, f64, f64)> {
-    let Ok(conn) = Connection::open(tape_path(app_dir, day)) else { return Vec::new() };
+    let Ok(conn) = Connection::open(tape_path(app_dir, day)) else {
+        return Vec::new();
+    };
     let Ok(mut stmt) = conn.prepare("SELECT ts, symbol, bid, ask FROM quotes ORDER BY ts ASC")
     else {
         return Vec::new();

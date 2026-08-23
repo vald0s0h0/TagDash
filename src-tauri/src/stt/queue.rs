@@ -90,8 +90,12 @@ pub fn load_persisted(app_dir: &Path) -> Vec<SttJob> {
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&p) else { continue };
-        let Ok(mut job) = serde_json::from_str::<SttJob>(&content) else { continue };
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut job) = serde_json::from_str::<SttJob>(&content) else {
+            continue;
+        };
         match job.state {
             JobState::Running => {
                 job.state = JobState::Queued;

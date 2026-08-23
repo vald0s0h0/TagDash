@@ -1303,6 +1303,25 @@ pub fn avg_volumes(conn: &Connection, days: u32) -> Result<Vec<(String, i64)>> {
     rows.collect()
 }
 
+/// One symbol's ADV over the most recent `days` strictly before `before_date`.
+/// This is the replay-safe denominator for the legacy cumulative day/ADV display.
+pub fn avg_volume_before(
+    conn: &Connection,
+    symbol: &str,
+    days: u32,
+    before_date: &str,
+) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT CAST(AVG(volume) AS INTEGER) FROM (
+             SELECT volume FROM daily_cache
+             WHERE symbol=?1 AND date < ?3 AND volume IS NOT NULL
+             ORDER BY date DESC LIMIT ?2
+         )",
+        params![symbol, days, before_date],
+        |row| row.get(0),
+    )
+}
+
 /// Average daily DOLLAR volume per symbol over the most recent `days` cached bars
 /// (close × volume, averaged). Computed in SQL alongside `avg_volumes`. Used by
 /// the Panic Mean Reversion premarket pre-filter (the "avg $ volume 20d > 5M"

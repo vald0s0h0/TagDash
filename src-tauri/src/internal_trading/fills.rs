@@ -5,7 +5,7 @@ use crate::types::Side;
 ///   Sell (Short entry or Long exit)  → bid  (unfavorable for seller)
 pub fn price_for_side(side: Side, bid: f64, ask: f64) -> f64 {
     match side {
-        Side::Long  => ask,
+        Side::Long => ask,
         Side::Short => bid,
     }
 }

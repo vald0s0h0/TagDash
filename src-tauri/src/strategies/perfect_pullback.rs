@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::strategies::ScanStrategy;
 use crate::types::{
     AlertSignal, IndicatorKind, InfoField, InfoSource, PaneIndicator, PaneSpec, Session,
-    StrategyCard, StrategyContext, StrategyRiskConfig, UniverseKey,
+    StrategyCard, StrategyContext, StrategyRiskConfig, StreamingScope, UniverseKey,
 };
 
 // ─── Identity (kept in sync with the engine's constants) ──────────────────────
@@ -73,6 +73,7 @@ impl ScanStrategy for PerfectPullback {
     fn card(&self) -> StrategyCard {
         StrategyCard {
             universe: UniverseKey::UsStocks,
+            streaming_scope: StreamingScope::None,
             // Two panes. Left: daily context (SMA 200/20 + volume), read-only.
             // Right: the intraday execution pane (SMA 20 + session VWAP + volume),
             // interactive (SL/TP, orders). The intraday timeframe here is a
@@ -81,39 +82,77 @@ impl ScanStrategy for PerfectPullback {
             // actual chart timeframe.
             panes: vec![
                 PaneSpec {
-                    timeframe:   "daily".into(),
-                    symbol:      None,
-                    indicators:  vec![
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(200) },
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(20) },
-                        PaneIndicator { kind: IndicatorKind::Volume, period: None },
+                    timeframe: "daily".into(),
+                    symbol: None,
+                    indicators: vec![
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(200),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(20),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Volume,
+                            period: None,
+                        },
                     ],
                     interactive: false,
-                    column:      None,
+                    column: None,
                 },
                 PaneSpec {
-                    timeframe:   "1m".into(),
-                    symbol:      None,
-                    indicators:  vec![
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(20) },
-                        PaneIndicator { kind: IndicatorKind::Vwap,   period: None },
-                        PaneIndicator { kind: IndicatorKind::Volume, period: None },
+                    timeframe: "1m".into(),
+                    symbol: None,
+                    indicators: vec![
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(20),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Vwap,
+                            period: None,
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Volume,
+                            period: None,
+                        },
                     ],
                     interactive: true,
-                    column:      None,
+                    column: None,
                 },
             ],
             // Live-sourced info band (no enrichment/LLM for this strategy). Float
             // comes from the universe DB via get_card_info (resolved as an extra);
             // Alert source so an unknown float shows "—" rather than a spinner.
             info_fields: vec![
-                InfoField { key: "change_day_pct".into(), label: "Gap".into(),   source: InfoSource::Alert },
-                InfoField { key: "float_shares".into(),   label: "Float".into(), source: InfoSource::Alert },
-                InfoField { key: "rvol".into(),           label: "RVOL".into(),  source: InfoSource::Alert },
-                InfoField { key: "vwap".into(),           label: "VWAP".into(),  source: InfoSource::Alert },
-                InfoField { key: "volume".into(),         label: "Vol".into(),   source: InfoSource::Alert },
+                InfoField {
+                    key: "change_day_pct".into(),
+                    label: "Gap".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "float_shares".into(),
+                    label: "Float".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "rvol".into(),
+                    label: "RVOL".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "vwap".into(),
+                    label: "VWAP".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "volume".into(),
+                    label: "Vol".into(),
+                    source: InfoSource::Alert,
+                },
             ],
-            llm:         None,
+            llm: None,
             enrichments: vec![],
         }
     }
@@ -122,5 +161,4 @@ impl ScanStrategy for PerfectPullback {
         // The dedicated engine is the sole firer for this strategy.
         None
     }
-
 }

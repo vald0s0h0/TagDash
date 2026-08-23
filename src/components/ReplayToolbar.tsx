@@ -24,6 +24,70 @@ import type { ReplayStatus } from "@/types";
 const SPEEDS = [0.5, 1, 2, 5, 10, 30, 60, 120];
 const SESSION_STARTS = ["04:00", "07:00", "09:30"] as const;
 
+type Badge = { label: string; title: string; className: string };
+
+/** Granularity of the replayed price path — `ReplayStatus.source`. */
+const GRANULARITY: Record<string, Badge> = {
+  tape: {
+    label: "TAPE",
+    title: "Trades réels enregistrés (granularité fine)",
+    className: "bg-emerald-500/20 text-emerald-300",
+  },
+  seconds: {
+    label: "1 SEC",
+    title:
+      "Agrégats 1 seconde réels sur les symboles affichés — rien n'est synthétisé sur ces titres",
+    className: "bg-emerald-500/20 text-emerald-300",
+  },
+  minutes: {
+    label: "MINUTES",
+    title: "Barres 1 min synthétisées (pas de tape pour ce jour)",
+    className: "bg-sky-500/20 text-sky-300",
+  },
+  daily: {
+    label: "DAILY",
+    title:
+      "Aucune donnée intraday disponible — barre daily unique simulée sur la séance",
+    className: "bg-amber-500/20 text-amber-300",
+  },
+};
+
+/**
+ * WHERE the replayed day came from — `ReplayStatus.provider`. Same priority as the
+ * live feed (SIP > Massive Starter+ > flat files), so the badge answers the one
+ * question a surprising replay raises: which tape am I actually watching?
+ */
+const PROVIDERS: Record<string, Badge> = {
+  alpaca_sip: {
+    label: "SIP",
+    title: "Alpaca SIP — tape consolidé complet (source prioritaire)",
+    className: "bg-violet-500/20 text-violet-300",
+  },
+  massive: {
+    label: "MASSIVE",
+    title:
+      "Massive Starter+ — agrégats seconde/minute sur tout le marché US. Le délai de 15 min du live n'existe pas ici : la séance est de l'historique.",
+    className: "bg-violet-500/20 text-violet-300",
+  },
+  alpaca_iex: {
+    label: "IEX",
+    title:
+      "Alpaca plan gratuit — uniquement les prints IEX (quelques % du volume). Un flat file téléchargé serait plus complet.",
+    className: "bg-amber-500/20 text-amber-300",
+  },
+  flat_files: {
+    label: "FLAT FILES",
+    title: "Fichiers plats locaux — aucune requête réseau",
+    className: "bg-slate-500/20 text-slate-300",
+  },
+  daily_cache: {
+    label: "CACHE DAILY",
+    title:
+      "Dernier recours : aucune source intraday n'a répondu, la séance est reconstruite depuis la seule barre daily locale",
+    className: "bg-amber-500/20 text-amber-300",
+  },
+};
+
 function EditableTime({
   simTime,
   onSeek,
@@ -250,22 +314,31 @@ export function ReplayToolbar() {
           <span
             className={cn(
               "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
-              status?.source === "tape"
-                ? "bg-emerald-500/20 text-emerald-300"
-                : status?.source === "daily"
-                ? "bg-amber-500/20 text-amber-300"
-                : "bg-sky-500/20 text-sky-300"
+              GRANULARITY[status?.source ?? ""]?.className ??
+                "bg-sky-500/20 text-sky-300"
             )}
             title={
-              status?.source === "tape"
-                ? "Trades réels enregistrés (granularité fine)"
-                : status?.source === "daily"
-                ? "Aucune donnée intraday (ni fichier plat minute, ni clés Alpaca) — barre daily unique simulée sur la séance"
-                : "Barres 1 min synthétisées (pas de tape pour ce jour)"
+              GRANULARITY[status?.source ?? ""]?.title ??
+              "Barres 1 min synthétisées (pas de tape pour ce jour)"
             }
           >
-            {status?.source === "tape" ? "TAPE" : status?.source === "daily" ? "DAILY" : "MINUTES"}
+            {GRANULARITY[status?.source ?? ""]?.label ?? "MINUTES"}
           </span>
+          {status?.provider && (
+            <span
+              className={cn(
+                "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                PROVIDERS[status.provider]?.className ??
+                  "bg-muted text-muted-foreground"
+              )}
+              title={
+                PROVIDERS[status.provider]?.title ??
+                "Source de données du replay"
+              }
+            >
+              {PROVIDERS[status.provider]?.label ?? status.provider}
+            </span>
+          )}
           <EditableTime
             simTime={status?.sim_time ?? null}
             onSeek={(hm) => cmd(() => api.replaySeekClock(hm))}

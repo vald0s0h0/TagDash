@@ -43,7 +43,7 @@ use crate::types::AttentionEntry;
 
 /// Gate 0 — active window in ET wall-clock minutes: 09:30 (570) → 12:30 (750).
 const SESSION_START_MIN: u32 = 9 * 60 + 30; // 570
-const SESSION_END_MIN:   u32 = 12 * 60 + 30; // 750
+const SESSION_END_MIN: u32 = 12 * 60 + 30; // 750
 
 /// Rolling analysis window (seconds) — the last 5 one-minute buckets.
 const WINDOW_SECS: i64 = 300;
@@ -54,31 +54,31 @@ const LOOP_INTERVAL_SECS: u64 = 5;
 const FLOAT_REFRESH_SECS: u64 = 300;
 
 // ── Gate 1 — minimum live liquidity (cheap, runs on every streamed ticker) ────
-const MIN_DOLLAR_VOL_5M:  f64 = 300_000.0;
-const MIN_VOLUME_5M:      u64 = 100_000;
+const MIN_DOLLAR_VOL_5M: f64 = 300_000.0;
+const MIN_VOLUME_5M: u64 = 100_000;
 const MIN_TRADE_COUNT_5M: u64 = 100;
 
 // ── Gate 2 — persistence hard filter (rejects single-minute spikes) ───────────
 /// Minimum minutes (of the last 5) with significant volume.
-const MIN_ACTIVE_MINUTES:   u8  = 3;
+const MIN_ACTIVE_MINUTES: u8 = 3;
 /// A minute counts as "active" when its volume is at least this fraction of the
 /// window's mean minute volume.
-const ACTIVE_BAR_FRACTION:  f64 = 0.10;
+const ACTIVE_BAR_FRACTION: f64 = 0.10;
 /// Reject when one minute carries more than this share of the 5-minute volume.
-const MAX_1M_VOLUME_SHARE:  f64 = 0.80;
+const MAX_1M_VOLUME_SHARE: f64 = 0.80;
 
 // ── Gate 4 — market-share groups ──────────────────────────────────────────────
 /// Float below this counts as a small cap (its own market-share group).
 const SMALLCAP_FLOAT_MAX: u64 = 100_000_000;
 /// Price below this counts as "under 20$" (its own market-share group).
-const UNDER20_PRICE:      f64 = 20.0;
+const UNDER20_PRICE: f64 = 20.0;
 
 // ── Final score weights (direction-agnostic) ──────────────────────────────────
 const W_PR_DOLLAR: f64 = 0.35;
 const W_PR_VOLUME: f64 = 0.20;
-const W_REL:       f64 = 0.25; // dropped (and the rest renormalised) when unknown
-const W_GROUP:     f64 = 0.10;
-const W_ACCEL:     f64 = 0.10;
+const W_REL: f64 = 0.25; // dropped (and the rest renormalised) when unknown
+const W_GROUP: f64 = 0.10;
+const W_ACCEL: f64 = 0.10;
 
 /// How many tickers the published list holds.
 const TOP_N: usize = 10;
@@ -101,20 +101,20 @@ type Baseline = HashMap<u32, f64>;
 
 #[derive(Debug, Clone, Copy)]
 struct WindowStats {
-    volume_5m:             u64,
-    dollar_volume_5m:      f64,
-    trade_count_5m:        u64,
-    active_minutes_5m:     u8,
-    max_1m_volume_share:   f64,
+    volume_5m: u64,
+    dollar_volume_5m: f64,
+    trade_count_5m: u64,
+    active_minutes_5m: u8,
+    max_1m_volume_share: f64,
     /// Dollar volume of the prior 5-minute window (−10..−5 min) for acceleration.
     prev_dollar_volume_5m: f64,
 }
 
 /// One streamed ticker's snapshot for this recompute.
 struct Row {
-    symbol:       String,
-    price:        f64,
-    stats:        WindowStats,
+    symbol: String,
+    price: f64,
+    stats: WindowStats,
     float_shares: Option<u64>,
 }
 
@@ -125,10 +125,10 @@ pub struct MarketAttentionEngine;
 impl MarketAttentionEngine {
     /// Spawn the background loop. Returns immediately.
     pub fn start(
-        running:   Arc<AtomicBool>,
-        market:    Arc<RwLock<MarketState>>,
-        db:        Arc<Mutex<rusqlite::Connection>>,
-        secrets:   Arc<RwLock<Secrets>>,
+        running: Arc<AtomicBool>,
+        market: Arc<RwLock<MarketState>>,
+        db: Arc<Mutex<rusqlite::Connection>>,
+        secrets: Arc<RwLock<Secrets>>,
         attention: Arc<RwLock<Vec<AttentionEntry>>>,
     ) {
         // Tauri-managed runtime so this can be launched from the sync `setup` hook.
@@ -138,7 +138,8 @@ impl MarketAttentionEngine {
 
             // Historical baselines (symbol → time-of-day profile), filled lazily by
             // background fetches and shared with them. `requested` dedups the fetches.
-            let hist: Arc<RwLock<HashMap<String, Baseline>>> = Arc::new(RwLock::new(HashMap::new()));
+            let hist: Arc<RwLock<HashMap<String, Baseline>>> =
+                Arc::new(RwLock::new(HashMap::new()));
             let requested: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             let mut hist_day: Option<String> = None;
 
@@ -217,8 +218,8 @@ impl MarketAttentionEngine {
 fn recompute(
     market: &Arc<RwLock<MarketState>>,
     floats: &HashMap<String, u64>,
-    hist:   &Arc<RwLock<HashMap<String, Baseline>>>,
-    now:    DateTime<Utc>,
+    hist: &Arc<RwLock<HashMap<String, Baseline>>>,
+    now: DateTime<Utc>,
 ) -> Vec<AttentionEntry> {
     // Snapshot per-ticker window stats under a brief read lock (only arithmetic on
     // ≤10 one-minute bars per symbol; all gating runs after the lock is released).
@@ -231,7 +232,7 @@ fn recompute(
                 let m1 = ms.closed_bars(&t.symbol, Timeframe::M1);
                 let stats = compute_window_stats(&m1, now)?;
                 Some(Row {
-                    symbol:       t.symbol.clone(),
+                    symbol: t.symbol.clone(),
                     price,
                     stats,
                     float_shares: floats.get(&t.symbol).copied(),
@@ -245,9 +246,17 @@ fn recompute(
 
     // Gate 4 totals — over ALL tickers with current-window data (not just the gate
     // survivors), so market share reflects the whole market / group.
-    let total_all:      f64 = rows.iter().map(|r| r.stats.dollar_volume_5m).sum();
-    let total_smallcap: f64 = rows.iter().filter(|r| is_smallcap(r)).map(|r| r.stats.dollar_volume_5m).sum();
-    let total_under20:  f64 = rows.iter().filter(|r| is_under20(r)).map(|r| r.stats.dollar_volume_5m).sum();
+    let total_all: f64 = rows.iter().map(|r| r.stats.dollar_volume_5m).sum();
+    let total_smallcap: f64 = rows
+        .iter()
+        .filter(|r| is_smallcap(r))
+        .map(|r| r.stats.dollar_volume_5m)
+        .sum();
+    let total_under20: f64 = rows
+        .iter()
+        .filter(|r| is_under20(r))
+        .map(|r| r.stats.dollar_volume_5m)
+        .sum();
 
     // Gates 1 + 2 — liquidity floor and persistence hard filter.
     let survivors: Vec<&Row> = rows.iter().filter(|r| passes_gate_1_2(&r.stats)).collect();
@@ -259,16 +268,30 @@ fn recompute(
     // lists let each survivor's rank be read with a binary search.
     let mut dv: Vec<f64> = survivors.iter().map(|r| r.stats.dollar_volume_5m).collect();
     let mut vv: Vec<f64> = survivors.iter().map(|r| r.stats.volume_5m as f64).collect();
-    let mut tv: Vec<f64> = survivors.iter().map(|r| r.stats.trade_count_5m as f64).collect();
+    let mut tv: Vec<f64> = survivors
+        .iter()
+        .map(|r| r.stats.trade_count_5m as f64)
+        .collect();
     dv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     vv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     tv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // Gate 4 — per-group leader shares, so a group's leader scores 1.0 and mega
     // caps can't crush very active low-price names.
-    let max_all      = survivors.iter().map(|r| share(r.stats.dollar_volume_5m, total_all)).fold(0.0, f64::max);
-    let max_smallcap = survivors.iter().filter(|r| is_smallcap(r)).map(|r| share(r.stats.dollar_volume_5m, total_smallcap)).fold(0.0, f64::max);
-    let max_under20  = survivors.iter().filter(|r| is_under20(r)).map(|r| share(r.stats.dollar_volume_5m, total_under20)).fold(0.0, f64::max);
+    let max_all = survivors
+        .iter()
+        .map(|r| share(r.stats.dollar_volume_5m, total_all))
+        .fold(0.0, f64::max);
+    let max_smallcap = survivors
+        .iter()
+        .filter(|r| is_smallcap(r))
+        .map(|r| share(r.stats.dollar_volume_5m, total_smallcap))
+        .fold(0.0, f64::max);
+    let max_under20 = survivors
+        .iter()
+        .filter(|r| is_under20(r))
+        .map(|r| share(r.stats.dollar_volume_5m, total_under20))
+        .fold(0.0, f64::max);
 
     // Gate 5 lookup key — the current 5-min-of-day bucket (ET start minute).
     let cur_bucket = (crate::time::et_minutes(now) / 5) * 5;
@@ -283,17 +306,29 @@ fn recompute(
             // Gate 3 ranks.
             let pr_dollar = percentile_rank(&dv, dvv);
             let pr_volume = percentile_rank(&vv, s.volume_5m as f64);
-            let pr_trade  = percentile_rank(&tv, s.trade_count_5m as f64);
+            let pr_trade = percentile_rank(&tv, s.trade_count_5m as f64);
 
             // Gate 4 shares + group score.
             let small = is_smallcap(r);
             let under = is_under20(r);
-            let ms_all   = share(dvv, total_all);
-            let ms_small = if small { share(dvv, total_smallcap) } else { 0.0 };
-            let ms_under = if under { share(dvv, total_under20) } else { 0.0 };
+            let ms_all = share(dvv, total_all);
+            let ms_small = if small {
+                share(dvv, total_smallcap)
+            } else {
+                0.0
+            };
+            let ms_under = if under {
+                share(dvv, total_under20)
+            } else {
+                0.0
+            };
             let mut group = normalise(ms_all, max_all);
-            if small { group = group.max(normalise(ms_small, max_smallcap)); }
-            if under { group = group.max(normalise(ms_under, max_under20)); }
+            if small {
+                group = group.max(normalise(ms_small, max_smallcap));
+            }
+            if under {
+                group = group.max(normalise(ms_under, max_under20));
+            }
 
             // Gate 6 acceleration (bonus) + Gate 5 relative attention (soft).
             let accel = (s.prev_dollar_volume_5m > 0.0).then(|| dvv / s.prev_dollar_volume_5m);
@@ -356,10 +391,18 @@ fn is_under20(r: &Row) -> bool {
 }
 
 fn share(x: f64, total: f64) -> f64 {
-    if total > 0.0 { x / total } else { 0.0 }
+    if total > 0.0 {
+        x / total
+    } else {
+        0.0
+    }
 }
 fn normalise(x: f64, max: f64) -> f64 {
-    if max > 0.0 { (x / max).clamp(0.0, 1.0) } else { 0.0 }
+    if max > 0.0 {
+        (x / max).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// Fraction of `sorted` (ascending) strictly below `x`, in [0,1]. The window
@@ -378,17 +421,19 @@ fn percentile_rank(sorted: &[f64], x: f64) -> f64 {
 /// and the remaining weights are renormalised (neutral, never penalising).
 fn score(pr_dollar: f64, pr_volume: f64, group: f64, accel: Option<f64>, rel: Option<f64>) -> f64 {
     let accel_bonus = accel.map_or(0.0, |a| ((a - 1.0) / 2.0).clamp(0.0, 1.0));
-    let mut num = W_PR_DOLLAR * pr_dollar
-        + W_PR_VOLUME * pr_volume
-        + W_GROUP * group
-        + W_ACCEL * accel_bonus;
+    let mut num =
+        W_PR_DOLLAR * pr_dollar + W_PR_VOLUME * pr_volume + W_GROUP * group + W_ACCEL * accel_bonus;
     let mut den = W_PR_DOLLAR + W_PR_VOLUME + W_GROUP + W_ACCEL;
     if let Some(r) = rel {
         let rel_score = ((r - 1.0) / 2.0).clamp(0.0, 1.0);
         num += W_REL * rel_score;
         den += W_REL;
     }
-    if den <= 0.0 { 0.0 } else { (100.0 * num / den).clamp(0.0, 100.0) }
+    if den <= 0.0 {
+        0.0
+    } else {
+        (100.0 * num / den).clamp(0.0, 100.0)
+    }
 }
 
 /// Per-symbol 5-minute window statistics from closed 1-minute bars (ascending).
@@ -397,7 +442,7 @@ fn score(pr_dollar: f64, pr_volume: f64, group: f64, accel: Option<f64>, rel: Op
 /// carries no volume. Pure on timestamps (no ET clock) so it's unit-testable.
 fn compute_window_stats(m1: &[Bar], now: DateTime<Utc>) -> Option<WindowStats> {
     let now_s = now.timestamp();
-    let cur_start  = now_s - WINDOW_SECS;
+    let cur_start = now_s - WINDOW_SECS;
     let prev_start = now_s - 2 * WINDOW_SECS;
 
     let mut volume_5m: u64 = 0;
@@ -457,11 +502,11 @@ fn compute_window_stats(m1: &[Bar], now: DateTime<Utc>) -> Option<WindowStats> {
 /// published survivors we don't yet have a baseline for. Each spawned task fills
 /// the shared `hist` cache; on failure the symbol is unmarked so it can retry.
 fn schedule_baseline_fetches(
-    entries:   &[AttentionEntry],
-    hist:      &Arc<RwLock<HashMap<String, Baseline>>>,
+    entries: &[AttentionEntry],
+    hist: &Arc<RwLock<HashMap<String, Baseline>>>,
     requested: &Arc<Mutex<HashSet<String>>>,
-    secrets:   &Arc<RwLock<Secrets>>,
-    now:       DateTime<Utc>,
+    secrets: &Arc<RwLock<Secrets>>,
+    now: DateTime<Utc>,
 ) {
     let mut to_fetch: Vec<String> = Vec::new();
     {
@@ -502,14 +547,16 @@ fn schedule_baseline_fetches(
 /// None on missing creds / REST error / no data.
 async fn fetch_baseline(
     secrets: &Arc<RwLock<Secrets>>,
-    symbol:  &str,
-    now:     DateTime<Utc>,
+    symbol: &str,
+    now: DateTime<Utc>,
 ) -> Option<Baseline> {
     let (key, sec) = {
         let s = secrets.read().unwrap();
         (s.alpaca_key.clone(), s.alpaca_secret.clone())
     };
-    let (Some(k), Some(sc)) = (key, sec) else { return None };
+    let (Some(k), Some(sc)) = (key, sec) else {
+        return None;
+    };
     if k.is_empty() || sc.is_empty() {
         return None;
     }
@@ -564,7 +611,11 @@ fn load_floats(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, u64> {
     universe_repository::get_all(&conn)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|a| a.float_shares.filter(|f| *f > 0).map(|f| (a.symbol, f as u64)))
+        .filter_map(|a| {
+            a.float_shares
+                .filter(|f| *f > 0)
+                .map(|f| (a.symbol, f as u64))
+        })
         .collect()
 }
 
@@ -666,10 +717,17 @@ mod tests {
         };
         assert!(passes_gate_1_2(&ok));
         // Single-minute spike (share > 0.80) → rejected by gate 2.
-        let spike = WindowStats { max_1m_volume_share: 0.95, active_minutes_5m: 2, ..ok };
+        let spike = WindowStats {
+            max_1m_volume_share: 0.95,
+            active_minutes_5m: 2,
+            ..ok
+        };
         assert!(!passes_gate_1_2(&spike));
         // Thin name (dollar volume below floor) → rejected by gate 1.
-        let thin = WindowStats { dollar_volume_5m: 100_000.0, ..ok };
+        let thin = WindowStats {
+            dollar_volume_5m: 100_000.0,
+            ..ok
+        };
         assert!(!passes_gate_1_2(&thin));
     }
 }

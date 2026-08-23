@@ -1,5 +1,6 @@
 import { Brain, LoaderCircle, Pin, TriangleAlert, X } from "lucide-react";
-import type { AlertSignal, ScreenerMatch } from "@/types";
+import { useQuery } from "@tanstack/react-query";
+import type { AlertSignal, Position, ScreenerMatch } from "@/types";
 import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import {
@@ -7,6 +8,9 @@ import {
   usePanicRun, useRunPanicLlm, useHasWebSearch,
 } from "@/queries/useScanner";
 import { cn } from "@/lib/utils";
+import { getCountryMeta } from "@/lib/countries";
+import { isHotIndustry, HOT_INDUSTRY_BADGE_CLASS } from "@/lib/industryCategories";
+import { api } from "@/lib/tauri";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -30,6 +34,10 @@ export function panicBandLabel(score: number): string {
   if (score >= 41) return "ambigu";
   if (score >= 21) return "catalyseur solide, exécution excessive";
   return "repricing justifié";
+}
+
+function fmt(v: number | null, decimals = 2): string {
+  return v != null ? v.toFixed(decimals) : "—";
 }
 
 function fmtGap(v: number | null): string {
@@ -74,6 +82,7 @@ export function matchToAlert(m: ScreenerMatch): AlertSignal {
     reason:         `Screener · ${m.strategy_name}`,
     display_timeframe: null,
     side:           null,
+    tempo_depth:    null,
   };
 }
 
@@ -94,11 +103,26 @@ export function visibleMatches(
  *
  *  The visible list is passed explicitly rather than re-derived server-side: the user
  *  removes technically poor candidates with the X, and those dismissals only exist in
- *  the UI. Re-deriving would spend a model call on every name they just discarded. */
-export function PanicScoreButton({ symbols }: { symbols: string[] }) {
+ *  the UI. Re-deriving would spend a model call on every name they just discarded.
+ *
+ *  It takes the matches, not just the symbols, so the button can COUNT what is still
+ *  unscored. The watchlist keeps growing after a run (the 09:25 build, every premarket
+ *  refresh), and a press then tops up only the missing tickers — the badge is what
+ *  tells the user that work is outstanding at all. */
+export function PanicScoreButton({ matches }: { matches: ScreenerMatch[] }) {
   const run = usePanicRun().data;
   const launch = useRunPanicLlm();
   const hasWeb = useHasWebSearch().data ?? false;
+  // Passed to the run so its catch-up wave skips them: the watchlist is rebuilt every
+  // five minutes through the premarket, and the backend has no other way to know which
+  // of the newly-arrived names the user already threw out.
+  const dismissed = useUiStore((s) => s.dismissedScreener);
+
+  const symbols = matches.map((m) => m.symbol);
+  // Unscored = never analysed OR analysed and returned N/A. Both are what a top-up
+  // press retries, so both belong in the same count.
+  const missing = matches.filter((m) => m.llm_panic_score == null).length;
+  const toppingUp = missing > 0 && missing < matches.length;
 
   const running = run?.running ?? false;
   const nothingToScore = symbols.length === 0;
@@ -107,7 +131,9 @@ export function PanicScoreButton({ symbols }: { symbols: string[] }) {
   // Phase drives the label so a long run never looks stuck: collection has no
   // per-ticker counter, scoring does, calibration is a single final call.
   const label = !running
-    ? "Panic Score"
+    ? toppingUp
+      ? `Panic +${missing}`
+      : "Panic Score"
     : run?.phase === "collecting"
       ? "Collecte…"
       : run?.phase === "calibrating"
@@ -119,10 +145,14 @@ export function PanicScoreButton({ symbols }: { symbols: string[] }) {
     : running
       ? `Analyse en cours — ${label}`
       : [
-          `Analyser les ${symbols.length} ticker(s) visibles et les classer par panic score.`,
+          toppingUp
+            ? `Noter les ${missing} ticker(s) encore sans score (les ${
+                matches.length - missing
+              } déjà notés sont conservés), puis reclasser la watchlist par panic score.`
+            : `Analyser les ${symbols.length} ticker(s) visibles et les classer par panic score décroissant.`,
           run?.error ? `\nDernière tentative : ${run.error}` : "",
           run?.phase === "done" && run.failed.length > 0
-            ? `\nDernier run : ${run.failed.length} échec(s) — ${run.failed.join(", ")}`
+            ? `\nDernier run : ${run.failed.length} N/A — ${run.failed.join(", ")}`
             : "",
           hasWeb
             ? ""
@@ -134,13 +164,15 @@ export function PanicScoreButton({ symbols }: { symbols: string[] }) {
   return (
     <button
       type="button"
-      onClick={() => launch.mutate(symbols)}
+      onClick={() => launch.mutate({ symbols, dismissed })}
       disabled={disabled}
       title={title}
       className={cn(
         "flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide transition-colors",
         "bg-violet-900/60 text-violet-200 hover:bg-violet-800/70",
         "disabled:cursor-not-allowed disabled:opacity-40",
+        // Tickers still unscored: the ranking is incomplete, so the button says so.
+        toppingUp && !running && "bg-amber-900/60 text-amber-100 hover:bg-amber-800/70",
         run?.phase === "error" && !running && "bg-red-950/60 text-red-300",
       )}
     >
@@ -172,7 +204,9 @@ function PanicRunBanner() {
         ? "Collecte des données…"
         : run.phase === "calibrating"
           ? "Calibrage du barème…"
-          : `Notation ${run.done}/${run.total}`;
+          : `Notation ${run.done}/${run.total}${
+            run.carried > 0 ? ` (+${run.carried} conservés)` : ""
+          }`;
     return (
       <div className="m-2 rounded border border-violet-700/50 bg-violet-950/40 px-2 py-1.5">
         <div className="flex items-center gap-1.5 text-[10px] text-violet-200">
@@ -185,7 +219,9 @@ function PanicRunBanner() {
         <div className="mt-1 h-0.5 w-full overflow-hidden rounded bg-violet-900/60">
           <div
             className="h-full bg-violet-400 transition-all"
-            style={{ width: `${run.phase === "scoring" ? pct : 3}%` }}
+            // `done > 0` keeps the bar where it was during the catch-up wave's
+            // collection phase, instead of snapping back to 3% mid-run.
+            style={{ width: `${run.phase === "scoring" || run.done > 0 ? pct : 3}%` }}
           />
         </div>
       </div>
@@ -211,8 +247,8 @@ function PanicRunBanner() {
       <div className="m-2 flex items-start gap-1.5 rounded border border-amber-700/40 bg-amber-950/30 px-2 py-1.5 text-[10px] text-amber-200">
         <TriangleAlert className="mt-0.5 h-3 w-3 shrink-0" />
         <span>
-          {run.failed.length} ticker(s) non noté(s) : {run.failed.join(", ")} — non
-          classés, pas «&nbsp;panique faible&nbsp;».
+          {run.failed.length} ticker(s) en N/A : {run.failed.join(", ")} — classés en bas
+          de liste, pas «&nbsp;panique faible&nbsp;». Relancer le bouton les retente.
         </span>
       </div>
     );
@@ -228,6 +264,9 @@ interface CardProps {
   pinned: boolean;
   /** The user's own 1..3 read of the ticker; 0 = unrated. */
   rating: number;
+  /** Open internal position on this symbol, if any — colours the symbol badge
+   *  by live PnL, exactly like the premarket/open alert cards. */
+  position: Position | null;
   onOpen: (m: ScreenerMatch) => void;
   onDismiss: (symbol: string) => void;
   onTogglePin: (symbol: string) => void;
@@ -277,13 +316,42 @@ function RatingDots({
   );
 }
 
+/** A past session's panic score, shown as a watermark to the left of today's
+ *  badge: identical shape/colour ramp (`panicTone`) as the live score, just
+ *  faded — more so the further back the session is — so the eye reads it as
+ *  "same signal, older" rather than a second, competing number. */
+function HistoryScoreBadge({
+  label,
+  score,
+  opacity,
+}: {
+  label: string;
+  score: number;
+  opacity: string;
+}) {
+  return (
+    <span
+      title={`Panic score ${label} : ${score.toFixed(0)}/100 — ${panicBandLabel(score)}.`}
+      className={cn(
+        "rounded px-1.5 py-0.5 text-xs font-bold tabular-nums",
+        panicTone(score),
+        opacity,
+      )}
+    >
+      {score.toFixed(0)}
+    </span>
+  );
+}
+
 function ScreenerCard({
-  match: m, selected, pinned, rating, onOpen, onDismiss, onTogglePin, onRate,
+  match: m, selected, pinned, rating, position, onOpen, onDismiss, onTogglePin, onRate,
 }: CardProps) {
   const gapColor =
     m.gap_pct == null ? "text-muted-foreground"
     : m.gap_pct >= 0 ? "text-emerald-400"
     : "text-red-400";
+  const country = getCountryMeta(m.country);
+  const hotIndustry = isHotIndustry(m.industry);
 
   return (
     <div
@@ -317,107 +385,92 @@ function ScreenerCard({
         </button>
       </div>
 
-      {/* Symbol + price. `mr-9` reserves room for the two absolutely-positioned
-          buttons above. */}
-      <div className="mr-9 flex items-baseline gap-2">
-        <span className="text-sm font-semibold tabular-nums">{m.symbol}</span>
-        {m.price != null && (
-          <span className="text-xs tabular-nums text-foreground/80">${m.price.toFixed(2)}</span>
-        )}
-        {/* Raw contextual reversibility. Final order also uses extension, confidence
-            and the structured eligibility/veto state shown below. */}
-        {m.llm_panic_score != null && (
+      {/* Row 1 — the verdict: symbol + panic score (today's, with the previous two
+          scored sessions as fading watermarks to its left). `mr-9` reserves room
+          for the two absolutely-positioned buttons above. */}
+      <div className="mr-9 flex items-center justify-between gap-2">
+        {position ? (
+          // Open position → the ticker name becomes a P&L-coloured badge
+          // (green = winning, red = losing), same treatment as the
+          // premarket/open alert cards.
           <span
-            title={[
-              `Panic score ${m.llm_panic_score.toFixed(0)}/100 — ${panicBandLabel(m.llm_panic_score)}.`,
-              "Haut = mouvement non justifié, forte probabilité de normalisation (bon candidat mean-reversion).",
-              m.llm_reversibility ? `Réversibilité : ${m.llm_reversibility}.` : "",
-              m.llm_one_liner ? `\n${m.llm_one_liner}` : "",
-            ]
-              .filter(Boolean)
-              .join(" ")}
+            title={`Position ${position.side} · PnL ${fmt(position.unrealized_pnl)}`}
             className={cn(
-              "ml-auto rounded px-1.5 py-0.5 text-xs font-bold tabular-nums",
-              panicTone(m.llm_panic_score),
+              "rounded px-1.5 py-0.5 text-sm font-bold tabular-nums",
+              (position.unrealized_pnl ?? 0) >= 0
+                ? "bg-emerald-600/30 text-emerald-200"
+                : "bg-red-600/30 text-red-200",
             )}
           >
-            {m.llm_panic_score.toFixed(0)}
+            {m.symbol}
           </span>
+        ) : (
+          <span className="text-sm font-semibold tabular-nums">{m.symbol}</span>
         )}
-      </div>
-
-      {/* The one-sentence read — the whole point of the analysis, so it is on the
-          card and not only in a tooltip. Clamped to two lines to keep the list
-          scannable; the full text lives in the daily pane's report. */}
-      {m.llm_one_liner != null && (
-        <p className="mr-9 mt-1 line-clamp-2 text-[10px] leading-snug text-muted-foreground">
-          {m.llm_one_liner}
-        </p>
-      )}
-
-      {(m.llm_trade_direction != null || m.llm_eligibility != null || m.llm_timing_state != null) && (
-        <div className="mt-1 flex flex-wrap gap-1 text-[9px] font-semibold uppercase">
-          {m.llm_trade_direction != null && (
-            <span className="rounded bg-slate-800 px-1 py-0.5 text-slate-200">
-              {m.llm_trade_direction}
+        <div className="flex items-center gap-1">
+          {m.llm_panic_score_prev2 != null && (
+            <HistoryScoreBadge label="il y a 2 jours" score={m.llm_panic_score_prev2} opacity="opacity-25" />
+          )}
+          {m.llm_panic_score_prev1 != null && (
+            <HistoryScoreBadge label="la veille" score={m.llm_panic_score_prev1} opacity="opacity-50" />
+          )}
+          {m.llm_panic_score == null && m.llm_eligibility === "n_a" && (
+            <span
+              title={
+                m.llm_one_liner ??
+                "Panic score non établi pour ce ticker — classé en bas de liste. Relancer le bouton le retente."
+              }
+              className="rounded bg-slate-800/70 px-1.5 py-0.5 text-[10px] font-bold uppercase tabular-nums text-slate-400 ring-1 ring-slate-500/30"
+            >
+              N/A
             </span>
           )}
-          {m.llm_eligibility != null && (
+          {m.llm_panic_score != null && (
             <span
-              title={m.llm_veto_reason ?? undefined}
+              title={[
+                `Panic score ${m.llm_panic_score.toFixed(0)}/100 — ${panicBandLabel(m.llm_panic_score)}.`,
+                "Haut = mouvement non justifié, forte probabilité de normalisation (bon candidat mean-reversion).",
+                m.llm_reversibility ? `Réversibilité : ${m.llm_reversibility}.` : "",
+                m.llm_one_liner ? `\n${m.llm_one_liner}` : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
               className={cn(
-                "rounded px-1 py-0.5",
-                m.llm_eligibility === "veto"
-                  ? "bg-red-950 text-red-300"
-                  : m.llm_eligibility === "review"
-                    ? "bg-amber-950 text-amber-300"
-                    : "bg-emerald-950 text-emerald-300",
+                "rounded px-1.5 py-0.5 text-xs font-bold tabular-nums",
+                panicTone(m.llm_panic_score),
               )}
             >
-              {m.llm_eligibility === "review" ? "à revoir" : m.llm_eligibility}
+              {m.llm_panic_score.toFixed(0)}
             </span>
           )}
-          {m.llm_timing_state != null && m.llm_timing_state !== "unknown" && (
+        </div>
+      </div>
+
+      {/* Row 2 — origin: country flag (name on hover) + industry, highlighted
+          green when it belongs to a historically explosive category. */}
+      {(country || m.industry) && (
+        <div className="mt-1 flex items-center gap-1.5">
+          {country && (
+            <span title={`${country.en} / ${country.fr}`} className="shrink-0 text-xs leading-none">
+              {country.flag}
+            </span>
+          )}
+          {m.industry && (
             <span
-              title="Phase descriptive uniquement — aucun signal automatique d’entrée"
-              className="rounded bg-slate-900 px-1 py-0.5 text-slate-400"
+              title={m.industry}
+              className={cn(
+                "max-w-[140px] truncate rounded px-1.5 py-0.5 text-[9px] font-medium",
+                hotIndustry ? HOT_INDUSTRY_BADGE_CLASS : "bg-slate-800/60 text-slate-300",
+              )}
             >
-              {m.llm_timing_state}
-            </span>
-          )}
-          {m.llm_confidence_score != null && (
-            <span className="rounded bg-slate-900 px-1 py-0.5 text-slate-400">
-              conf {m.llm_confidence_score.toFixed(0)}
-            </span>
-          )}
-          {m.llm_ranking_score != null && (
-            <span className="rounded bg-slate-900 px-1 py-0.5 text-slate-400">
-              rang {m.llm_ranking_score.toFixed(0)}
+              {m.industry}
             </span>
           )}
         </div>
       )}
 
-      {/* Quantitative panic reading: σ = how exceptional the move is for THIS ticker,
-          × = by how much its ATR expanded, then the window in days. Demoted to a
-          secondary chip once the LLM score exists. */}
-      {m.score_label != null && (
-        <div className="mt-1 flex">
-          <span
-            title="σ = ampleur du choc rapportée à la volatilité habituelle du titre · × = expansion de l'ATR · nj = fenêtre retenue"
-            className={cn(
-              "rounded px-1.5 py-0.5 text-[9px] font-semibold tabular-nums",
-              m.score == null
-                ? "bg-amber-900/50 text-amber-200"
-                : "bg-violet-900/40 text-violet-300/90",
-            )}
-          >
-            {m.score_label}
-          </span>
-        </div>
-      )}
-
-      {/* Gap · RVOL · Volume */}
+      {/* Row 3 — the quantitative read: gap · rvol · volume, and the user's own
+          rating pushed to the far right of the same line. */}
       <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] tabular-nums">
         <span className="flex items-center gap-1">
           <span className="text-[8px] uppercase tracking-wide text-muted-foreground/50">Gap</span>
@@ -431,14 +484,9 @@ function ScreenerCard({
           <span className="text-[8px] uppercase tracking-wide text-muted-foreground/50">Vol</span>
           <span className="text-muted-foreground">{fmtVol(m.volume)}</span>
         </span>
-      </div>
-
-      {/* Strategy chip, and the user's own rating in the bottom-right corner. */}
-      <div className="mt-1.5 flex items-center justify-between gap-2">
-        <span className="rounded bg-blue-900/40 px-1.5 py-0.5 text-[9px] font-medium text-blue-300">
-          {m.strategy_name}
+        <span className="ml-auto flex items-center">
+          <RatingDots symbol={m.symbol} rating={rating} onRate={onRate} />
         </span>
-        <RatingDots symbol={m.symbol} rating={rating} onRate={onRate} />
       </div>
     </div>
   );
@@ -460,6 +508,11 @@ export function ScreenerPanel({ matches }: Props) {
   const togglePin         = useTogglePin();
   const ratings           = useScreenerRatings().data ?? {};
   const setRating         = useSetRating();
+  const { data: positions = [] } = useQuery({
+    queryKey: ["internal_positions"],
+    queryFn:  () => api.getInternalPositions(),
+    refetchInterval: 1000,
+  });
 
   // Dismissal wins over a pin for the current day: the X hides the row until
   // tomorrow, the pin survives it and brings the ticker back.
@@ -474,6 +527,16 @@ export function ScreenerPanel({ matches }: Props) {
   function open(m: ScreenerMatch) {
     setSelectedTicker(m.symbol);
     openInActiveZone(matchToAlert(m));
+  }
+
+  /** Dismissing a card advances to the next one below it (falling back to the
+   *  previous one if it was last), so working down the list stays a single
+   *  stream of X-then-look rather than X-then-hunt-for-the-next-chart. */
+  function dismiss(symbol: string) {
+    const idx = visible.findIndex((m) => m.symbol === symbol);
+    dismissScreener(symbol);
+    const next = idx === -1 ? undefined : visible[idx + 1] ?? visible[idx - 1];
+    if (next) open(next);
   }
 
   if (visible.length === 0) {
@@ -496,8 +559,9 @@ export function ScreenerPanel({ matches }: Props) {
             selected={selectedTicker === m.symbol}
             pinned={pinned}
             rating={ratings[m.symbol] ?? 0}
+            position={positions.find((p) => p.symbol === m.symbol) ?? null}
             onOpen={open}
-            onDismiss={dismissScreener}
+            onDismiss={dismiss}
             onTogglePin={(symbol) => togglePin.mutate({ symbol, pinned })}
             onRate={(symbol, rating) => setRating.mutate({ symbol, rating })}
           />

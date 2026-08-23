@@ -32,6 +32,80 @@ export interface AlertSignal {
   display_timeframe: string | null;
   /** Directional bias of the alert; drives a side badge. */
   side: Side | null;
+  /** Micro Pullback only: every detection tempo (seconds) that fired, ascending.
+   *  Depth is signal — a move that trips 10s/20s/40s has more behind it than one
+   *  that only spikes the 10s. The list widens in place as the move develops. */
+  tempo_depth: number[] | null;
+}
+
+/** Micro Pullback's own Settings panel. Strategy-specific rather than a generic
+ *  per-strategy channel: the knobs are particular to this engine and not all of
+ *  them are booleans. Mirrors `micro_pullback::options::MicroPullbackOptions`. */
+export interface MicroPullbackOptions {
+  /** Current event-price universe band. */
+  price_min: number;
+  price_max: number;
+  /** Free-float ceiling in shares. A KNOWN float above this excludes the ticker; an
+   *  unknown float is still admitted (and marked FLOAT_INCONNU on the alert). */
+  float_max: number;
+  /** Only watch "hot" industries — biotech/pharma, space/aerospace/defence, crypto,
+   *  quantum, cannabis, AI. Classified from the SEC SIC title in `company_meta`,
+   *  with a keyword fallback. An industry we never collected counts as NOT hot, so
+   *  it is excluded too. */
+  hot_industry_only: boolean;
+  /** Drop tickers domiciled in the four pump & dump base-rate jurisdictions: China
+   *  (incl. Hong Kong), Cayman Islands, British Virgin Islands. Off = they are still
+   *  watched with a −25 penalty. An unknown domicile is never excluded. */
+  exclude_risk_domicile: boolean;
+  /** Catalyst qualification (live intel, LLM scoring and news watch). Price, VWAP,
+   *  volume and splits remain context rather than hidden A+ vetoes. */
+  quality_aplus: boolean;
+  /** Keep watching for a headline after qualification and re-score when one lands —
+   *  including for a candidate that was turned away for having no news. */
+  news_watch: boolean;
+  /** Run the second, deeper LLM pass (fundamentals, dilution, filings). */
+  deep_llm: boolean;
+  /** false (default) = the LLM score gates the alert; true = publish immediately and
+   *  let the scores update the row in place. */
+  alert_before_score: boolean;
+  /** Final score (bonuses/penalties included) required to reach the screen. */
+  alert_score_threshold: number;
+  /** How many candidates may be sent to the model per rolling 5 minutes of market
+   *  time. Candidates are ranked by priority and the budget is spent from the top;
+   *  what does not fit stays eligible for the next tick rather than being lost. */
+  llm_budget_per_5min: number;
+  /** Push every alert to the phone via ntfy at maximum priority. Needs a topic in
+   *  Settings → API Keys; without one the flag is inert rather than an error. */
+  ntfy_alerts: boolean;
+  tempo_10s: boolean;
+  tempo_20s: boolean;
+  tempo_40s: boolean;
+  tempo_1m: boolean;
+  tempo_2m: boolean;
+  tempo_5m: boolean;
+}
+
+export interface MicroAttentionEntry {
+  symbol: string;
+  tempo_secs: number;
+  rank: number;
+  attention_score: number;
+  direction_score: number;
+  flow_rank: number;
+  range_rank: number;
+  relative_rank: number | null;
+  /** Current tempo volume / median of prior same-length windows. */
+  tempo_rvol: number | null;
+  baseline_windows: number;
+  continuity: number;
+  distribution_quality: number;
+  evidence_ok: boolean;
+  dominance_z: number;
+  head_size: number;
+  dominant: boolean;
+  already_alerted: boolean;
+  market_time: string;
+  received_at: string;
 }
 
 export interface Strategy {
@@ -58,6 +132,9 @@ export interface ScreenerMatch {
   rvol:          number | null;
   volume:        number;
   float_shares:  number | null;
+  /** SIC industry + country of origin (sec-api company_meta cache). */
+  industry:      string | null;
+  country:       string | null;
   /** Ranking score (0..100) for score-based screeners (Panic Mean Reversion);
    *  null for plain gap/volume screeners. The list sorts on this when present. */
   score:         number | null;
@@ -79,6 +156,12 @@ export interface ScreenerMatch {
   /** long | short */
   llm_trade_direction: string | null;
   llm_veto_reason: string | null;
+  /** Panic score from the most recent PRIOR day this symbol was analysed; null if
+   *  never scored on an earlier day. Shown on the card as a faded watermark badge
+   *  to the left of today's score. */
+  llm_panic_score_prev1: number | null;
+  /** Panic score from the day before that — faded further still. */
+  llm_panic_score_prev2: number | null;
   updated_at:    string;
 }
 
@@ -90,9 +173,14 @@ export interface PanicRunState {
   running:     boolean;
   day:         string;
   simulated:   boolean;
+  /** Tickers this run has to score: the visible list minus the ones already scored
+   *  under the current rubric. */
   total:       number;
+  /** Tickers whose score was kept from an earlier press of the same day. */
+  carried:     number;
   done:        number;
-  /** Symbols whose scoring call failed; the run still completes for the rest. */
+  /** Symbols that end the run without a score — they are written as N/A at the
+   *  bottom of the ranking rather than dropped. */
   failed:      string[];
   /** Set when the run as a whole could not proceed (no key, no visible tickers). */
   error:       string | null;
@@ -137,6 +225,71 @@ export interface PanicLlmScore {
   veto_reason:        string | null;
   eligibility:        string | null;
   catalyst_direction: string | null;
+}
+
+/** One Micro Pullback A+ judgement (mirrors QualityRow in quality_repository.rs).
+ *
+ *  `red_flags`, `key_drivers` and `tempo_depth` cross the bridge as JSON strings,
+ *  exactly as they are stored — the overlay parses them defensively. */
+export interface MicroQualityRow {
+  symbol:         string;
+  day:            string;
+  /** "premarket" | "open" | … — the A+ lock is per session, so one ticker can hold
+   *  two judgements in one day and they are about two different moves. */
+  session:        string;
+  simulated:      boolean;
+  /** Fast-pass score, kept even when the deep pass overrode it. */
+  pass1_score:    number | null;
+  pass2_score:    number | null;
+  /** Model score + deterministic adjustments, clamped 0..100. The verdict. */
+  final_score:    number | null;
+  threshold:      number | null;
+  passed:         boolean;
+  adjustments:    string | null;
+  confidence:     number | null;
+  sustain_prob:   number | null;
+  /** "solide" | "faible" | "bluff" | "aucune" */
+  news_verdict:   string | null;
+  /** "breaking" | "fraiche" | "recente" | "ancienne" | "posterieure" | "aucune" */
+  news_freshness: string | null;
+  catalyst_type:  string | null;
+  catalyst_label: string | null;
+  /** "faible" | "moyen" | "eleve" | "critique" */
+  dilution_risk:  string | null;
+  dilution_read:  string | null;
+  financial_read: string | null;
+  /** JSON array. */
+  red_flags:      string | null;
+  /** JSON array. */
+  key_drivers:    string | null;
+  one_liner:      string | null;
+  entry_note:     string | null;
+  /** JSON array of tempo seconds. */
+  tempo_depth:    string | null;
+  rejection:      string | null;
+  rubric_version: string | null;
+  /** "triage" | "deep" — which pass produced `final_score`. */
+  model:          string | null;
+  /** MARKET time of the verdict (replay clock in a replay). Compared with a
+   *  headline's publication time to tell a current score from a stale one. */
+  scored_at:      string | null;
+}
+
+/** What the A+ pipeline is doing for one symbol right now. Absent from the list
+ *  means nothing is in flight and the persisted verdict is current. */
+export interface MicroQualityLive {
+  symbol:              string;
+  /** "queued" | "triage" | "deep" | "rescoring", or null once the pass ends. */
+  phase:               string | null;
+  /** A headline that landed after the displayed score and has not been folded in. */
+  pending_headline:    string | null;
+  pending_headline_at: string | null;
+}
+
+/** One poll of the A+ board: the day's judgements and what is still moving. */
+export interface MicroQualityBoard {
+  rows: MicroQualityRow[];
+  live: MicroQualityLive[];
 }
 
 /** Decoded `data_quality` blob. Every field optional — it is stored as free JSON. */
@@ -195,12 +348,23 @@ export interface CardInfo {
   bbz:               number | null;
   /** Today's premarket cumulative volume (04:00–09:30 ET). */
   premarket_volume:  number | null;
+  /** Cumulative volume since 04:00 ET today (premarket + regular + any
+   *  after-hours so far). Backs the chart top bar's single "Vol" chip. */
+  volume_since_4am:  number | null;
+  /** Relative volume: today's cumulative volume over the symbol's average daily
+   *  volume. Same formula as the scanner's live rvol. */
+  rvol:              number | null;
   /** A live news headline is on file for the symbol. */
   has_news:          boolean;
   /** Most recent live headline text, if any. */
   news_title:        string | null;
-  // ── Micro Pullback overlay: behavioural / risk scores (0..100, 100 = worst;
-  //    null = inputs not collected). ──────────────────────────────────────────
+  // ── Behavioural / risk scores (0..100, 100 = worst; null = inputs not
+  //    collected). NO LONGER DRAWN: the Micro Pullback overlay used to render these
+  //    five as unlabelled bars, three of them saying the same thing about dilution.
+  //    The A+ deep pass reads the same filings and answers in one word
+  //    (`MicroQualityRow.dilution_risk`) with a sentence behind it, which is what
+  //    the pane shows now. Still served, still available to anything that wants a
+  //    number rather than a verdict. ────────────────────────────────────────────
   short_interest_score:    number | null;
   dilution_capacity_score: number | null;
   dilution_need_score:     number | null;
@@ -324,6 +488,7 @@ export interface EnrichmentSpec {
 
 export interface StrategyCard {
   universe: UniverseKey;
+  streaming_scope: StreamingScope;
   panes: PaneSpec[];
   info_fields: InfoField[];
   llm: LlmSpec | null;
@@ -661,6 +826,12 @@ export interface SecretsStatus {
   tradetally_token: boolean;
   tradetally_email: boolean;
   tradetally_password: boolean;
+  /** ntfy push notifications. The TOPIC is a secret on the public server: anyone
+   *  who knows it can read it and publish to it. The server URL and token are
+   *  optional — a public ntfy.sh topic needs neither. */
+  ntfy_server: boolean;
+  ntfy_topic: boolean;
+  ntfy_token: boolean;
 }
 
 /** Which secret keys can be set from the UI. */
@@ -749,6 +920,9 @@ export interface StartupStep {
 
 /** Which universe the single live feed streams. */
 export type UniverseKey = "us_stocks" | "low_float";
+
+/** Live-feed subscription scope a strategy needs beyond charts on screen + orders. */
+export type StreamingScope = "none" | "watchlist" | "universe";
 
 export interface UniverseStats {
   cache_symbols: number;
@@ -997,7 +1171,9 @@ export interface MarketSnapshot {
 export interface FeedDiagnostics {
   state: string; // idle|connecting|authenticating|authenticated|subscribed|streaming|error|reconnecting|stopped
   feed: string;
-  /** Subscription detected at connect time: "sip" (paid) | "iex" (free). */
+  /** Subscription detected at connect time: "sip" (paid) | "iex" (free) |
+   *  "massive_unlimited" (Massive Starter+ replacing IEX — 15-min delayed,
+   *  per-second bars, no trades/quotes). */
   plan?: string;
   /** Max streamable symbols for that plan; 0 = unlimited. Free tier is 30. */
   symbol_limit?: number;
@@ -1056,8 +1232,17 @@ export interface ReplayStatus {
   state: "idle" | "loading" | "playing" | "paused" | "ended" | "error";
   /** ET date being replayed (YYYY-MM-DD). */
   day: string | null;
-  /** "tape" (recorded real trades) | "minutes" (synthesized from 1-min bars). */
+  /**
+   * Granularity of the replayed price path: "tape" (recorded real trades) |
+   * "seconds" (real 1-second aggregates) | "minutes" (synthesized from 1-min
+   * bars) | "daily" (the day's single OHLCV bar walked across the session).
+   */
   source: string | null;
+  /**
+   * Where the day was loaded from, resolved with the same priority as the live
+   * feed: "alpaca_sip" | "massive" | "alpaca_iex" | "flat_files" | "daily_cache".
+   */
+  provider: string | null;
   sim_time: string | null;
   speed: number;
   playing: boolean;
@@ -1143,6 +1328,16 @@ export interface BrokerSelection {
   credentials_ready: boolean;
 }
 
+/** Auto-detected vs. manually-forced Massive subscription tier — mirrors
+ *  src-tauri/src/commands/broker.rs::MassiveTierStatus. `"unlimited"` (Starter+,
+ *  paid) is 15-minute delayed and disables the Alpaca broker; `"basic"` (free)
+ *  is unaffected. */
+export interface MassiveTierStatus {
+  detected: "unlimited" | "basic" | null;
+  override: "unlimited" | "basic" | null;
+  effective: "unlimited" | "basic";
+}
+
 export type BrokerOrderStatus = "open" | "held" | "filled" | "closed";
 
 /** One order as the BROKER holds it — never a locally-computed view. */
@@ -1212,7 +1407,41 @@ export interface BrokerMirror {
 /** Whether a symbol may be sold short, per the venue. */
 export interface Shortability {
   symbol: string;
+  broker: "tagdash" | "alpaca";
   shortable: boolean;
-  easy_to_borrow: boolean;
+  borrow_status: "easy_to_borrow" | "hard_to_borrow" | "unavailable" | "unknown";
   from_cache: boolean;
+}
+
+export interface LocateRecord {
+  id: string;
+  broker: "tagdash" | "alpaca";
+  symbol: string;
+  requested_qty: number;
+  located_qty: number;
+  available_qty: number | null;
+  price_per_share: number;
+  total_fee: number;
+  status: string;
+  created_at: string | null;
+  expires_at: string | null;
+}
+
+/** Known loss band for a short after locate and, when Alpaca exposes it, borrow. */
+export interface ShortCostZone {
+  broker: "tagdash" | "alpaca";
+  symbol: string;
+  source: "estimate" | "position";
+  entry_price: number;
+  stop_loss: number;
+  quantity: number;
+  located_quantity: number;
+  locate_fee: number;
+  annual_borrow_rate: number | null;
+  borrow_days: number;
+  borrow_fee: number | null;
+  total_known_cost: number;
+  break_even_price: number;
+  costs_complete: boolean;
+  locates: LocateRecord[];
 }

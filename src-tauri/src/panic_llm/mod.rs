@@ -16,7 +16,8 @@
 //   3. CALIBRATE — one pass over the (symbol, score, summary) tuples only, correcting
 //      rubric-order violations. It never sees the payloads again, so it cannot become
 //      a second, batched scoring round.
-//   4. PERSIST — replace the day's rows for this mode (live vs replay never mix).
+//   4. PERSIST — upsert the day's rows for this mode (live vs replay never mix), so
+//      a top-up press adds to the analysis instead of replacing it.
 //
 // THE CONTEXT CASCADE is mechanical, decided BEFORE any model call so each ticker
 // still costs exactly one scoring request: Alpaca news → Massive news → open web.
@@ -181,12 +182,8 @@ fn opt_string(v: Option<&str>) -> Option<String> {
 /// nothing to rank, so the ticker is reported as failed rather than defaulted to 0 —
 /// a silent 0 would rank a real panic candidate last.
 pub fn parse_score_answer(raw: &str) -> Result<ScoreAnswer, String> {
-    let json = extract_json(raw).ok_or_else(|| {
-        format!(
-            "réponse non-json: {}",
-            payload::truncate(raw, 160)
-        )
-    })?;
+    let json = extract_json(raw)
+        .ok_or_else(|| format!("réponse non-json: {}", payload::truncate(raw, 160)))?;
     let v: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("json invalide: {e}"))?;
 
@@ -227,8 +224,67 @@ pub fn parse_score_answer(raw: &str) -> Result<ScoreAnswer, String> {
     })
 }
 
+/// The `eligibility` marker for a ticker that ends the run without a score.
+///
+/// A ticker that could not be scored used to be simply ABSENT from the day's rows,
+/// which made it indistinguishable from one that was never analysed — so it sat in
+/// the middle of the ranking with no explanation. It now gets a row whose
+/// `panic_score` is NULL, which the read orders last, with the reason attached.
+pub const NA_ELIGIBILITY: &str = "n_a";
+
+/// Whether the payload is too thin to support a score, and why.
+///
+/// Deterministic and checked BEFORE the call: spending a request on a payload with no
+/// move to judge buys a confident-looking guess, not an answer. Watchlist tickers
+/// effectively never land here (a quant panic score is how they got on the list); the
+/// case this catches is a live-matched or pinned symbol whose data never arrived.
+pub fn insufficient_data(p: &TickerPayload) -> Option<String> {
+    // The rubric reasons in percentages and ratios, so a known amplitude is the real
+    // minimum — a missing last price alone is not disqualifying.
+    let knows_the_move = p.price.change_from_prev_close_pct.is_some()
+        || p.quant_panic.move_pct.is_some()
+        || p.quant_panic.score.is_some()
+        || p.price.change_multiday_pct.iter().any(Option::is_some);
+    if knows_the_move {
+        return None;
+    }
+    if p.price.last.is_none() && p.price.prev_close.is_none() {
+        return Some("ni prix ni amplitude connus".into());
+    }
+    Some("amplitude du mouvement inconnue".into())
+}
+
+/// The row written for a ticker the run could not score. Ranked last by the NULL
+/// score, with `reason` visible on the card and in the daily report.
+fn na_row(
+    symbol: &str,
+    day: &str,
+    simulated: bool,
+    payload: Option<&TickerPayload>,
+    reason: &str,
+) -> PanicLlmScore {
+    PanicLlmScore {
+        symbol: symbol.to_string(),
+        day: day.to_string(),
+        simulated,
+        one_liner: Some(format!("N/A — {}", payload::truncate(reason, 180))),
+        data_quality: payload.and_then(|p| serde_json::to_string(&p.data_quality).ok()),
+        web_used: payload.map(|p| p.context_sources.web_used).unwrap_or(false),
+        web_provider: payload.and_then(|p| p.context_sources.web_provider.clone()),
+        rubric_version: Some(prompt::RUBRIC_VERSION.to_string()),
+        model: Some(MODEL_PRO.to_string()),
+        eligibility: Some(NA_ELIGIBILITY.to_string()),
+        // Deliberately no `trade_direction`: the scanner drops an analysis whose
+        // direction contradicts today's move, and an N/A row must never be dropped —
+        // being unable to score a ticker is precisely what the user needs to see.
+        ..Default::default()
+    }
+}
+
 fn inferred_timing_state(p: &TickerPayload) -> String {
-    let Some(direction) = p.quant_panic.direction else { return "unknown".into() };
+    let Some(direction) = p.quant_panic.direction else {
+        return "unknown".into();
+    };
     let recent = p.price.change_5m_pct;
     let broader = p.price.change_15m_pct;
     match (recent, broader) {
@@ -250,14 +306,7 @@ fn material_catalyst_type(kind: Option<&str>) -> bool {
     matches!(
         kind,
         Some(
-            "fda"
-                | "earnings"
-                | "ma"
-                | "offering"
-                | "clinical"
-                | "legal"
-                | "guidance"
-                | "contract"
+            "fda" | "earnings" | "ma" | "offering" | "clinical" | "legal" | "guidance" | "contract"
         )
     )
 }
@@ -310,8 +359,8 @@ pub fn parse_calibration(raw: &str) -> Vec<Adjustment> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|a| {
-                    let symbol = opt_string(a.get("symbol").and_then(|s| s.as_str()))?
-                        .to_uppercase();
+                    let symbol =
+                        opt_string(a.get("symbol").and_then(|s| s.as_str()))?.to_uppercase();
                     let score = a.get("panic_score").and_then(|s| s.as_f64())?;
                     // An adjustment without a stated reason is exactly the "spread the
                     // notes" behaviour the rubric forbids, so it is dropped.
@@ -344,7 +393,9 @@ pub fn apply_adjustments(rows: &mut [PanicLlmScore], adjustments: &[Adjustment])
         if (adj.panic_score - raw).abs() > prompt::MAX_ADJUSTMENT {
             eprintln!(
                 "[tagdash] panic_llm: calibration refusée pour {} ({raw:.0} → {:.0}, > {} points)",
-                adj.symbol, adj.panic_score, prompt::MAX_ADJUSTMENT,
+                adj.symbol,
+                adj.panic_score,
+                prompt::MAX_ADJUSTMENT,
             );
             continue;
         }
@@ -466,8 +517,7 @@ fn collect_db_facts(
     if let Ok(Some(intel)) = company_intel_repository::get_intel(conn, symbol) {
         p.float_and_short.short_interest = intel.short_interest.short_interest;
         p.float_and_short.days_to_cover = intel.short_interest.days_to_cover;
-        p.float_and_short.short_interest_settlement =
-            intel.short_interest.settlement_date.clone();
+        p.float_and_short.short_interest_settlement = intel.short_interest.settlement_date.clone();
         // Short interest as a share of float is the figure the rubric actually keys
         // on; the raw count means little without it.
         if let (Some(si), Some(fl)) = (
@@ -475,8 +525,7 @@ fn collect_db_facts(
             p.float_and_short.float_shares,
         ) {
             if fl > 0 {
-                p.float_and_short.short_interest_pct_float =
-                    Some(si as f64 / fl as f64 * 100.0);
+                p.float_and_short.short_interest_pct_float = Some(si as f64 / fl as f64 * 100.0);
             }
         }
         p.financials.net_income_last_q = intel.financials.net_income_last_q;
@@ -501,9 +550,13 @@ fn collect_db_facts(
     }
 
     // ── Filings, DATE-BOUNDED so a replay never sees a filing from after the day.
-    let filings =
-        company_intel_repository::get_recent_filings_before(conn, symbol, day, payload::FILINGS_LIMIT)
-            .unwrap_or_default();
+    let filings = company_intel_repository::get_recent_filings_before(
+        conn,
+        symbol,
+        day,
+        payload::FILINGS_LIMIT,
+    )
+    .unwrap_or_default();
     p.sec.recent_filings = filings
         .iter()
         .map(|f| payload::Filing {
@@ -537,8 +590,7 @@ fn collect_db_facts(
         Some("premarket") => Some(day.to_string()),
         Some("multiday") => p.quant_panic.window_days.and_then(|w| {
             let w = w as usize;
-            (w > 0 && daily.len() >= w)
-                .then(|| daily[daily.len() - w].date.clone())
+            (w > 0 && daily.len() >= w).then(|| daily[daily.len() - w].date.clone())
         }),
         _ => None,
     };
@@ -603,8 +655,10 @@ fn collect_db_facts(
     } else {
         if let Some(first) = today_m1.first() {
             p.price.open_today = Some(first.open);
-            p.price.change_from_open_pct =
-                p.price.last.and_then(|px| payload::pct_change(first.open, px));
+            p.price.change_from_open_pct = p
+                .price
+                .last
+                .and_then(|px| payload::pct_change(first.open, px));
         }
         p.price.change_1m_pct = payload::change_over_minutes(&today_m1, 1);
         p.price.change_5m_pct = payload::change_over_minutes(&today_m1, 5);
@@ -618,7 +672,9 @@ fn collect_db_facts(
         }
 
         // The momentum window: the tail of today's session.
-        let tail_from = today_m1.len().saturating_sub(payload::INTRADAY_LOOKBACK_MIN);
+        let tail_from = today_m1
+            .len()
+            .saturating_sub(payload::INTRADAY_LOOKBACK_MIN);
         let tail = &today_m1[tail_from..];
         p.volatility.directional_efficiency = payload::directional_efficiency(tail);
         p.volatility.max_pullback_pct = payload::max_pullback_pct(tail);
@@ -770,14 +826,8 @@ async fn fill_context(
     //    instant), so no extra guard is needed here.
     let mut articles = Vec::new();
     if let Some((k, sec)) = &alpaca {
-        match crate::alpaca::news::fetch_recent_news(
-            k,
-            sec,
-            symbol,
-            news_days,
-            payload::NEWS_LIMIT,
-        )
-        .await
+        match crate::alpaca::news::fetch_recent_news(k, sec, symbol, news_days, payload::NEWS_LIMIT)
+            .await
         {
             Ok(a) => articles = a,
             Err(e) => eprintln!("[tagdash] panic_llm: news {symbol}: {e}"),
@@ -817,9 +867,8 @@ async fn fill_context(
 
     // ── Stage 2: Massive news.
     //
-    // NOTE: this endpoint's URL and field names are UNVERIFIED in the codebase (see
-    // `massive::news`), so a failure here is expected rather than exceptional and the
-    // cascade simply continues.
+    // Official Massive reference-news endpoint; still best-effort because a provider
+    // failure must never abort the rest of the context cascade.
     if let Some(mk) = massive_key.filter(|k| !k.trim().is_empty()) {
         match crate::massive::news::fetch_latest_news(&mk, symbol).await {
             Ok(items) => {
@@ -831,8 +880,8 @@ async fn fill_context(
                             published_at: it.published_at.clone().unwrap_or_default(),
                             hours_ago: None,
                             headline: it.title,
-                            source: Some("Massive".into()),
-                            body_excerpt: None,
+                            source: it.source.or_else(|| Some("Massive".into())),
+                            body_excerpt: it.summary,
                         });
                     }
                     p.context_sources.stage = "massive_news".into();
@@ -879,8 +928,247 @@ async fn fill_context(
 /// dismissals. The backend deliberately does not re-derive it: the user removes
 /// technically poor candidates in the UI, and re-deriving would re-analyse names they
 /// just discarded.
+/// Collect one payload per symbol. The DB read is lock-scoped and synchronous; the
+/// news/web cascade awaits, so it runs after the lock is released.
+async fn collect_payloads(
+    symbols: &[String],
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    secrets: &Arc<RwLock<Secrets>>,
+    market: &Arc<RwLock<MarketState>>,
+    market_caps: &HashMap<String, f64>,
+    day: &str,
+    simulated: bool,
+    feed: &str,
+) -> Vec<(String, TickerPayload)> {
+    let mut prepared: Vec<(String, TickerPayload)> = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let facts = {
+            let conn = db.lock().unwrap();
+            collect_db_facts(&conn, market, market_caps, symbol, day, simulated, feed)
+        };
+        let mut p = facts.payload;
+        fill_context(&mut p, secrets, symbol, facts.company_name.as_deref()).await;
+        prepared.push((symbol.clone(), p));
+    }
+    prepared
+}
+
+/// One scoring wave: `CONCURRENCY` isolated calls in flight, one per ticker.
+///
+/// Isolation is the point — a batched call lets the model spread notes across whichever
+/// peers share the batch, so the same ticker would score differently depending on its
+/// batch mates.
+async fn score_wave(
+    prepared: Vec<(String, TickerPayload)>,
+    ds: &Arc<Deepseek>,
+    run_state: &RunState,
+) -> Vec<(String, Result<ScoreAnswer, String>, TickerPayload)> {
+    stream::iter(prepared.into_iter().map(|(symbol, p)| {
+        let ds = ds.clone();
+        let run_state = run_state.clone();
+        async move {
+            // Nothing to judge → N/A without spending a call.
+            if let Some(why) = insufficient_data(&p) {
+                {
+                    let mut st = run_state.write().unwrap();
+                    st.tick();
+                    st.fail(&symbol);
+                }
+                return (symbol, Err(format!("données insuffisantes ({why})")), p);
+            }
+            let body = p.to_json();
+            let user = prompt::score_user_message(&symbol, &body);
+            let call = |effort: Effort| Request {
+                model: MODEL_PRO,
+                system: prompt::SYSTEM_RUBRIC,
+                user: &user,
+                effort: Some(effort),
+                json: true,
+                max_tokens: prompt::SCORE_MAX_TOKENS,
+                temperature: 0.0,
+            };
+            let mut out = ds.chat(call(SCORE_EFFORT)).await;
+            // ONE retry at lower effort when the budget was exhausted by hidden
+            // reasoning. Truncation depends on how long the model chose to think, so
+            // it is worth one cheaper attempt before the ticker becomes an N/A.
+            if matches!(&out, Err(e) if e.contains("tronquée")) {
+                eprintln!("[tagdash] panic_llm {symbol}: tronqué, retry en effort réduit");
+                out = ds.chat(call(RETRY_EFFORT)).await;
+            }
+            let parsed = match out {
+                Ok(ans) => {
+                    // Cache hits are the runtime proof that the rubric prefix is
+                    // byte-identical across calls — the basis of comparability.
+                    eprintln!(
+                        "[tagdash] panic_llm {symbol}: prompt {} (cache hit {}), sortie {}",
+                        ans.usage.prompt, ans.usage.cache_hit, ans.usage.completion,
+                    );
+                    parse_score_answer(&ans.content)
+                }
+                Err(e) => Err(e),
+            };
+            {
+                let mut st = run_state.write().unwrap();
+                st.tick();
+                if parsed.is_err() {
+                    st.fail(&symbol);
+                }
+            }
+            (symbol, parsed, p)
+        }
+    }))
+    .buffer_unordered(CONCURRENCY)
+    .collect()
+    .await
+}
+
+/// Turn a model answer into the row that gets persisted. Everything here is
+/// deterministic post-processing of the answer plus the payload: the trade side, the
+/// fundamental veto, the eligibility state, the timing phase and the confidence-aware
+/// rank. Kept out of the run loop so both waves produce identical rows.
+fn build_row(
+    symbol: String,
+    a: ScoreAnswer,
+    p: &TickerPayload,
+    day: &str,
+    simulated: bool,
+) -> PanicLlmScore {
+    let quality = serde_json::to_string(&p.data_quality).ok();
+    let trade_direction = match p.quant_panic.direction {
+        Some(d) if d > 0 => Some("short".to_string()),
+        Some(d) if d < 0 => Some("long".to_string()),
+        _ => None,
+    };
+    let catalyst_direction = a
+        .catalyst_direction
+        .as_deref()
+        .filter(|v| matches!(*v, "positive" | "negative" | "neutral" | "unknown"))
+        .unwrap_or("unknown")
+        .to_string();
+    let strength = a.catalyst_strength.unwrap_or(0.0);
+    let fundamental_veto = (a.fundamental_reset
+        || (strength >= 80.0 && material_catalyst_type(a.catalyst_type.as_deref())))
+        && strength >= 60.0
+        && catalyst_matches_move(p.quant_panic.direction, Some(catalyst_direction.as_str()));
+    let low_confidence = a.confidence_score.unwrap_or(0.0) < 50.0;
+    let direction_uncertain = strength >= 60.0 && catalyst_direction == "unknown";
+    let unavailable_short =
+        trade_direction.as_deref() == Some("short") && p.float_and_short.shortable == Some(false);
+    let eligibility = if fundamental_veto {
+        "veto"
+    } else if low_confidence || unavailable_short || direction_uncertain {
+        "review"
+    } else {
+        "eligible"
+    };
+    let deterministic_timing = inferred_timing_state(p);
+    let timing_state = if deterministic_timing != "unknown" {
+        deterministic_timing
+    } else {
+        a.timing_state
+            .as_deref()
+            .filter(|v| matches!(*v, "extending" | "exhausting" | "reversing" | "unknown"))
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let adjusted_rank = ranking_score(
+        a.panic_score,
+        a.normalization_prob,
+        a.confidence_score,
+        fundamental_veto,
+        eligibility,
+    );
+    let veto_reason = fundamental_veto.then_some(
+        a.veto_reason
+            .clone()
+            .unwrap_or_else(|| "Le catalyseur fondamental justifie le mouvement.".into()),
+    );
+    PanicLlmScore {
+        symbol,
+        day: day.to_string(),
+        simulated,
+        panic_score: Some(a.panic_score),
+        panic_score_raw: Some(a.panic_score),
+        confidence_score: a.confidence_score,
+        catalyst_strength: a.catalyst_strength,
+        catalyst_label: a.catalyst_label,
+        catalyst_type: a.catalyst_type,
+        reversibility: a.reversibility,
+        one_liner: a.one_liner,
+        key_drivers: a.key_drivers,
+        forced_flow: a.forced_flow,
+        euphoria: a.euphoria,
+        normalization_prob: a.normalization_prob,
+        data_quality: quality,
+        web_used: p.context_sources.web_used,
+        web_provider: p.context_sources.web_provider.clone(),
+        adjustment_reason: None,
+        rubric_version: Some(prompt::RUBRIC_VERSION.to_string()),
+        model: Some(MODEL_PRO.to_string()),
+        ranking_score: Some(adjusted_rank),
+        trade_direction,
+        timing_state: Some(timing_state),
+        fundamental_veto,
+        veto_reason,
+        eligibility: Some(eligibility.into()),
+        catalyst_direction: Some(catalyst_direction),
+        created_at: None,
+    }
+}
+
+/// Which watchlist tickers the catch-up wave should score: the ones that arrived while
+/// the run was in flight.
+///
+/// Excluded: everything that already has a row from this run (scored OR N/A — an N/A is
+/// a decided outcome, not a gap to fill twice), and everything the user dismissed. The
+/// dismissal check is what keeps the catch-up from quietly re-scoring the candidates
+/// they removed with the X.
+fn catch_up_targets(
+    watchlist: Vec<String>,
+    rows: &[PanicLlmScore],
+    dismissed: &[String],
+) -> Vec<String> {
+    let have: std::collections::HashSet<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
+    watchlist
+        .into_iter()
+        .filter(|s| !have.contains(s.as_str()) && !dismissed.iter().any(|d| d == s))
+        .collect()
+}
+
+/// Fold one wave's results into `rows`.
+///
+/// EVERY ticker in the wave ends up with a row: one that could not be scored becomes an
+/// explicit N/A at the bottom of the ranking rather than vanishing. An absent row is
+/// indistinguishable from "never analysed", which is exactly what made a partial run
+/// look like a complete one.
+fn absorb_wave(
+    results: Vec<(String, Result<ScoreAnswer, String>, TickerPayload)>,
+    rows: &mut Vec<PanicLlmScore>,
+    first_error: &mut Option<String>,
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    day: &str,
+    simulated: bool,
+) {
+    for (symbol, parsed, p) in results {
+        match parsed {
+            Ok(a) => rows.push(build_row(symbol, a, &p, day, simulated)),
+            Err(e) => {
+                eprintln!("[tagdash] panic_llm {symbol}: {e}");
+                // Also to the DB, so Réglages → Logs shows it. A user-triggered
+                // feature that fails must leave a trace the user can actually reach.
+                log_db(db, "error", &format!("panic score {symbol}: {e}"));
+                if first_error.is_none() {
+                    *first_error = Some(format!("{symbol}: {e}"));
+                }
+                rows.push(na_row(&symbol, day, simulated, Some(&p), &e));
+            }
+        }
+    }
+}
+
 pub async fn run(
     symbols: Vec<String>,
+    dismissed: Vec<String>,
     db: Arc<Mutex<rusqlite::Connection>>,
     secrets: Arc<RwLock<Secrets>>,
     market: Arc<RwLock<MarketState>>,
@@ -896,14 +1184,18 @@ pub async fn run(
     let day = crate::time::et_date(now);
     let simulated = crate::replay::clock::is_active();
 
-    let symbols: Vec<String> = {
+    let normalise = |list: Vec<String>| -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        symbols
-            .into_iter()
+        list.into_iter()
             .map(|s| s.trim().to_uppercase())
             .filter(|s| !s.is_empty() && seen.insert(s.clone()))
             .collect()
     };
+    let symbols = normalise(symbols);
+    // Tickers the user removed from the panel with the X. They exist only in the UI, so
+    // the caller has to say: without them the catch-up wave below would spend a call on
+    // every candidate they just threw out.
+    let dismissed = normalise(dismissed);
 
     run_state
         .write()
@@ -937,200 +1229,159 @@ pub async fn run(
             .unwrap_or_else(|| "inconnu".to_string())
     };
 
-    // ── 1. Collect payloads. The market-cap map spans the whole universe, so it is
+    // ── 1. Decide what this press has to score.
+    //
+    // The visible list is authoritative for WHICH tickers count (dismissals exist only
+    // in the UI), but it is a moving target: the 09:25 build and every premarket
+    // refresh REPLACE the watchlist, so tickers keep arriving after a run has started.
+    // That is how a run that reported "19 notés" left 17 later arrivals unscored.
+    //
+    // So a press tops up whatever is missing, and re-scores the whole list only when
+    // nothing is missing (then the press means "redo the analysis"). Combined with the
+    // upsert below, two presses add up to a fully analysed list instead of the second
+    // erasing the first.
+    let existing: HashMap<String, PanicLlmScore> = {
+        let conn = db.lock().unwrap();
+        panic_llm_repository::get_for_day(&conn, &day, simulated)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.symbol.clone(), r))
+            .collect()
+    };
+    // A row counts as done only if it actually carries a score AND came from the
+    // rubric in force. An N/A row is retried on the next press; a row from an older
+    // rubric is not comparable with today's, so it is re-scored.
+    let already_scored = |symbol: &String| {
+        existing.get(symbol).is_some_and(|r| {
+            r.panic_score.is_some() && r.rubric_version.as_deref() == Some(prompt::RUBRIC_VERSION)
+        })
+    };
+    let mut to_score: Vec<String> = symbols
+        .iter()
+        .filter(|s| !already_scored(s))
+        .cloned()
+        .collect();
+    if to_score.is_empty() {
+        to_score = symbols.clone();
+    }
+    // Rows kept from an earlier press. They go through calibration and are rewritten,
+    // so the final ranking is one coherent scale over the whole visible list rather
+    // than two runs' scales side by side.
+    let mut rows: Vec<PanicLlmScore> = symbols
+        .iter()
+        .filter(|s| !to_score.contains(s))
+        .filter_map(|s| existing.get(s).cloned())
+        .map(|mut r| {
+            // Calibration is capped RELATIVE TO THE RAW READING. Re-calibrating an
+            // already-calibrated value would let the same ±15 cap drift a second time,
+            // so a carried row goes back to its raw score first.
+            r.panic_score = r.panic_score_raw.or(r.panic_score);
+            r.adjustment_reason = None;
+            r
+        })
+        .collect();
+    {
+        let mut st = run_state.write().unwrap();
+        st.total = to_score.len();
+        st.carried = rows.len();
+    }
+    if rows.is_empty() {
+        eprintln!("[tagdash] panic_llm: {} ticker(s) à noter", to_score.len());
+    } else {
+        eprintln!(
+            "[tagdash] panic_llm: {} ticker(s) à noter, {} conservé(s) d'un run antérieur",
+            to_score.len(),
+            rows.len(),
+        );
+    }
+
+    // ── 2. Collect payloads. The market-cap map spans the whole universe, so it is
     //    built ONCE for the run rather than per ticker.
     let market_caps = {
         let conn = db.lock().unwrap();
         crate::sec_shares::market_caps_as_of(&conn, &day)
     };
-    let mut prepared: Vec<(String, TickerPayload)> = Vec::with_capacity(symbols.len());
-    for symbol in &symbols {
-        let facts = {
-            let conn = db.lock().unwrap();
-            collect_db_facts(&conn, &market, &market_caps, symbol, &day, simulated, &feed)
-        };
-        let mut p = facts.payload;
-        fill_context(&mut p, &secrets, symbol, facts.company_name.as_deref()).await;
-        prepared.push((symbol.clone(), p));
-    }
+    let prepared = collect_payloads(
+        &to_score,
+        &db,
+        &secrets,
+        &market,
+        &market_caps,
+        &day,
+        simulated,
+        &feed,
+    )
+    .await;
 
-    // ── 2. Score, one isolated call per ticker.
+    // ── 3. Score, one isolated call per ticker.
     run_state.write().unwrap().set_phase(Phase::Scoring);
     let ds = Arc::new(Deepseek::new(ds_key));
-    let results: Vec<(String, Result<ScoreAnswer, String>, TickerPayload)> =
-        stream::iter(prepared.into_iter().map(|(symbol, p)| {
-            let ds = ds.clone();
-            let run_state = run_state.clone();
-            async move {
-                let body = p.to_json();
-                let user = prompt::score_user_message(&symbol, &body);
-                let call = |effort: Effort| Request {
-                    model: MODEL_PRO,
-                    system: prompt::SYSTEM_RUBRIC,
-                    user: &user,
-                    effort: Some(effort),
-                    json: true,
-                    max_tokens: prompt::SCORE_MAX_TOKENS,
-                    temperature: 0.0,
-                };
-                let mut out = ds.chat(call(SCORE_EFFORT)).await;
-                // ONE retry at lower effort when the budget was exhausted by hidden
-                // reasoning. Truncation is the only failure that loses a ticker
-                // outright, and it depends on how long the model chose to think — so
-                // it is worth one cheaper attempt rather than dropping the name.
-                if matches!(&out, Err(e) if e.contains("tronquée")) {
-                    eprintln!("[tagdash] panic_llm {symbol}: tronqué, retry en effort réduit");
-                    out = ds.chat(call(RETRY_EFFORT)).await;
-                }
-                let parsed = match out {
-                    Ok(ans) => {
-                        // Cache hits are the runtime proof that the rubric prefix is
-                        // byte-identical across calls — the basis of comparability.
-                        eprintln!(
-                            "[tagdash] panic_llm {symbol}: prompt {} (cache hit {}), sortie {}",
-                            ans.usage.prompt, ans.usage.cache_hit, ans.usage.completion,
-                        );
-                        parse_score_answer(&ans.content)
-                    }
-                    Err(e) => Err(e),
-                };
-                {
-                    let mut st = run_state.write().unwrap();
-                    st.tick();
-                    if parsed.is_err() {
-                        st.fail(&symbol);
-                    }
-                }
-                (symbol, parsed, p)
-            }
-        }))
-        .buffer_unordered(CONCURRENCY)
-        .collect()
-        .await;
+    let results = score_wave(prepared, &ds, &run_state).await;
 
-    let mut rows: Vec<PanicLlmScore> = Vec::new();
     // The first concrete failure, carried into the abort message. A bare "no ticker
     // could be scored" is what made the first version of this feature undiagnosable:
     // the real reason (a truncated reply) existed only in the dev terminal.
     let mut first_error: Option<String> = None;
-    for (symbol, parsed, p) in results {
-        // A ticker that failed to score is simply absent from the day's rows (already
-        // counted in `state.failed`), so the rest of the analysis still lands.
-        let a = match parsed {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("[tagdash] panic_llm {symbol}: {e}");
-                // Also to the DB, so Réglages → Logs shows it. A user-triggered
-                // feature that fails must leave a trace the user can actually reach.
-                log_db(&db, "error", &format!("panic score {symbol}: {e}"));
-                if first_error.is_none() {
-                    first_error = Some(format!("{symbol}: {e}"));
-                }
-                continue;
-            }
-        };
-        let quality = serde_json::to_string(&p.data_quality).ok();
-        let trade_direction = match p.quant_panic.direction {
-            Some(d) if d > 0 => Some("short".to_string()),
-            Some(d) if d < 0 => Some("long".to_string()),
-            _ => None,
-        };
-        let catalyst_direction = a
-            .catalyst_direction
-            .as_deref()
-            .filter(|v| matches!(*v, "positive" | "negative" | "neutral" | "unknown"))
-            .unwrap_or("unknown")
-            .to_string();
-        let strength = a.catalyst_strength.unwrap_or(0.0);
-        let fundamental_veto = (a.fundamental_reset
-            || (strength >= 80.0 && material_catalyst_type(a.catalyst_type.as_deref())))
-            && strength >= 60.0
-            && catalyst_matches_move(
-                p.quant_panic.direction,
-                Some(catalyst_direction.as_str()),
-            );
-        let low_confidence = a.confidence_score.unwrap_or(0.0) < 50.0;
-        let direction_uncertain = strength >= 60.0 && catalyst_direction == "unknown";
-        let unavailable_short = trade_direction.as_deref() == Some("short")
-            && p.float_and_short.shortable == Some(false);
-        let eligibility = if fundamental_veto {
-            "veto"
-        } else if low_confidence || unavailable_short || direction_uncertain {
-            "review"
-        } else {
-            "eligible"
-        };
-        let deterministic_timing = inferred_timing_state(&p);
-        let timing_state = if deterministic_timing != "unknown" {
-            deterministic_timing
-        } else {
-            a.timing_state
-                .as_deref()
-                .filter(|v| {
-                    matches!(*v, "extending" | "exhausting" | "reversing" | "unknown")
-                })
-                .unwrap_or("unknown")
-                .to_string()
-        };
-        let adjusted_rank = ranking_score(
-            a.panic_score,
-            a.normalization_prob,
-            a.confidence_score,
-            fundamental_veto,
-            eligibility,
+    absorb_wave(results, &mut rows, &mut first_error, &db, &day, simulated);
+
+    // ── 3b. Catch-up wave: the watchlist is REBUILT every five minutes through the
+    //    premarket and again at the 09:25 promotion, and each rebuild replaces the
+    //    whole row set. A run takes minutes, so tickers routinely arrive while it is
+    //    in flight — which is how a press that reported "19 notés" left 17 later
+    //    arrivals with no score at all.
+    //
+    //    So the run finishes the job for whatever landed meanwhile. ONE extra wave
+    //    only: the list keeps churning, and chasing it would never terminate. Anything
+    //    arriving after this shows on the button as "+N" for the next press.
+    //
+    //    Still button-triggered — this is the same press finishing its own work, not a
+    //    schedule. `dismissed` is honoured so the catch-up never spends a call on a
+    //    ticker the user has already thrown out.
+    let arrived = {
+        let conn = db.lock().unwrap();
+        let watchlist: Vec<String> =
+            scoring_repository::get_top(&conn, &day, crate::scanner::MR_TOP_N)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.symbol)
+                .collect();
+        drop(conn);
+        catch_up_targets(watchlist, &rows, &dismissed)
+    };
+    if !arrived.is_empty() {
+        eprintln!(
+            "[tagdash] panic_llm: {} ticker(s) arrivé(s) pendant le run — rattrapage: {}",
+            arrived.len(),
+            arrived.join(", "),
         );
-        let veto_reason = fundamental_veto.then_some(
-            a.veto_reason
-                .clone()
-                .unwrap_or_else(|| "Le catalyseur fondamental justifie le mouvement.".into()),
-        );
-        rows.push(PanicLlmScore {
-            symbol,
-            day: day.clone(),
+        {
+            let mut st = run_state.write().unwrap();
+            st.total += arrived.len();
+            st.set_phase(Phase::Collecting);
+        }
+        let prepared = collect_payloads(
+            &arrived,
+            &db,
+            &secrets,
+            &market,
+            &market_caps,
+            &day,
             simulated,
-            panic_score: Some(a.panic_score),
-            panic_score_raw: Some(a.panic_score),
-            confidence_score: a.confidence_score,
-            catalyst_strength: a.catalyst_strength,
-            catalyst_label: a.catalyst_label,
-            catalyst_type: a.catalyst_type,
-            reversibility: a.reversibility,
-            one_liner: a.one_liner,
-            key_drivers: a.key_drivers,
-            forced_flow: a.forced_flow,
-            euphoria: a.euphoria,
-            normalization_prob: a.normalization_prob,
-            data_quality: quality,
-            web_used: p.context_sources.web_used,
-            web_provider: p.context_sources.web_provider.clone(),
-            adjustment_reason: None,
-            rubric_version: Some(prompt::RUBRIC_VERSION.to_string()),
-            model: Some(MODEL_PRO.to_string()),
-            ranking_score: Some(adjusted_rank),
-            trade_direction,
-            timing_state: Some(timing_state),
-            fundamental_veto,
-            veto_reason,
-            eligibility: Some(eligibility.into()),
-            catalyst_direction: Some(catalyst_direction),
-            created_at: None,
-        });
+            &feed,
+        )
+        .await;
+        run_state.write().unwrap().set_phase(Phase::Scoring);
+        let results = score_wave(prepared, &ds, &run_state).await;
+        absorb_wave(results, &mut rows, &mut first_error, &db, &day, simulated);
     }
 
-    if rows.is_empty() {
-        let why = first_error
-            .map(|e| format!("aucun ticker noté — {e}"))
-            .unwrap_or_else(|| "aucun ticker n'a pu être noté".to_string());
-        log_db(&db, "error", &format!("panic score: {why}"));
-        run_state.write().unwrap().abort(why);
-        return;
-    }
-
-    // ── 3. Calibration. Only worth a call with at least two scores to compare.
-    if rows.len() > 1 {
+    // ── 4. Calibration, over the scored rows only. Worth a call from two scores up.
+    let scored = rows.iter().filter(|r| r.panic_score.is_some()).count();
+    if scored > 1 {
         run_state.write().unwrap().set_phase(Phase::Calibrating);
         let entries: Vec<prompt::CalibrationEntry> = rows
             .iter()
+            .filter(|r| r.panic_score.is_some())
             .map(|r| prompt::CalibrationEntry {
                 symbol: r.symbol.clone(),
                 panic_score: r.panic_score.unwrap_or_default(),
@@ -1185,10 +1436,12 @@ pub async fn run(
         });
     }
 
-    // ── 4. Persist.
+    // ── 5. Persist. UPSERT, not replace: a top-up press must add to the day's
+    //    analysis, and a symbol the user has since dismissed keeps its row rather than
+    //    being wiped by a run that no longer mentions it.
     {
         let conn = db.lock().unwrap();
-        if let Err(e) = panic_llm_repository::replace_for_day(&conn, &day, simulated, &rows) {
+        if let Err(e) = panic_llm_repository::upsert_many(&conn, &day, simulated, &rows) {
             run_state
                 .write()
                 .unwrap()
@@ -1197,21 +1450,37 @@ pub async fn run(
         }
         let _ = panic_llm_repository::prune(&conn);
     }
-    let failed = run_state.read().unwrap().failed.len();
+    let na: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.panic_score.is_none())
+        .map(|r| r.symbol.as_str())
+        .collect();
+    let scored = rows.len() - na.len();
     let summary = format!(
-        "panic score {day}: {} ticker(s) noté(s){} (feed={feed}{})",
+        "panic score {day}: {scored}/{} ticker(s) noté(s){} (feed={feed}{})",
         rows.len(),
-        if failed > 0 {
-            format!(", {failed} échec(s)")
-        } else {
+        if na.is_empty() {
             String::new()
+        } else {
+            format!(", {} N/A — {}", na.len(), na.join(", "))
         },
         if simulated { ", replay" } else { "" },
     );
     eprintln!("[tagdash] {summary}");
     // Logged on SUCCESS too: it is the record that tells the user which run produced
-    // the ranking they are looking at, and whether any ticker was left out of it.
-    log_db(&db, if failed > 0 { "warn" } else { "info" }, &summary);
+    // the ranking they are looking at, and which tickers it could not score.
+    log_db(&db, if na.is_empty() { "info" } else { "warn" }, &summary);
+
+    // Not one ticker could be scored: the N/A rows are already persisted (so the list
+    // shows what happened), but the run itself failed and says why.
+    if scored == 0 {
+        let why = first_error
+            .map(|e| format!("aucun ticker noté — {e}"))
+            .unwrap_or_else(|| "aucun ticker n'a pu être noté".to_string());
+        log_db(&db, "error", &format!("panic score: {why}"));
+        run_state.write().unwrap().abort(why);
+        return;
+    }
     run_state.write().unwrap().finish();
 }
 
@@ -1271,6 +1540,122 @@ mod tests {
         assert_eq!(news_lookback_days(Some("2026-07-01"), "2026-08-14"), 14);
     }
 
+    // ── N/A: every submitted ticker ends the run with a row ────────────────────
+
+    /// A payload with nothing to judge is refused BEFORE a call is spent on it.
+    #[test]
+    fn an_empty_payload_cannot_be_scored() {
+        let p = TickerPayload::default();
+        assert_eq!(
+            insufficient_data(&p).as_deref(),
+            Some("ni prix ni amplitude connus")
+        );
+    }
+
+    #[test]
+    fn a_price_without_a_move_is_still_not_scorable() {
+        let mut p = TickerPayload::default();
+        p.price.last = Some(4.20);
+        assert_eq!(
+            insufficient_data(&p).as_deref(),
+            Some("amplitude du mouvement inconnue"),
+            "a last price alone says nothing about a move to fade",
+        );
+    }
+
+    /// The normal watchlist case: a quant panic score is how the ticker got on the
+    /// list, so it always carries an amplitude. This must NOT be refused, or a press
+    /// would mark the whole list N/A.
+    #[test]
+    fn a_watchlist_payload_is_scorable() {
+        let mut p = TickerPayload::default();
+        p.price.last = Some(4.20);
+        p.quant_panic.score = Some(48.0);
+        assert!(insufficient_data(&p).is_none());
+
+        // Live-matched rows have no quant panic score; the day change carries them.
+        let mut q = TickerPayload::default();
+        q.price.prev_close = Some(9.0);
+        q.price.change_from_prev_close_pct = Some(31.0);
+        assert!(insufficient_data(&q).is_none());
+    }
+
+    /// The row a failed ticker gets. NULL score (so it ranks last, not as a zero),
+    /// the reason on the sentence, and no trade direction — the scanner drops an
+    /// analysis whose direction contradicts today's move, and an N/A must never be
+    /// dropped, since being unable to read a ticker is what the user has to see.
+    #[test]
+    fn an_unscorable_ticker_still_produces_a_ranked_row() {
+        let r = na_row("MTEN", "2026-08-14", false, None, "délai dépassé");
+        assert_eq!(r.symbol, "MTEN");
+        assert!(
+            r.panic_score.is_none(),
+            "no score, so the read ranks it last"
+        );
+        assert!(r.panic_score_raw.is_none());
+        assert!(r.ranking_score.is_none());
+        assert_eq!(r.eligibility.as_deref(), Some(NA_ELIGIBILITY));
+        assert_eq!(r.one_liner.as_deref(), Some("N/A — délai dépassé"));
+        assert!(r.trade_direction.is_none());
+        assert_eq!(r.rubric_version.as_deref(), Some(prompt::RUBRIC_VERSION));
+    }
+
+    /// A ticker already scored under the CURRENT rubric is not re-scored by a top-up
+    /// press; an N/A row and a row from an older rubric both are.
+    #[test]
+    fn a_top_up_press_rescores_only_what_is_missing() {
+        let scored = |symbol: &str| PanicLlmScore {
+            symbol: symbol.into(),
+            panic_score: Some(70.0),
+            rubric_version: Some(prompt::RUBRIC_VERSION.into()),
+            ..Default::default()
+        };
+        let mut stale = scored("STALE");
+        stale.rubric_version = Some("panic-v0".into());
+        let na = na_row("NADA", "2026-08-14", false, None, "réponse tronquée");
+
+        let existing: HashMap<String, PanicLlmScore> = [scored("DONE"), stale, na]
+            .into_iter()
+            .map(|r| (r.symbol.clone(), r))
+            .collect();
+        let visible = ["DONE", "STALE", "NADA", "NEW"].map(String::from);
+
+        let missing: Vec<&String> = visible
+            .iter()
+            .filter(|s| {
+                !existing.get(*s).is_some_and(|r| {
+                    r.panic_score.is_some()
+                        && r.rubric_version.as_deref() == Some(prompt::RUBRIC_VERSION)
+                })
+            })
+            .collect();
+        assert_eq!(missing, vec!["STALE", "NADA", "NEW"]);
+    }
+
+    /// The watchlist is rebuilt every five minutes through the premarket, so tickers
+    /// routinely arrive while a run is in flight. The catch-up wave scores exactly
+    /// those — never a ticker already decided, never a dismissed one.
+    #[test]
+    fn the_catch_up_wave_scores_only_what_arrived() {
+        let scored = PanicLlmScore {
+            symbol: "DONE".into(),
+            panic_score: Some(60.0),
+            ..Default::default()
+        };
+        let na = na_row("NADA", "2026-08-14", false, None, "délai dépassé");
+        let rows = vec![scored, na];
+        let watchlist = ["DONE", "NADA", "ARRIVED", "TRASHED"]
+            .map(String::from)
+            .to_vec();
+
+        let targets = catch_up_targets(watchlist, &rows, &["TRASHED".to_string()]);
+        assert_eq!(
+            targets,
+            vec!["ARRIVED"],
+            "an N/A is a decided outcome, and a dismissed ticker must never cost a call",
+        );
+    }
+
     // ── Answer parsing ─────────────────────────────────────────────────────────
 
     fn valid_answer() -> &'static str {
@@ -1313,7 +1698,10 @@ mod tests {
         let high_conf = ranking_score(90.0, Some(80.0), Some(90.0), false, "eligible");
         let low_conf = ranking_score(90.0, Some(80.0), Some(20.0), false, "review");
         assert!(high_conf > low_conf);
-        assert_eq!(ranking_score(99.0, Some(99.0), Some(99.0), true, "veto"), 0.0);
+        assert_eq!(
+            ranking_score(99.0, Some(99.0), Some(99.0), true, "veto"),
+            0.0
+        );
     }
 
     #[test]
@@ -1355,8 +1743,18 @@ mod tests {
 
     #[test]
     fn out_of_range_scores_are_clamped() {
-        assert_eq!(parse_score_answer(r#"{"panic_score":140}"#).unwrap().panic_score, 100.0);
-        assert_eq!(parse_score_answer(r#"{"panic_score":-20}"#).unwrap().panic_score, 0.0);
+        assert_eq!(
+            parse_score_answer(r#"{"panic_score":140}"#)
+                .unwrap()
+                .panic_score,
+            100.0
+        );
+        assert_eq!(
+            parse_score_answer(r#"{"panic_score":-20}"#)
+                .unwrap()
+                .panic_score,
+            0.0
+        );
         let a = parse_score_answer(r#"{"panic_score":50,"confidence_score":250}"#).unwrap();
         assert_eq!(a.confidence_score, Some(100.0));
     }
@@ -1411,7 +1809,11 @@ mod tests {
         assert!(rows[0].adjustment_reason.is_some());
         // The raw score is preserved so the drift stays auditable.
         assert_eq!(rows[0].panic_score_raw, Some(55.0));
-        assert_eq!(rows[1].panic_score, Some(74.0), "untouched ticker unchanged");
+        assert_eq!(
+            rows[1].panic_score,
+            Some(74.0),
+            "untouched ticker unchanged"
+        );
     }
 
     /// The cap is what stops the calibration pass from silently re-scoring. A 30-point
@@ -1435,8 +1837,9 @@ mod tests {
     fn an_adjustment_without_a_reason_is_dropped_at_parse_time() {
         let adj = parse_calibration(r#"{"adjustments":[{"symbol":"AAAA","panic_score":60}]}"#);
         assert!(adj.is_empty());
-        let blank =
-            parse_calibration(r#"{"adjustments":[{"symbol":"AAAA","panic_score":60,"reason":"  "}]}"#);
+        let blank = parse_calibration(
+            r#"{"adjustments":[{"symbol":"AAAA","panic_score":60,"reason":"  "}]}"#,
+        );
         assert!(blank.is_empty());
     }
 

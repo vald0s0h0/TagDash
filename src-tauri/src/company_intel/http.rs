@@ -21,7 +21,10 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_retries: 3, base_backoff: Duration::from_millis(500) }
+        Self {
+            max_retries: 3,
+            base_backoff: Duration::from_millis(500),
+        }
     }
 }
 
@@ -73,7 +76,10 @@ impl Http {
                         let backoff = policy.base_backoff * 2u32.pow(attempt);
                         eprintln!(
                             "[tagdash][company_intel][{}] {url} failed ({e}); retry {}/{} in {:?}",
-                            self.provider, attempt + 1, policy.max_retries, backoff
+                            self.provider,
+                            attempt + 1,
+                            policy.max_retries,
+                            backoff
                         );
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
@@ -91,7 +97,10 @@ impl Http {
         for (name, value) in headers {
             req = req.header(*name, *value);
         }
-        let resp = req.send().await.map_err(|e| IntelError::Network(e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| IntelError::Network(e.to_string()))?;
         let status = resp.status();
         if status.as_u16() == 404 {
             return Err(IntelError::NotFound);
@@ -100,6 +109,8 @@ impl Http {
             let body = resp.text().await.unwrap_or_default();
             return Err(IntelError::http(status.as_u16(), body));
         }
-        resp.text().await.map_err(|e| IntelError::Network(e.to_string()))
+        resp.text()
+            .await
+            .map_err(|e| IntelError::Network(e.to_string()))
     }
 }

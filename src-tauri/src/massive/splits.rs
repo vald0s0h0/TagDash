@@ -16,7 +16,7 @@ pub struct Split {
     /// Execution / ex date, YYYY-MM-DD.
     pub date: String,
     pub from: f64,
-    pub to:   f64,
+    pub to: f64,
 }
 
 impl Split {
@@ -63,7 +63,7 @@ impl RawSplit {
         Some(Split {
             date,
             from: self.split_from.unwrap_or(1.0),
-            to:   self.split_to.unwrap_or(1.0),
+            to: self.split_to.unwrap_or(1.0),
         })
     }
 }
@@ -84,5 +84,9 @@ pub async fn fetch_latest_split(api_key: &str, ticker: &str) -> Result<Option<Sp
         return Err(format!("Massive splits HTTP {status}"));
     }
     let parsed: SplitsResponse = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(parsed.results.into_iter().filter_map(RawSplit::into_split).next())
+    Ok(parsed
+        .results
+        .into_iter()
+        .filter_map(RawSplit::into_split)
+        .next())
 }

@@ -46,6 +46,9 @@ impl AlertEngine {
     /// Starts the 2-min post-close anti-spam window immediately.
     pub fn reset(&self, symbol: &str, strategy_id: &str, _post_close_window: Duration) {
         let key = (symbol.to_string(), strategy_id.to_string());
-        self.cooldowns.lock().unwrap().insert(key, crate::time::now());
+        self.cooldowns
+            .lock()
+            .unwrap()
+            .insert(key, crate::time::now());
     }
 }

@@ -41,7 +41,10 @@ Réponds UNIQUEMENT par un JSON compact: {\"title\":\"<titre>\",\"text\":\"<note
 /// Clean a raw transcription. Always returns something usable.
 pub async fn clean(secrets: &Arc<RwLock<Secrets>>, kind: JobKind, raw: &str) -> Cleaned {
     let raw = raw.trim();
-    let fallback = || Cleaned { text: raw.to_string(), title: None };
+    let fallback = || Cleaned {
+        text: raw.to_string(),
+        title: None,
+    };
 
     let key = {
         let s = secrets.read().unwrap();
@@ -82,6 +85,9 @@ fn parse_reply(resp: &str) -> Option<Cleaned> {
     if text.is_empty() {
         return None;
     }
-    let title = parsed.title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let title = parsed
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
     Some(Cleaned { text, title })
 }

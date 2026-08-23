@@ -56,10 +56,10 @@ pub fn classify(bars: &[Bar]) -> Option<Classification> {
             .max((b.high - pc).abs())
             .max((b.low - pc).abs());
 
-        let body  = (b.close - b.open).abs();
+        let body = (b.close - b.open).abs();
         let upper = (b.high - b.open.max(b.close)).max(0.0);
         let lower = (b.open.min(b.close) - b.low).max(0.0);
-        let wick  = upper + lower;
+        let wick = upper + lower;
         let range = (b.high - b.low).max(1e-9);
         body_ratios.push(body / range);
 

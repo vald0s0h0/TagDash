@@ -58,6 +58,8 @@ const KIND_META: Record<
     blurb:
       "Barres 1 minute (pré-marché + séance + post-marché) des 2000 actions les plus " +
       "échangées du jour, plus les 5 jours précédents pour l'historique intraday. " +
+      "Avec Massive Starter actif, ces minutes servent de couche de découverte puis " +
+      "les réveils sont rechargés en vraies secondes par l'API avant le replay. " +
       "Un fichier par jour.",
     unitSymbols: "symboles",
     unitBars: "barres",

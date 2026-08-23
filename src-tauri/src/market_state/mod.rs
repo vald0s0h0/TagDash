@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use self::aggregators::{Bar, CandleAggregator, Timeframe};
 use self::ring_buffer::RingBuffer;
-use crate::types::{LatencyLevel, LatencyStatus, NewsHeadline, NewsRef};
+use crate::types::{LatencyLevel, LatencyStatus, NewsHeadline, NewsRef, TapeKind};
 
 const RING_CAP: usize = 600;
 
@@ -31,7 +31,10 @@ const NEWS_LOG_CAP: usize = 100;
 /// Cap on retained headlines per symbol (newest kept).
 const NEWS_PER_SYMBOL_CAP: usize = 20;
 /// Seconds of per-symbol trade-count history retained (≥ any accel window).
-const TRADE_COUNT_RETAIN_SECS: i64 = 180;
+// Micro Pullback v2 derives every tempo (through 5 minutes) from the same compact
+// per-second tape. Keep a little headroom beyond the longest window so its local
+// baseline never needs a second store.
+const TRADE_COUNT_RETAIN_SECS: i64 = 15 * 60;
 
 /// Per-ticker live state — serialized and sent to the frontend via get_market_snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,40 +197,195 @@ impl Default for NewsDiagnostics {
     }
 }
 
-/// Per-symbol rolling count of trade prints, bucketed by unix second. Used to
-/// measure trade acceleration (recent rate vs baseline rate) without storing
+/// One second of tape for a symbol: how many prints, how many shares and how many
+/// dollars crossed. Kept per second (rather than per print) so a whole rolling
+/// minute costs a handful of words.
+#[derive(Debug, Clone, Copy)]
+struct TapeSecond {
+    sec: i64,
+    prints: u32,
+    shares: u64,
+    notional: f64,
+    // f32 is ample for exchange prices at one-second diagnostic precision and
+    // saves 16 bytes per retained market-second. On a universe wildcard this is
+    // hundreds of MB avoided versus four f64s.
+    open: f32,
+    high: f32,
+    low: f32,
+    close: f32,
+}
+
+/// Per-symbol rolling tape, bucketed by unix second. Used to measure trade
+/// acceleration (recent rate vs baseline rate) and live liquidity without storing
 /// every print.
+///
+/// Both providers land here through `ingest_trade`, but they do NOT mean the same
+/// thing: an Alpaca print records one real trade, whereas a Massive per-second
+/// aggregate records one bucket carrying that second's whole volume with
+/// `prints = 1`. `prints` is therefore only a trade rate on the Alpaca path — see
+/// `MarketState::tape_kind` and `active_seconds_in_last`, which is the measure
+/// that means the same thing on both feeds.
 #[derive(Debug, Default)]
 struct TradeCounter {
-    /// (unix_second, count) buckets, oldest at the front, newest at the back.
-    buckets: VecDeque<(i64, u32)>,
+    /// Oldest at the front, newest at the back; one entry per second that printed.
+    buckets: VecDeque<TapeSecond>,
 }
 
 impl TradeCounter {
-    /// Record `n` prints at `sec` (unix seconds), dropping buckets older than the
-    /// retention window. Live trades record 1; replay slices record the share of
-    /// the minute bar's trade count they carry.
-    fn record(&mut self, sec: i64, n: u32) {
+    /// Record `n` prints of `shares` shares at `price` on second `sec` (unix
+    /// seconds), dropping buckets older than the retention window. Live trades
+    /// record 1 print; replay slices record the share of the minute bar's trade
+    /// count they carry.
+    fn record(&mut self, sec: i64, n: u32, shares: u64, price: f64) {
+        let notional = price * shares as f64;
         match self.buckets.back_mut() {
-            Some((s, c)) if *s == sec => *c += n,
-            _ => self.buckets.push_back((sec, n)),
+            Some(b) if b.sec == sec => {
+                b.prints += n;
+                b.shares += shares;
+                b.notional += notional;
+                let price = price as f32;
+                b.high = b.high.max(price);
+                b.low = b.low.min(price);
+                b.close = price;
+            }
+            _ => self.buckets.push_back(TapeSecond {
+                sec,
+                prints: n,
+                shares,
+                notional,
+                open: price as f32,
+                high: price as f32,
+                low: price as f32,
+                close: price as f32,
+            }),
         }
         let cutoff = sec - TRADE_COUNT_RETAIN_SECS;
-        while matches!(self.buckets.front(), Some((s, _)) if *s < cutoff) {
+        while matches!(self.buckets.front(), Some(b) if b.sec < cutoff) {
             self.buckets.pop_front();
         }
     }
 
-    /// Number of prints in the last `secs` seconds relative to `now_sec`.
-    fn count_last(&self, now_sec: i64, secs: i64) -> u64 {
+    /// Replace the close-only approximation written by `record` with the real
+    /// OHLC/VWAP carried by a provider's one-second aggregate. The common ingest
+    /// path still updates every existing consumer; Micro Pullback's tape then gets
+    /// the richer range without fabricating four trades or quadrupling volume.
+    fn amend_aggregate(
+        &mut self,
+        sec: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        vwap: Option<f64>,
+    ) {
+        let Some(bucket) = self.buckets.iter_mut().rev().find(|b| b.sec == sec) else {
+            return;
+        };
+        if ![open, high, low, close]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0)
+        {
+            return;
+        }
+        bucket.open = open as f32;
+        bucket.high = high.max(open).max(close) as f32;
+        bucket.low = low.min(open).min(close) as f32;
+        bucket.close = close as f32;
+        if let Some(vw) = vwap.filter(|v| v.is_finite() && *v > 0.0) {
+            bucket.notional = vw * bucket.shares as f64;
+        }
+    }
+
+    /// The buckets covering the last `secs` seconds relative to `now_sec`.
+    fn window(&self, now_sec: i64, secs: i64) -> impl Iterator<Item = &TapeSecond> {
         let cutoff = now_sec - secs;
         self.buckets
             .iter()
             .rev()
-            .take_while(|(s, _)| *s > cutoff)
-            .map(|(_, c)| *c as u64)
-            .sum()
+            .take_while(move |b| b.sec > cutoff)
     }
+
+    /// Number of prints in the last `secs` seconds relative to `now_sec`.
+    fn count_last(&self, now_sec: i64, secs: i64) -> u64 {
+        self.window(now_sec, secs).map(|b| b.prints as u64).sum()
+    }
+
+    /// Distinct seconds that printed at least once in the window — the tape
+    /// continuity measure that carries the same meaning on both feeds.
+    fn active_seconds_last(&self, now_sec: i64, secs: i64) -> u32 {
+        self.window(now_sec, secs).count() as u32
+    }
+
+    /// Dollars traded over the window, accumulated print by print (not
+    /// volume × last price, which drifts when the price moves inside the window).
+    fn notional_last(&self, now_sec: i64, secs: i64) -> f64 {
+        self.window(now_sec, secs).map(|b| b.notional).sum()
+    }
+
+    /// The single busiest second of the window, in dollars. Feeds the "one very
+    /// hot second confirms immediately" layer of the liquidity gate.
+    fn max_second_notional(&self, now_sec: i64, secs: i64) -> f64 {
+        self.window(now_sec, secs)
+            .map(|b| b.notional)
+            .fold(0.0, f64::max)
+    }
+
+    /// Everything a live-liquidity gate needs from one trailing window, computed
+    /// in a single pass. Keeping this atomic avoids four scans of the same deque
+    /// (and, at the caller, four separate `MarketState` read locks) per ticker.
+    fn window_stats(&self, now_sec: i64, secs: i64) -> TapeWindowStats {
+        self.window(now_sec, secs)
+            .fold(TapeWindowStats::default(), |mut out, b| {
+                out.prints += b.prints as u64;
+                out.active_seconds += 1;
+                out.dollars += b.notional;
+                out.max_second_dollars = out.max_second_dollars.max(b.notional);
+                out
+            })
+    }
+
+    fn series(&self, now_sec: i64, secs: i64) -> Vec<SecondTapeBar> {
+        let mut out: Vec<SecondTapeBar> = self
+            .window(now_sec, secs)
+            .map(|b| SecondTapeBar {
+                sec: b.sec,
+                open: b.open as f64,
+                high: b.high as f64,
+                low: b.low as f64,
+                close: b.close as f64,
+                shares: b.shares,
+                dollars: b.notional,
+                prints: b.prints,
+            })
+            .collect();
+        out.reverse();
+        out
+    }
+}
+
+/// Snapshot of one symbol's rolling tape window. Public because strategy engines
+/// consume it, but provider-specific interpretation remains outside MarketState.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TapeWindowStats {
+    pub prints: u64,
+    pub active_seconds: u32,
+    pub dollars: f64,
+    pub max_second_dollars: f64,
+}
+
+/// One non-empty market second. Massive supplies one aggregate per second; Alpaca
+/// prints are folded into the same shape. Sparse storage is intentional: callers
+/// know the requested window length and therefore infer silent seconds exactly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SecondTapeBar {
+    pub sec: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub shares: u64,
+    pub dollars: f64,
+    pub prints: u32,
 }
 
 /// Accumulates the price path of one symbol since the internal book last drained
@@ -314,6 +472,14 @@ pub struct MarketState {
     news_log: VecDeque<NewsHeadline>,
     /// Live health of the Alpaca news WebSocket feed (news debug panel).
     pub news_feed: NewsDiagnostics,
+    /// What the prints in `trade_counts` actually are — see `TapeKind`. Declared by
+    /// the live-feed task; `Prints` is the safe default (it is what the app has
+    /// always assumed) until a task says otherwise.
+    tape_kind: TapeKind,
+    /// Greatest market-event timestamp ingested. Strategy engines use this
+    /// watermark as their clock, so a delayed whole-market feed remains internally
+    /// causal instead of comparing T-15 minute prints with the wall clock.
+    market_watermark: Option<DateTime<Utc>>,
 }
 
 impl MarketState {
@@ -336,6 +502,8 @@ impl MarketState {
             news_by_symbol: HashMap::new(),
             news_log: VecDeque::new(),
             news_feed: NewsDiagnostics::default(),
+            tape_kind: TapeKind::Prints,
+            market_watermark: None,
         }
     }
 
@@ -451,6 +619,44 @@ impl MarketState {
         );
     }
 
+    /// Process one provider-native one-second aggregate. It follows the normal
+    /// trade ingestion path for all existing state, then preserves the aggregate's
+    /// real intrasecond OHLC/VWAP in the strategy tape. This matters on fast 04:00
+    /// moves where using only the close materially understates the current spike.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_second_aggregate(
+        &mut self,
+        symbol: &str,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        vwap: Option<f64>,
+        size: u64,
+        event_time: DateTime<Utc>,
+        now: DateTime<Utc>,
+        warn_ms: u32,
+        critical_ms: u32,
+    ) {
+        self.ingest_trade(
+            symbol,
+            close,
+            size,
+            1,
+            event_time,
+            now,
+            warn_ms,
+            critical_ms,
+        );
+        if let Some(tc) = self.trade_counts.get_mut(symbol) {
+            tc.amend_aggregate(event_time.timestamp(), open, high, low, close, vwap);
+        }
+        if let Some(ticker) = self.tickers.get_mut(symbol) {
+            ticker.high_day = Some(ticker.high_day.map_or(high, |h| h.max(high)));
+            ticker.low_day = Some(ticker.low_day.map_or(low, |l| l.min(low)));
+        }
+    }
+
     /// Market Replay ingestion: identical to `on_trade` but the print may stand
     /// for `prints` real trades (synthetic 10s slices built from minute bars
     /// carry the bar's `n` spread across the slices). `now` = the simulated
@@ -488,6 +694,11 @@ impl MarketState {
         critical_ms: u32,
     ) {
         self.ensure_ticker_buffers(symbol);
+
+        self.market_watermark = Some(
+            self.market_watermark
+                .map_or(event_time, |seen| seen.max(event_time)),
+        );
 
         let latency_ms = (now - event_time)
             .num_milliseconds()
@@ -607,13 +818,14 @@ impl MarketState {
             self.premarket_daily.remove(symbol);
         }
 
+        let n = prints.min(u32::MAX as u64) as u32;
         if let Some(tc) = self.trade_counts.get_mut(symbol) {
-            tc.record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+            tc.record(event_time.timestamp(), n, size, price);
         } else {
             self.trade_counts
                 .entry(symbol.to_string())
                 .or_default()
-                .record(event_time.timestamp(), prints.min(u32::MAX as u64) as u32);
+                .record(event_time.timestamp(), n, size, price);
         }
 
         if let Some(w) = self.fill_windows.get_mut(symbol) {
@@ -678,15 +890,118 @@ impl MarketState {
         self.premarket_daily.clear();
         self.news_by_symbol.clear();
         self.news_log.clear();
+        self.market_watermark = None;
     }
 
     /// Number of trade prints for `symbol` over the last `secs` seconds. None
     /// when the symbol has never printed. Used by micro_pullback's acceleration
     /// trigger via the scanner.
+    ///
+    /// Only a genuine trade rate when `tape_kind()` is `Prints`: a Massive
+    /// per-second aggregate counts as ONE print whatever its volume.
     pub fn trades_in_last(&self, symbol: &str, secs: i64, now: DateTime<Utc>) -> Option<u64> {
         self.trade_counts
             .get(symbol)
             .map(|tc| tc.count_last(now.timestamp(), secs))
+    }
+
+    /// Distinct seconds in which `symbol` printed at least once over the last
+    /// `secs` seconds. None when the symbol has never printed.
+    ///
+    /// This is the tape-continuity measure that means the same thing on both
+    /// feeds, which is why the Massive variant of the liquidity gate is built on
+    /// it: a genuinely liquid name prints in nearly every second, a dead micro-cap
+    /// prints in bursts. On the Massive path (one `A` message per symbol per
+    /// second) it is exactly the number of seconds the symbol traded.
+    pub fn active_seconds_in_last(
+        &self,
+        symbol: &str,
+        secs: i64,
+        now: DateTime<Utc>,
+    ) -> Option<u32> {
+        self.trade_counts
+            .get(symbol)
+            .map(|tc| tc.active_seconds_last(now.timestamp(), secs))
+    }
+
+    /// Dollars traded in `symbol` over the last `secs` seconds, accumulated print
+    /// by print. None when the symbol has never printed.
+    ///
+    /// Preferred over `volume_in_last × last_price`: it does not drift when the
+    /// price moves inside the window, and it is not quantised to the 10-second bar
+    /// grid, so a 1-second window is meaningful.
+    pub fn dollar_volume_in_last(
+        &self,
+        symbol: &str,
+        secs: i64,
+        now: DateTime<Utc>,
+    ) -> Option<f64> {
+        self.trade_counts
+            .get(symbol)
+            .map(|tc| tc.notional_last(now.timestamp(), secs))
+    }
+
+    /// Dollars traded in the single busiest second of the last `secs` seconds.
+    /// None when the symbol has never printed.
+    pub fn max_second_dollar_volume(
+        &self,
+        symbol: &str,
+        secs: i64,
+        now: DateTime<Utc>,
+    ) -> Option<f64> {
+        self.trade_counts
+            .get(symbol)
+            .map(|tc| tc.max_second_notional(now.timestamp(), secs))
+    }
+
+    /// Read prints, continuity and notional for one trailing window in one lookup
+    /// and one pass over the per-second buckets.
+    pub fn tape_window_stats(
+        &self,
+        symbol: &str,
+        secs: i64,
+        now: DateTime<Utc>,
+    ) -> Option<TapeWindowStats> {
+        self.trade_counts
+            .get(symbol)
+            .map(|tc| tc.window_stats(now.timestamp(), secs))
+    }
+
+    /// Sparse per-second OHLCV path ending at the supplied market instant.
+    pub fn tape_series(&self, symbol: &str, secs: i64, now: DateTime<Utc>) -> Vec<SecondTapeBar> {
+        self.trade_counts
+            .get(symbol)
+            .map(|tc| tc.series(now.timestamp(), secs))
+            .unwrap_or_default()
+    }
+
+    /// Feed-time clock. In replay the explicit replay clock wins; live feeds use
+    /// the latest event timestamp (near-now for SIP/IEX, about T-15m for Massive
+    /// Starter). None until the first market event arrives.
+    pub fn strategy_market_now(&self) -> Option<DateTime<Utc>> {
+        if crate::replay::clock::is_active() {
+            Some(crate::time::now())
+        } else {
+            self.market_watermark
+        }
+    }
+
+    /// Which kind of tape is currently feeding `ingest_trade`. Set once by
+    /// whichever stream task is driving the feed.
+    pub fn tape_kind(&self) -> TapeKind {
+        self.tape_kind
+    }
+
+    /// Declare the tape shape. Called by the live-feed task at start-up:
+    /// `Prints` from the Alpaca stream, `SecondAggregates` from the Massive one.
+    pub fn set_tape_kind(&mut self, kind: TapeKind) {
+        if self.tape_kind != kind {
+            // A delayed Massive event must never be evaluated against a watermark
+            // left by a previous realtime Alpaca connection (or vice versa).
+            self.trade_counts.clear();
+            self.market_watermark = None;
+        }
+        self.tape_kind = kind;
     }
 
     /// Total share volume for `symbol` over the last `secs` seconds, summed from
@@ -743,17 +1058,18 @@ impl MarketState {
         self.news_feed.updated_at = now;
     }
 
-    /// Headlines for `symbol` whose arrival is within `window_secs` of `now`
-    /// (oldest first). The list is per-symbol, so every entry genuinely
-    /// references this ticker. The caller (micro_pullback) applies the precise
-    /// ±window match against the price-event time; `window_secs` is passed wide
-    /// enough (≈2× the correlation window) to also cover a headline that lands
-    /// after a recent price event.
+    /// Headlines for `symbol` already visible at `now` and no older than the
+    /// requested window (oldest first). The one-sided condition is load-bearing
+    /// for delayed feeds: a realtime news socket must not leak a T+10 headline into
+    /// a Massive price event whose market clock is still at T.
     pub fn recent_news(&self, symbol: &str, now: DateTime<Utc>, window_secs: i64) -> Vec<NewsRef> {
         match self.news_by_symbol.get(symbol) {
             Some(list) => list
                 .iter()
-                .filter(|n| (now - n.received_at).num_seconds().abs() <= window_secs)
+                .filter(|n| {
+                    let age = (now - n.received_at).num_seconds();
+                    (0..=window_secs).contains(&age)
+                })
                 .map(|n| NewsRef {
                     at: n.received_at,
                     headline: n.headline.clone(),
@@ -761,6 +1077,22 @@ impl MarketState {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Count recent headlines without cloning their text. The A+ news watcher polls
+    /// this once a second per candidate and only needs to know whether the count grew.
+    pub fn recent_news_count(&self, symbol: &str, now: DateTime<Utc>, window_secs: i64) -> usize {
+        self.news_by_symbol
+            .get(symbol)
+            .map(|list| {
+                list.iter()
+                    .filter(|n| {
+                        let age = (now - n.received_at).num_seconds();
+                        (0..=window_secs).contains(&age)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Latest live trade price for `symbol`, or None if unseen. Cheap accessor
@@ -1101,6 +1433,16 @@ impl MarketState {
         }
         by_time.into_values().collect()
     }
+
+    /// Timestamp of the newest completed candle without cloning the ring. Stateful
+    /// engines use this as a watermark before paying to snapshot the full history.
+    pub fn latest_closed_bar_time(&self, symbol: &str, tf: Timeframe) -> Option<DateTime<Utc>> {
+        self.bars
+            .get(symbol)
+            .and_then(|m| m.get(&tf))
+            .and_then(|rb| rb.last())
+            .map(|b| b.time)
+    }
 }
 
 impl Default for MarketState {
@@ -1117,6 +1459,111 @@ mod tests {
         chrono::TimeZone::timestamp_opt(&Utc, 1_700_000_000 + s, 0)
             .single()
             .unwrap()
+    }
+
+    #[test]
+    fn tape_window_stats_match_the_four_individual_measures() {
+        let mut tc = TradeCounter::default();
+        tc.record(100, 2, 100, 5.0);
+        tc.record(101, 3, 200, 6.0);
+        tc.record(102, 1, 50, 4.0);
+
+        let s = tc.window_stats(103, 3);
+        assert_eq!(s.prints, tc.count_last(103, 3));
+        assert_eq!(s.active_seconds, tc.active_seconds_last(103, 3));
+        assert_eq!(s.dollars, tc.notional_last(103, 3));
+        assert_eq!(s.max_second_dollars, tc.max_second_notional(103, 3));
+        // Trailing windows are half-open: at now=103, a 3-second window covers
+        // seconds 101 and 102; the bucket exactly on the cutoff is excluded.
+        assert_eq!(s.prints, 4);
+        assert_eq!(s.active_seconds, 2);
+        assert_eq!(s.dollars, 1_400.0);
+        assert_eq!(s.max_second_dollars, 1_200.0);
+    }
+
+    #[test]
+    fn retained_second_stays_compact_for_universe_streaming() {
+        assert!(std::mem::size_of::<TapeSecond>() <= 48);
+    }
+
+    #[test]
+    fn strategy_clock_follows_the_event_watermark_not_receipt_time() {
+        let mut ms = MarketState::new();
+        let event = t(0);
+        let receipt = event + chrono::Duration::minutes(15);
+        ms.on_trade("AAA", 5.0, 100, event, receipt, 1_000, 2_000);
+        // Inspect the feed watermark directly: another parallel unit test may have
+        // the process-global replay clock active for its own fixture.
+        assert_eq!(ms.market_watermark, Some(event));
+        let stats = ms.tape_window_stats("AAA", 10, event).unwrap();
+        assert_eq!(stats.active_seconds, 1);
+        assert_eq!(
+            ms.tape_window_stats("AAA", 10, receipt)
+                .unwrap()
+                .active_seconds,
+            0
+        );
+    }
+
+    #[test]
+    fn provider_second_aggregate_keeps_real_ohlc_and_vwap_notional() {
+        let mut ms = MarketState::new();
+        let event = t(0);
+        ms.on_second_aggregate(
+            "AAA",
+            5.0,
+            6.0,
+            4.5,
+            5.5,
+            Some(5.25),
+            100,
+            event,
+            event,
+            1_000,
+            2_000,
+        );
+        let tape = ms.tape_series("AAA", 10, event);
+        assert_eq!(tape.len(), 1);
+        assert_eq!(
+            (tape[0].open, tape[0].high, tape[0].low, tape[0].close),
+            (5.0, 6.0, 4.5, 5.5)
+        );
+        assert_eq!(tape[0].dollars, 525.0);
+    }
+
+    #[test]
+    fn changing_feed_shape_clears_an_incompatible_realtime_watermark() {
+        let mut ms = MarketState::new();
+        let realtime = t(900);
+        ms.on_trade("AAA", 5.0, 100, realtime, realtime, 1_000, 2_000);
+        ms.set_tape_kind(TapeKind::SecondAggregates);
+        assert_eq!(ms.market_watermark, None);
+
+        let delayed = t(0);
+        ms.on_second_aggregate(
+            "AAA", 5.0, 5.1, 4.9, 5.0, None, 100, delayed, realtime, 1_000, 2_000,
+        );
+        assert_eq!(ms.market_watermark, Some(delayed));
+    }
+
+    #[test]
+    fn delayed_market_clock_cannot_see_future_news() {
+        let mut ms = MarketState::new();
+        ms.news_by_symbol.insert(
+            "AAA".into(),
+            vec![NewsHeadline {
+                id: 1,
+                headline: "future catalyst".into(),
+                summary: None,
+                url: None,
+                source: None,
+                symbols: vec!["AAA".into()],
+                created_at: t(60),
+                received_at: t(60),
+            }],
+        );
+        assert_eq!(ms.recent_news_count("AAA", t(0), 3600), 0);
+        assert_eq!(ms.recent_news_count("AAA", t(60), 3600), 1);
     }
 
     // Trades accumulate into a per-symbol window (range + extreme order) that the

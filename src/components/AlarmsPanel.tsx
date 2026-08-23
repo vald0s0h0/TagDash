@@ -41,6 +41,7 @@ function alarmToAlert(a: AlarmView): AlertSignal {
     reason:         `Alarme · ${a.strategy_name}`,
     display_timeframe: null,
     side:           null,
+    tempo_depth:    null,
   };
 }
 

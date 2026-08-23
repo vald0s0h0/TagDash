@@ -64,12 +64,12 @@ impl RawShortInterest {
         let symbol = self.ticker.filter(|t| !t.trim().is_empty())?;
         let short_interest = self.short_interest.map(|v| v as i64);
         // Use the API's days-to-cover when present, else derive it.
-        let days_to_cover = self.days_to_cover.or_else(|| {
-            match (self.short_interest, self.avg_daily_volume) {
-                (Some(si), Some(adv)) if adv > 0.0 => Some(si / adv),
-                _ => None,
-            }
-        });
+        let days_to_cover =
+            self.days_to_cover
+                .or_else(|| match (self.short_interest, self.avg_daily_volume) {
+                    (Some(si), Some(adv)) if adv > 0.0 => Some(si / adv),
+                    _ => None,
+                });
         // Skip rows with no usable figure at all.
         if short_interest.is_none() && days_to_cover.is_none() {
             return None;
@@ -84,8 +84,12 @@ impl RawShortInterest {
 }
 
 /// Fetch the latest short interest for the whole universe (one row per ticker),
-/// following `next_url` pagination and honouring the free-tier rate limit.
-pub async fn fetch_short_interest_all(api_key: &str) -> Result<Vec<MassiveShortInterest>, String> {
+/// following `next_url` pagination and honouring the free-tier rate limit, unless
+/// `unlimited` (a confirmed Starter+ tier, see `plan::Tier`) says otherwise.
+pub async fn fetch_short_interest_all(
+    api_key: &str,
+    unlimited: bool,
+) -> Result<Vec<MassiveShortInterest>, String> {
     if api_key.trim().is_empty() {
         return Err("missing Massive API key".into());
     }
@@ -94,12 +98,14 @@ pub async fn fetch_short_interest_all(api_key: &str) -> Result<Vec<MassiveShortI
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut url = with_key(
-        &format!("{BASE_URL}/stocks/v1/short-interest?limit={PAGE_LIMIT}&sort=settlement_date.desc"),
+        &format!(
+            "{BASE_URL}/stocks/v1/short-interest?limit={PAGE_LIMIT}&sort=settlement_date.desc"
+        ),
         api_key,
     );
 
     for page in 0..MAX_PAGES {
-        if page > 0 {
+        if page > 0 && !unlimited {
             tokio::time::sleep(RATE_LIMIT).await;
         }
         let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
@@ -110,7 +116,10 @@ pub async fn fetch_short_interest_all(api_key: &str) -> Result<Vec<MassiveShortI
                 eprintln!("[tagdash][massive] rate limited — stopping short-interest fetch");
                 break;
             }
-            return Err(format!("Massive short-interest HTTP {status}: {}", &body[..body.len().min(200)]));
+            return Err(format!(
+                "Massive short-interest HTTP {status}: {}",
+                &body[..body.len().min(200)]
+            ));
         }
         let parsed: Response = resp.json().await.map_err(|e| e.to_string())?;
         if let Some(s) = &parsed.status {
@@ -119,7 +128,11 @@ pub async fn fetch_short_interest_all(api_key: &str) -> Result<Vec<MassiveShortI
             }
         }
         let mut new_this_page = 0usize;
-        for raw in parsed.results.into_iter().filter_map(RawShortInterest::into_model) {
+        for raw in parsed
+            .results
+            .into_iter()
+            .filter_map(RawShortInterest::into_model)
+        {
             if seen.insert(raw.symbol.to_uppercase()) {
                 out.push(raw);
                 new_this_page += 1;
@@ -146,8 +159,11 @@ mod tests {
             {"ticker":"BBB","settlement_date":"2026-05-15","short_interest":9000000,"days_to_cover":2.5}
         ]}"#;
         let parsed: Response = serde_json::from_str(body).unwrap();
-        let rows: Vec<MassiveShortInterest> =
-            parsed.results.into_iter().filter_map(RawShortInterest::into_model).collect();
+        let rows: Vec<MassiveShortInterest> = parsed
+            .results
+            .into_iter()
+            .filter_map(RawShortInterest::into_model)
+            .collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short_interest, Some(12_000_000));
         assert_eq!(rows[0].days_to_cover, Some(4.0));
@@ -161,8 +177,11 @@ mod tests {
             {"ticker":"X","settlement_date":"2026-05-15"}
         ]}"#;
         let parsed: Response = serde_json::from_str(body).unwrap();
-        let rows: Vec<MassiveShortInterest> =
-            parsed.results.into_iter().filter_map(RawShortInterest::into_model).collect();
+        let rows: Vec<MassiveShortInterest> = parsed
+            .results
+            .into_iter()
+            .filter_map(RawShortInterest::into_model)
+            .collect();
         assert!(rows.is_empty());
     }
 }

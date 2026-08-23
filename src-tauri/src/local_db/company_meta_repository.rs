@@ -20,15 +20,21 @@ pub fn upsert(conn: &Connection, m: &CompanyMeta) -> Result<()> {
              country=excluded.country, sic=excluded.sic,
              industry=excluded.industry, sector=excluded.sector,
              updated_at=excluded.updated_at",
-        params![m.symbol, m.country, m.sic, m.industry, m.sector, m.updated_at],
+        params![
+            m.symbol,
+            m.country,
+            m.sic,
+            m.industry,
+            m.sector,
+            m.updated_at
+        ],
     )?;
     Ok(())
 }
 
 pub fn get_all(conn: &Connection) -> Result<Vec<CompanyMeta>> {
-    let mut stmt = conn.prepare(
-        "SELECT symbol, country, sic, industry, sector, updated_at FROM company_meta",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT symbol, country, sic, industry, sector, updated_at FROM company_meta")?;
     let rows = stmt.query_map([], |row| {
         Ok(CompanyMeta {
             symbol: row.get(0)?,
@@ -68,11 +74,9 @@ pub fn count(conn: &Connection) -> Result<i64> {
 /// Most recent `updated_at` across company_meta — used to throttle the sec-api
 /// full refresh to once per calendar day.
 pub fn last_date(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT MAX(updated_at) FROM company_meta",
-        [],
-        |r| r.get::<_, Option<String>>(0),
-    )
+    conn.query_row("SELECT MAX(updated_at) FROM company_meta", [], |r| {
+        r.get::<_, Option<String>>(0)
+    })
     .ok()
     .flatten()
 }

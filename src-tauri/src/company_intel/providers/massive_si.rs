@@ -39,12 +39,12 @@ impl RawShortInterest {
     fn into_model(self) -> ShortInterest {
         let short_interest = self.short_interest.map(|v| v as i64);
         // Use the API's days-to-cover when present, else derive it.
-        let days_to_cover = self.days_to_cover.or_else(|| {
-            match (self.short_interest, self.avg_daily_volume) {
-                (Some(si), Some(adv)) if adv > 0.0 => Some(si / adv),
-                _ => None,
-            }
-        });
+        let days_to_cover =
+            self.days_to_cover
+                .or_else(|| match (self.short_interest, self.avg_daily_volume) {
+                    (Some(si), Some(adv)) if adv > 0.0 => Some(si / adv),
+                    _ => None,
+                });
         ShortInterest {
             short_interest,
             days_to_cover,
@@ -79,7 +79,11 @@ pub async fn fetch_short_interest(
     match resp.results.into_iter().next() {
         Some(r) => {
             let si = r.into_model();
-            if si.is_empty() { Err(IntelError::NotFound) } else { Ok(si) }
+            if si.is_empty() {
+                Err(IntelError::NotFound)
+            } else {
+                Ok(si)
+            }
         }
         None => Err(IntelError::NotFound),
     }

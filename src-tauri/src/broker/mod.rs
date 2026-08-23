@@ -93,6 +93,10 @@ pub struct BrokerEngine {
     pub journal: Arc<RwLock<journal::BrokerJournal>>,
     /// Durable TP/SL plans used while Alpaca disallows advanced orders outside RTH.
     pub protection: Arc<RwLock<protection::ProtectionBook>>,
+    /// Locate cost bases explicitly prepared by the user, keyed by symbol. They
+    /// stay separate from the position mirror because Alpaca positions do not carry
+    /// locate fees or borrow rates.
+    pub locate_plans: Arc<RwLock<HashMap<String, ShortCostBasis>>>,
     reconcile_now: Arc<Notify>,
 }
 
@@ -108,6 +112,7 @@ impl BrokerEngine {
             mirror: Arc::new(RwLock::new(BrokerMirror::default())),
             journal: Arc::new(RwLock::new(journal::BrokerJournal::default())),
             protection: Arc::new(RwLock::new(protection::ProtectionBook::default())),
+            locate_plans: Arc::new(RwLock::new(HashMap::new())),
             reconcile_now: Arc::new(Notify::new()),
         }
     }
@@ -348,10 +353,14 @@ pub fn spawn(
                         let protection_snapshot = engine.protection.read().unwrap().clone();
                         let conn = deps.db.lock().unwrap();
                         let _ = crate::local_db::broker_state_repository::save_journal(
-                            &conn, &previous, &journal_snapshot,
+                            &conn,
+                            &previous,
+                            &journal_snapshot,
                         );
                         let _ = crate::local_db::broker_state_repository::save_protection(
-                            &conn, &previous, &protection_snapshot,
+                            &conn,
+                            &previous,
+                            &protection_snapshot,
                         );
                     }
                     journal.write().unwrap().open.clear();

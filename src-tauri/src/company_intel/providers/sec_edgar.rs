@@ -71,7 +71,10 @@ pub fn document_url(cik: &str, accession_number: &str, primary_document: &str) -
     }
     let cik_int = cik.trim_start_matches('0');
     let cik_int = if cik_int.is_empty() { "0" } else { cik_int };
-    let acc_nodash: String = accession_number.chars().filter(|c| c.is_ascii_digit()).collect();
+    let acc_nodash: String = accession_number
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
     Some(format!(
         "{WWW_BASE}/Archives/edgar/data/{cik_int}/{acc_nodash}/{primary_document}"
     ))
@@ -94,8 +97,7 @@ pub async fn fetch_ticker_cik_map(
 ) -> IntelResult<HashMap<String, String>> {
     let url = format!("{WWW_BASE}/files/company_tickers.json");
     // The feed is a JSON object keyed by an arbitrary index ("0","1",…).
-    let raw: HashMap<String, TickerRow> =
-        http.get_json(limiter, &url, &headers(), policy).await?;
+    let raw: HashMap<String, TickerRow> = http.get_json(limiter, &url, &headers(), policy).await?;
     let mut map = HashMap::with_capacity(raw.len());
     for row in raw.into_values() {
         let cik = match &row.cik_str {
@@ -120,6 +122,109 @@ pub async fn fetch_ticker_cik_map(
 struct SubmissionsResponse {
     #[serde(default)]
     filings: Filings,
+    // ── Issuer identity, free in the same response ──
+    // `submissions/CIK*.json` carries the SIC code, the SIC title and the domicile
+    // alongside the filing feed. That is the whole of what sec-api.io (paid) supplies
+    // for `company_meta`, at no extra request — this JSON is already being fetched
+    // for the filings. See `CompanyProfile`.
+    #[serde(default)]
+    sic: Option<String>,
+    #[serde(default, rename = "sicDescription")]
+    sic_description: Option<String>,
+    #[serde(default, rename = "stateOfIncorporationDescription")]
+    state_of_incorporation_description: Option<String>,
+    #[serde(default, rename = "stateOfIncorporation")]
+    state_of_incorporation: Option<String>,
+    #[serde(default)]
+    addresses: Addresses,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Addresses {
+    #[serde(default)]
+    business: Address,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Address {
+    #[serde(default, rename = "stateOrCountryDescription")]
+    state_or_country_description: Option<String>,
+    #[serde(default, rename = "stateOrCountry")]
+    state_or_country: Option<String>,
+}
+
+/// Who the issuer is, as EDGAR states it. The free replacement for the sec-api.io
+/// `company_meta` fields — same SIC title wording, so
+/// `strategies::issuer_profile::hot_industry` matches it unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompanyProfile {
+    /// Four-digit SIC code, e.g. "2834".
+    pub sic: Option<String>,
+    /// SIC title, e.g. "Pharmaceutical Preparations".
+    pub industry: Option<String>,
+    /// Business location, preferring the human-readable description. For a US filer
+    /// this is a state; for a foreign private issuer it is the country — which is
+    /// exactly what the risk-domicile read needs.
+    pub country: Option<String>,
+}
+
+impl CompanyProfile {
+    pub fn is_empty(&self) -> bool {
+        self.sic.is_none() && self.industry.is_none() && self.country.is_none()
+    }
+}
+
+/// Fetch the issuer profile from the submissions feed.
+///
+/// Deliberately a separate entry point rather than a second return value of
+/// `fetch_recent_filings`: the collector needs the profile even for a ticker whose
+/// filings all classify as "other", and callers that only want filings should not
+/// have to thread a value they ignore. The HTTP layer's own caching makes the second
+/// call cheap, and EDGAR is keyless and rate-generous.
+pub async fn fetch_company_profile(
+    http: &Http,
+    limiter: &RateLimiter,
+    policy: &RetryPolicy,
+    cik: &str,
+) -> IntelResult<CompanyProfile> {
+    let url = format!("{DATA_BASE}/submissions/CIK{}.json", pad_cik(cik));
+    let resp: SubmissionsResponse = http.get_json(limiter, &url, &headers(), policy).await?;
+    let profile = resp.profile();
+    if profile.is_empty() {
+        Err(IntelError::NotFound)
+    } else {
+        Ok(profile)
+    }
+}
+
+impl SubmissionsResponse {
+    fn profile(&self) -> CompanyProfile {
+        let pick = |a: &Option<String>, b: &Option<String>| {
+            a.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| b.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+                .map(String::from)
+        };
+        CompanyProfile {
+            sic: pick(&self.sic, &None),
+            industry: pick(&self.sic_description, &None),
+            // The business address is where the company actually operates; the state
+            // of incorporation is a legal choice (half the market is Delaware) and is
+            // only the fallback. A Cayman shell operating from Shenzhen must read as
+            // the risk it is, not as "KY".
+            country: pick(
+                &self.addresses.business.state_or_country_description,
+                &self.addresses.business.state_or_country,
+            )
+            .or_else(|| {
+                pick(
+                    &self.state_of_incorporation_description,
+                    &self.state_of_incorporation,
+                )
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,7 +310,10 @@ pub async fn summarize_dilution(
     filings: &[SecFiling],
     scan_latest_doc: bool,
 ) -> DilutionInfo {
-    let dilution: Vec<&SecFiling> = filings.iter().filter(|f| f.category == "dilution").collect();
+    let dilution: Vec<&SecFiling> = filings
+        .iter()
+        .filter(|f| f.category == "dilution")
+        .collect();
     let Some(latest) = dilution.first() else {
         return DilutionInfo::default();
     };
@@ -246,8 +354,12 @@ pub async fn summarize_dilution(
 pub fn flags_from_text(text: &str) -> DilutionFlags {
     let lower = text.to_lowercase();
     DilutionFlags {
-        atm: lower.contains("at-the-market") || lower.contains("at the market") || lower.contains("atm offering"),
-        resale: lower.contains("resale") || lower.contains("selling stockholder") || lower.contains("selling shareholder"),
+        atm: lower.contains("at-the-market")
+            || lower.contains("at the market")
+            || lower.contains("atm offering"),
+        resale: lower.contains("resale")
+            || lower.contains("selling stockholder")
+            || lower.contains("selling shareholder"),
         warrants: lower.contains("warrant"),
         offering_amount: parse_offering_amount(&lower),
     }
@@ -266,7 +378,9 @@ pub fn parse_offering_amount(lower: &str) -> Option<f64> {
                 j += 1;
             }
             let num_start = j;
-            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b',' || bytes[j] == b'.') {
+            while j < bytes.len()
+                && (bytes[j].is_ascii_digit() || bytes[j] == b',' || bytes[j] == b'.')
+            {
                 j += 1;
             }
             if j > num_start {
@@ -334,8 +448,12 @@ fn span_days(start: &str, end: &str) -> Option<i64> {
 fn quarterly_values(entries: &[FactEntry]) -> Vec<(String, f64)> {
     let mut by_end: HashMap<String, (f64, bool)> = HashMap::new(); // end → (val, has_frame)
     for e in entries {
-        let (Some(start), Some(end), Some(val)) = (&e.start, &e.end, e.val) else { continue };
-        let Some(days) = span_days(start, end) else { continue };
+        let (Some(start), Some(end), Some(val)) = (&e.start, &e.end, e.val) else {
+            continue;
+        };
+        let Some(days) = span_days(start, end) else {
+            continue;
+        };
         if !(80..=100).contains(&days) {
             continue; // keep only ~one-quarter windows
         }
@@ -359,8 +477,12 @@ fn quarterly_values(entries: &[FactEntry]) -> Vec<(String, f64)> {
 fn annual_values(entries: &[FactEntry]) -> Vec<(String, f64)> {
     let mut by_end: HashMap<String, f64> = HashMap::new();
     for e in entries {
-        let (Some(start), Some(end), Some(val)) = (&e.start, &e.end, e.val) else { continue };
-        let Some(days) = span_days(start, end) else { continue };
+        let (Some(start), Some(end), Some(val)) = (&e.start, &e.end, e.val) else {
+            continue;
+        };
+        let Some(days) = span_days(start, end) else {
+            continue;
+        };
         if (330..=400).contains(&days) {
             by_end.insert(end.clone(), val);
         }
@@ -420,7 +542,9 @@ fn financials_from_facts(facts: &CompanyFacts) -> FinancialHealth {
     // Cash & equivalents: most recent balance-sheet instant.
     let cash = latest_instant(&usd("CashAndCashEquivalentsAtCarryingValue"));
     let cash = cash.or_else(|| {
-        latest_instant(&usd("CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"))
+        latest_instant(&usd(
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ))
     });
     fh.cash_and_equivalents = cash.map(|(_, v)| v);
 
@@ -471,7 +595,12 @@ struct FrameEntry {
 /// `lag_days` before `today` (so filings likely exist). `instant` → "CY{Y}Q{Q}I"
 /// (balance-sheet instants like shares/cash); otherwise → "CY{Y}Q{Q}" (the
 /// 3-month duration concepts like quarterly net income).
-pub fn recent_quarter_frames(today: NaiveDate, count: usize, lag_days: i64, instant: bool) -> Vec<String> {
+pub fn recent_quarter_frames(
+    today: NaiveDate,
+    count: usize,
+    lag_days: i64,
+    instant: bool,
+) -> Vec<String> {
     let cutoff = today - chrono::Duration::days(lag_days);
     let quarter_end = |y: i32, q: u32| -> NaiveDate {
         let (m, d) = match q {
@@ -535,7 +664,9 @@ pub async fn fetch_concept_frame(
     let resp: FramesResponse = http.get_json(limiter, &url, &headers(), policy).await?;
     let mut out = Vec::with_capacity(resp.data.len());
     for e in resp.data {
-        let (Some(cik), Some(end), Some(val)) = (e.cik, e.end, e.val) else { continue };
+        let (Some(cik), Some(end), Some(val)) = (e.cik, e.end, e.val) else {
+            continue;
+        };
         if !val.is_finite() {
             continue;
         }
@@ -561,9 +692,16 @@ pub async fn fetch_shares_outstanding_frame(
     policy: &RetryPolicy,
     frame: &str,
 ) -> IntelResult<Vec<(String, String, f64)>> {
-    let rows =
-        fetch_concept_frame(http, limiter, policy, "dei", "EntityCommonStockSharesOutstanding", "shares", frame)
-            .await?;
+    let rows = fetch_concept_frame(
+        http,
+        limiter,
+        policy,
+        "dei",
+        "EntityCommonStockSharesOutstanding",
+        "shares",
+        frame,
+    )
+    .await?;
     let out: Vec<_> = rows.into_iter().filter(|(_, _, v)| *v > 0.0).collect();
     if out.is_empty() {
         Err(IntelError::NotFound)
@@ -635,7 +773,9 @@ pub async fn fetch_holders(
         ],
     )
     .map_err(|e| IntelError::Parse(e.to_string()))?;
-    let resp: FtsResponse = http.get_json(limiter, url.as_str(), &headers(), policy).await?;
+    let resp: FtsResponse = http
+        .get_json(limiter, url.as_str(), &headers(), policy)
+        .await?;
 
     let mut holders: Vec<Holder> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -668,7 +808,11 @@ pub async fn fetch_holders(
 
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -696,7 +840,10 @@ mod tests {
     #[test]
     fn doc_url_built_from_unpadded_cik() {
         let u = document_url("0000320193", "0000320193-24-000123", "form.htm").unwrap();
-        assert_eq!(u, "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/form.htm");
+        assert_eq!(
+            u,
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/form.htm"
+        );
         assert!(document_url("320193", "x-24-1", "").is_none());
     }
 
@@ -711,9 +858,18 @@ mod tests {
 
     #[test]
     fn offering_amount_scaling() {
-        assert_eq!(parse_offering_amount("up to $50 million in shares"), Some(50_000_000.0));
-        assert_eq!(parse_offering_amount("aggregate of $1.5 billion"), Some(1_500_000_000.0));
-        assert_eq!(parse_offering_amount("$250,000,000 shelf"), Some(250_000_000.0));
+        assert_eq!(
+            parse_offering_amount("up to $50 million in shares"),
+            Some(50_000_000.0)
+        );
+        assert_eq!(
+            parse_offering_amount("aggregate of $1.5 billion"),
+            Some(1_500_000_000.0)
+        );
+        assert_eq!(
+            parse_offering_amount("$250,000,000 shelf"),
+            Some(250_000_000.0)
+        );
         // Too small to be an offering → ignored.
         assert_eq!(parse_offering_amount("a fee of $500"), None);
         assert_eq!(parse_offering_amount("no dollar figure here"), None);
@@ -724,11 +880,36 @@ mod tests {
         // Four ~quarterly net-income entries (two negative) + one annual that must
         // be ignored by the quarterly extractor.
         let entries = vec![
-            FactEntry { start: Some("2024-01-01".into()), end: Some("2024-03-31".into()), val: Some(-1_000.0), frame: Some("CY2024Q1".into()) },
-            FactEntry { start: Some("2024-04-01".into()), end: Some("2024-06-30".into()), val: Some(-500.0),  frame: Some("CY2024Q2".into()) },
-            FactEntry { start: Some("2024-07-01".into()), end: Some("2024-09-30".into()), val: Some(200.0),   frame: Some("CY2024Q3".into()) },
-            FactEntry { start: Some("2024-10-01".into()), end: Some("2024-12-31".into()), val: Some(300.0),   frame: Some("CY2024Q4".into()) },
-            FactEntry { start: Some("2024-01-01".into()), end: Some("2024-12-31".into()), val: Some(-1_000.0), frame: Some("CY2024".into()) },
+            FactEntry {
+                start: Some("2024-01-01".into()),
+                end: Some("2024-03-31".into()),
+                val: Some(-1_000.0),
+                frame: Some("CY2024Q1".into()),
+            },
+            FactEntry {
+                start: Some("2024-04-01".into()),
+                end: Some("2024-06-30".into()),
+                val: Some(-500.0),
+                frame: Some("CY2024Q2".into()),
+            },
+            FactEntry {
+                start: Some("2024-07-01".into()),
+                end: Some("2024-09-30".into()),
+                val: Some(200.0),
+                frame: Some("CY2024Q3".into()),
+            },
+            FactEntry {
+                start: Some("2024-10-01".into()),
+                end: Some("2024-12-31".into()),
+                val: Some(300.0),
+                frame: Some("CY2024Q4".into()),
+            },
+            FactEntry {
+                start: Some("2024-01-01".into()),
+                end: Some("2024-12-31".into()),
+                val: Some(-1_000.0),
+                frame: Some("CY2024".into()),
+            },
         ];
         let q = quarterly_values(&entries);
         assert_eq!(q.len(), 4);
@@ -752,18 +933,34 @@ mod tests {
         concept.units.insert(
             "USD".into(),
             vec![
-                FactEntry { start: None, end: Some("2023-12-31".into()), val: Some(5_000.0), frame: None },
-                FactEntry { start: None, end: Some("2024-09-30".into()), val: Some(9_000.0), frame: None },
+                FactEntry {
+                    start: None,
+                    end: Some("2023-12-31".into()),
+                    val: Some(5_000.0),
+                    frame: None,
+                },
+                FactEntry {
+                    start: None,
+                    end: Some("2024-09-30".into()),
+                    val: Some(9_000.0),
+                    frame: None,
+                },
             ],
         );
-        facts.facts.us_gaap.insert("CashAndCashEquivalentsAtCarryingValue".into(), concept);
+        facts
+            .facts
+            .us_gaap
+            .insert("CashAndCashEquivalentsAtCarryingValue".into(), concept);
         let fh = financials_from_facts(&facts);
         assert_eq!(fh.cash_and_equivalents, Some(9_000.0));
     }
 
     #[test]
     fn display_name_cleaning() {
-        assert_eq!(clean_display_name("BLACKROCK INC. (CIK 0001364742)"), "BLACKROCK INC.");
+        assert_eq!(
+            clean_display_name("BLACKROCK INC. (CIK 0001364742)"),
+            "BLACKROCK INC."
+        );
         assert_eq!(clean_display_name("Some Holder"), "Some Holder");
     }
 
@@ -781,6 +978,9 @@ mod tests {
     fn annual_frames_format() {
         let today = NaiveDate::from_ymd_opt(2026, 6, 18).unwrap();
         // lag 120d → cutoff 2026-02-18 → most recent full year ≤ cutoff = 2025.
-        assert_eq!(recent_annual_frames(today, 2, 120), vec!["CY2025", "CY2024"]);
+        assert_eq!(
+            recent_annual_frames(today, 2, 120),
+            vec!["CY2025", "CY2024"]
+        );
     }
 }

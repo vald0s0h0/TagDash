@@ -4,11 +4,10 @@
 
 use std::time::Duration;
 
-
 use crate::strategies::ScanStrategy;
 use crate::types::{
     AlertSignal, IndicatorKind, InfoField, InfoSource, PaneIndicator, PaneSpec, Session,
-    StrategyCard, StrategyContext, StrategyRiskConfig, UniverseKey,
+    StrategyCard, StrategyContext, StrategyRiskConfig, StreamingScope, UniverseKey,
 };
 
 const ENABLED: bool = true;
@@ -56,39 +55,57 @@ impl ScanStrategy for BacksideParabolic {
         StrategyCard {
             // Short-biased exhaustion setup on liquid movers → full US universe.
             universe: UniverseKey::UsStocks,
+            streaming_scope: StreamingScope::None,
             panes: vec![
                 PaneSpec {
-                    timeframe:   "1m".into(),
-                    symbol:      None,
-                    indicators:  vec![
-                        PaneIndicator { kind: IndicatorKind::Vwap,   period: None },
-                        PaneIndicator { kind: IndicatorKind::Volume, period: None },
+                    timeframe: "1m".into(),
+                    symbol: None,
+                    indicators: vec![
+                        PaneIndicator {
+                            kind: IndicatorKind::Vwap,
+                            period: None,
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Volume,
+                            period: None,
+                        },
                     ],
                     interactive: true,
-                    column:      None,
+                    column: None,
                 },
                 PaneSpec {
-                    timeframe:   "2m".into(),
-                    symbol:      None,
-                    indicators:  vec![PaneIndicator { kind: IndicatorKind::Vwap, period: None }],
+                    timeframe: "2m".into(),
+                    symbol: None,
+                    indicators: vec![PaneIndicator {
+                        kind: IndicatorKind::Vwap,
+                        period: None,
+                    }],
                     interactive: false,
-                    column:      None,
+                    column: None,
                 },
             ],
             info_fields: vec![
-                InfoField { key: "change_day_pct".into(), label: "Chg".into(),  source: InfoSource::Alert },
-                InfoField { key: "rvol".into(),           label: "RVOL".into(), source: InfoSource::Enrichment },
+                InfoField {
+                    key: "change_day_pct".into(),
+                    label: "Chg".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "rvol".into(),
+                    label: "RVOL".into(),
+                    source: InfoSource::Enrichment,
+                },
             ],
-            llm:         None,
+            llm: None,
             enrichments: vec![],
         }
     }
 
     fn should_alert(&self, ctx: &StrategyContext) -> Option<AlertSignal> {
         let price = ctx.price?;
-        let high  = ctx.high_day?;
-        let low   = ctx.low_day?;
-        let vwap  = ctx.vwap?;
+        let high = ctx.high_day?;
+        let low = ctx.low_day?;
+        let vwap = ctx.vwap?;
         if low <= 0.0 || vwap <= 0.0 {
             return None;
         }
@@ -111,33 +128,33 @@ impl ScanStrategy for BacksideParabolic {
 
         let now = crate::time::now();
         Some(AlertSignal {
-            alert_id:      format!("{}-{}-{}", now.timestamp_millis(), ctx.symbol, self.id()),
-            timestamp:     now,
-            symbol:        ctx.symbol.clone(),
-            strategy_id:   self.id().to_string(),
+            alert_id: format!("{}-{}-{}", now.timestamp_millis(), ctx.symbol, self.id()),
+            timestamp: now,
+            symbol: ctx.symbol.clone(),
+            strategy_id: self.id().to_string(),
             strategy_name: self.name().to_string(),
-            priority:      PRIORITY,
-            session:       Session::Open,
-            price:         ctx.price,
-            bid:           ctx.bid,
-            ask:           ctx.ask,
-            spread:        ctx.spread,
-            volume:        Some(ctx.volume_day),
-            rvol:          ctx.rvol,
+            priority: PRIORITY,
+            session: Session::Open,
+            price: ctx.price,
+            bid: ctx.bid,
+            ask: ctx.ask,
+            spread: ctx.spread,
+            volume: Some(ctx.volume_day),
+            rvol: ctx.rvol,
             change_day_pct: ctx.change_day_pct,
-            float_shares:  ctx.float_shares,
-            news_today:    false,
-            halted:        Some(false),
+            float_shares: ctx.float_shares,
+            news_today: false,
+            halted: Some(false),
             latency_ui_ms: None,
-            reason:        format!(
+            reason: format!(
                 "Backside VWAP ${:.2} — range {:.1}% HOD ${:.2}",
                 vwap,
                 day_range_pct * 100.0,
                 high,
             ),
             display_timeframe: None,
-            side:          None,
+            side: None,
+            tempo_depth: None,
         })
     }
-
 }

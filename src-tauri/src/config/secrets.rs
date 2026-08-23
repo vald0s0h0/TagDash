@@ -53,6 +53,17 @@ pub struct Secrets {
     /// API token cannot do (the /images route requires a logged-in session).
     pub tradetally_email: Option<String>,
     pub tradetally_password: Option<String>,
+    /// ntfy server base URL. Optional: unset means the public https://ntfy.sh.
+    /// Kept here rather than in `tagdash.toml` because it travels with the topic,
+    /// and a self-hosted URL is often as identifying as the topic itself.
+    pub ntfy_server: Option<String>,
+    /// ntfy topic to publish to. THIS IS A SECRET on the public server: anyone who
+    /// knows a topic name can read it and publish to it — there is no other access
+    /// control. Treat it exactly like a key.
+    pub ntfy_topic: Option<String>,
+    /// ntfy access token (`tk_…`). Only needed for a protected/self-hosted topic;
+    /// a public ntfy.sh topic publishes without any auth.
+    pub ntfy_token: Option<String>,
 }
 
 /// Safe status sent to the frontend: true = key is present and non-empty.
@@ -74,6 +85,9 @@ pub struct SecretsStatus {
     pub tradetally_token: bool,
     pub tradetally_email: bool,
     pub tradetally_password: bool,
+    pub ntfy_server: bool,
+    pub ntfy_topic: bool,
+    pub ntfy_token: bool,
 }
 
 /// Partial update sent from Settings → API Keys. Only fields the user actually
@@ -97,6 +111,9 @@ pub struct SecretsUpdate {
     pub tradetally_token: Option<String>,
     pub tradetally_email: Option<String>,
     pub tradetally_password: Option<String>,
+    pub ntfy_server: Option<String>,
+    pub ntfy_topic: Option<String>,
+    pub ntfy_token: Option<String>,
 }
 
 impl Secrets {
@@ -119,6 +136,9 @@ impl Secrets {
             tradetally_token: set(&self.tradetally_token),
             tradetally_email: set(&self.tradetally_email),
             tradetally_password: set(&self.tradetally_password),
+            ntfy_server: set(&self.ntfy_server),
+            ntfy_topic: set(&self.ntfy_topic),
+            ntfy_token: set(&self.ntfy_token),
         }
     }
 
@@ -149,6 +169,9 @@ impl Secrets {
         set(&mut self.tradetally_token, u.tradetally_token);
         set(&mut self.tradetally_email, u.tradetally_email);
         set(&mut self.tradetally_password, u.tradetally_password);
+        set(&mut self.ntfy_server, u.ntfy_server);
+        set(&mut self.ntfy_topic, u.ntfy_topic);
+        set(&mut self.ntfy_token, u.ntfy_token);
     }
 
     /// Is this pair usable (both halves present and non-blank)?
@@ -255,7 +278,13 @@ pub fn save(app_dir: &Path, s: &Secrets) -> Result<(), String> {
          brave_api_key       = \"{}\"\n\n\
          tradetally_token    = \"{}\"\n\
          tradetally_email    = \"{}\"\n\
-         tradetally_password = \"{}\"\n",
+         tradetally_password = \"{}\"\n\n\
+         # ntfy push (phone alerts). The TOPIC is the access control on the public\n\
+         # server: anyone who knows it can read and publish to it. Server and token\n\
+         # are optional — a public ntfy.sh topic needs neither.\n\
+         ntfy_server         = \"{}\"\n\
+         ntfy_topic          = \"{}\"\n\
+         ntfy_token          = \"{}\"\n",
         esc(&s.alpaca_paper_key),
         esc(&s.alpaca_paper_secret),
         esc(&s.alpaca_live_key),
@@ -272,6 +301,9 @@ pub fn save(app_dir: &Path, s: &Secrets) -> Result<(), String> {
         esc(&s.tradetally_token),
         esc(&s.tradetally_email),
         esc(&s.tradetally_password),
+        esc(&s.ntfy_server),
+        esc(&s.ntfy_topic),
+        esc(&s.ntfy_token),
     );
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
@@ -437,5 +469,195 @@ mod tests {
         assert_eq!(back.alpaca_live_key.as_deref(), Some("AKl"));
         assert_eq!(back.alpaca_live_secret.as_deref(), Some("sl"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    /// Unique scratch directory per test run, cleaned up by the caller.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tagdash-secrets-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Every field set to a distinct, recognisable value.
+    fn fully_populated() -> Secrets {
+        Secrets {
+            alpaca_key: Some("v-alpaca_key".into()),
+            alpaca_secret: Some("v-alpaca_secret".into()),
+            alpaca_paper_key: Some("PKv-paper_key".into()),
+            alpaca_paper_secret: Some("v-paper_secret".into()),
+            alpaca_live_key: Some("AKv-live_key".into()),
+            alpaca_live_secret: Some("v-live_secret".into()),
+            fmp_api_key: Some("v-fmp".into()),
+            massive_api_key: Some("v-massive".into()),
+            sec_api_key: Some("v-sec".into()),
+            claude_api_key: Some("v-claude".into()),
+            deepseek_api_key: Some("v-deepseek".into()),
+            tavily_api_key: Some("v-tavily".into()),
+            brave_api_key: Some("v-brave".into()),
+            tradetally_token: Some("tt_live_v".into()),
+            tradetally_email: Some("v@example.com".into()),
+            tradetally_password: Some("v-password".into()),
+            ntfy_server: Some("https://push.example.com".into()),
+            ntfy_topic: Some("v-topic".into()),
+            ntfy_token: Some("tk_v".into()),
+        }
+    }
+
+    /// THE guard on `save`. That writer hand-builds its TOML from a fixed list of
+    /// fields — `Secrets` is deliberately not `Serialize`, so nothing makes the list
+    /// track the struct. A field added to `Secrets` and forgotten there is written
+    /// nowhere and silently lost on the next restart, with the UI still cheerfully
+    /// reporting the key as configured. (That is exactly how the ntfy topic failed to
+    /// persist.) Round-tripping every field through the real file catches it.
+    #[test]
+    fn every_secret_survives_a_save_and_reload() {
+        let dir = scratch("roundtrip");
+        let original = fully_populated();
+        save(&dir, &original).expect("save");
+        let loaded = load(&dir);
+
+        // Field by field, so a failure names the field that was dropped.
+        let pairs: [(&str, &Option<String>, &Option<String>); 19] = [
+            ("alpaca_key", &original.alpaca_key, &loaded.alpaca_key),
+            (
+                "alpaca_secret",
+                &original.alpaca_secret,
+                &loaded.alpaca_secret,
+            ),
+            (
+                "alpaca_paper_key",
+                &original.alpaca_paper_key,
+                &loaded.alpaca_paper_key,
+            ),
+            (
+                "alpaca_paper_secret",
+                &original.alpaca_paper_secret,
+                &loaded.alpaca_paper_secret,
+            ),
+            (
+                "alpaca_live_key",
+                &original.alpaca_live_key,
+                &loaded.alpaca_live_key,
+            ),
+            (
+                "alpaca_live_secret",
+                &original.alpaca_live_secret,
+                &loaded.alpaca_live_secret,
+            ),
+            ("fmp_api_key", &original.fmp_api_key, &loaded.fmp_api_key),
+            (
+                "massive_api_key",
+                &original.massive_api_key,
+                &loaded.massive_api_key,
+            ),
+            ("sec_api_key", &original.sec_api_key, &loaded.sec_api_key),
+            (
+                "claude_api_key",
+                &original.claude_api_key,
+                &loaded.claude_api_key,
+            ),
+            (
+                "deepseek_api_key",
+                &original.deepseek_api_key,
+                &loaded.deepseek_api_key,
+            ),
+            (
+                "tavily_api_key",
+                &original.tavily_api_key,
+                &loaded.tavily_api_key,
+            ),
+            (
+                "brave_api_key",
+                &original.brave_api_key,
+                &loaded.brave_api_key,
+            ),
+            (
+                "tradetally_token",
+                &original.tradetally_token,
+                &loaded.tradetally_token,
+            ),
+            (
+                "tradetally_email",
+                &original.tradetally_email,
+                &loaded.tradetally_email,
+            ),
+            (
+                "tradetally_password",
+                &original.tradetally_password,
+                &loaded.tradetally_password,
+            ),
+            ("ntfy_server", &original.ntfy_server, &loaded.ntfy_server),
+            ("ntfy_topic", &original.ntfy_topic, &loaded.ntfy_topic),
+            ("ntfy_token", &original.ntfy_token, &loaded.ntfy_token),
+        ];
+        for (name, want, got) in pairs {
+            assert_eq!(got, want, "`{name}` did not survive save → load");
+        }
+
+        // And the count is pinned: adding a field to `Secrets` without adding it to
+        // the list above (and therefore to `save`) fails here rather than in the wild.
+        let written = std::fs::read_to_string(dir.join("tagdash.secrets.toml")).unwrap();
+        let assignments = written
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && l.contains(" = "))
+            .count();
+        assert_eq!(
+            assignments,
+            pairs.len(),
+            "`save` writes {assignments} fields but {} are checked — a field is missing \
+             from the writer or from this test:\n{written}",
+            pairs.len(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The status the UI reads must agree with what is on disk, or the API Keys tab
+    /// shows "configuré" for a key that was never written.
+    #[test]
+    fn the_status_reported_to_the_ui_matches_what_was_persisted() {
+        let dir = scratch("status");
+        save(&dir, &fully_populated()).expect("save");
+        let st = load(&dir).status();
+        assert!(st.ntfy_topic, "the topic must read back as configured");
+        assert!(st.ntfy_server);
+        assert!(st.ntfy_token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blank input must never wipe a stored secret — the whole reason the update is
+    /// partial. Regression guard for the ntfy fields specifically.
+    #[test]
+    fn a_blank_update_leaves_an_existing_topic_alone() {
+        let mut s = fully_populated();
+        s.apply_update(SecretsUpdate {
+            ntfy_topic: Some("   ".into()),
+            ntfy_token: None,
+            ..Default::default()
+        });
+        assert_eq!(s.ntfy_topic.as_deref(), Some("v-topic"));
+        assert_eq!(s.ntfy_token.as_deref(), Some("tk_v"));
+
+        s.apply_update(SecretsUpdate {
+            ntfy_topic: Some("  nouveau-topic  ".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            s.ntfy_topic.as_deref(),
+            Some("nouveau-topic"),
+            "and is trimmed"
+        );
     }
 }

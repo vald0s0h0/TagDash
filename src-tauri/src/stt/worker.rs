@@ -20,7 +20,9 @@ use crate::market_state::MarketState;
 use crate::tradetally;
 use crate::types::LatencyLevel;
 
-use super::{cleanup, model, queue, vad, JobKind, JobState, SttJob, SttShared, EV_CHANGED, EV_DIARY_RESULT};
+use super::{
+    cleanup, model, queue, vad, JobKind, JobState, SttJob, SttShared, EV_CHANGED, EV_DIARY_RESULT,
+};
 
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -47,7 +49,12 @@ async fn run(
 ) {
     if !super::platform_available() {
         eprintln!("[tagdash] STT désactivé : macOS < 14 (BLAS crash whisper.cpp)");
-        set_worker(&shared, &app, "paused", Some("non disponible sur ce Mac".into()));
+        set_worker(
+            &shared,
+            &app,
+            "paused",
+            Some("non disponible sur ce Mac".into()),
+        );
         return;
     }
 
@@ -98,7 +105,9 @@ fn first_queued_id(shared: &SttShared) -> Option<String> {
 fn claim(shared: &SttShared, id: &str) -> Option<SttJob> {
     let mut job = {
         let mut jobs = shared.jobs.lock().unwrap();
-        let slot = jobs.iter_mut().find(|j| j.id == id && j.state == JobState::Queued)?;
+        let slot = jobs
+            .iter_mut()
+            .find(|j| j.id == id && j.state == JobState::Queued)?;
         slot.state = JobState::Running;
         slot.clone()
     };
@@ -135,7 +144,11 @@ fn emit_changed(app: &AppHandle) {
 
 // ─── Pause heuristic ────────────────────────────────────────────────────────────
 
-fn pause_reason(config: &Arc<RwLock<AppConfig>>, market: &Arc<RwLock<MarketState>>, cpu: f32) -> Option<String> {
+fn pause_reason(
+    config: &Arc<RwLock<AppConfig>>,
+    market: &Arc<RwLock<MarketState>>,
+    cpu: f32,
+) -> Option<String> {
     let cfg = config.read().unwrap().stt.clone();
     if cpu > cfg.pause_cpu_pct {
         return Some(format!("CPU {cpu:.0}%"));
@@ -198,11 +211,12 @@ async fn process_job(
         Ok(c) => c,
         Err(e) => return retry(shared, app, job, e).await,
     };
-    let text = match tokio::task::spawn_blocking(move || transcribe(ctx, trimmed, lang, prompt)).await {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => return retry(shared, app, job, e).await,
-        Err(e) => return retry(shared, app, job, format!("transcription: {e}")).await,
-    };
+    let text =
+        match tokio::task::spawn_blocking(move || transcribe(ctx, trimmed, lang, prompt)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return retry(shared, app, job, e).await,
+            Err(e) => return retry(shared, app, job, format!("transcription: {e}")).await,
+        };
     if text.trim().is_empty() {
         return finish_empty(shared, app, job);
     }
@@ -259,10 +273,18 @@ fn append_trade_note(
     let existing = journal_repository::get(&conn, trade_id).ok().flatten();
     let (prev, confidence, tags, sym) = match existing {
         Some(e) => {
-            let sym = symbol.filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(e.symbol);
+            let sym = symbol
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or(e.symbol);
             (e.notes, e.confidence, e.tags, sym)
         }
-        None => (String::new(), None, Vec::new(), symbol.unwrap_or("").to_string()),
+        None => (
+            String::new(),
+            None,
+            Vec::new(),
+            symbol.unwrap_or("").to_string(),
+        ),
     };
     let next = if prev.trim().is_empty() {
         block.to_string()

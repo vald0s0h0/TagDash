@@ -310,7 +310,12 @@ mod tests {
     #[test]
     fn final_promotion_happens_at_0925_then_stays_final() {
         assert!(needs_build(Some(&ledger(560)), TRIGGER_MIN, 1, false));
-        assert!(!needs_build(Some(&ledger(TRIGGER_MIN)), TRIGGER_MIN + 10, 1, false));
+        assert!(!needs_build(
+            Some(&ledger(TRIGGER_MIN)),
+            TRIGGER_MIN + 10,
+            1,
+            false
+        ));
     }
 
     #[test]
@@ -319,11 +324,6 @@ mod tests {
         l.retryable = true;
         l.attempts = 1;
         l.row_count = 8;
-        assert!(needs_build(
-            Some(&l),
-            TRIGGER_MIN + RETRY_GAP_MIN,
-            1,
-            false,
-        ));
+        assert!(needs_build(Some(&l), TRIGGER_MIN + RETRY_GAP_MIN, 1, false,));
     }
 }

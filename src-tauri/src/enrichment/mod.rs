@@ -63,7 +63,9 @@ pub async fn run(
     if strategy_id == crate::strategies::panic_mean_reversion::ID {
         let latest = {
             let conn = db.lock().unwrap();
-            crate::local_db::llm_repository::get_latest(&conn, &symbol).ok().flatten()
+            crate::local_db::llm_repository::get_latest(&conn, &symbol)
+                .ok()
+                .flatten()
         };
         if let Some(a) = latest {
             update(&store, &symbol, |e| {
@@ -74,7 +76,9 @@ pub async fn run(
     } else if strategy_id == crate::strategies::micro_pullback::ID {
         let latest = {
             let conn = db.lock().unwrap();
-            crate::local_db::llm_repository::get_latest(&conn, &symbol).ok().flatten()
+            crate::local_db::llm_repository::get_latest(&conn, &symbol)
+                .ok()
+                .flatten()
         };
         if let Some(a) = latest {
             update(&store, &symbol, |e| {
@@ -95,14 +99,22 @@ pub async fn run(
     // ── Step 1: immediate, from the local DB (country / industry / float) ──
     {
         let conn = db.lock().unwrap();
-        let meta = company_meta_repository::get_by_symbol(&conn, &symbol).ok().flatten();
-        let fund = cache_repository::get_fundamental(&conn, &symbol).ok().flatten();
+        let meta = company_meta_repository::get_by_symbol(&conn, &symbol)
+            .ok()
+            .flatten();
+        let fund = cache_repository::get_fundamental(&conn, &symbol)
+            .ok()
+            .flatten();
         drop(conn);
         update(&store, &symbol, |e| {
             if let Some(m) = &meta {
                 e.country = m.country.clone();
                 e.industry = m.industry.clone();
-                e.country_flagged = m.country.as_deref().map(is_flagged_country).unwrap_or(false);
+                e.country_flagged = m
+                    .country
+                    .as_deref()
+                    .map(is_flagged_country)
+                    .unwrap_or(false);
             }
             if let Some(f) = &fund {
                 e.float_shares = f.float_shares.map(|v| v as f64);
@@ -133,12 +145,13 @@ pub async fn run(
     // recent split's label + age. Alpaca serves real ex-dates (the Massive endpoint
     // was a guessed shape that returned nothing), and 2y covers what's chart-visible.
     if let (Some(k), Some(sec)) = (&alpaca_key, &alpaca_secret) {
-        if let Ok(splits) = crate::alpaca::corporate_actions::fetch_splits(k, sec, &symbol, 2).await {
+        if let Ok(splits) = crate::alpaca::corporate_actions::fetch_splits(k, sec, &symbol, 2).await
+        {
             let markers: Vec<SplitMarker> = splits
                 .iter()
                 .filter_map(|s| {
                     parse_date(&s.date).map(|d| SplitMarker {
-                        time:  d.timestamp(),
+                        time: d.timestamp(),
                         label: s.label.clone(),
                     })
                 })
@@ -197,7 +210,11 @@ pub async fn run_panic_llm(
 ) {
     let (alpaca_key, alpaca_secret, deepseek_key) = {
         let s = secrets.read().unwrap();
-        (s.alpaca_key.clone(), s.alpaca_secret.clone(), s.deepseek_api_key.clone())
+        (
+            s.alpaca_key.clone(),
+            s.alpaca_secret.clone(),
+            s.deepseek_api_key.clone(),
+        )
     };
     let Some(dk) = deepseek_key else { return };
 
@@ -207,8 +224,14 @@ pub async fn run_panic_llm(
     let mut articles = Vec::new();
     if let (Some(k), Some(sec)) = (&alpaca_key, &alpaca_secret) {
         match crate::alpaca::news::fetch_recent_news(
-            k, sec, &symbol, PANIC_NEWS_DAYS, PANIC_NEWS_LIMIT,
-        ).await {
+            k,
+            sec,
+            &symbol,
+            PANIC_NEWS_DAYS,
+            PANIC_NEWS_LIMIT,
+        )
+        .await
+        {
             Ok(a) => articles = a,
             Err(e) => eprintln!("[tagdash] panic llm: news fetch failed for {symbol}: {e}"),
         }
@@ -220,10 +243,9 @@ pub async fn run_panic_llm(
     let ohlc_block = {
         let today = crate::time::et_date(crate::time::now());
         let conn = db.lock().unwrap();
-        let mut bars = cache_repository::get_daily_bars_before(
-            &conn, &symbol, &today, PANIC_NEWS_DAYS as u32,
-        )
-        .unwrap_or_default();
+        let mut bars =
+            cache_repository::get_daily_bars_before(&conn, &symbol, &today, PANIC_NEWS_DAYS as u32)
+                .unwrap_or_default();
         drop(conn);
         bars.reverse(); // get_daily_bars is date-DESC → make ascending
         format_ohlc(&bars)
@@ -250,7 +272,10 @@ pub async fn run_panic_llm(
     );
 
     let ds = crate::llm::deepseek::Deepseek::new(dk);
-    match ds.complete_with_temperature(SYSTEM_PANIC_FR, &prompt, 0.2).await {
+    match ds
+        .complete_with_temperature(SYSTEM_PANIC_FR, &prompt, 0.2)
+        .await
+    {
         Ok(ans) => {
             let (ctx, verdict) = parse_panic_answer(&ans);
             // Persist ONLY the result (context + verdict) — appended to history.
@@ -270,7 +295,9 @@ pub async fn run_panic_llm(
             });
         }
         Err(err) => {
-            update(&store, &symbol, |e| e.llm_context = Some(format!("Erreur LLM: {err}")));
+            update(&store, &symbol, |e| {
+                e.llm_context = Some(format!("Erreur LLM: {err}"))
+            });
         }
     }
 
@@ -295,7 +322,11 @@ pub async fn run_micro_pullback_llm(
 
     update(&store, &symbol, |e| e.llm_pending = true);
     let ds = crate::llm::deepseek::Deepseek::new(dk);
-    let news_title = store.read().unwrap().get(&symbol).and_then(|e| e.news_title.clone());
+    let news_title = store
+        .read()
+        .unwrap()
+        .get(&symbol)
+        .and_then(|e| e.news_title.clone());
 
     // (a) Recent risks, dilution-focused (always).
     let dilution_prompt = format!(
@@ -350,7 +381,12 @@ fn format_ohlc(bars: &[crate::local_db::cache_repository::DailyBar]) -> String {
         let vol = b.volume.map(format_volume).unwrap_or_else(|| "—".into());
         s.push_str(&format!(
             "{}  {:>6}  {:>6}  {:>6}  {:>6}  {:>10}\n",
-            b.date, f(b.open), f(b.high), f(b.low), f(b.close), vol,
+            b.date,
+            f(b.open),
+            f(b.high),
+            f(b.low),
+            f(b.close),
+            vol,
         ));
     }
     s
@@ -367,7 +403,11 @@ fn format_news(articles: &[crate::alpaca::news::NewsArticle]) -> String {
         let when = a.created_at.format("%Y-%m-%d %H:%M UTC");
         let body = {
             let stripped = strip_html(&a.content);
-            let text = if stripped.trim().is_empty() { a.summary.clone() } else { stripped };
+            let text = if stripped.trim().is_empty() {
+                a.summary.clone()
+            } else {
+                stripped
+            };
             truncate(&text, PANIC_CONTENT_CHARS)
         };
         s.push_str(&format!("{}. [{when}] {}\n", i + 1, a.headline));
@@ -413,10 +453,15 @@ fn truncate(s: &str, max: usize) -> String {
 /// Human volume, e.g. 12_300_000 → "12.3M".
 fn format_volume(v: i64) -> String {
     let v = v as f64;
-    if v >= 1e9 { format!("{:.1}B", v / 1e9) }
-    else if v >= 1e6 { format!("{:.1}M", v / 1e6) }
-    else if v >= 1e3 { format!("{:.0}K", v / 1e3) }
-    else { format!("{v:.0}") }
+    if v >= 1e9 {
+        format!("{:.1}B", v / 1e9)
+    } else if v >= 1e6 {
+        format!("{:.1}M", v / 1e6)
+    } else if v >= 1e3 {
+        format!("{:.0}K", v / 1e3)
+    } else {
+        format!("{v:.0}")
+    }
 }
 
 /// Split the two-line panic answer into (context, verdict). Tolerant of missing
@@ -455,11 +500,13 @@ fn parse_panic_answer(ans: &str) -> (Option<String>, Option<String>) {
 
 fn update<F: FnOnce(&mut AlertEnrichment)>(store: &Store, symbol: &str, f: F) {
     let mut map = store.write().unwrap();
-    let e = map.entry(symbol.to_string()).or_insert_with(|| AlertEnrichment {
-        symbol: symbol.to_string(),
-        status: "loading".into(),
-        ..Default::default()
-    });
+    let e = map
+        .entry(symbol.to_string())
+        .or_insert_with(|| AlertEnrichment {
+            symbol: symbol.to_string(),
+            status: "loading".into(),
+            ..Default::default()
+        });
     f(e);
 }
 

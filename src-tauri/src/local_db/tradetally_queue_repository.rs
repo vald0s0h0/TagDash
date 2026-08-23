@@ -30,8 +30,14 @@ pub fn enqueue(conn: &Connection, row: &SyncQueueRow) -> Result<()> {
              (event_id,timestamp,trade_id,symbol,event_type,endpoint,payload,status,created_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8)",
         params![
-            row.event_id, row.timestamp, row.trade_id, row.symbol,
-            row.event_type, row.endpoint, row.payload_summary, row.created_at,
+            row.event_id,
+            row.timestamp,
+            row.trade_id,
+            row.symbol,
+            row.event_type,
+            row.endpoint,
+            row.payload_summary,
+            row.created_at,
         ],
     )?;
     Ok(())
@@ -76,7 +82,12 @@ pub fn get_status(conn: &Connection, recent_limit: u32) -> Result<SyncQueueStatu
         |r| r.get(0),
     )?;
     let recent = get_recent(conn, recent_limit)?;
-    Ok(SyncQueueStatus { pending, success, failed, recent })
+    Ok(SyncQueueStatus {
+        pending,
+        success,
+        failed,
+        recent,
+    })
 }
 
 fn get_recent(conn: &Connection, limit: u32) -> Result<Vec<SyncQueueRow>> {

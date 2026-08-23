@@ -8,8 +8,8 @@ use rusqlite::{params, Connection, Result};
 /// One persisted analysis result (latest read).
 #[derive(Debug, Clone)]
 pub struct LlmAnalysis {
-    pub context:    Option<String>,
-    pub verdict:    Option<String>,
+    pub context: Option<String>,
+    pub verdict: Option<String>,
     pub created_at: String,
 }
 
@@ -40,8 +40,8 @@ pub fn get_latest(conn: &Connection, symbol: &str) -> Result<Option<LlmAnalysis>
     )?;
     let mut rows = stmt.query_map(params![symbol], |row| {
         Ok(LlmAnalysis {
-            context:    row.get(0)?,
-            verdict:    row.get(1)?,
+            context: row.get(0)?,
+            verdict: row.get(1)?,
             created_at: row.get(2)?,
         })
     })?;

@@ -21,6 +21,7 @@ import { nyTime, nyDateTime, nyDayMonth, nyMonth, nyYear } from "@/lib/nyTime";
 import { ExecutionsPrimitive } from "@/charts/executionsPrimitive";
 import { BollingerPrimitive } from "@/charts/bollingerPrimitive";
 import { GridPrimitive } from "@/charts/gridPrimitive";
+import { ShortCostPrimitive, type ShortCostBand } from "@/charts/shortCostPrimitive";
 import { NewsPrimitive } from "@/charts/newsPrimitive";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
 import { useChartTheme, getChartTheme } from "@/stores/chartThemeStore";
@@ -66,8 +67,8 @@ const PRICE_HIT  = 7;   // px to grab a horizontal price line
 
 // Default chart scale options, re-applied after a drag temporarily froze them.
 // `mouseWheel` is off: the main-wheel time zoom is driven by our `onWheel` handler
-// (which pins the current bar at the default view, anchors on the cursor once
-// panned) — native wheel zoom always anchors on the cursor, which we don't want.
+// (which always pins the current/rightmost bar) — native wheel zoom anchors on
+// the cursor, which we don't want.
 const DEFAULT_SCALE = {
   mouseWheel:           false,
   pinch:                true,
@@ -122,6 +123,7 @@ interface Props {
   slPrice:     number | null;
   tpPrice:     number | null;
   entryPrice:  number | null;
+  shortCostBand?: ShortCostBand | null;
   bid:         number | null;
   ask:         number | null;
   ordersActive: boolean; // true when a position is open → SL/TP shown as orders
@@ -188,6 +190,7 @@ export function LightweightChart({
   slPrice,
   tpPrice,
   entryPrice,
+  shortCostBand = null,
   bid,
   ask,
   ordersActive,
@@ -250,6 +253,7 @@ export function LightweightChart({
   const execPrimRef     = useRef<ExecutionsPrimitive | null>(null);
   const bollingerPrimRef = useRef<BollingerPrimitive | null>(null);
   const gridPrimRef      = useRef<GridPrimitive | null>(null);
+  const shortCostPrimRef = useRef<ShortCostPrimitive | null>(null);
   const newsPrimRef      = useRef<NewsPrimitive | null>(null);
   // User trend lines + selection handles (custom primitive).
   const drawingsPrimRef = useRef<DrawingsPrimitive | null>(null);
@@ -416,10 +420,10 @@ export function LightweightChart({
     scale.applyOptions({ scaleMargins: { top: clamp(m.top + step), bottom: clamp(m.bottom + step) } });
   }, []);
 
-  // Time-axis zoom. factor>1 = zoom in. Default view (pinned to realtime) keeps the
-  // current bar fixed; once panned into history it scales the visible range around
-  // `anchorX` (px from the container's left), matching the mouse-wheel behaviour.
-  const zoomTimeAxis = useCallback((factor: number, anchorX?: number) => {
+  // Time-axis zoom. factor>1 = zoom in. Always keep the current/rightmost visible
+  // bar fixed and grow/shrink the range from the left. This deliberately avoids a
+  // cursor anchor so mouse wheels and vertical trackpad scrolling behave alike.
+  const zoomTimeAxis = useCallback((factor: number) => {
     const chart = chartRef.current;
     const container = containerRef.current;
     if (!chart || !container) return;
@@ -435,10 +439,9 @@ export function LightweightChart({
       ts.applyOptions({ barSpacing: next, rightOffset: pxOffset / next });
       return;
     }
-    const anchor = (anchorX != null ? ts.coordinateToLogical(anchorX) : null) ?? (logical.from + logical.to) / 2;
     const inv  = 1 / factor;
-    const from = anchor - (anchor - logical.from) * inv;
-    const to   = anchor + (logical.to - anchor) * inv;
+    const to   = logical.to;
+    const from = to - (to - logical.from) * inv;
     if (factor > 1 && to - from < container.clientWidth / 80) return;
     ts.setVisibleLogicalRange({ from, to });
   }, []);
@@ -586,6 +589,10 @@ export function LightweightChart({
     candle.attachPrimitive(bollingerPrim);
     bollingerPrimRef.current = bollingerPrim;
 
+    const shortCostPrim = new ShortCostPrimitive();
+    candle.attachPrimitive(shortCostPrim);
+    shortCostPrimRef.current = shortCostPrim;
+
     const drawingsPrim = new DrawingsPrimitive();
     candle.attachPrimitive(drawingsPrim);
     drawingsPrimRef.current = drawingsPrim;
@@ -699,7 +706,7 @@ export function LightweightChart({
       let zoomIn  = delta < 0;
       if (zoomInvertRef.current) zoomIn = !zoomIn;
       const factor = zoomIn ? 1 + mag : 1 / (1 + mag);
-      zoomTimeAxis(factor, e.clientX - container.getBoundingClientRect().left);
+      zoomTimeAxis(factor);
     };
     container.addEventListener("wheel", onWheel, { passive: false });
 
@@ -730,6 +737,7 @@ export function LightweightChart({
       sessionBgRef.current = null;
       execPrimRef.current = null;
       bollingerPrimRef.current = null;
+      shortCostPrimRef.current = null;
       gridPrimRef.current = null;
       newsPrimRef.current = null;
       drawingsPrimRef.current = null;
@@ -774,6 +782,21 @@ export function LightweightChart({
 
   // ── Reference price lines — entry + live bid/ask (extracted hook) ──────────
   useReferenceLines(candleRef, entryLineRef, bidLineRef, askLineRef, entryPrice, bid, ask);
+
+  // Massive Starter has no historical NBBO. When quotes are absent, show the
+  // candlestick series' native last-price line instead of two fabricated bid/ask
+  // lines. It follows each replay tick automatically, including 1-second data.
+  useEffect(() => {
+    candleRef.current?.applyOptions({
+      priceLineVisible: bid == null && ask == null,
+      lastValueVisible: bid == null && ask == null,
+    });
+  }, [bid, ask]);
+
+  // ── Locate/borrow break-even loss band ───────────────────────────────────
+  useEffect(() => {
+    shortCostPrimRef.current?.setData(shortCostBand);
+  }, [shortCostBand]);
 
   // ── User trend lines (custom primitive) — fed with live drag preview ───────
   const linesKey = lines.map((l) => `${l.id}:${l.point1.time},${l.point1.price},${l.point2.time},${l.point2.price}:${l.color}:${l.opacity}:${l.width}:${l.lineStyle}`).join("|");
@@ -1086,7 +1109,7 @@ export function LightweightChart({
             }}
             className={isEmoji
               ? "absolute z-10 select-none leading-none"
-              : "absolute z-10 select-none whitespace-nowrap rounded bg-black/40 px-1.5 py-0.5 leading-tight shadow"}
+              : "absolute z-10 select-none whitespace-pre-line rounded bg-black/40 px-1.5 py-0.5 text-center leading-tight shadow"}
           >
             {ann.text}
           </div>
@@ -1099,13 +1122,16 @@ export function LightweightChart({
           className="absolute z-30"
           style={{ left: textEdit.x, top: textEdit.y, transform: "translate(-50%, -110%)" }}
         >
-          <div className="flex items-center gap-1 rounded border border-amber-700/60 bg-zinc-900 px-1.5 py-1 shadow-lg">
-            <input
+          <div className="flex items-start gap-1 rounded border border-amber-700/60 bg-zinc-900 px-1.5 py-1 shadow-lg">
+            <textarea
               autoFocus
+              rows={Math.max(1, textEdit.value.split("\n").length)}
               value={textEdit.value}
               onChange={(e) => setTextEdit({ ...textEdit, value: e.target.value })}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && textEdit.value.trim()) {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!textEdit.value.trim()) return;
                   if (textEdit.editingId) onEditAnnotation?.(textEdit.editingId, textEdit.value.trim());
                   else onCreateAnnotation?.("text", textEdit.time, textEdit.price, textEdit.value.trim());
                   setTextEdit(null);
@@ -1115,7 +1141,7 @@ export function LightweightChart({
                 }
               }}
               placeholder="Annotation…"
-              className="w-28 bg-transparent text-[10px] text-amber-300 placeholder-muted-foreground/40 outline-none"
+              className="w-28 resize-none bg-transparent text-[10px] text-amber-300 placeholder-muted-foreground/40 outline-none"
             />
             <button
               onClick={() => {

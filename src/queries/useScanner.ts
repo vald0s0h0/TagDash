@@ -1,7 +1,9 @@
 import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
-import type { PanicLlmScore, StrategyRiskConfig } from "@/types";
+import type {
+  MicroPullbackOptions, MicroQualityLive, MicroQualityRow, PanicLlmScore, StrategyRiskConfig,
+} from "@/types";
 
 export function useStrategies() {
   return useQuery({
@@ -151,6 +153,41 @@ export function usePanicLlmScores() {
   return { ...query, bySymbol };
 }
 
+/** Micro Pullback's A+ board for the current day + mode, keyed by symbol.
+ *
+ *  Polled at 1 s rather than the panic board's 2 s: this one carries an in-flight
+ *  phase, and a spinner that lingers a second after the score has landed is exactly
+ *  the kind of lie the pane exists to avoid. Day- and mode-scoped server-side, so
+ *  entering or leaving a Market Replay swaps the set with no listener here.
+ *
+ *  A ticker can hold two judgements in one day — the A+ lock is per session, so a
+ *  name that ran in the premarket is a fresh candidate at the open, and those are two
+ *  verdicts about two different moves. The overlay wants the CURRENT one, so the
+ *  reduce keeps the latest `scored_at` rather than the best score. */
+export function useMicroQualityScores() {
+  const query = useQuery({
+    queryKey: ["micro-quality-scores"],
+    queryFn:  api.getMicroQualityScores,
+    refetchInterval: 1000,
+  });
+  const bySymbol = useMemo(() => {
+    const map: Record<string, MicroQualityRow> = {};
+    // Newest verdict per symbol. `scored_at` is market time, so this holds in a
+    // replay too; rows without one fall back to insertion order.
+    for (const r of query.data?.rows ?? []) {
+      const seen = map[r.symbol];
+      if (!seen || (r.scored_at ?? "") >= (seen.scored_at ?? "")) map[r.symbol] = r;
+    }
+    return map;
+  }, [query.data]);
+  const liveBySymbol = useMemo(() => {
+    const map: Record<string, MicroQualityLive> = {};
+    for (const l of query.data?.live ?? []) map[l.symbol] = l;
+    return map;
+  }, [query.data]);
+  return { ...query, bySymbol, liveBySymbol };
+}
+
 /** Launch the analysis over an explicit symbol list (the visible watchlist).
  *
  *  Invalidates the run state immediately so the button flips to its pending look
@@ -158,7 +195,8 @@ export function usePanicLlmScores() {
 export function useRunPanicLlm() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (symbols: string[]) => api.runPanicLlmAnalysis(symbols),
+    mutationFn: ({ symbols, dismissed }: { symbols: string[]; dismissed: string[] }) =>
+      api.runPanicLlmAnalysis(symbols, dismissed),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["panic-llm-run"] });
     },
@@ -193,5 +231,35 @@ export function useStopScanner() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["active-alerts"] });
     },
+  });
+}
+
+/** Micro Pullback's own options (active tempos + Qualité A+). Strategy-specific,
+ *  not a generic per-strategy channel — see `micro_pullback::options` for why. */
+export function useMicroPullbackOptions() {
+  return useQuery({
+    queryKey: ["micro-pullback-options"],
+    queryFn: api.getMicroPullbackOptions,
+    staleTime: Infinity, // only this UI changes it; the mutation invalidates below
+  });
+}
+
+/** Replace Micro Pullback's options. The engine re-reads them every tick, so a
+ *  change lands on the next second without a restart. */
+export function useSetMicroPullbackOptions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (options: MicroPullbackOptions) => api.setMicroPullbackOptions(options),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["micro-pullback-options"] });
+    },
+  });
+}
+
+export function useMicroPullbackAttention() {
+  return useQuery({
+    queryKey: ["micro-pullback-attention"],
+    queryFn: api.getMicroPullbackAttention,
+    refetchInterval: 5_000,
   });
 }

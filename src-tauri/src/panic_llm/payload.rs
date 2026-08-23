@@ -338,7 +338,10 @@ pub fn volume_acceleration(bars: &[Bar], window: usize) -> Option<f64> {
     }
     let n = bars.len();
     let recent: u64 = bars[n - window..].iter().map(|b| b.volume).sum();
-    let prior: u64 = bars[n - window * 2..n - window].iter().map(|b| b.volume).sum();
+    let prior: u64 = bars[n - window * 2..n - window]
+        .iter()
+        .map(|b| b.volume)
+        .sum();
     if prior == 0 {
         return None;
     }
@@ -369,7 +372,10 @@ pub fn directional_efficiency(bars: &[Bar]) -> Option<f64> {
         return None;
     }
     let net = (bars.last()?.close - bars.first()?.close).abs();
-    let path: f64 = bars.windows(2).map(|w| (w[1].close - w[0].close).abs()).sum();
+    let path: f64 = bars
+        .windows(2)
+        .map(|w| (w[1].close - w[0].close).abs())
+        .sum();
     if path <= 0.0 {
         return None;
     }
@@ -615,12 +621,21 @@ mod tests {
 
     #[test]
     fn volume_acceleration_compares_two_equal_windows() {
-        let bars = vec![bar(10.0, 100), bar(10.0, 100), bar(10.0, 400), bar(10.0, 400)];
+        let bars = vec![
+            bar(10.0, 100),
+            bar(10.0, 100),
+            bar(10.0, 400),
+            bar(10.0, 400),
+        ];
         assert_eq!(volume_acceleration(&bars, 2), Some(4.0));
         // A silent earlier window would divide by zero → refuse instead of ∞.
         let zeros = vec![bar(10.0, 0), bar(10.0, 0), bar(10.0, 50), bar(10.0, 50)];
         assert_eq!(volume_acceleration(&zeros, 2), None);
-        assert_eq!(volume_acceleration(&bars, 3), None, "needs two full windows");
+        assert_eq!(
+            volume_acceleration(&bars, 3),
+            None,
+            "needs two full windows"
+        );
     }
 
     #[test]
@@ -628,9 +643,16 @@ mod tests {
         // +1% then +4% over equal windows.
         let bars = series(&[100.0, 100.5, 101.0, 103.0, 105.04]);
         let acc = price_acceleration(&bars, 2).expect("defined");
-        assert!(acc > 3.0, "a sharply faster leg must read well above 1, got {acc}");
+        assert!(
+            acc > 3.0,
+            "a sharply faster leg must read well above 1, got {acc}"
+        );
         let flat = series(&[100.0, 100.0, 100.0, 100.0, 100.0]);
-        assert_eq!(price_acceleration(&flat, 2), None, "no earlier move to scale by");
+        assert_eq!(
+            price_acceleration(&flat, 2),
+            None,
+            "no earlier move to scale by"
+        );
     }
 
     #[test]
@@ -640,9 +662,16 @@ mod tests {
         // Same endpoints, twice the path travelled.
         let choppy = series(&[10.0, 12.0, 11.0, 13.0]);
         let eff = directional_efficiency(&choppy).unwrap();
-        assert!(eff < 0.7, "chop must score well below a clean drive, got {eff}");
+        assert!(
+            eff < 0.7,
+            "chop must score well below a clean drive, got {eff}"
+        );
         assert_eq!(directional_efficiency(&series(&[10.0])), None);
-        assert_eq!(directional_efficiency(&series(&[10.0, 10.0])), None, "no path");
+        assert_eq!(
+            directional_efficiency(&series(&[10.0, 10.0])),
+            None,
+            "no path"
+        );
     }
 
     #[test]

@@ -368,7 +368,11 @@ mod tests {
     fn snippets_are_capped_and_trimmed() {
         let long = "x".repeat(SNIPPET_CHARS + 50);
         let cut = truncate(&long, SNIPPET_CHARS);
-        assert_eq!(cut.chars().count(), SNIPPET_CHARS + 1, "capped plus ellipsis");
+        assert_eq!(
+            cut.chars().count(),
+            SNIPPET_CHARS + 1,
+            "capped plus ellipsis"
+        );
         assert!(cut.ends_with('…'));
         assert_eq!(truncate("  hello  ", 100), "hello");
     }

@@ -80,9 +80,9 @@ pub fn close_flash_overlay(app: &AppHandle) {
 fn mode_matches(mode: &str, session: Session) -> bool {
     match mode {
         "premarket" => session == Session::Premarket,
-        "open"      => session == Session::Open,
-        "both"      => matches!(session, Session::Premarket | Session::Open),
-        _           => false, // "off" / unknown
+        "open" => session == Session::Open,
+        "both" => matches!(session, Session::Premarket | Session::Open),
+        _ => false, // "off" / unknown
     }
 }
 
@@ -94,7 +94,10 @@ pub fn on_alert(session: Session) {
     let (flash_mode, fg_mode) = {
         let state = app.state::<AppState>();
         let cfg = state.config.read().unwrap();
-        (cfg.ui.flash_alerts.clone(), cfg.ui.foreground_alerts.clone())
+        (
+            cfg.ui.flash_alerts.clone(),
+            cfg.ui.foreground_alerts.clone(),
+        )
     };
 
     if mode_matches(&flash_mode, session) {
@@ -112,7 +115,9 @@ pub fn on_alert(session: Session) {
 /// so `request_user_attention` flashes the taskbar icon / bounces the dock as a
 /// reliable fallback cue.
 fn bring_to_front(app: &AppHandle) {
-    let Some(win) = app.get_webview_window("main") else { return };
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
     let _ = win.unminimize();
     let _ = win.show();
     let _ = win.set_focus();

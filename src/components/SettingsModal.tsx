@@ -38,6 +38,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { MicroPullbackPanel } from "@/components/settings/MicroPullbackPanel";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
 import { useSecretsStatus, useUpdateSecrets } from "@/queries/useSecretsStatus";
 import { useStrategies, useSetStrategyEnabled, useSetStrategyRisk } from "@/queries/useScanner";
@@ -105,10 +106,49 @@ interface Props {
   onClose: () => void;
 }
 
+/** Fires a real push at the real priority, so a typo in the topic or a revoked token
+ *  is visible here instead of at 04:05 as an alert that never arrived. Reports the
+ *  server's own error text — a 403 says 403. */
+function NtfyTestButton({ hasTopic }: { hasTopic: boolean }) {
+  const [state, setState] = useState<
+    { kind: "idle" } | { kind: "sending" } | { kind: "ok" } | { kind: "err"; msg: string }
+  >({ kind: "idle" });
+
+  async function run() {
+    setState({ kind: "sending" });
+    try {
+      await api.testNtfy();
+      setState({ kind: "ok" });
+    } catch (e) {
+      setState({ kind: "err", msg: String(e) });
+    }
+  }
+
+  return (
+    <div className="mt-2 flex items-start justify-end gap-2">
+      {state.kind === "ok" && (
+        <span className="text-xs text-emerald-400">Envoyé ✓ — ton téléphone doit sonner</span>
+      )}
+      {state.kind === "err" && (
+        <span className="max-w-[60%] text-right text-xs text-red-400">{state.msg}</span>
+      )}
+      <Button
+        size="sm"
+        variant="secondary"
+        onClick={run}
+        disabled={state.kind === "sending" || !hasTopic}
+        title={hasTopic ? undefined : "Enregistre d'abord un topic ntfy"}
+      >
+        {state.kind === "sending" ? "Envoi…" : "Tester la notification"}
+      </Button>
+    </div>
+  );
+}
+
 /** Editable API-key fields shown in Settings → API Keys (order = display order). The
  *  tradetally_* keys are rendered in a dedicated "TradeTally" subsection below the rest. */
 const SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
-  { key: "massive_api_key",     label: "Massive API key (float)" },
+  { key: "massive_api_key",     label: "Massive API key (float · short interest · tier)" },
   { key: "sec_api_key",         label: "sec-api.io key (pays · industrie)" },
   { key: "fmp_api_key",         label: "FMP API key (fallback)" },
   { key: "claude_api_key",      label: "Claude API key" },
@@ -129,6 +169,16 @@ const ALPACA_ACCOUNT_FIELDS: { key: SecretKey; label: string; type?: string }[] 
   { key: "alpaca_paper_secret", label: "Compte paper (démo) — secret" },
   { key: "alpaca_live_key",     label: "Compte RÉEL — key" },
   { key: "alpaca_live_secret",  label: "Compte RÉEL — secret" },
+];
+
+/** ntfy push — the "my phone must ring" path for Micro Pullback alerts.
+ *  Only the topic is required. It lives with the secrets rather than in tagdash.toml
+ *  because on the public server a topic name IS the access control: anyone who knows
+ *  it can read it and publish to it. */
+const NTFY_SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
+  { key: "ntfy_topic",  label: "ntfy topic (obligatoire — traite-le comme une clé)" },
+  { key: "ntfy_server", label: "ntfy serveur (optionnel — défaut https://ntfy.sh)" },
+  { key: "ntfy_token",  label: "ntfy token (optionnel — topic protégé / auto-hébergé)" },
 ];
 
 const TRADETALLY_SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
@@ -766,15 +816,16 @@ export function SettingsModal({ open, onClose }: Props) {
   const hasSecretEdits = Object.values(secretInputs).some((v) => v.trim() !== "");
 
   function saveSecrets() {
+    // Iterate what the user actually typed, NOT a hand-maintained list of field
+    // groups. The previous version looped over the group constants, so rendering a
+    // new group without also adding it there silently discarded everything typed
+    // into it — the field accepted input, the button enabled, the save "succeeded",
+    // and the key was never sent. (That is how the ntfy topic refused to save.)
+    // `secretInputs` can only contain a key a rendered field wrote, so there is
+    // nothing left to keep in sync.
     const updates: SecretsUpdate = {};
-    // Every rendered group must be listed here — a field that is displayed but
-    // absent from this loop silently discards whatever the user typed into it.
-    for (const { key } of [
-      ...ALPACA_ACCOUNT_FIELDS,
-      ...SECRET_FIELDS,
-      ...TRADETALLY_SECRET_FIELDS,
-    ]) {
-      const v = secretInputs[key]?.trim();
+    for (const [key, raw] of Object.entries(secretInputs) as [SecretKey, string][]) {
+      const v = raw?.trim();
       if (v) updates[key] = v;
     }
     if (Object.keys(updates).length === 0) return;
@@ -866,7 +917,11 @@ export function SettingsModal({ open, onClose }: Props) {
             <div className="min-w-0 flex-1 overflow-y-auto p-4">
               {/* ── Broker: where orders go, and against which account ── */}
               <TabsContent value="broker" className="mt-0">
-                <BrokerTab />
+                <BrokerTab
+                  onPersisted={(broker, environment) =>
+                    setDraft((prev) => (prev ? { ...prev, broker: { broker, environment } } : prev))
+                  }
+                />
               </TabsContent>
 
               {/* ── Trading ── */}
@@ -950,6 +1005,10 @@ export function SettingsModal({ open, onClose }: Props) {
                         disabled={setStrategyRisk.isPending}
                         onCommit={(risk) => setStrategyRisk.mutate({ id: s.id, risk })}
                       />
+                      {/* Strategy-specific options. Only Micro Pullback has any —
+                          deliberately not a generic channel, see
+                          `micro_pullback::options`. */}
+                      {s.id === "micro_pullback" && <MicroPullbackPanel />}
                     </div>
                   ))}
                 </div>
@@ -1259,6 +1318,34 @@ export function SettingsModal({ open, onClose }: Props) {
                     />
                   ))}
                 </div>
+
+                <Separator className="my-3" />
+                <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">
+                  ntfy — alerte téléphone
+                </div>
+                <p className="mb-2 text-[11px] leading-snug text-muted-foreground">
+                  Installe l'app <strong>ntfy</strong> sur l'iPhone, abonne-toi au topic,
+                  puis coche <strong>Alerte téléphone</strong> dans{" "}
+                  <strong>Réglages → Stratégies → Micro Pullback</strong>. Les alertes
+                  partent en priorité maximale (sonnerie + vibreur). Pour le{" "}
+                  <strong>flash lumineux</strong>, active-le côté iPhone&nbsp;:{" "}
+                  <em>Réglages → Accessibilité → Audio et visuel → Flash LED pour
+                  alertes</em> — aucune notification ne peut le déclencher à distance.
+                  Pour percer un mode Concentration, ajoute ntfy aux exceptions.
+                </p>
+                <div className="space-y-0.5">
+                  {NTFY_SECRET_FIELDS.map((f) => (
+                    <SecretField
+                      key={f.key}
+                      label={f.label}
+                      type={f.type}
+                      configured={secrets?.[f.key] ?? false}
+                      value={secretInputs[f.key] ?? ""}
+                      onChange={(v) => setSecretInputs((s) => ({ ...s, [f.key]: v }))}
+                    />
+                  ))}
+                </div>
+                <NtfyTestButton hasTopic={secrets?.ntfy_topic ?? false} />
 
                 <Separator className="my-3" />
                 <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/60">

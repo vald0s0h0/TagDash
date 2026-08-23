@@ -19,9 +19,11 @@ pub mod market_state;
 pub mod massive;
 pub mod micro_pullback;
 pub mod notify;
+pub mod ntfy;
 pub mod panic_llm;
 pub mod panic_watchlist;
 pub mod perfect_pullback;
+pub mod quality_llm;
 pub mod replay;
 pub mod scanner;
 pub mod scoring;
@@ -116,6 +118,12 @@ pub fn run() {
         m
     };
 
+    // ── Micro Pullback options: defaults + the persisted blob ────────────────
+    // Strategy-specific (active tempos, Qualité A+ and its sub-settings), unlike the
+    // two maps above which are generic across strategies. See
+    // `micro_pullback::options` for why it isn't a generic channel.
+    let micro_pullback_options = micro_pullback::MicroPullbackOptions::load(&db);
+
     // ── Restore the internal trading book + chart contexts ───────────────────
     // Positions can be held across several days, so the book (positions, resting
     // orders, trades, fills) and the per-ticker chart SL/TP/tradeID lines are
@@ -167,10 +175,12 @@ pub fn run() {
         trading_loop_running: Arc::new(AtomicBool::new(false)),
         strategy_enabled: Arc::new(RwLock::new(strategy_enabled)),
         strategy_risk: Arc::new(RwLock::new(strategy_risk)),
+        micro_pullback_options: Arc::new(RwLock::new(micro_pullback_options)),
         active_alerts: Arc::new(RwLock::new(Vec::new())),
         alert_history: Arc::new(RwLock::new(Vec::new())),
         screener: Arc::new(RwLock::new(Vec::new())),
         attention: Arc::new(RwLock::new(Vec::new())),
+        micro_attention: Arc::new(RwLock::new(Vec::new())),
         chart: Arc::new(RwLock::new(chart_state)),
         internal_book: Arc::new(RwLock::new(internal_book)),
         enrichments: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -231,6 +241,17 @@ pub fn run() {
                 }
             }
 
+            // Editable A+ rubrics. Written once if absent, never overwritten — a
+            // user's edit survives every upgrade, and deleting a file restores the
+            // built-in default on the next launch. The path is logged because it is
+            // the only way to find the files without being told.
+            {
+                let paths = quality_llm::rubric::ensure_seeded();
+                if let Some(dir) = paths.first().and_then(|p| p.parent()) {
+                    println!("[tagdash] barèmes A+ éditables : {}", dir.display());
+                }
+            }
+
             // 0. Desktop attention cues for new alerts (flash overlay + foreground).
             //    The full-screen white flash overlay is NO LONGER created at startup
             //    — it was a permanent resident webview (extra WebView2 process tree)
@@ -260,6 +281,7 @@ pub fn run() {
                 let startup = state.startup.clone();
                 let internal_book = state.internal_book.clone();
                 let broker_mirror = state.broker.mirror.clone();
+                let strategy_enabled = state.strategy_enabled.clone();
                 let live_feed_running = state.live_feed_running.clone();
                 let focus_rx = state.focus_symbols_tx.subscribe();
                 let app_handle = app.handle().clone();
@@ -295,6 +317,7 @@ pub fn run() {
                         db,
                         internal_book,
                         broker_mirror,
+                        strategy_enabled,
                         live_feed_running,
                         focus_rx,
                         app_handle,
@@ -342,6 +365,7 @@ pub fn run() {
                     db: state.db.clone(),
                     chart: state.chart.clone(),
                     protection: engine.protection.clone(),
+                    locate_plans: engine.locate_plans.clone(),
                 };
                 broker::spawn(engine, cfg, sec, deps);
             }
@@ -410,11 +434,11 @@ pub fn run() {
                 );
             }
 
-            // 3b. Micro Pullback engine (stateful, per-ticker): watches every dormant
-            //    low-float small cap in the premarket window for the first state change
-            //    of the session (silence → 10s ignition → 30s confirmation) and fires
-            //    one locked alert per ticker. Auto-started; idles outside premarket and
-            //    honours the Settings toggle.
+            // 3b. Micro Pullback v2: ranks the whole eligible US-stock tape on six
+            //    tempos, keeps only a genuinely detached attention head, verifies a
+            //    clean upward impulse, then optionally runs catalyst quality A+.
+            //    Runs 04:00–20:00 ET on the feed-event clock (including Massive's
+            //    deliberate 15-minute delay).
             {
                 let mp_running = state.micro_pullback_running.clone();
                 let market = state.market.clone();
@@ -423,6 +447,9 @@ pub fn run() {
                 let active_alerts = state.active_alerts.clone();
                 let alert_history = state.alert_history.clone();
                 let strategy_enabled = state.strategy_enabled.clone();
+                let mp_options = state.micro_pullback_options.clone();
+                let mp_config = state.config.clone();
+                let mp_attention = state.micro_attention.clone();
                 mp_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 micro_pullback::MicroPullbackEngine::start(
                     mp_running,
@@ -432,6 +459,9 @@ pub fn run() {
                     active_alerts,
                     alert_history,
                     strategy_enabled,
+                    mp_options,
+                    mp_config,
+                    mp_attention,
                 );
             }
 
@@ -554,6 +584,8 @@ pub fn run() {
             commands::broker::get_broker_selection,
             commands::broker::set_broker_selection,
             commands::broker::get_broker_mirror,
+            commands::broker::get_massive_tier_status,
+            commands::broker::set_massive_tier_override,
             commands::broker::get_broker_account,
             commands::broker::broker_submit_order,
             commands::broker::broker_cancel_order,
@@ -561,6 +593,8 @@ pub fn run() {
             commands::broker::broker_close_position,
             commands::broker::get_shortability,
             commands::broker::get_non_shortable_symbols,
+            commands::broker::prepare_short_locate,
+            commands::broker::get_short_cost_zone,
             commands::get_market_snapshot,
             commands::get_ticker_bars,
             commands::load_chart_bars,
@@ -574,6 +608,10 @@ pub fn run() {
             commands::get_strategies,
             commands::set_strategy_enabled,
             commands::set_strategy_risk,
+            commands::test_ntfy,
+            commands::get_micro_pullback_options,
+            commands::set_micro_pullback_options,
+            commands::get_micro_pullback_attention,
             commands::get_strategy_cards,
             commands::start_alert_enrichment,
             commands::run_alert_llm,
@@ -582,6 +620,7 @@ pub fn run() {
             commands::run_panic_llm_analysis,
             commands::get_panic_llm_run,
             commands::get_panic_llm_scores,
+            commands::get_micro_quality_scores,
             commands::has_web_search_provider,
             commands::get_active_alerts,
             commands::get_alert_history,

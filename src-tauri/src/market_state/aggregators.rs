@@ -22,12 +22,12 @@ pub enum Timeframe {
 impl Timeframe {
     pub fn seconds(self) -> i64 {
         match self {
-            Timeframe::S5    =>     5,
-            Timeframe::S10   =>    10,
-            Timeframe::M1    =>    60,
-            Timeframe::M2    =>   120,
-            Timeframe::M5    =>   300,
-            Timeframe::M15   =>   900,
+            Timeframe::S5 => 5,
+            Timeframe::S10 => 10,
+            Timeframe::M1 => 60,
+            Timeframe::M2 => 120,
+            Timeframe::M5 => 300,
+            Timeframe::M15 => 900,
             Timeframe::Daily => 86400,
         }
     }
@@ -44,14 +44,14 @@ impl Timeframe {
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "5s"    => Some(Timeframe::S5),
-            "10s"   => Some(Timeframe::S10),
-            "1m"    => Some(Timeframe::M1),
-            "2m"    => Some(Timeframe::M2),
-            "5m"    => Some(Timeframe::M5),
-            "15m"   => Some(Timeframe::M15),
+            "5s" => Some(Timeframe::S5),
+            "10s" => Some(Timeframe::S10),
+            "1m" => Some(Timeframe::M1),
+            "2m" => Some(Timeframe::M2),
+            "5m" => Some(Timeframe::M5),
+            "15m" => Some(Timeframe::M15),
             "daily" => Some(Timeframe::Daily),
-            _       => None,
+            _ => None,
         }
     }
 }
@@ -77,10 +77,10 @@ pub struct Bar {
 pub struct CandleAggregator {
     pub timeframe: Timeframe,
     bar_open_time: Option<DateTime<Utc>>,
-    open:   f64,
-    high:   f64,
-    low:    f64,
-    close:  f64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
     volume: u64,
     pv_sum: f64, // price × volume, for VWAP
     trades: u64, // number of prints folded into the current bucket
@@ -91,10 +91,10 @@ impl CandleAggregator {
         Self {
             timeframe,
             bar_open_time: None,
-            open:   0.0,
-            high:   0.0,
-            low:    0.0,
-            close:  0.0,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
             volume: 0,
             pv_sum: 0.0,
             trades: 0,
@@ -145,20 +145,20 @@ impl CandleAggregator {
     }
 
     fn reset(&mut self, price: f64, size: u64, prints: u64, bar_start: DateTime<Utc>) {
-        self.open         = price;
-        self.high         = price;
-        self.low          = price;
-        self.close        = price;
-        self.volume       = size;
-        self.pv_sum       = price * size as f64;
-        self.trades       = prints;
+        self.open = price;
+        self.high = price;
+        self.low = price;
+        self.close = price;
+        self.volume = size;
+        self.pv_sum = price * size as f64;
+        self.trades = prints;
         self.bar_open_time = Some(bar_start);
     }
 
     fn update(&mut self, price: f64, size: u64, prints: u64) {
-        self.high   = self.high.max(price);
-        self.low    = self.low.min(price);
-        self.close  = price;
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
         self.volume += size;
         self.pv_sum += price * size as f64;
         self.trades += prints;
@@ -173,17 +173,17 @@ impl CandleAggregator {
 
     fn close_bar(&self, bar_open_time: DateTime<Utc>) -> Bar {
         Bar {
-            time:   bar_open_time,
-            open:   self.open,
-            high:   self.high,
-            low:    self.low,
-            close:  self.close,
+            time: bar_open_time,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
             volume: self.volume,
-            vwap:   if self.volume > 0 {
-                        Some(self.pv_sum / self.volume as f64)
-                    } else {
-                        None
-                    },
+            vwap: if self.volume > 0 {
+                Some(self.pv_sum / self.volume as f64)
+            } else {
+                None
+            },
             // Number of prints folded into this bucket. Lets the per-bar print
             // rate be read straight off the trade-built candles (the micro_pullback
             // dormancy/ignition engine reads it from the 10s ring); Alpaca minute
@@ -194,7 +194,7 @@ impl CandleAggregator {
 }
 
 fn bucket_start(t: DateTime<Utc>, bar_secs: i64) -> DateTime<Utc> {
-    let ts     = t.timestamp();
+    let ts = t.timestamp();
     let bucket = (ts / bar_secs) * bar_secs;
     Utc.timestamp_opt(bucket, 0).single().unwrap_or(t)
 }

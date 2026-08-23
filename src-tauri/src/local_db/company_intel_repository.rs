@@ -68,8 +68,12 @@ pub fn upsert_short_interest(
              short_interest_source=excluded.short_interest_source,
              short_interest_updated_at=excluded.short_interest_updated_at",
         params![
-            symbol, si.short_interest, si.days_to_cover, si.settlement_date,
-            source, updated_at
+            symbol,
+            si.short_interest,
+            si.days_to_cover,
+            si.settlement_date,
+            source,
+            updated_at
         ],
     )?;
     Ok(())
@@ -98,9 +102,15 @@ pub fn upsert_financials(
              financials_source=excluded.financials_source,
              financials_updated_at=excluded.financials_updated_at",
         params![
-            symbol, fh.net_income_last_q, fh.net_income_ttm, fh.negative_quarters_last4,
-            fh.operating_cash_flow_ttm, fh.cash_and_equivalents, fh.period_end,
-            source, updated_at
+            symbol,
+            fh.net_income_last_q,
+            fh.net_income_ttm,
+            fh.negative_quarters_last4,
+            fh.operating_cash_flow_ttm,
+            fh.cash_and_equivalents,
+            fh.period_end,
+            source,
+            updated_at
         ],
     )?;
     Ok(())
@@ -127,8 +137,13 @@ pub fn upsert_dilution(
              dilution_source=excluded.dilution_source,
              dilution_updated_at=excluded.dilution_updated_at",
         params![
-            symbol, d.has_recent_shelf as i64, d.latest_form, d.latest_date,
-            flags_json, source, updated_at
+            symbol,
+            d.has_recent_shelf as i64,
+            d.latest_form,
+            d.latest_date,
+            flags_json,
+            source,
+            updated_at
         ],
     )?;
     Ok(())
@@ -157,9 +172,14 @@ pub fn upsert_ownership(
              ownership_source=excluded.ownership_source,
              ownership_updated_at=excluded.ownership_updated_at",
         params![
-            symbol, o.institutional_ownership_pct, o.insider_ownership_pct,
-            o.holders_5pct.len() as i64, holders_json, o.restricted_shares,
-            source, updated_at
+            symbol,
+            o.institutional_ownership_pct,
+            o.insider_ownership_pct,
+            o.holders_5pct.len() as i64,
+            holders_json,
+            o.restricted_shares,
+            source,
+            updated_at
         ],
     )?;
     Ok(())
@@ -193,9 +213,19 @@ pub fn upsert_filing(conn: &Connection, f: &SecFiling) -> Result<()> {
              detected_warrants=excluded.detected_warrants, offering_amount=excluded.offering_amount,
              fetched_at=excluded.fetched_at",
         params![
-            f.accession_number, f.symbol, f.cik, f.form_type, f.filing_date, f.report_date,
-            f.primary_document, f.document_url, f.description, f.category,
-            f.detected_atm as i64, f.detected_resale as i64, f.detected_warrants as i64,
+            f.accession_number,
+            f.symbol,
+            f.cik,
+            f.form_type,
+            f.filing_date,
+            f.report_date,
+            f.primary_document,
+            f.document_url,
+            f.description,
+            f.category,
+            f.detected_atm as i64,
+            f.detected_resale as i64,
+            f.detected_warrants as i64,
             f.offering_amount
         ],
     )?;
@@ -357,10 +387,12 @@ pub fn get_intel(conn: &Connection, symbol: &str) -> Result<Option<CompanyIntel>
 /// `symbol → last_updated_at` for every cached record. The orchestrator uses this
 /// to decide which candidate tickers are stale (TTL) in a single query.
 pub fn all_last_updated(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt =
-        conn.prepare("SELECT symbol, last_updated_at FROM company_intel")?;
+    let mut stmt = conn.prepare("SELECT symbol, last_updated_at FROM company_intel")?;
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        ))
     })?;
     rows.collect()
 }

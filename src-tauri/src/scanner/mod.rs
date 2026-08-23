@@ -22,8 +22,10 @@ use crate::market_state::MarketState;
 use crate::strategies::{panic_mean_reversion, registry, StrategyKind};
 use crate::types::{AlertSignal, ScreenerMatch, Session, StrategyContext};
 
-/// How many top-scored tickers the Panic Mean Reversion screener surfaces.
-const MR_TOP_N: u32 = 30;
+/// How many top-scored tickers the Panic Mean Reversion screener surfaces. Public
+/// because `panic_llm`'s catch-up wave reads the SAME depth: if the two drifted, the
+/// analysis would either miss visible tickers or score invisible ones.
+pub const MR_TOP_N: u32 = 30;
 
 /// How often the per-symbol float + average-volume maps are reloaded from the
 /// universe table (so in-script float/rvol filters use fresh values).
@@ -62,6 +64,7 @@ impl ScannerEngine {
             // float/rvol filters. Refreshed periodically.
             let mut floats = load_floats(&db);
             let mut avg_volumes = load_avg_volumes(&db);
+            let mut company_meta = load_company_meta(&db);
             let mut floats_loaded = Instant::now();
 
             // Panic Mean Reversion watchlist rows (pre-open screener). Refreshed in
@@ -85,12 +88,17 @@ impl ScannerEngine {
                 crate::local_db::panic_llm_repository::PanicLlmScore,
             > = HashMap::new();
             let mut llm_loaded = Instant::now();
+            // Panic score from each symbol's previous 1-2 SCORED sessions (not
+            // necessarily yesterday/day-before-yesterday by the calendar — weekends
+            // and gaps are skipped, see `load_llm_history`). Reloaded on the same
+            // cadence as `llm_scores`; index 0 = most recent prior day.
+            let mut llm_history: HashMap<String, [Option<f64>; 2]> = HashMap::new();
             let panic_priority = strategies
                 .iter()
                 .find(|s| s.id() == panic_mean_reversion::ID)
                 .map(|s| s.priority())
                 .unwrap_or(5);
-            let panic_name = "Panic Mean Reversion".to_string();
+            let panic_name = "Panic".to_string();
 
             // Armed price alarms (watched for level crossings) + last seen price
             // per alarm, so we fire on a genuine crossing rather than on first
@@ -123,6 +131,7 @@ impl ScannerEngine {
                     mr_scores = load_top_scores(&db, &mr_day);
                     mr_loaded = Instant::now();
                     llm_scores = load_llm_scores(&db, &mr_day);
+                    llm_history = load_llm_history(&db, &mr_day);
                 } else if mr_loaded.elapsed() >= MR_REFRESH {
                     mr_scores = load_top_scores(&db, &mr_day);
                     mr_loaded = Instant::now();
@@ -130,6 +139,7 @@ impl ScannerEngine {
                 if floats_loaded.elapsed() >= FLOAT_REFRESH {
                     floats = load_floats(&db);
                     avg_volumes = load_avg_volumes(&db);
+                    company_meta = load_company_meta(&db);
                     floats_loaded = Instant::now();
                 }
                 if alarms_loaded.elapsed() >= ALARM_REFRESH {
@@ -142,6 +152,7 @@ impl ScannerEngine {
                 // indexed SELECT over ~20 rows every 2 s is negligible.
                 if llm_loaded.elapsed() >= LLM_SCORE_REFRESH {
                     llm_scores = load_llm_scores(&db, &mr_day);
+                    llm_history = load_llm_history(&db, &mr_day);
                     llm_loaded = Instant::now();
                 }
                 // App clock: simulated instant during a Market Replay.
@@ -222,6 +233,12 @@ impl ScannerEngine {
                                         rvol: ctx.rvol,
                                         volume: ctx.volume_day,
                                         float_shares: ctx.float_shares,
+                                        industry: company_meta
+                                            .get(&ctx.symbol)
+                                            .and_then(|m| m.0.clone()),
+                                        country: company_meta
+                                            .get(&ctx.symbol)
+                                            .and_then(|m| m.1.clone()),
                                         score: None,
                                         score_label: None,
                                         llm_panic_score: None,
@@ -233,6 +250,8 @@ impl ScannerEngine {
                                         llm_timing_state: None,
                                         llm_trade_direction: None,
                                         llm_veto_reason: None,
+                                        llm_panic_score_prev1: None,
+                                        llm_panic_score_prev2: None,
                                         updated_at: now,
                                     });
                                 }
@@ -291,9 +310,16 @@ impl ScannerEngine {
                             priority: panic_priority,
                             price: t.and_then(|t| t.last_price),
                             gap_pct: t.and_then(|t| t.change_day_pct),
-                            rvol: None,
+                            rvol: t.and_then(|t| {
+                                avg_volumes
+                                    .get(sym)
+                                    .filter(|&&v| v > 0)
+                                    .map(|&v| t.volume_day as f64 / v as f64)
+                            }),
                             volume: t.map(|t| t.volume_day).unwrap_or(0),
                             float_shares: floats.get(sym).copied(),
+                            industry: company_meta.get(sym).and_then(|m| m.0.clone()),
+                            country: company_meta.get(sym).and_then(|m| m.1.clone()),
                             // No score today — the UI shows the pin, not a ranking.
                             score: None,
                             score_label: Some("PIN".to_string()),
@@ -305,11 +331,23 @@ impl ScannerEngine {
                                 .get(sym)
                                 .and_then(|s| s.reversibility.clone()),
                             llm_ranking_score: llm_scores.get(sym).and_then(|s| s.ranking_score),
-                            llm_confidence_score: llm_scores.get(sym).and_then(|s| s.confidence_score),
-                            llm_eligibility: llm_scores.get(sym).and_then(|s| s.eligibility.clone()),
-                            llm_timing_state: llm_scores.get(sym).and_then(|s| s.timing_state.clone()),
-                            llm_trade_direction: llm_scores.get(sym).and_then(|s| s.trade_direction.clone()),
-                            llm_veto_reason: llm_scores.get(sym).and_then(|s| s.veto_reason.clone()),
+                            llm_confidence_score: llm_scores
+                                .get(sym)
+                                .and_then(|s| s.confidence_score),
+                            llm_eligibility: llm_scores
+                                .get(sym)
+                                .and_then(|s| s.eligibility.clone()),
+                            llm_timing_state: llm_scores
+                                .get(sym)
+                                .and_then(|s| s.timing_state.clone()),
+                            llm_trade_direction: llm_scores
+                                .get(sym)
+                                .and_then(|s| s.trade_direction.clone()),
+                            llm_veto_reason: llm_scores
+                                .get(sym)
+                                .and_then(|s| s.veto_reason.clone()),
+                            llm_panic_score_prev1: llm_history.get(sym).and_then(|h| h[0]),
+                            llm_panic_score_prev2: llm_history.get(sym).and_then(|h| h[1]),
                             updated_at: now,
                         });
                     }
@@ -320,7 +358,9 @@ impl ScannerEngine {
                         // upward one (or vice versa). Never attach a contextual score
                         // produced for the opposite trade direction.
                         let analysis = llm_scores.get(&row.symbol).filter(|s| {
-                            s.trade_direction.as_deref().is_none_or(|v| v == expected_side)
+                            s.trade_direction
+                                .as_deref()
+                                .is_none_or(|v| v == expected_side)
                         });
                         // The card shows the PREVIOUS day's volume (the move this
                         // screener is built on happened yesterday), not the (often
@@ -333,9 +373,20 @@ impl ScannerEngine {
                             priority: panic_priority,
                             price: t.and_then(|t| t.last_price),
                             gap_pct: t.and_then(|t| t.change_day_pct),
-                            rvol: None, // not meaningful for a prior-day ranking
+                            // Live premarket volume so far vs the symbol's average daily
+                            // volume — same formula as the generic per-tick screener path.
+                            // `volume` above stays yesterday's total (the shock this
+                            // ranking is built on); rvol is a separate, live signal.
+                            rvol: t.and_then(|t| {
+                                avg_volumes
+                                    .get(&row.symbol)
+                                    .filter(|&&v| v > 0)
+                                    .map(|&v| t.volume_day as f64 / v as f64)
+                            }),
                             volume: prev_volume,
                             float_shares: floats.get(&row.symbol).copied(),
+                            industry: company_meta.get(&row.symbol).and_then(|m| m.0.clone()),
+                            country: company_meta.get(&row.symbol).and_then(|m| m.1.clone()),
                             score: Some(row.score),
                             llm_panic_score: analysis.and_then(|s| s.panic_score),
                             llm_one_liner: analysis.and_then(|s| s.one_liner.clone()),
@@ -346,6 +397,8 @@ impl ScannerEngine {
                             llm_timing_state: analysis.and_then(|s| s.timing_state.clone()),
                             llm_trade_direction: analysis.and_then(|s| s.trade_direction.clone()),
                             llm_veto_reason: analysis.and_then(|s| s.veto_reason.clone()),
+                            llm_panic_score_prev1: llm_history.get(&row.symbol).and_then(|h| h[0]),
+                            llm_panic_score_prev2: llm_history.get(&row.symbol).and_then(|h| h[1]),
                             score_label: {
                                 // Both factors + the winning window + the move's
                                 // direction, e.g. "σ4.2 ×2.1 · 2j ▼": how exceptional
@@ -379,42 +432,18 @@ impl ScannerEngine {
 
                 // Replace the live screener list.
                 //
-                // Composite ranking: extension is available for every quant row;
-                // contextual reversibility defaults to a neutral 50 when unanalysed.
-                // Analysis PRESENCE is therefore never a bullish/bearish signal.
-                // A fundamental veto is the only categorical demotion.
-                let max_extension = screener_now
-                    .iter()
-                    .filter_map(|m| m.score)
-                    .filter(|v| v.is_finite() && *v > 0.0)
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
-                screener_now.sort_by(|a, b| {
-                    let composite = |m: &ScreenerMatch| {
-                        if m.llm_eligibility.as_deref() == Some("veto") {
-                            return -1.0;
-                        }
-                        let extension = m.score.unwrap_or(0.0).max(0.0) / max_extension * 100.0;
-                        let contextual = m.llm_ranking_score.unwrap_or(50.0);
-                        extension * 0.55 + contextual * 0.45
-                    };
-                    composite(b)
-                        .partial_cmp(&composite(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            b.score
-                                .unwrap_or(f64::MIN)
-                                .partial_cmp(&a.score.unwrap_or(f64::MIN))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .then_with(|| b.volume.cmp(&a.volume))
-                        .then_with(|| {
-                            b.gap_pct
-                                .unwrap_or(f64::MIN)
-                                .partial_cmp(&a.gap_pct.unwrap_or(f64::MIN))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                });
+                // PANIC SCORE DESCENDING is the ranking, full stop. A ticker with a
+                // score outranks any ticker without one, whatever its quant extension:
+                // once the analysis has run, the answer to "is this move reversible?"
+                // is what the list is for, and an unscored row has no answer to give.
+                // Rows with no score — never analysed, or analysed and returned N/A —
+                // fall to the bottom and keep their quant order among themselves.
+                //
+                // The composite blend this replaces (55% extension + 45% contextual
+                // rank, with a neutral 50 imputed for unanalysed rows) let a strongly
+                // extended unanalysed ticker outrank an analysed one, which made a
+                // partial analysis look like a complete ranking.
+                screener_now.sort_by(by_panic_score);
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 screener_now.retain(|m| seen.insert(m.symbol.clone()));
                 // Queue any newly-surfaced screener ticker for on-demand "capacité à
@@ -452,30 +481,68 @@ pub fn push_alert(
     alert_history: &Arc<RwLock<Vec<AlertSignal>>>,
     alert: AlertSignal,
 ) {
-    // Every strategy + the alarm watcher funnel through here, already cooldown-
-    // gated, so this is the right place to fire the low-latency desktop attention
-    // cue (white flash / foreground) for a genuinely new alert.
     let session = alert.session;
-    // Just-in-time "capacité à diluer" collection for an alerted ticker (premarket
-    // dilution readiness). Non-blocking; the worker dedups + TTL-gates.
-    crate::company_intel::ondemand::request(&alert.symbol);
-    {
+    let symbol = alert.symbol.clone();
+    let is_new = {
         let mut active = active_alerts.write().unwrap();
+        // Micro Pullback deliberately republishes the same `alert_id` when its tempo
+        // depth or A+ score lands. That is an update, not another alert: it must not
+        // flash/ring again or start the enrichment pipeline again.
+        let is_new = !active.iter().any(|a| a.alert_id == alert.alert_id);
         // Keep only one entry per (symbol, strategy) in the active list
         active.retain(|a| !(a.symbol == alert.symbol && a.strategy_id == alert.strategy_id));
         active.insert(0, alert.clone());
         if active.len() > 100 {
             active.truncate(100);
         }
-    }
+        is_new
+    };
     {
         let mut history = alert_history.write().unwrap();
+        // Re-render the existing history item in place instead of consuming several
+        // of the 500 history slots for triage/deep/depth versions of one event.
+        history.retain(|a| a.alert_id != alert.alert_id);
         history.insert(0, alert);
         if history.len() > 500 {
             history.truncate(500);
         }
     }
-    crate::notify::on_alert(session);
+    if is_new {
+        // Just-in-time "capacité à diluer" collection for an alerted ticker
+        // (premarket dilution readiness). Non-blocking; worker-side TTL still guards
+        // other request sources.
+        crate::company_intel::ondemand::request(&symbol);
+        // Every strategy + the alarm watcher funnels through here, already cooldown-
+        // gated. Only a genuinely new id deserves the attention cue.
+        crate::notify::on_alert(session);
+    }
+}
+
+/// The screener ordering: **panic score descending, unscored last.**
+///
+/// A ticker WITH a score outranks any ticker without one, whatever its quant
+/// extension — once the analysis has run, "is this move reversible?" is the question
+/// the list exists to answer, and an unscored row has no answer to give. Rows with no
+/// score (never analysed, or analysed and returned N/A) fall to the bottom and keep
+/// their quant order among themselves.
+fn by_panic_score(a: &ScreenerMatch, b: &ScreenerMatch) -> std::cmp::Ordering {
+    let desc = |x: Option<f64>, y: Option<f64>| {
+        y.unwrap_or(f64::MIN)
+            .partial_cmp(&x.unwrap_or(f64::MIN))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let panic = |m: &ScreenerMatch| m.llm_panic_score.filter(|v| v.is_finite());
+    match (panic(a), panic(b)) {
+        (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    // Equal panic scores: the confidence-aware rank separates them.
+    .then_with(|| desc(a.llm_ranking_score, b.llm_ranking_score))
+    .then_with(|| desc(a.score, b.score))
+    .then_with(|| b.volume.cmp(&a.volume))
+    .then_with(|| desc(a.gap_pct, b.gap_pct))
 }
 
 /// Load the per-symbol float (shares) map from the universe table. Symbols with
@@ -508,6 +575,20 @@ fn load_avg_volumes(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, u6
         .collect()
 }
 
+/// Load per-symbol (industry, country) from the sec-api company_meta cache, for
+/// the screener card's industry/country display. Refreshed on the same slow
+/// cadence as `load_floats` — this metadata barely changes intraday.
+fn load_company_meta(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    let conn = db.lock().unwrap();
+    crate::local_db::company_meta_repository::get_all(&conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.symbol, (m.industry, m.country)))
+        .collect()
+}
+
 /// Load the Panic Mean Reversion watchlist rows for `day`, strongest panic first.
 /// Empty until that day's 09:25 ET build has run — and, crucially, empty rather than
 /// wrong when the app clock sits on a day the list wasn't built for.
@@ -533,6 +614,31 @@ fn load_llm_scores(
         .into_iter()
         .map(|s| (s.symbol.clone(), s))
         .collect()
+}
+
+/// Panic score from each symbol's previous 1-2 SCORED days (see
+/// `panic_llm_repository::distinct_days_before` for why this is not simply
+/// `day - 1` / `day - 2`). `[prev1, prev2]`, most recent first; a symbol not
+/// analysed on a given day is just absent from that slot (None).
+fn load_llm_history(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    day: &str,
+) -> HashMap<String, [Option<f64>; 2]> {
+    let simulated = crate::replay::clock::is_active();
+    let conn = db.lock().unwrap();
+    let days =
+        crate::local_db::panic_llm_repository::distinct_days_before(&conn, day, simulated, 2)
+            .unwrap_or_default();
+
+    let mut history: HashMap<String, [Option<f64>; 2]> = HashMap::new();
+    for (i, d) in days.iter().enumerate() {
+        let rows = crate::local_db::panic_llm_repository::get_for_day(&conn, d, simulated)
+            .unwrap_or_default();
+        for row in rows {
+            history.entry(row.symbol).or_insert([None, None])[i] = row.panic_score;
+        }
+    }
+    history
 }
 
 /// Load armed (not-yet-triggered) price alarms from the DB.
@@ -603,6 +709,7 @@ fn watch_alarms(
                 reason: format!("Alarme déclenchée à ${:.2} — touché ${:.2}", level, price),
                 display_timeframe: None,
                 side: None,
+                tempo_depth: None,
             };
             push_alert(active_alerts, alert_history, alert);
         }
@@ -629,3 +736,128 @@ fn watch_alarms(
 
 // Market-session resolution now lives in `crate::time::session_at` (DST-aware,
 // shared with the engines and the live/news streams).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert(id: &str, reason: &str) -> AlertSignal {
+        AlertSignal {
+            alert_id: id.into(),
+            timestamp: chrono::Utc::now(),
+            symbol: "TEST".into(),
+            strategy_id: "micro_pullback".into(),
+            strategy_name: "Micro Pullback".into(),
+            priority: 5,
+            session: Session::Premarket,
+            price: Some(5.0),
+            bid: None,
+            ask: None,
+            spread: None,
+            volume: Some(10_000),
+            rvol: None,
+            change_day_pct: None,
+            float_shares: None,
+            news_today: false,
+            halted: Some(false),
+            latency_ui_ms: None,
+            reason: reason.into(),
+            display_timeframe: Some("10s".into()),
+            side: None,
+            tempo_depth: Some(vec![10]),
+        }
+    }
+
+    #[test]
+    fn republishing_one_alert_updates_active_and_history_without_duplicates() {
+        let old = alert("same-id", "triage");
+        let active = Arc::new(RwLock::new(vec![old.clone()]));
+        let history = Arc::new(RwLock::new(vec![old]));
+
+        push_alert(&active, &history, alert("same-id", "deep"));
+
+        let active = active.read().unwrap();
+        let history = history.read().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(history.len(), 1);
+        assert_eq!(active[0].reason, "deep");
+        assert_eq!(history[0].reason, "deep");
+    }
+
+    fn row(symbol: &str, panic: Option<f64>, quant: f64) -> ScreenerMatch {
+        ScreenerMatch {
+            symbol: symbol.into(),
+            strategy_id: "panic_mean_reversion".into(),
+            strategy_name: "Panic".into(),
+            priority: 1,
+            price: Some(10.0),
+            gap_pct: Some(5.0),
+            rvol: None,
+            volume: 1_000_000,
+            float_shares: None,
+            industry: None,
+            country: None,
+            score: Some(quant),
+            score_label: None,
+            llm_panic_score: panic,
+            llm_one_liner: None,
+            llm_reversibility: None,
+            llm_ranking_score: panic,
+            llm_confidence_score: None,
+            llm_eligibility: Some(if panic.is_some() {
+                "eligible".into()
+            } else {
+                "n_a".into()
+            }),
+            llm_timing_state: None,
+            llm_trade_direction: None,
+            llm_veto_reason: None,
+            llm_panic_score_prev1: None,
+            llm_panic_score_prev2: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The ranking the analysis produces: panic score descending over the WHOLE list.
+    #[test]
+    fn the_list_ranks_by_panic_score_descending() {
+        let mut rows = vec![
+            row("LOW", Some(22.0), 300.0),
+            row("HIGH", Some(91.0), 12.0),
+            row("MID", Some(57.0), 40.0),
+        ];
+        rows.sort_by(by_panic_score);
+        let order: Vec<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["HIGH", "MID", "LOW"],
+            "a huge quant extension must not outrank a higher panic score",
+        );
+    }
+
+    /// N/A (analysed, not scorable) and never-analysed rows both sink to the bottom,
+    /// where they keep their quantitative order relative to each other.
+    #[test]
+    fn rows_without_a_score_sink_below_every_scored_row() {
+        let mut rows = vec![
+            row("NA_STRONG", None, 900.0),
+            row("SCORED_LOW", Some(3.0), 5.0),
+            row("NA_WEAK", None, 10.0),
+        ];
+        rows.sort_by(by_panic_score);
+        let order: Vec<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
+        assert_eq!(order, vec!["SCORED_LOW", "NA_STRONG", "NA_WEAK"]);
+    }
+
+    /// A NaN score is not a score. Guards the `filter(is_finite)`: without it the
+    /// comparison poisons the sort and the row's position becomes arbitrary.
+    #[test]
+    fn a_nan_score_is_treated_as_no_score() {
+        let mut rows = vec![
+            row("NAN", Some(f64::NAN), 500.0),
+            row("REAL", Some(10.0), 1.0),
+        ];
+        rows.sort_by(by_panic_score);
+        assert_eq!(rows[0].symbol, "REAL");
+    }
+}

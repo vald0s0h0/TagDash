@@ -30,19 +30,26 @@ export function useChartBars(
   const noMoreOlderRef  = useRef<boolean>(false);
   const [bars, setBars] = useState<Bar[] | undefined>(undefined);
 
-  // ── Unified bar load (refresh on open): the backend refreshes history from
-  // Alpaca (gaps + today's forming bar) and merges into RAM; the fast RAM poll
-  // below renders it. Sub-minute frames Alpaca can't serve → RAM only, no interval.
+  // ── History: fetched ONCE per (symbol, timeframe), never on a timer. The
+  // backend pulls the provider's history and merges it into RAM; from then on the
+  // live WebSocket owns the series (Massive: one aggregate/second per subscribed
+  // symbol; Alpaca SIP: tick-by-tick trades + quotes), surfacing through the fast
+  // RAM poll below.
+  //
+  // The old 15 s / 30 s `refetchInterval` is gone deliberately. It re-fetched a
+  // window the WebSocket was already keeping current, and each refetch re-merged a
+  // full history batch into the ring — which is what turned Massive's
+  // `from`-anchored bucket drift into visibly duplicated bars (see
+  // `massive::bars::aligned_from_ms`). The alignment fix makes a repeat merge
+  // harmless, but the refetch itself was never buying anything the feed doesn't
+  // already deliver.
   const { data: backfilled } = useQuery({
     queryKey: ["chart_history", symbol, timeframe],
     queryFn:  () => api.loadChartBars(symbol, timeframe),
     enabled:  !!symbol,
     refetchOnMount: "always",
     refetchOnWindowFocus: false,
-    refetchInterval:
-      timeframe === "5s" || timeframe === "10s" ? false
-      : timeframe === "daily" ? 30_000
-      : 15_000,
+    refetchInterval: false,
     retry: false,
   });
   // Once a refresh lands, nudge the live bars query so it renders immediately.
@@ -101,7 +108,6 @@ export function useChartBars(
     const sym = symbolRef.current;
     const tf  = timeframeRef.current;
     if (loadingOlderRef.current || noMoreOlderRef.current) return;
-    if (tf === "5s" || tf === "10s") return; // Alpaca REST can't serve sub-minute
     const accum = accumRef.current;
     if (accum.size === 0) return;
 

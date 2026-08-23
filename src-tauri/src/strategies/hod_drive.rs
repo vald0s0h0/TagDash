@@ -20,7 +20,7 @@ use crate::hod_drive::{COOLDOWN_SECS, MAX_RISK_DOLLARS, PRIORITY};
 use crate::strategies::ScanStrategy;
 use crate::types::{
     AlertSignal, IndicatorKind, InfoField, InfoSource, PaneIndicator, PaneSpec, Session,
-    StrategyCard, StrategyContext, StrategyRiskConfig, UniverseKey,
+    StrategyCard, StrategyContext, StrategyRiskConfig, StreamingScope, UniverseKey,
 };
 
 // ─── Identity (kept in sync with the engine's constants) ──────────────────────
@@ -70,6 +70,7 @@ impl ScanStrategy for HodDrive {
     fn card(&self) -> StrategyCard {
         StrategyCard {
             universe: UniverseKey::UsStocks,
+            streaming_scope: StreamingScope::None,
             // Two panes. Left: daily context (SMA 200/20 + volume), read-only. Right:
             // the timeframe that detected the signal (SMA 20 + session VWAP + volume),
             // interactive (SL/TP, orders) — it carries the HOD Drive overlay + the
@@ -77,37 +78,67 @@ impl ScanStrategy for HodDrive {
             // placeholder seeded by the alert's `display_timeframe` (the firing tf).
             panes: vec![
                 PaneSpec {
-                    timeframe:   "daily".into(),
-                    symbol:      None,
-                    indicators:  vec![
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(200) },
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(20) },
-                        PaneIndicator { kind: IndicatorKind::Volume, period: None },
+                    timeframe: "daily".into(),
+                    symbol: None,
+                    indicators: vec![
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(200),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(20),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Volume,
+                            period: None,
+                        },
                     ],
                     interactive: false,
-                    column:      None,
+                    column: None,
                 },
                 PaneSpec {
-                    timeframe:   "5m".into(),
-                    symbol:      None,
-                    indicators:  vec![
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(20) },
-                        PaneIndicator { kind: IndicatorKind::Vwap,   period: None },
-                        PaneIndicator { kind: IndicatorKind::Volume, period: None },
+                    timeframe: "5m".into(),
+                    symbol: None,
+                    indicators: vec![
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(20),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Vwap,
+                            period: None,
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Volume,
+                            period: None,
+                        },
                     ],
                     interactive: true,
-                    column:      None,
+                    column: None,
                 },
             ],
             // Live-sourced info band (no enrichment/LLM). The five strategy KPIs
             // (series share / pullback volume / power / efficiency) live in the
             // dedicated on-chart HOD Drive overlay, not here.
             info_fields: vec![
-                InfoField { key: "change_day_pct".into(), label: "Gap".into(),    source: InfoSource::Alert },
-                InfoField { key: "volume".into(),         label: "Vol".into(),    source: InfoSource::Alert },
-                InfoField { key: "price".into(),          label: "Prix".into(),   source: InfoSource::Alert },
+                InfoField {
+                    key: "change_day_pct".into(),
+                    label: "Gap".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "volume".into(),
+                    label: "Vol".into(),
+                    source: InfoSource::Alert,
+                },
+                InfoField {
+                    key: "price".into(),
+                    label: "Prix".into(),
+                    source: InfoSource::Alert,
+                },
             ],
-            llm:         None,
+            llm: None,
             enrichments: vec![],
         }
     }

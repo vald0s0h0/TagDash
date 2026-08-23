@@ -14,7 +14,7 @@ use super::cache_repository::{get_app_meta, set_app_meta};
 use crate::chart_state::ZoneTradeContext;
 use crate::internal_trading::InternalBook;
 
-const BOOK_KEY:  &str = "internal_book_v1";
+const BOOK_KEY: &str = "internal_book_v1";
 const CHART_KEY: &str = "chart_contexts_v1";
 
 /// Persist the internal trading book. Pass the result of

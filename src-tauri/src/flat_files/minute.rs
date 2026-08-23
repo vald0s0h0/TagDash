@@ -28,6 +28,17 @@ use crate::types::NewsHeadline;
 /// How many previous trading days to guarantee alongside a downloaded day (chart
 /// intraday lead-in).
 const HISTORY_DAYS: usize = 5;
+const RVOL_HISTORY_DAYS: usize = 20;
+const RVOL_BUCKET_MINUTES: u32 = 10;
+const RVOL_SESSION_START: u32 = 4 * 60;
+const RVOL_SESSION_END: u32 = 20 * 60;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RvolBaseline {
+    pub median_volume_10m: f64,
+    pub mad_volume_10m: f64,
+    pub sample_days: u8,
+}
 
 // ─── Availability + calendar ────────────────────────────────────────────────────
 
@@ -46,27 +57,45 @@ pub fn has_day(app_dir: &Path, day: &str) -> bool {
 /// The most recent COMPLETE minute day on disk (YYYY-MM-DD), or None when none has
 /// been downloaded. Used to pick the day to park in Market Replay on a flat-files boot.
 pub fn latest_complete_day(app_dir: &Path) -> Option<String> {
-    calendar(app_dir).into_iter().filter(|d| d.complete).map(|d| d.day).max()
+    calendar(app_dir)
+        .into_iter()
+        .filter(|d| d.complete)
+        .map(|d| d.day)
+        .max()
 }
 
 pub fn calendar(app_dir: &Path) -> Vec<FlatFileDay> {
     let dir = kind_dir(app_dir, Kind::Minute);
     let mut out: Vec<FlatFileDay> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(day) = day_of_file(&name, "minute-") else { continue };
+        let Some(day) = day_of_file(&name, "minute-") else {
+            continue;
+        };
         let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let (symbol_count, bar_count, complete) = Connection::open(entry.path())
             .ok()
             .map(|c| {
-                let sc = get_meta(&c, "symbol_count").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let bc = get_meta(&c, "bar_count").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let sc = get_meta(&c, "symbol_count")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let bc = get_meta(&c, "bar_count")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
                 let complete = get_meta(&c, "complete").map(|v| v == "1").unwrap_or(false);
                 (sc, bc, complete)
             })
             .unwrap_or((0, 0, false));
-        out.push(FlatFileDay { day, bytes, symbol_count, bar_count, complete });
+        out.push(FlatFileDay {
+            day,
+            bytes,
+            symbol_count,
+            bar_count,
+            complete,
+        });
     }
     out.sort_by(|a, b| a.day.cmp(&b.day));
     out
@@ -114,8 +143,10 @@ pub async fn write_day(
     ensure_history: bool,
 ) -> Result<usize, String> {
     let main_span = if ensure_history { 0.6 } else { 1.0 };
-    let bars = write_one_day(app_dir, db, key, secret, day, &|f| shared.set_progress(f * main_span))
-        .await?;
+    let bars = write_one_day(app_dir, db, key, secret, day, &|f| {
+        shared.set_progress(f * main_span)
+    })
+    .await?;
 
     if ensure_history {
         let prior = prior_trading_days(day, HISTORY_DAYS);
@@ -130,9 +161,10 @@ pub async fn write_day(
             let lo = main_span + (i as f32 / n) * (1.0 - main_span);
             let hi = main_span + ((i + 1) as f32 / n) * (1.0 - main_span);
             // Holidays / no-data days simply fail here — skip them, never abort.
-            if let Err(e) =
-                write_one_day(app_dir, db, key, secret, pday, &|f| shared.set_progress(lo + f * (hi - lo)))
-                    .await
+            if let Err(e) = write_one_day(app_dir, db, key, secret, pday, &|f| {
+                shared.set_progress(lo + f * (hi - lo))
+            })
+            .await
             {
                 eprintln!("[tagdash] flat_files minute: historique {pday} ignoré ({e})");
             }
@@ -153,7 +185,8 @@ async fn write_one_day(
     day: &str,
     progress: &(dyn Fn(f32) + Sync),
 ) -> Result<usize, String> {
-    let nd = NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| format!("invalid date: {day}"))?;
+    let nd =
+        NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| format!("invalid date: {day}"))?;
     let noon = data::noon_utc(nd);
     let pm_start = crate::time::et_clock_utc(noon, 4, 0); // 04:00 ET
     let day_end = crate::time::et_clock_utc(noon, 20, 0); // 20:00 ET
@@ -161,17 +194,26 @@ async fn write_one_day(
     // 1. Universe (symbols known to the app).
     let universe: Vec<String> = {
         let conn = db.lock().unwrap();
-        crate::local_db::universe_repository::get_active_symbols(&conn).map_err(|e| e.to_string())?
+        crate::local_db::universe_repository::get_active_symbols(&conn)
+            .map_err(|e| e.to_string())?
     };
     if universe.is_empty() {
         return Err("univers vide — lance d'abord le Startup Pipeline".into());
     }
 
     // 2. Daily window: previous close + this-day volume (activity filter).
-    let daily_start = (nd - chrono::Duration::days(10)).format("%Y-%m-%dT00:00:00Z").to_string();
+    let daily_start = (nd - chrono::Duration::days(10))
+        .format("%Y-%m-%dT00:00:00Z")
+        .to_string();
     let daily_end = day_end.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let daily = data::fetch_bars_window(
-        key, secret, &universe, "1Day", &daily_start, &daily_end, &|f| progress(f * 0.18),
+        key,
+        secret,
+        &universe,
+        "1Day",
+        &daily_start,
+        &daily_end,
+        &|f| progress(f * 0.18),
     )
     .await?;
     let (prev_closes, day_volume) = data::split_daily(&daily, day);
@@ -179,23 +221,30 @@ async fn write_one_day(
     // The day's 2000 most-traded symbols (no focus symbols here).
     let active = data::rank_active(&day_volume, &[]);
     if active.is_empty() {
-        return Err(format!("aucune donnée de marché pour le {day} (jour non ouvré ?)"));
+        return Err(format!(
+            "aucune donnée de marché pour le {day} (jour non ouvré ?)"
+        ));
     }
 
     // 3. Minute bars 04:00→20:00 ET.
     let min_start = pm_start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let min_end = day_end.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let minutes = data::fetch_bars_window(
-        key, secret, &active, "1Min", &min_start, &min_end, &|f| progress(0.18 + f * 0.72),
-    )
-    .await?;
+    let minutes =
+        data::fetch_bars_window(key, secret, &active, "1Min", &min_start, &min_end, &|f| {
+            progress(0.18 + f * 0.72)
+        })
+        .await?;
 
     // 4. News of the day (published 00:00 ET → 20:00 ET).
-    let news_start = crate::time::et_clock_utc(noon, 0, 0).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let news = data::fetch_news_window(key, secret, &news_start, &min_end, &[]).await.unwrap_or_else(|e| {
-        eprintln!("[tagdash] flat_files minute: {day} news ignorées ({e})");
-        Vec::new()
-    });
+    let news_start = crate::time::et_clock_utc(noon, 0, 0)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let news = data::fetch_news_window(key, secret, &news_start, &min_end, &[])
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[tagdash] flat_files minute: {day} news ignorées ({e})");
+            Vec::new()
+        });
     progress(0.95);
 
     // 5. Write to a temp DB, then atomically rename.
@@ -214,9 +263,19 @@ async fn write_one_day(
                 .map_err(|e| e.to_string())?;
             for (sym, raw_bars) in &minutes {
                 for b in raw_bars {
-                    let Ok(t) = b.t.parse::<chrono::DateTime<Utc>>() else { continue };
+                    let Ok(t) = b.t.parse::<chrono::DateTime<Utc>>() else {
+                        continue;
+                    };
                     ins.execute(rusqlite::params![
-                        sym, t.timestamp_millis(), b.o, b.h, b.l, b.c, b.v, b.n.unwrap_or(0), b.vw,
+                        sym,
+                        t.timestamp_millis(),
+                        b.o,
+                        b.h,
+                        b.l,
+                        b.c,
+                        b.v,
+                        b.n.unwrap_or(0),
+                        b.vw,
                     ])
                     .map_err(|e| e.to_string())?;
                     bars += 1;
@@ -229,7 +288,9 @@ async fn write_one_day(
                 .prepare("INSERT OR REPLACE INTO prev_closes (symbol, close) VALUES (?1, ?2)")
                 .map_err(|e| e.to_string())?;
             for (sym, close) in &prev_closes {
-                ins_pc.execute(rusqlite::params![sym, close]).map_err(|e| e.to_string())?;
+                ins_pc
+                    .execute(rusqlite::params![sym, close])
+                    .map_err(|e| e.to_string())?;
             }
             let mut ins_news = tx
                 .prepare("INSERT INTO news (id, headline, summary, url, source, symbols_json, created_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)")
@@ -238,7 +299,12 @@ async fn write_one_day(
                 let syms_json = serde_json::to_string(&h.symbols).unwrap_or_else(|_| "[]".into());
                 ins_news
                     .execute(rusqlite::params![
-                        h.id, h.headline, h.summary, h.url, h.source, syms_json,
+                        h.id,
+                        h.headline,
+                        h.summary,
+                        h.url,
+                        h.source,
+                        syms_json,
                         h.created_at.timestamp_millis(),
                     ])
                     .map_err(|e| e.to_string())?;
@@ -261,6 +327,12 @@ async fn write_one_day(
 
     let _ = std::fs::remove_file(&final_path);
     std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+    // Any newly downloaded historical day can improve a previously cached
+    // point-in-time RVOL profile. Invalidate the derived cache; it is rebuilt once
+    // by the startup/replay pipeline, never in the hot scanner loop.
+    if let Ok(conn) = db.lock() {
+        let _ = conn.execute("DELETE FROM micro_rvol_baselines", []);
+    }
     progress(1.0);
     Ok(bar_count)
 }
@@ -268,7 +340,9 @@ async fn write_one_day(
 /// The `n` previous weekday dates before `day` (most recent first). Holidays are not
 /// excluded here — they simply fail to download and are skipped by the caller.
 fn prior_trading_days(day: &str, n: usize) -> Vec<String> {
-    let Ok(mut d) = NaiveDate::parse_from_str(day, "%Y-%m-%d") else { return Vec::new() };
+    let Ok(mut d) = NaiveDate::parse_from_str(day, "%Y-%m-%d") else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
         d -= chrono::Duration::days(1);
@@ -296,7 +370,9 @@ pub fn read_premarket_bars(
     let path = minute_path(app_dir, day);
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT symbol, t_ms, o, h, l, c, v FROM minute_bars WHERE t_ms >= ?1 AND t_ms < ?2")
+        .prepare(
+            "SELECT symbol, t_ms, o, h, l, c, v FROM minute_bars WHERE t_ms >= ?1 AND t_ms < ?2",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params![start_ms, end_ms], |r| {
@@ -319,6 +395,194 @@ pub fn read_premarket_bars(
     Ok(out)
 }
 
+/// Build (if absent) and return a point-in-time, robust time-of-day volume profile
+/// for `target_day`. Only complete minute files strictly older than the target are
+/// read, so replaying an old session cannot see future volume.
+///
+/// The provider files contain only bars that traded. For every symbol present in a
+/// day we therefore explicitly retain missing 10-minute buckets as zero: dormancy is
+/// information and dropping it would make a 04:00 wake-up look ordinary.
+pub fn ensure_rvol_baseline(
+    app_dir: &Path,
+    db: &Arc<Mutex<Connection>>,
+    target_day: &str,
+) -> Result<HashMap<(String, u32), RvolBaseline>, String> {
+    {
+        let conn = db.lock().unwrap();
+        let existing = conn
+            .query_row(
+                "SELECT COUNT(*) FROM micro_rvol_baselines WHERE target_day=?1",
+                [target_day],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        if existing > 0 {
+            return read_rvol_baseline(&conn, target_day);
+        }
+    }
+
+    let eligible: HashSet<String> = {
+        let conn = db.lock().unwrap();
+        crate::local_db::universe_repository::get_all(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.tradable)
+            .filter(|a| a.float_shares.is_none_or(|f| f > 0 && f <= 100_000_000))
+            .map(|a| a.symbol)
+            .collect()
+    };
+
+    let mut days = calendar(app_dir)
+        .into_iter()
+        .filter(|d| d.complete && d.day.as_str() < target_day)
+        .map(|d| d.day)
+        .collect::<Vec<_>>();
+    days.sort();
+    days.reverse();
+    days.truncate(RVOL_HISTORY_DAYS);
+    if days.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Observed daily 10m totals and number of source days in which each symbol was
+    // actually part of the top-2 000 file. Zero-fill happens after all files load.
+    let mut samples: HashMap<(String, u32), Vec<f64>> = HashMap::new();
+    let mut symbol_days: HashMap<String, usize> = HashMap::new();
+    for day in &days {
+        let conn = Connection::open(minute_path(app_dir, day)).map_err(|e| e.to_string())?;
+        let mut daily: HashMap<(String, u32), f64> = HashMap::new();
+        let mut present: HashSet<String> = HashSet::new();
+        let mut stmt = conn
+            .prepare("SELECT symbol,t_ms,v FROM minute_bars")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.flatten() {
+            let (symbol, t_ms, volume) = row;
+            if !eligible.contains(&symbol) {
+                continue;
+            }
+            let Some(ts) = chrono::TimeZone::timestamp_millis_opt(&Utc, t_ms).single() else {
+                continue;
+            };
+            let minute = crate::time::et_minutes(ts);
+            if !(RVOL_SESSION_START..RVOL_SESSION_END).contains(&minute) {
+                continue;
+            }
+            let bucket = (minute / RVOL_BUCKET_MINUTES) * RVOL_BUCKET_MINUTES;
+            *daily.entry((symbol.clone(), bucket)).or_default() += volume.max(0) as f64;
+            present.insert(symbol);
+        }
+        for symbol in present {
+            *symbol_days.entry(symbol).or_default() += 1;
+        }
+        for (key, volume) in daily {
+            samples.entry(key).or_default().push(volume);
+        }
+    }
+
+    let mut built: HashMap<(String, u32), RvolBaseline> = HashMap::new();
+    for (symbol, n_days) in symbol_days {
+        for bucket in (RVOL_SESSION_START..RVOL_SESSION_END).step_by(RVOL_BUCKET_MINUTES as usize) {
+            let key = (symbol.clone(), bucket);
+            let mut values = samples.remove(&key).unwrap_or_default();
+            values.resize(n_days, 0.0);
+            let median = robust_median(&mut values).unwrap_or(0.0);
+            let mut deviations = values
+                .iter()
+                .map(|v| (v - median).abs())
+                .collect::<Vec<_>>();
+            let mad = robust_median(&mut deviations).unwrap_or(0.0);
+            built.insert(
+                key,
+                RvolBaseline {
+                    median_volume_10m: median,
+                    mad_volume_10m: mad,
+                    sample_days: n_days.min(u8::MAX as usize) as u8,
+                },
+            );
+        }
+    }
+
+    {
+        let mut conn = db.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM micro_rvol_baselines WHERE target_day=?1",
+            [target_day],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO micro_rvol_baselines
+                     (target_day,symbol,et_bucket_minute,median_volume_10m,mad_volume_10m,sample_days)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                )
+                .map_err(|e| e.to_string())?;
+            for ((symbol, bucket), baseline) in &built {
+                insert
+                    .execute(rusqlite::params![
+                        target_day,
+                        symbol,
+                        *bucket as i64,
+                        baseline.median_volume_10m,
+                        baseline.mad_volume_10m,
+                        baseline.sample_days as i64,
+                    ])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    Ok(built)
+}
+
+pub fn read_rvol_baseline(
+    conn: &Connection,
+    target_day: &str,
+) -> Result<HashMap<(String, u32), RvolBaseline>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT symbol,et_bucket_minute,median_volume_10m,mad_volume_10m,sample_days
+             FROM micro_rvol_baselines WHERE target_day=?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([target_day], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32),
+                RvolBaseline {
+                    median_volume_10m: r.get(2)?,
+                    mad_volume_10m: r.get(3)?,
+                    sample_days: r.get::<_, i64>(4)?.clamp(0, u8::MAX as i64) as u8,
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.flatten().collect())
+}
+
+fn robust_median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    Some(if n % 2 == 0 {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    } else {
+        values[n / 2]
+    })
+}
+
 /// Rebuild a `DayData` from the minute file, optionally overlaying real trades+quotes
 /// from the trade file (the synthetic slices inside an overlay window are suppressed).
 pub fn read_day(
@@ -333,8 +597,9 @@ pub fn read_day(
     // Previous closes (change% seed).
     let mut prev_closes: HashMap<String, f64> = HashMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT symbol, close FROM prev_closes").map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT symbol, close FROM prev_closes")
+            .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
             .map_err(|e| e.to_string())?;
@@ -391,7 +656,12 @@ pub fn read_day(
             for (ts_ms, price, size, prints) in data::slices_of(&bar) {
                 events.push(data::TimedEvent {
                     ts_ms,
-                    ev: data::Event::Trade { symbol: sym.clone(), price, size, prints },
+                    ev: data::Event::Trade {
+                        symbol: sym.clone(),
+                        price,
+                        size,
+                        prints,
+                    },
                 });
             }
             symbols.insert(sym);
@@ -401,7 +671,9 @@ pub fn read_day(
     // News, emitted at its publication instant.
     {
         let mut stmt = conn
-            .prepare("SELECT id, headline, summary, url, source, symbols_json, created_ms FROM news")
+            .prepare(
+                "SELECT id, headline, summary, url, source, symbols_json, created_ms FROM news",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
@@ -418,13 +690,16 @@ pub fn read_day(
             .map_err(|e| e.to_string())?;
         for row in rows.flatten() {
             let (id, headline, summary, url, source, symbols_json, created_ms) = row;
-            let Some(headline) = headline.filter(|h| !h.trim().is_empty()) else { continue };
+            let Some(headline) = headline.filter(|h| !h.trim().is_empty()) else {
+                continue;
+            };
             let Some(created) = chrono::TimeZone::timestamp_millis_opt(&Utc, created_ms).single()
             else {
                 continue;
             };
-            let syms: Vec<String> =
-                symbols_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+            let syms: Vec<String> = symbols_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
             events.push(data::TimedEvent {
                 ts_ms: created_ms,
                 ev: data::Event::News(NewsHeadline {
@@ -453,7 +728,13 @@ pub fn read_day(
     };
 
     events.sort_by_key(|e| e.ts_ms);
-    Ok(data::DayData { events, prev_closes, source, symbols: symbols.len() })
+    Ok(data::DayData {
+        events,
+        prev_closes,
+        source,
+        provider: data::Provider::FlatFiles.as_str(),
+        symbols: symbols.len(),
+    })
 }
 
 // ─── Reader (offline chart source: per-symbol OHLC bars) ───────────────────────
@@ -492,8 +773,11 @@ pub fn read_symbol_bars(
     });
 
     // Complete day files, newest first.
-    let mut days: Vec<String> =
-        calendar(app_dir).into_iter().filter(|d| d.complete).map(|d| d.day).collect();
+    let mut days: Vec<String> = calendar(app_dir)
+        .into_iter()
+        .filter(|d| d.complete)
+        .map(|d| d.day)
+        .collect();
     days.sort();
     days.reverse();
 
@@ -507,7 +791,9 @@ pub fn read_symbol_bars(
             }
         }
         let path = minute_path(app_dir, &day);
-        let Ok(conn) = Connection::open(&path) else { continue };
+        let Ok(conn) = Connection::open(&path) else {
+            continue;
+        };
         let Ok(mut stmt) =
             conn.prepare("SELECT t_ms,o,h,l,c,v,n,vw FROM minute_bars WHERE symbol=?1")
         else {

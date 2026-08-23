@@ -20,7 +20,10 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(min_interval: Duration) -> Self {
-        Self { min_interval, next_allowed: Mutex::new(None) }
+        Self {
+            min_interval,
+            next_allowed: Mutex::new(None),
+        }
     }
 
     /// Build from a requests-per-minute budget (0 / absurd values are clamped).

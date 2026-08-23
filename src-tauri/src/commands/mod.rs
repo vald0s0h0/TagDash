@@ -710,6 +710,7 @@ pub fn spawn_live_feed(
     db: Arc<Mutex<rusqlite::Connection>>,
     internal_book: Arc<RwLock<InternalBook>>,
     broker_mirror: Arc<RwLock<crate::broker::BrokerMirror>>,
+    strategy_enabled: Arc<RwLock<std::collections::HashMap<String, bool>>>,
     running: Arc<std::sync::atomic::AtomicBool>,
     focus_rx: tokio::sync::watch::Receiver<Vec<String>>,
     app: tauri::AppHandle,
@@ -736,6 +737,11 @@ pub fn spawn_live_feed(
             (Some(k), Some(sec)) if !k.is_empty() && !sec.is_empty() => (k, sec),
             _ => return Err("Alpaca keys not configured".into()),
         }
+    };
+    // Only consulted when the Alpaca plan turns out to be free (IEX) — see below.
+    let massive_key = {
+        let s = secrets.read().unwrap();
+        s.massive_api_key.clone().filter(|k| !k.is_empty())
     };
 
     let (configured_feed, warn_ms, critical_ms) = {
@@ -808,6 +814,49 @@ pub fn spawn_live_feed(
             }
         };
 
+        // SIP is always the best available feed — never overridden by Massive.
+        // Only on the free IEX plan do we ask whether Massive Starter+ is a better
+        // fallback than IEX: unlimited per-second bars (but no trades/quotes, and
+        // 15-minute delayed) vs. real-time trades+quotes capped at 30 symbols. The
+        // tier here mirrors the same resolution the startup pipeline and the broker
+        // safety gate already use — see `crate::massive::plan`.
+        let massive_tier = if matches!(plan, crate::alpaca::plan::Plan::Iex) {
+            massive_key
+                .as_ref()
+                .map(|_| crate::massive::plan::effective_from_app_state(&db, &config))
+        } else {
+            None
+        };
+
+        if let (Some(crate::massive::plan::Tier::Unlimited), Some(m_key)) =
+            (massive_tier, massive_key)
+        {
+            eprintln!("[tagdash] flux live : Massive Starter+ détecté — bascule depuis Alpaca IEX");
+            // Massive Starter is delayed. Micro Pullback v2 follows the feed's
+            // market-event watermark, so its windows stay causal; surface the mode
+            // because alerts and simulated fills intentionally arrive ~15m late.
+            if let Ok(conn) = db.lock() {
+                let _ = crate::local_db::insert_log(
+                    &conn,
+                    "warn",
+                    "micro_pullback v2: flux Massive Starter différé — horloge stratégie pilotée par le watermark marché",
+                );
+            }
+            crate::massive::stream::run(
+                market,
+                db,
+                internal_book,
+                broker_mirror,
+                strategy_enabled,
+                m_key,
+                running,
+                focus_rx,
+                app,
+            )
+            .await;
+            return;
+        }
+
         // The plan dictates the endpoint: a free key authenticating against /v2/sip
         // is rejected outright. The configured feed only gets a say among the
         // variants SIP actually allows (e.g. "delayed_sip").
@@ -848,6 +897,7 @@ pub async fn start_live_feed(
         state.db.clone(),
         state.internal_book.clone(),
         state.broker.mirror.clone(),
+        state.strategy_enabled.clone(),
         state.live_feed_running.clone(),
         state.focus_symbols_tx.subscribe(),
         app,
@@ -939,16 +989,14 @@ pub async fn get_ticker_bars(
         Some(tf) => tf,
         None => return Ok(vec![]),
     };
-    // On a historical series, serve the same on-demand store that `load_chart_bars`
-    // uses. The frontend merges the two queries into one series with the live poll
-    // winning per time slot, so returning the RAM ring here would let the replay's
-    // synthesised prints overwrite the real bars — on a daily-only day those prints
-    // are six points spread across the session. Same rule as every other read, so a
-    // replay behaves identically in both data-source modes; live trading keeps the
-    // RAM ring, whose forming bar is authoritative. Read-only and CURRENT SESSION
-    // only: this polls once a second, so the download and the multi-day lead-in stay
-    // on the slower history query.
-    if intraday_is_historical(&state) && crate::flat_files::intraday::serves(tf) {
+    // Offline browsing can use the on-demand store. An active replay must instead
+    // expose the RAM series fed by its resolved provider; otherwise this fast poll
+    // would overwrite Massive/SIP bars with whatever Alpaca plan populated the
+    // on-demand cache.
+    if intraday_is_historical(&state)
+        && !crate::replay::clock::is_active()
+        && crate::flat_files::intraday::serves(tf)
+    {
         let app_dir = state.app_dir.clone();
         let sym = symbol.clone();
         let found = tokio::task::spawn_blocking(move || intraday_read(&app_dir, &sym, tf))
@@ -1110,6 +1158,44 @@ async fn intraday_bars(
     intraday_read_days(&app_dir, &days, symbol, tf)
 }
 
+/// The Massive key to use for THIS historical bar request, when Massive should be
+/// preferred over Alpaca — Alpaca is NOT on the paid SIP plan (whose REST bars
+/// already cover the full consolidated tape, nothing to gain) AND the Massive tier
+/// is confirmed `Unlimited`. On a free Alpaca (IEX) plan, historical REST bars only
+/// reflect IEX's own prints — a few percent of total volume (see `crate::alpaca::
+/// plan`'s module doc) — so real gaps appear on less-liquid names, which
+/// `load_older_bars` used to read as "reached the start of history" and disable
+/// further back-fill permanently. `None` = today's Alpaca-only behaviour, unchanged
+/// (the safe default when nothing is confirmed).
+fn preferred_massive_bars_key(
+    state: &tauri::State<'_, AppState>,
+    tf: crate::market_state::aggregators::Timeframe,
+) -> Option<String> {
+    if crate::alpaca::bars::alpaca_timeframe(tf).is_some() {
+        let alpaca_sip = {
+            let conn = state.db.lock().unwrap();
+            cache_repository::get_app_meta(&conn, crate::alpaca::plan::PLAN_META_KEY)
+                .and_then(|s| crate::alpaca::plan::Plan::from_meta(&s))
+        } == Some(crate::alpaca::plan::Plan::Sip);
+        if alpaca_sip {
+            return None;
+        }
+    }
+    // Either Alpaca can't serve this timeframe at all (5s/10s), or it's on the free
+    // IEX plan — Massive is preferred once its tier is confirmed Unlimited.
+    let tier = crate::massive::plan::effective_from_app_state(&state.db, &state.config);
+    if !matches!(tier, crate::massive::plan::Tier::Unlimited) {
+        return None;
+    }
+    state
+        .secrets
+        .read()
+        .unwrap()
+        .massive_api_key
+        .clone()
+        .filter(|k| !k.is_empty())
+}
+
 /// Single, unified entry point for loading a chart's bars — used by every pane,
 /// every strategy, every timeframe. On each call it refreshes the (symbol,
 /// timeframe) history straight from Alpaca: this fills any gaps and pulls the
@@ -1131,16 +1217,33 @@ pub async fn load_chart_bars(
         None => return Ok(vec![]),
     };
 
-    // A timeframe Alpaca's REST bars don't serve (5s/10s) → return the live RAM
-    // series (built from trade ticks) without hitting the network.
+    // A timeframe Alpaca's REST bars don't serve at all (5s/10s) → Massive is the
+    // only possible source when it's the effective provider; otherwise fall back to
+    // the live RAM series (built from trade ticks) without hitting the network.
     if crate::alpaca::bars::alpaca_timeframe(tf).is_none() {
+        if !intraday_is_historical(&state) {
+            if let Some(key) = preferred_massive_bars_key(&state, tf) {
+                match crate::massive::bars::fetch_recent_bars(&key, &symbol, tf, 400).await {
+                    Ok(h) if !h.is_empty() => {
+                        state
+                            .market
+                            .write()
+                            .unwrap()
+                            .merge_history_bars(&symbol, tf, h);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[tagdash] massive recent bars {symbol} {timeframe} failed: {e}")
+                    }
+                }
+            }
+        }
         return Ok(state.market.read().unwrap().get_bars(&symbol, tf));
     }
 
-    // ── Intraday execution panes: resolved by SOURCE, not by data-source mode ──
-    // The on-demand 1-minute store answers whenever the series is historical — see
-    // `intraday_is_historical`. One rule covering flat files and API alike, which is
-    // the point: a replayed session must behave identically either way.
+    // ── Offline intraday panes ──
+    // The on-demand 1-minute store belongs to offline browsing. During an active
+    // replay the resolved DayData/RAM provider must remain authoritative.
     //
     // It goes first because it is the only source holding a full 04:00→20:00 session
     // for a name OUTSIDE the day's top-2000 — which every Panic Mean Reversion
@@ -1149,7 +1252,10 @@ pub async fn load_chart_bars(
     // synthesised from the DAILY bar (six prints across the whole session). One
     // download per (symbol, day) at 1-minute granularity then serves every intraday
     // timeframe from disk, `HISTORY_DAYS` sessions deep.
-    if intraday_is_historical(&state) && crate::flat_files::intraday::serves(tf) {
+    if intraday_is_historical(&state)
+        && !crate::replay::clock::is_active()
+        && crate::flat_files::intraday::serves(tf)
+    {
         if let Some(bars) = intraday_bars(&state, &symbol, tf).await {
             return Ok(bars);
         }
@@ -1201,6 +1307,44 @@ pub async fn load_chart_bars(
             if !bars.is_empty() || offline {
                 return Ok(bars);
             }
+        }
+    }
+
+    // Prefer Massive over Alpaca's free (IEX) plan, which only reflects IEX's own
+    // prints — see `preferred_massive_bars_key`. Never on Alpaca SIP (already the
+    // full tape, nothing to gain). A failed/empty Massive answer falls through to
+    // Alpaca below rather than turning into a blank chart.
+    if let Some(m_key) = preferred_massive_bars_key(&state, tf) {
+        match crate::massive::bars::fetch_recent_bars(&m_key, &symbol, tf, limit).await {
+            Ok(h) if !h.is_empty() => {
+                state
+                    .market
+                    .write()
+                    .unwrap()
+                    .merge_history_bars(&symbol, tf, h);
+                // Daily chart during premarket: seed the provisional premarket candle
+                // (see the Alpaca path below for the full rationale) from Massive
+                // instead of Alpaca — same fuller-than-IEX coverage as the rest of
+                // this module, so the premarket range on illiquid names is accurate.
+                if tf == Timeframe::Daily && crate::time::is_premarket(crate::time::now()) {
+                    match crate::massive::bars::fetch_premarket_daily_bar(&m_key, &symbol).await {
+                        Ok(Some(bar)) => state
+                            .market
+                            .write()
+                            .unwrap()
+                            .seed_premarket_daily(&symbol, bar),
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("[tagdash] massive premarket daily bar {symbol} failed: {e}")
+                        }
+                    }
+                }
+                return Ok(state.market.read().unwrap().get_bars(&symbol, tf));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[tagdash] massive recent bars {symbol} {timeframe} failed: {e} — repli Alpaca"
+            ),
         }
     }
 
@@ -1264,9 +1408,6 @@ pub async fn load_older_bars(
         Some(tf) => tf,
         None => return Ok(vec![]),
     };
-    if crate::alpaca::bars::alpaca_timeframe(tf).is_none() {
-        return Ok(vec![]);
-    }
 
     let limit = limit.clamp(1, 1000);
     let historical = intraday_is_historical(&state);
@@ -1290,6 +1431,84 @@ pub async fn load_older_bars(
         .ok()
         .map(|d| d.timestamp_millis());
 
+    // A replay chart must keep the same provider order as the replayed day itself.
+    // Previously this command always reached Alpaca first, so opening/scrolling a
+    // Massive replay could silently replace consolidated Massive bars with thin IEX
+    // history. Stop at the first non-empty source, exactly like replay::data.
+    if crate::replay::clock::is_active() && tf != Timeframe::Daily {
+        #[derive(Clone, Copy)]
+        enum HistoryStep {
+            Alpaca,
+            Massive,
+            Flat,
+        }
+        let provider = state.replay.status.read().unwrap().provider.clone();
+        let order: &[HistoryStep] = match provider.as_deref() {
+            Some("alpaca_sip") => &[HistoryStep::Alpaca, HistoryStep::Massive, HistoryStep::Flat],
+            Some("massive") => &[HistoryStep::Massive, HistoryStep::Flat, HistoryStep::Alpaca],
+            Some("alpaca_iex") => &[HistoryStep::Flat, HistoryStep::Alpaca],
+            _ => &[HistoryStep::Flat],
+        };
+        for step in order {
+            match step {
+                HistoryStep::Massive => {
+                    let key = state
+                        .secrets
+                        .read()
+                        .unwrap()
+                        .massive_api_key
+                        .clone()
+                        .filter(|k| !k.is_empty());
+                    if let Some(key) = key {
+                        match crate::massive::bars::fetch_bars_before(
+                            &key, &symbol, tf, &before, limit,
+                        )
+                        .await
+                        {
+                            Ok(bars) if !bars.is_empty() => return Ok(bars),
+                            Ok(_) => {}
+                            Err(e) => eprintln!(
+                                "[tagdash] replay Massive older bars {symbol} {timeframe} failed: {e}"
+                            ),
+                        }
+                    }
+                }
+                HistoryStep::Flat => {
+                    let bars = crate::flat_files::minute::read_symbol_bars(
+                        &state.app_dir,
+                        &symbol,
+                        tf,
+                        limit as usize,
+                        before_ms,
+                    );
+                    if !bars.is_empty() {
+                        return Ok(bars);
+                    }
+                }
+                HistoryStep::Alpaca => {
+                    let credentials = {
+                        let s = state.secrets.read().unwrap();
+                        s.alpaca_key.clone().zip(s.alpaca_secret.clone())
+                    };
+                    if let Some((key, secret)) = credentials {
+                        match crate::alpaca::bars::fetch_bars_before(
+                            &key, &secret, &symbol, tf, &before, limit,
+                        )
+                        .await
+                        {
+                            Ok(bars) if !bars.is_empty() => return Ok(bars),
+                            Ok(_) => {}
+                            Err(e) => eprintln!(
+                                "[tagdash] replay Alpaca older bars {symbol} {timeframe} failed: {e}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(vec![]);
+    }
+
     // ── Intraday back-fill: every source that could hold older bars, in order of
     // fidelity, stopping at the first non-empty answer. Resolved by SOURCE, never by
     // data-source mode — zooming out fills the same way online and offline.
@@ -1300,7 +1519,11 @@ pub async fn load_older_bars(
     // command went straight to the minute flat files, which snapshot only the day's
     // top-2000 symbols, so a screener candidate got an empty FIRST batch and could
     // never be zoomed out again. The on-demand store now answers first.
-    if tf != Timeframe::Daily && historical && crate::flat_files::intraday::serves(tf) {
+    if tf != Timeframe::Daily
+        && historical
+        && !crate::replay::clock::is_active()
+        && crate::flat_files::intraday::serves(tf)
+    {
         let day = crate::time::et_date(crate::time::now());
         let days = intraday_history_days(&state, &day);
         let app_dir = state.app_dir.clone();
@@ -1321,35 +1544,59 @@ pub async fn load_older_bars(
         }
     }
 
-    // Alpaca REST. Already clamped to the simulated instant while a replay is running
-    // (`alpaca::bars::effective_end`), so reaching for it here cannot leak the future
-    // — which is what lets the same path serve replay and live alike.
-    let (key, secret) = {
-        let s = state.secrets.read().unwrap();
-        (s.alpaca_key.clone(), s.alpaca_secret.clone())
-    };
-    if let (Some(key), Some(secret)) = (key, secret) {
-        if !key.is_empty() && !secret.is_empty() {
-            match crate::alpaca::bars::fetch_bars_before(&key, &secret, &symbol, tf, &before, limit)
-                .await
-            {
+    // Prefer Massive when it fills a real gap: always for 5s/10s (Alpaca never
+    // serves them at all), or for 1min+/daily when Alpaca is on the free IEX plan
+    // (whose bars only reflect IEX's own thin slice of volume) — see
+    // `preferred_massive_bars_key`. Never during replay/offline (`historical`).
+    if !historical {
+        if let Some(key) = preferred_massive_bars_key(&state, tf) {
+            match crate::massive::bars::fetch_bars_before(&key, &symbol, tf, &before, limit).await {
                 Ok(bars) if !bars.is_empty() => return Ok(bars),
                 Ok(_) => {}
-                Err(e) => eprintln!("[tagdash] load_older_bars {symbol} {timeframe} failed: {e}"),
+                Err(e) => {
+                    eprintln!("[tagdash] massive older bars {symbol} {timeframe} failed: {e}")
+                }
             }
         }
     }
 
-    // Last resort: the day's minute flat files (top-2000 only, so this is a bonus for
-    // the liquid names rather than a source to rely on).
-    if tf != Timeframe::Daily {
-        return Ok(crate::flat_files::minute::read_symbol_bars(
-            &state.app_dir,
-            &symbol,
-            tf,
-            limit as usize,
-            before_ms,
-        ));
+    // Alpaca REST. Already clamped to the simulated instant while a replay is running
+    // (`alpaca::bars::effective_end`), so reaching for it here cannot leak the future
+    // — which is what lets the same path serve replay and live alike. Sub-minute
+    // timeframes (5s/10s) never reach this: Alpaca's REST bars don't serve them.
+    if crate::alpaca::bars::alpaca_timeframe(tf).is_some() {
+        let (key, secret) = {
+            let s = state.secrets.read().unwrap();
+            (s.alpaca_key.clone(), s.alpaca_secret.clone())
+        };
+        if let (Some(key), Some(secret)) = (key, secret) {
+            if !key.is_empty() && !secret.is_empty() {
+                match crate::alpaca::bars::fetch_bars_before(
+                    &key, &secret, &symbol, tf, &before, limit,
+                )
+                .await
+                {
+                    Ok(bars) if !bars.is_empty() => return Ok(bars),
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[tagdash] load_older_bars {symbol} {timeframe} failed: {e}")
+                    }
+                }
+            }
+        }
+
+        // Last resort: the day's minute flat files (top-2000 only, so this is a bonus
+        // for the liquid names rather than a source to rely on). Never built for
+        // sub-minute granularity, hence guarded behind `alpaca_timeframe(tf).is_some()`.
+        if tf != Timeframe::Daily {
+            return Ok(crate::flat_files::minute::read_symbol_bars(
+                &state.app_dir,
+                &symbol,
+                tf,
+                limit as usize,
+                before_ms,
+            ));
+        }
     }
     Ok(vec![])
 }
@@ -1568,6 +1815,70 @@ pub fn set_strategy_risk(
     cache_repository::set_app_meta(&db, "strategy_risk_overrides", &json).map_err(|e| e.to_string())
 }
 
+/// Send a test push to the configured ntfy topic, at the same maximum priority a
+/// real alert uses.
+///
+/// Exists because every other failure mode here is silent: a typo in the topic, a
+/// revoked token or a self-hosted server that is down all look exactly like "no
+/// alerts fired this morning". The error text is the server's own, so a 403 says 403.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn test_ntfy(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let cfg = {
+        let s = state.secrets.read().unwrap();
+        crate::ntfy::NtfyConfig::from_secrets(&s)
+    }
+    .ok_or_else(|| "Aucun topic ntfy configuré (Réglages → API Keys).".to_string())?;
+    crate::ntfy::publish(
+        &cfg,
+        "🚀 TagDash — test",
+        "Si ton téléphone sonne et vibre, le pipeline ntfy est opérationnel.",
+        vec!["rotating_light"],
+    )
+    .await
+}
+
+/// Micro Pullback's own options. Strategy-specific rather than a generic
+/// per-strategy channel — see `crate::micro_pullback::options` for why.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_micro_pullback_options(
+    state: tauri::State<'_, AppState>,
+) -> crate::micro_pullback::MicroPullbackOptions {
+    *state.micro_pullback_options.read().unwrap()
+}
+
+/// Replace Micro Pullback's options. Persisted in `app_meta`; the engine re-reads
+/// the struct every tick, so a change lands on the next second without a restart.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_micro_pullback_options(
+    options: crate::micro_pullback::MicroPullbackOptions,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Sanitise before storing, not after reading: the value the engine sees and the
+    // value the UI reads back are then the same one.
+    let clean = options.sanitized();
+    {
+        let db = state.db.lock().unwrap();
+        clean.save(&db)?;
+    }
+    // Publish to the live engine only after persistence succeeded; otherwise the UI
+    // receives an error while the scanner silently runs settings that will vanish on
+    // restart.
+    *state.micro_pullback_options.write().unwrap() = clean;
+    Ok(())
+}
+
+/// Live Top 10 per Micro Pullback tempo, including dominance and directional
+/// diagnostics. Read-only and cheap: the engine replaces one RAM vector every 10s.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_micro_pullback_attention(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::types::MicroAttentionEntry>, String> {
+    let rows = state.micro_attention.clone();
+    tokio::task::spawn_blocking(move || rows.read().unwrap().clone())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Identity card per strategy (keyed by strategy id). Static metadata used by
 /// the UI to lay out panes/indicators and the info band when an alert lands.
 #[tauri::command(rename_all = "snake_case")]
@@ -1663,12 +1974,17 @@ pub fn get_alert_enrichment(
 /// Returns immediately; progress is polled through `get_panic_llm_run`. Never
 /// automatic — this command is the only thing that starts a run.
 #[tauri::command(rename_all = "snake_case")]
-pub fn run_panic_llm_analysis(symbols: Vec<String>, state: tauri::State<'_, AppState>) {
+pub fn run_panic_llm_analysis(
+    symbols: Vec<String>,
+    dismissed: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) {
     if state.panic_run.read().unwrap().running {
         return;
     }
     tauri::async_runtime::spawn(crate::panic_llm::run(
         symbols,
+        dismissed,
         state.db.clone(),
         state.secrets.clone(),
         state.market.clone(),
@@ -1695,6 +2011,31 @@ pub fn get_panic_llm_scores(
     let simulated = crate::replay::clock::is_active();
     let conn = state.db.lock().unwrap();
     crate::local_db::panic_llm_repository::get_for_day(&conn, &day, simulated).unwrap_or_default()
+}
+
+/// Micro Pullback's A+ judgements for the CURRENT app-clock day and mode, plus what
+/// the qualification layer is doing right now.
+///
+/// Day- and mode-scoped exactly like `get_panic_llm_scores`, so a replay's verdicts
+/// never surface in live mode. The live half is merged in rather than served from a
+/// second command: the overlay needs "score, and is it still moving?" as ONE answer —
+/// polled separately the two would disagree for a poll interval and the pane would
+/// flicker between a stale score and a spinner.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_micro_quality_scores(
+    state: tauri::State<'_, AppState>,
+) -> crate::micro_pullback::quality::QualityBoard {
+    let day = crate::time::et_date(crate::time::now());
+    let simulated = crate::replay::clock::is_active();
+    let rows = {
+        let conn = state.db.lock().unwrap();
+        crate::local_db::quality_repository::get_for_day(&conn, &day, simulated)
+            .unwrap_or_default()
+    };
+    crate::micro_pullback::quality::QualityBoard {
+        rows,
+        live: crate::micro_pullback::live_status::snapshot(),
+    }
 }
 
 /// Whether a web-search provider is configured — the button uses this to explain that
@@ -1887,6 +2228,14 @@ pub struct CardInfo {
     /// Today's premarket cumulative volume (04:00–09:30 ET), summed from the live
     /// 1-minute ring buffer. None when no premarket bars are on file.
     pub premarket_volume: Option<i64>,
+    /// Cumulative volume since 04:00 ET today (premarket + regular + any
+    /// after-hours so far), summed from the live 1-minute ring buffer. Backs the
+    /// chart top bar's single "Vol" chip. None when no bars are on file yet.
+    pub volume_since_4am: Option<i64>,
+    /// Relative volume: today's cumulative volume (`TickerLiveState::volume_day`)
+    /// over the symbol's average daily volume (universe table). Same formula as
+    /// the scanner's `StrategyContext::rvol`. None until the average is cached.
+    pub rvol: Option<f64>,
     /// Whether a live news headline is on file for the symbol (Alpaca news feed).
     pub has_news: bool,
     /// The most recent live headline text, if any (for the common "News" chip).
@@ -1941,11 +2290,14 @@ pub async fn get_card_info(
             None => (None, None, None),
         };
 
-        let daily = cache_repository::get_daily_bars(&db, &symbol, 30).unwrap_or_default();
+        let daily = cache_repository::get_daily_bars_before(&db, &symbol, &score_day, 30)
+            .unwrap_or_default();
+        let avg_volume_asof =
+            cache_repository::avg_volume_before(&db, &symbol, 20, &score_day).unwrap_or(None);
         let closes_asc: Vec<f64> = daily.iter().rev().filter_map(|b| b.close).collect();
         drop(db);
 
-        let (bbz, premarket_volume, news_title, live_volume) = {
+        let (bbz, premarket_volume, volume_since_4am, rvol, news_title, live_volume) = {
             let market = market_arc.read().unwrap();
             let price = market
                 .last_price(&symbol)
@@ -1954,9 +2306,15 @@ pub async fn get_card_info(
 
             let now = crate::time::now();
             let today = crate::time::et_date(now);
+            let now_mins = crate::time::et_minutes(now);
             let m1 = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
             let mut pm_sum: i64 = 0;
             let mut pm_any = false;
+            // Cumulative volume since 04:00 ET today — same premarket sum widened
+            // to run through "now" instead of stopping at the 09:30 open, so it
+            // reads as one running total across premarket + regular + after-hours.
+            let mut since_4am_sum: i64 = 0;
+            let mut since_4am_any = false;
             for b in &m1 {
                 if crate::time::et_date(b.time) != today {
                     continue;
@@ -1966,11 +2324,34 @@ pub async fn get_card_info(
                     pm_sum += b.volume as i64;
                     pm_any = true;
                 }
+                if mins >= 240 && mins <= now_mins {
+                    since_4am_sum += b.volume as i64;
+                    since_4am_any = true;
+                }
             }
             let premarket_volume = if pm_any { Some(pm_sum) } else { None };
+            let volume_since_4am = if since_4am_any {
+                Some(since_4am_sum)
+            } else {
+                None
+            };
+            // Same formula as the scanner's live rvol (StrategyContext::rvol):
+            // today's cumulative volume over the symbol's average daily volume.
+            let volume_day = market.tickers.get(&symbol).map(|t| t.volume_day);
+            let rvol = match (volume_day, avg_volume_asof) {
+                (Some(v), Some(avg)) if avg > 0 => Some(v as f64 / avg as f64),
+                _ => None,
+            };
             let news_title = market.latest_news(&symbol).map(|h| h.headline);
             let live_volume = market.volume_in_last(&symbol, 60, now);
-            (bbz, premarket_volume, news_title, live_volume)
+            (
+                bbz,
+                premarket_volume,
+                volume_since_4am,
+                rvol,
+                news_title,
+                live_volume,
+            )
         };
 
         CardInfo {
@@ -1983,6 +2364,8 @@ pub async fn get_card_info(
             country: meta.as_ref().and_then(|m| m.country.clone()),
             bbz,
             premarket_volume,
+            volume_since_4am,
+            rvol,
             has_news: news_title.is_some(),
             news_title,
             short_interest_score: risk.short_interest_score,
@@ -3330,6 +3713,7 @@ pub async fn replay_start(
         secrets: state.secrets.clone(),
         internal_book: state.internal_book.clone(),
         broker_mirror: state.broker.mirror.clone(),
+        strategy_enabled: state.strategy_enabled.clone(),
         chart: state.chart.clone(),
         live_feed_running: state.live_feed_running.clone(),
         news_feed_running: state.news_feed_running.clone(),
@@ -3579,8 +3963,8 @@ pub async fn sync_tradetally_trades(state: tauri::State<'_, AppState>) -> Result
         return Err("TradeTally token not set".into());
     }
 
-    let client = tradetally::TtClient::new(base_url, token)
-        .with_session_creds(tt_email, tt_password);
+    let client =
+        tradetally::TtClient::new(base_url, token).with_session_creds(tt_email, tt_password);
 
     // Network fetch happens with no DB lock held.
     let trades = crate::dashboard::sync_trades(&client).await?;

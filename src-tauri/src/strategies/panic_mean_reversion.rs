@@ -26,7 +26,7 @@ use std::time::Duration;
 use crate::strategies::{ScanStrategy, StrategyKind};
 use crate::types::{
     AlertSignal, IndicatorKind, InfoField, InfoSource, LlmSpec, PaneIndicator, PaneSpec, Session,
-    StrategyCard, StrategyContext, StrategyRiskConfig, UniverseKey,
+    StrategyCard, StrategyContext, StrategyRiskConfig, StreamingScope, UniverseKey,
 };
 
 /// Stable strategy id (shared with the scanner's screener-building block).
@@ -51,7 +51,7 @@ impl ScanStrategy for PanicMeanReversion {
     }
 
     fn name(&self) -> &'static str {
-        "Panic Mean Reversion"
+        "Panic"
     }
 
     fn enabled(&self) -> bool {
@@ -84,6 +84,10 @@ impl ScanStrategy for PanicMeanReversion {
     fn card(&self) -> StrategyCard {
         StrategyCard {
             universe: UniverseKey::UsStocks,
+            // capped_watch_list (alpaca::stream) already spends its 3rd tier on this
+            // strategy's daily watchlist unconditionally — this documents that fact
+            // rather than changing behaviour.
+            streaming_scope: StreamingScope::Watchlist,
             panes: vec![
                 // Left — daily context with Bollinger bands.
                 PaneSpec {

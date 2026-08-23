@@ -4,42 +4,19 @@
 // ChartZone focused on orchestration.
 
 import { useEffect, useState } from "react";
-import { Ban, LoaderCircle, Sparkles } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import type { RefObject } from "react";
+import { Ban, ChevronRight, LoaderCircle } from "lucide-react";
 import type {
   AlertEnrichment, CardInfo, CardNews, HodDriveOverlay, InfoField, StrategyCard,
+  MicroQualityLive, MicroQualityRow,
   PanicDataQuality, PanicLlmScore, TickerLiveState, Timeframe, ZoneAssignment,
 } from "@/types";
-import { cn } from "@/lib/utils";
 import { api } from "@/lib/tauri";
-
-/** Whether `symbol` may be sold short, per the broker. `null` while unknown.
- *
- *  Cached per symbol for the lifetime of the module: the answer comes from the
- *  venue's asset list and changes at most a few times a day, so re-asking on every
- *  chart mount would spend a request per zone per render for a near-constant. */
-const shortabilityCache = new Map<string, boolean>();
-
-function useShortability(symbol: string | null | undefined): boolean | null {
-  const [ok, setOk] = useState<boolean | null>(
-    symbol ? shortabilityCache.get(symbol) ?? null : null,
-  );
-  useEffect(() => {
-    if (!symbol) { setOk(null); return; }
-    const cached = shortabilityCache.get(symbol);
-    if (cached !== undefined) { setOk(cached); return; }
-    let alive = true;
-    api.getShortability(symbol)
-      .then((s) => {
-        shortabilityCache.set(symbol, s.shortable);
-        if (alive) setOk(s.shortable);
-      })
-      // Unknown stays unknown: a failed lookup must not render as "non shortable"
-      // and talk the user out of a valid trade.
-      .catch(() => alive && setOk(null));
-    return () => { alive = false; };
-  }, [symbol]);
-  return ok;
-}
+import { cn } from "@/lib/utils";
+import { useShortability } from "@/queries/useShortability";
+import { getCountryMeta } from "@/lib/countries";
+import { isHotIndustry, HOT_INDUSTRY_BADGE_CLASS } from "@/lib/industryCategories";
 
 // ─── Priority colours ─────────────────────────────────────────────────────────
 
@@ -190,10 +167,12 @@ export function StrategyBadge({
 // ─── Common chart info bar (identical across strategies) ──────────────────────
 
 /** Compact "label + value" cell for the common info bar. */
-function BarChip({ label, children }: { label: string; children: React.ReactNode }) {
+function BarChip({ label, children }: { label?: string; children: React.ReactNode }) {
   return (
     <span className="flex shrink-0 items-center gap-1">
-      <span className="text-[8px] uppercase tracking-wide text-muted-foreground/45">{label}</span>
+      {label && (
+        <span className="text-[8px] uppercase tracking-wide text-muted-foreground/45">{label}</span>
+      )}
       <span className="flex items-center gap-0.5 text-[11px] tabular-nums text-foreground/85">
         {children}
       </span>
@@ -201,145 +180,128 @@ function BarChip({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
-/** The shared info bar shown above every chart, identical for all strategies:
- *  strategy badge · Bollinger Z · premarket volume · current-bar volume · news
- *  presence · IA news-analysis button · context/verdict. Strategy-specific fields
- *  live in the on-chart overlay (StrategyInfoOverlay), not here. */
+/** The shared info bar shown above every chart, identical for all strategies and
+ *  merged onto the same line as the ticker/toolbar header: strategy badge ·
+ *  country · industry · float · gap · rvol · volume since 04:00 ET. Strategy-
+ *  specific fields live in the on-chart overlay (StrategyInfoOverlay), not here.
+ *  `bandRef` is forwarded from ChartZone so its screenshot capture can rasterize
+ *  just this segment (not the ticker/toolbar around it). */
 export function ChartInfoBar({
+  bandRef,
   zone,
-  card,
   cardInfo,
   enrichment,
-  dayVolume,
-  currentBarVolume,
-  onRunLlm,
+  live,
 }: {
+  bandRef: RefObject<HTMLDivElement>;
   zone: ZoneAssignment;
-  card: StrategyCard | null;
   cardInfo: CardInfo | null;
   enrichment: AlertEnrichment | null;
-  dayVolume: number | null;
-  currentBarVolume: number | null;
-  onRunLlm: () => void;
+  live: TickerLiveState | null;
 }) {
-  // Shortability, straight from the venue's asset list. Shown ONLY when the answer
-  // is "no": a badge on every long-only name would be noise, whereas the one case
-  // that matters is discovering mid-setup that the short cannot be sent.
-  const shortable = useShortability(zone.symbol);
+  // Broker-labelled by design: ETB/HTB criteria are venue-specific and must never
+  // look like a universal property of the ticker.
+  const shortability = useShortability(zone.symbol);
+  const shortabilityBroker = shortability?.broker === "tagdash" ? "TagDash" : "Alpaca";
 
-  const bbz = cardInfo?.bbz ?? null;
-  // BBZ colours by stretch: amber past ±2σ, red past ±3σ.
-  const bbzCls = bbz == null ? "" : Math.abs(bbz) >= 3
-    ? "text-red-400" : Math.abs(bbz) >= 2 ? "text-amber-400" : "text-foreground/85";
+  // Enrichment (per-alert pipeline) wins over the polled card-info extras once it
+  // lands — same precedence as the on-chart overlay's resolveFieldValue.
+  const country = getCountryMeta(enrichment?.country ?? cardInfo?.country ?? null);
+  const industry = enrichment?.industry ?? cardInfo?.industry ?? null;
+  const floatShares = enrichment?.float_shares ?? cardInfo?.float_shares ?? null;
 
-  const newsTitle = cardInfo?.news_title ?? enrichment?.news_title ?? null;
-  const newsChecked = enrichment?.news_checked ?? false;
+  const gapPct = live?.change_day_pct ?? null;
+  const gapCls = gapPct == null ? "" : gapPct >= 0 ? "text-emerald-400" : "text-red-400";
 
-  // LLM context/verdict, sourced uniformly across strategies (panic: context /
-  // reversion; micro: dilution / news bluff). Button shown when the strategy
-  // declares an LLM call.
-  const hasLlm  = !!card?.llm;
-  const pending = enrichment?.llm_pending ?? false;
-  const context = enrichment ? (enrichment.llm_context  ?? enrichment.llm_dilution) : null;
-  const verdict = enrichment ? (enrichment.llm_reversion ?? enrichment.llm_news)    : null;
-  const hasResult = context != null || verdict != null;
+  const rvol = cardInfo?.rvol ?? null;
+  const volSince4am = cardInfo?.volume_since_4am ?? null;
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 px-2 pt-1">
+    <div ref={bandRef} className="flex shrink-0 items-center gap-x-3">
       <StrategyBadge strategyId={zone.strategy_id} name={zone.strategy_name} />
 
-      {shortable === false && (
-        <span
-          title="Alpaca ne prête pas ce titre — un ordre short serait refusé"
-          className="flex items-center gap-1 rounded border border-red-600/50 bg-red-950/40 px-1.5 py-0.5 text-[10px] font-medium text-red-300"
-        >
-          <Ban className="h-3 w-3" /> Non shortable
+      {/* Country of origin — flag only; the name (EN/FR) is a hover tooltip. */}
+      {country && (
+        <span title={`${country.en} / ${country.fr}`} className="shrink-0 text-sm leading-none">
+          {country.flag}
         </span>
       )}
 
-      {/* Bollinger Z of the live price (daily basis) */}
-      <BarChip label="BBZ">
-        {bbz != null
-          ? <span className={bbzCls}>{bbz >= 0 ? "+" : ""}{bbz.toFixed(2)}σ</span>
-          : <span className="text-muted-foreground/30">—</span>}
-      </BarChip>
-
-      {/* Premarket cumulative volume */}
-      <BarChip label="Vol PM">
-        {cardInfo?.premarket_volume != null
-          ? fmtCompact(cardInfo.premarket_volume)
-          : <span className="text-muted-foreground/30">—</span>}
-      </BarChip>
-
-      {/* Cumulative volume traded so far today — live */}
-      <BarChip label="Vol Day">
-        {dayVolume != null
-          ? fmtCompact(dayVolume)
-          : <span className="text-muted-foreground/30">—</span>}
-      </BarChip>
-
-      {/* Current (forming) bar volume — live */}
-      <BarChip label="Vol barre">
-        {currentBarVolume != null
-          ? fmtCompact(currentBarVolume)
-          : <span className="text-muted-foreground/30">—</span>}
-      </BarChip>
-
-      {/* News presence */}
-      <BarChip label="News">
-        {newsTitle ? (
-          <span className="max-w-[220px] truncate" title={newsTitle}>{newsTitle}</span>
-        ) : newsChecked ? (
-          <span className="rounded bg-red-900/60 px-1 py-0.5 text-[9px] font-semibold text-red-300">
-            aucune
-          </span>
-        ) : cardInfo?.has_news === false ? (
-          <span className="text-muted-foreground/40">aucune</span>
+      <BarChip>
+        {industry ? (
+          isHotIndustry(industry) ? (
+            <span
+              title={industry}
+              className={cn("max-w-[150px] truncate rounded px-1 py-0.5", HOT_INDUSTRY_BADGE_CLASS)}
+            >
+              {industry}
+            </span>
+          ) : (
+            <span className="max-w-[150px] truncate" title={industry}>{industry}</span>
+          )
         ) : (
           <span className="text-muted-foreground/30">—</span>
         )}
       </BarChip>
 
-      {/* IA news-analysis button + context/verdict (strategies with an LLM) */}
-      {hasLlm && (
-        <>
-          <button
-            type="button"
-            onClick={onRunLlm}
-            disabled={pending}
-            title="Analyser les news et le contexte (IA)"
-            className={cn(
-              "flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-semibold",
-              "bg-blue-900/50 text-blue-200 hover:bg-blue-800/60 disabled:opacity-50",
-            )}
-          >
-            {pending ? (
-              <LoaderCircle className="h-2.5 w-2.5 animate-spin" />
-            ) : (
-              <Sparkles className="h-2.5 w-2.5" />
-            )}
-            {hasResult ? "Réanalyser" : "Analyse IA"}
-          </button>
-          {(context || pending) && (
-            <BarChip label="Contexte">
-              <span className="max-w-[260px] truncate" title={context ?? undefined}>
-                {context ?? <LoaderCircle className="h-2.5 w-2.5 animate-spin text-blue-400/70" />}
-              </span>
-            </BarChip>
-          )}
-          {(verdict || pending) && (
-            <BarChip label="Verdict">
-              <span className="max-w-[260px] truncate" title={verdict ?? undefined}>
-                {verdict ?? <LoaderCircle className="h-2.5 w-2.5 animate-spin text-blue-400/70" />}
-              </span>
-            </BarChip>
-          )}
-        </>
-      )}
+      <BarChip label="Float">
+        {floatShares != null
+          ? fmtCompact(floatShares)
+          : <span className="text-muted-foreground/30">—</span>}
+      </BarChip>
 
-      {zone.price != null && (
-        <span className="ml-auto shrink-0 text-xs font-medium tabular-nums">
-          ${zone.price.toFixed(2)}
+      {/* Premarket gap vs previous close, still updating live post-open. */}
+      <BarChip label="Gap">
+        {gapPct != null
+          ? <span className={gapCls}>{gapPct >= 0 ? "+" : ""}{gapPct.toFixed(1)}%</span>
+          : <span className="text-muted-foreground/30">—</span>}
+      </BarChip>
+
+      {/* This legacy figure is cumulative day volume / ADV20, not a tempo- or
+          time-of-day RVOL. Name it honestly; Micro Pullback's real tempo RVOL is
+          shown in its own ranking panel and alert reason. */}
+      <BarChip label="Vol/ADV">
+        {rvol != null
+          ? `${rvol.toFixed(1)}×`
+          : <span className="text-muted-foreground/30">—</span>}
+      </BarChip>
+
+      {/* Cumulative volume since 04:00 ET (premarket included). */}
+      <BarChip label="Vol">
+        {volSince4am != null
+          ? fmtCompact(volSince4am)
+          : <span className="text-muted-foreground/30">—</span>}
+      </BarChip>
+
+      {shortability && (
+        <span
+          title={
+            shortability.from_cache
+              ? `Statut ${shortabilityBroker} en cache — disponibilité borrow non confirmée en temps réel`
+              : shortability.borrow_status === "easy_to_borrow"
+                ? `${shortabilityBroker} · Easy-to-Borrow — aucun locate requis`
+                : shortability.borrow_status === "hard_to_borrow"
+                  ? `${shortabilityBroker} · Hard-to-Borrow — locate requis avant le short`
+                  : shortability.borrow_status === "unavailable"
+                    ? `${shortabilityBroker} ne permet pas de shorter ce titre`
+                    : `Statut borrow ${shortabilityBroker} inconnu`
+          }
+          className={cn(
+            "flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium",
+            shortability.borrow_status === "easy_to_borrow"
+              ? "border-emerald-700/50 bg-emerald-950/30 text-emerald-300"
+              : shortability.borrow_status === "hard_to_borrow"
+                ? "border-amber-600/50 bg-amber-950/35 text-amber-300"
+                : shortability.borrow_status === "unavailable"
+                  ? "border-red-600/50 bg-red-950/40 text-red-300"
+                  : "border-zinc-600/50 bg-zinc-900/50 text-zinc-400",
+          )}
+        >
+          {shortability.borrow_status === "unavailable" && <Ban className="h-3 w-3" />}
+          {shortabilityBroker} · {shortability.borrow_status === "easy_to_borrow" ? "ETB"
+            : shortability.borrow_status === "hard_to_borrow" ? "HTB"
+            : shortability.borrow_status === "unavailable" ? "non shortable" : "borrow ?"}
+          {shortability.from_cache && " · cache"}
         </span>
       )}
     </div>
@@ -433,9 +395,8 @@ function bandLabel(score: number): string {
  *  deserves less weight than one built on SIP plus a filing, and the only honest way
  *  to convey that is to show it. */
 export function PanicReportOverlay({ score }: { score: PanicLlmScore | null }) {
-  if (!score || score.panic_score == null) return null;
-  const s = score.panic_score;
-  const tone = reportTone(s);
+  const [expanded, setExpanded] = useState(false);
+  if (!score) return null;
 
   const quality: PanicDataQuality = (() => {
     if (!score.data_quality) return {};
@@ -446,6 +407,44 @@ export function PanicReportOverlay({ score }: { score: PanicLlmScore | null }) {
     }
   })();
 
+  // Analysed, but no score could be established. Reported rather than hidden: an
+  // empty pane is indistinguishable from "never analysed", and the difference decides
+  // whether the trader should look for the context by hand.
+  if (score.panic_score == null) {
+    return (
+      <div
+        data-capture-overlay
+        className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex max-w-[47%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
+      >
+        <div className="flex items-baseline gap-2">
+          <span className="rounded px-2 py-0.5 text-[22px] font-bold leading-none text-slate-300 ring-1 ring-slate-500/40">
+            N/A
+          </span>
+          <span className="text-[11px] font-medium leading-tight text-slate-300">
+            non établi — classé en bas
+          </span>
+        </div>
+        {score.one_liner && (
+          <p className="text-[11px] leading-snug text-foreground/90">
+            {score.one_liner}
+          </p>
+        )}
+        <span className="text-[8px] leading-tight text-muted-foreground/50">
+          {[
+            quality.feed ? `feed ${quality.feed.toUpperCase()}` : null,
+            score.simulated ? "replay (sans web)" : null,
+            "relancer le bouton retente ce ticker",
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </span>
+      </div>
+    );
+  }
+
+  const s = score.panic_score;
+  const tone = reportTone(s);
+
   const provenance = [
     quality.feed ? `feed ${quality.feed.toUpperCase()}` : null,
     score.simulated ? "replay (sans web)" : null,
@@ -455,11 +454,18 @@ export function PanicReportOverlay({ score }: { score: PanicLlmScore | null }) {
     score.rubric_version ?? null,
   ].filter(Boolean) as string[];
 
+  const hasComplementary =
+    score.trade_direction != null || score.eligibility != null || score.timing_state != null
+    || score.key_drivers.length > 0 || score.forced_flow != null || score.euphoria != null
+    || provenance.length > 0 || score.adjustment_reason != null;
+
   return (
     <div
       data-capture-overlay
-      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex max-w-[78%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex max-w-[47%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
     >
+      {/* ── Essentials ── */}
+
       {/* 1 — the verdict */}
       <div className="flex items-baseline gap-2">
         <span
@@ -471,24 +477,14 @@ export function PanicReportOverlay({ score }: { score: PanicLlmScore | null }) {
         >
           {s.toFixed(0)}
         </span>
-        <div className="flex flex-col">
-          <span className="text-[9px] uppercase leading-none tracking-wide text-muted-foreground/60">
-            Panic score
-          </span>
-          <span className={cn("text-[11px] font-medium leading-tight", tone.text)}>
-            {bandLabel(s)}
-          </span>
-        </div>
-        {score.reversibility && (
-          <span className="ml-1 self-center rounded bg-white/10 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-foreground/80">
-            retour {score.reversibility}
-          </span>
-        )}
+        <span className={cn("text-[11px] font-medium leading-tight", tone.text)}>
+          {bandLabel(s)}
+        </span>
       </div>
 
       {/* 2 — why */}
       {score.one_liner && (
-        <p className="max-w-[52ch] text-[11px] leading-snug text-foreground/90">
+        <p className="text-[11px] leading-snug text-foreground/90">
           {score.one_liner}
         </p>
       )}
@@ -499,55 +495,72 @@ export function PanicReportOverlay({ score }: { score: PanicLlmScore | null }) {
         <ReportStat label="Confiance" value={score.confidence_score} suffix="/100" />
         <ReportStat label="Normalisation" value={score.normalization_prob} suffix="%" />
         <ReportStat label="Classement" value={score.ranking_score} suffix="/100" />
-        {score.catalyst_label && (
-          <span className="text-foreground/70">{score.catalyst_label}</span>
-        )}
       </div>
 
-      {(score.trade_direction || score.eligibility || score.timing_state) && (
-        <div className="flex flex-wrap gap-1 text-[9px] font-semibold uppercase">
-          {score.trade_direction && <span>{score.trade_direction}</span>}
-          {score.eligibility && <span>· {score.eligibility}</span>}
-          {score.timing_state && <span>· phase {score.timing_state}</span>}
-          {score.fundamental_veto && score.veto_reason && (
-            <span className="normal-case text-red-300">· veto : {score.veto_reason}</span>
+      {/* ── Toggle → complementary info ── */}
+      {hasComplementary && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="pointer-events-auto flex items-center gap-1 self-start text-[9px] uppercase tracking-wide text-muted-foreground/60 hover:text-foreground/80"
+        >
+          <ChevronRight className={cn("h-2.5 w-2.5 transition-transform", expanded && "rotate-90")} />
+          {expanded ? "moins" : "plus"}
+        </button>
+      )}
+
+      {expanded && (
+        <div className="flex flex-col gap-1 border-t border-white/10 pt-1">
+          {score.catalyst_label && (
+            <span className="text-[10px] text-foreground/70">{score.catalyst_label}</span>
+          )}
+
+          {(score.trade_direction || score.eligibility || score.timing_state) && (
+            <div className="flex flex-wrap gap-1 text-[9px] font-semibold uppercase">
+              {score.trade_direction && <span>{score.trade_direction}</span>}
+              {score.eligibility && <span>· {score.eligibility}</span>}
+              {score.timing_state && <span>· phase {score.timing_state}</span>}
+              {score.fundamental_veto && score.veto_reason && (
+                <span className="normal-case text-red-300">· veto : {score.veto_reason}</span>
+              )}
+            </div>
+          )}
+
+          {/* the evidence */}
+          {score.key_drivers.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {score.key_drivers.map((d) => (
+                <span
+                  key={d}
+                  className="rounded bg-white/10 px-1.5 py-0.5 text-[9px] leading-none text-foreground/80"
+                >
+                  {d}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Forced flow / euphoria — the strategy's two behavioural reads. */}
+          {(score.forced_flow || score.euphoria) && (
+            <div className="flex flex-col gap-0.5 text-[10px] leading-snug text-muted-foreground">
+              {score.forced_flow && <span>⇉ {score.forced_flow}</span>}
+              {score.euphoria && <span>◎ {score.euphoria}</span>}
+            </div>
+          )}
+
+          {/* provenance, plus any calibration note so an adjusted score is never
+              silently different from what the model first said. */}
+          {provenance.length > 0 && (
+            <span className="text-[8px] leading-tight text-muted-foreground/50">
+              {provenance.join(" · ")}
+            </span>
+          )}
+          {score.adjustment_reason && score.panic_score_raw != null && (
+            <span className="text-[8px] leading-tight text-amber-300/60">
+              calibré {score.panic_score_raw.toFixed(0)} → {s.toFixed(0)} · {score.adjustment_reason}
+            </span>
           )}
         </div>
-      )}
-
-      {/* 4 — the evidence */}
-      {score.key_drivers.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {score.key_drivers.map((d) => (
-            <span
-              key={d}
-              className="rounded bg-white/10 px-1.5 py-0.5 text-[9px] leading-none text-foreground/80"
-            >
-              {d}
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Forced flow / euphoria — the strategy's two behavioural reads. */}
-      {(score.forced_flow || score.euphoria) && (
-        <div className="flex flex-col gap-0.5 text-[10px] leading-snug text-muted-foreground">
-          {score.forced_flow && <span>⇉ {score.forced_flow}</span>}
-          {score.euphoria && <span>◎ {score.euphoria}</span>}
-        </div>
-      )}
-
-      {/* 5 — provenance, plus any calibration note so an adjusted score is never
-              silently different from what the model first said. */}
-      {provenance.length > 0 && (
-        <span className="text-[8px] leading-tight text-muted-foreground/50">
-          {provenance.join(" · ")}
-        </span>
-      )}
-      {score.adjustment_reason && score.panic_score_raw != null && (
-        <span className="text-[8px] leading-tight text-amber-300/60">
-          calibré {score.panic_score_raw.toFixed(0)} → {s.toFixed(0)} · {score.adjustment_reason}
-        </span>
       )}
     </div>
   );
@@ -585,16 +598,6 @@ function ReportStat({
 
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 
-/** Float "tightness" fill: a LOWER float reads as a fuller bar (more explosive —
- *  the whole point of a low-float scanner). Plain linear scale, full at ≤500K,
- *  empty at ≥30M (the low-float ceiling). The exact share count is shown
- *  alongside, so the bar is the at-a-glance. */
-function floatFill(f: number): number {
-  const lo = 500_000;
-  const hi = 30_000_000;
-  return clamp01(1 - (f - lo) / (hi - lo));
-}
-
 /** Real-time liquidity fill from the last-60s share volume: log scale, empty at
  *  ≤1K shares/min, full at ≥1M shares/min. */
 function volumeFill(v: number): number {
@@ -602,9 +605,6 @@ function volumeFill(v: number): number {
   const hi = Math.log10(1_000_000);
   return clamp01((Math.log10(Math.max(v, 1)) - lo) / (hi - lo));
 }
-
-/** A 0..100 score as a 0..1 bar fill (clamped). */
-const scoreFill = (s: number) => clamp01(s / 100);
 
 type Tone = "blue" | "red" | "muted";
 
@@ -708,117 +708,405 @@ function useNowTick(ms: number): number {
   return now;
 }
 
-/** The Micro Pullback overlay: a compact, at-a-glance risk panel drawn top-left
- *  of the right (sub-minute) pane. Keeps the generic overlay's look (transparent
- *  dark backdrop, muted uppercase labels, semibold tabular values) but lays the
- *  values out as aligned horizontal bars: blue = liquidity / interest (float,
- *  premarket volume, short interest), red = dilution / manipulation risk, plus a
- *  (not-yet-wired) news-score placeholder and the most recent headlines with a
- *  freshness badge. Missing data greys its row out. */
+/** The instant news ages are measured against: the SIMULATED clock during a Market
+ *  Replay, the wall clock otherwise.
+ *
+ *  Not a detail. Replaying yesterday's premarket today, a headline that is two
+ *  minutes old inside the replayed session is nineteen hours old by the wall clock,
+ *  and the freshness badge painted it red — "ancienne" — while the model, which
+ *  reads the same headline through the replay clock, correctly called it breaking.
+ *  The panel and the score have to measure time the same way or they contradict each
+ *  other on the one field the A+ decision turns on.
+ *
+ *  Shares the `replay_status` query key with the session clock, so the extra
+ *  consumer costs no extra poll. */
+function useMarketNowMs(): number {
+  const wall = useNowTick(1000);
+  const { data: replay } = useQuery({
+    queryKey: ["replay_status"],
+    queryFn:  () => api.getReplayStatus(),
+    refetchInterval: 1000,
+  });
+  if (replay?.active && replay.sim_time) {
+    const t = Date.parse(replay.sim_time);
+    if (Number.isFinite(t)) return t;
+  }
+  return wall;
+}
+/** Parse one of the A+ row's JSON-array columns. They cross the bridge as raw text
+ *  exactly as stored, so a malformed blob must degrade to "no chips", never to a
+ *  blank pane. */
+function jsonList(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** What the pipeline is doing, in the trader's words. */
+const PHASE_LABEL: Record<string, string> = {
+  queued:    "en file",
+  triage:    "lecture de la news…",
+  deep:      "analyse approfondie…",
+  rescoring: "re-scoring sur news…",
+};
+
+/** News verdict → colour. `aucune` is deliberately NOT red: it is a fact about the
+ *  setup, not a fault. It does cap the Score Breaking at 10, so it will already be
+ *  visible in the number. */
+const NEWS_VERDICT_CLS: Record<string, string> = {
+  solide: "text-emerald-300",
+  faible: "text-amber-300",
+  bluff:  "text-rose-300",
+  aucune: "text-muted-foreground/70",
+};
+
+/** Dilution risk → colour. `faible` never reaches the screen (see the render). */
+const DILUTION_CLS: Record<string, string> = {
+  moyen:    "text-amber-300",
+  eleve:    "text-rose-300",
+  critique: "text-rose-200",
+};
+
+/** Verdict colour, keyed on the distance to the trader's own threshold rather than
+ *  on absolute bands: the bar is a Settings value, so "good" is relative to it. */
+function microTone(score: number, threshold: number): { ring: string; text: string } {
+  if (score >= threshold) return { ring: "ring-emerald-500/60", text: "text-emerald-200" };
+  if (score >= threshold - 10) return { ring: "ring-amber-500/50", text: "text-amber-200" };
+  return { ring: "ring-slate-500/40", text: "text-slate-300" };
+}
+
+/** The Micro Pullback A+ report, drawn top-left of the right (sub-minute) pane.
+ *
+ *  Same information hierarchy as `PanicReportOverlay`, deliberately — the two
+ *  strategies put a model verdict on a chart pane and the trader reads both the same
+ *  way, in the seconds before deciding:
+ *    1. the final score, biggest thing on the pane, against the trader's own bar;
+ *    2. the one-sentence explanation — the only prose worth reading in ten seconds;
+ *    3. the news state, which for THIS strategy is the subject of the score;
+ *    4. the qualifiers — Score Breaking, setup points, confidence;
+ *    5. everything else behind a "plus" toggle, including the audit line.
+ *
+ *  WHAT THE NUMBERS MEAN. The model grades the CATALYST alone and returns the Score
+ *  Breaking (0–100). The deterministic setup points — hot industry, risk domicile,
+ *  exceptional RVOL, detached attention, tempo depth — are added outside it. Showing
+ *  both, and their difference, is the only way a trader can tell "the news is strong"
+ *  from "the news is thin but the setup carried it".
+ *
+ *  NEWS IS NEVER LEFT AMBIGUOUS, because "no headline" and "a headline we have not
+ *  read yet" call for opposite decisions and used to look identical (an empty list):
+ *    • no catalyst        → said in words, not by an absence;
+ *    • scored WITH news   → the model's verdict on it, plus the headline itself;
+ *    • headline in flight → the RAW headline and a spinner. That case is common on a
+ *      runner — the wire lands after the move starts — and the honest display is the
+ *      text the trader can read himself, not a summary computed before it existed.
+ *      A score already on screen at that moment is stale by construction, which is
+ *      why the spinner also sits on the score.
+ *
+ *  The five abstract 0..100 risk bars this panel used to draw are gone. Three were the
+ *  same subject (dilution capacity / need / history) rendered as unlabelled fills, the
+ *  "News score" bar was never wired to anything, and none survived the ten-second
+ *  test. With the deep pass on, its `dilution_risk` says the same thing in one word.
+ *
+ *  With Qualité A+ off, no judgement exists and none is invented: the pane falls back
+ *  to the structural facts plus the headlines. */
 export function MicroInfoOverlay({
   cardInfo,
   enrichment,
   news,
+  quality,
+  live,
 }: {
   cardInfo: CardInfo | null;
   enrichment: AlertEnrichment | null;
   news: CardNews[];
+  quality: MicroQualityRow | null;
+  live: MicroQualityLive | null;
 }) {
-  const nowMs = useNowTick(1000);
+  const [expanded, setExpanded] = useState(false);
+  const nowMs = useMarketNowMs();
 
   const country  = enrichment?.country  ?? cardInfo?.country  ?? null;
   const industry = enrichment?.industry ?? cardInfo?.industry ?? null;
   const float    = enrichment?.float_shares ?? cardInfo?.float_shares ?? null;
   const liveVol  = cardInfo?.live_volume ?? null;
 
+  const phase  = live?.phase ?? null;
+  const busy   = phase != null;
+  const newest = news.length > 0 ? news[0] : null;
+
+  // A headline the displayed score has not read. Two independent sources, because
+  // each catches a case the other misses: the pipeline announces the headline it is
+  // re-scoring on (fastest, and the only one that knows a REST-only story), while
+  // comparing publication time with `scored_at` catches a headline that landed after
+  // the last verdict and has not triggered a re-score yet (the watch is capped at
+  // three per session — beyond that the pane must still say the score is behind).
+  const unreadFromPipeline = live?.pending_headline ?? null;
+  const unreadFromClock =
+    newest && quality?.scored_at && Date.parse(newest.created_at) > Date.parse(quality.scored_at)
+      ? newest.headline
+      : null;
+  const unread = unreadFromPipeline ?? unreadFromClock;
+
+  const score     = quality?.final_score ?? null;
+  const threshold = quality?.threshold ?? null;
+  const passed    = quality?.passed ?? false;
+  const flags     = jsonList(quality?.red_flags ?? null).slice(0, 4);
+  const drivers   = jsonList(quality?.key_drivers ?? null);
+
+  // The model's own number, and what the deterministic terms did to it. Derived
+  // rather than stored: the difference IS the adjustment total, and `adjustments`
+  // already carries the term-by-term audit line for the expanded view.
+  const breaking =
+    quality == null ? null : quality.model === "deep" ? quality.pass2_score : quality.pass1_score;
+  const setupDelta =
+    breaking != null && score != null ? Math.round(score - breaking) : null;
+
+  const hasAplus = quality != null || busy;
+  if (!hasAplus && float == null && liveVol == null && news.length === 0 && !country && !industry) {
+    return null;
+  }
+
+  const tone = score != null && threshold != null ? microTone(score, threshold) : null;
+  const hasComplementary =
+    flags.length > 0
+    || drivers.length > 0
+    || quality?.catalyst_label != null
+    || quality?.dilution_risk != null
+    || quality?.dilution_read != null
+    || quality?.entry_note != null
+    || quality?.adjustments != null
+    || float != null
+    || liveVol != null
+    || country != null
+    || industry != null;
+
   return (
     <div
       data-capture-overlay
-      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[246px] max-w-[78%] flex-col gap-1.5 rounded bg-black/40 px-2 py-1.5 backdrop-blur-[1px]"
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[300px] max-w-[68%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
     >
-      {/* Pays · Industrie */}
-      <div data-capture-cell className="flex items-baseline gap-1.5 leading-none">
-        <span data-cap-label className="hidden" />
-        <span
-          data-cap-value
-          className="truncate text-[11px] font-semibold text-foreground/90"
-          title={[country, industry].filter(Boolean).join(" · ")}
-        >
-          {country || industry ? (
-            <>
-              {country ?? "—"}
-              {industry && (
-                <span className="font-normal text-muted-foreground/70"> · {industry}</span>
+      {/* ── 1. The verdict ─────────────────────────────────────────────────── */}
+      {hasAplus && (
+        <div className="flex items-baseline gap-2">
+          {score != null ? (
+            <span
+              className={cn(
+                "rounded px-2 py-0.5 text-[26px] font-bold leading-none tabular-nums ring-1",
+                tone?.ring ?? "ring-slate-500/40",
+                tone?.text ?? "text-slate-300",
               )}
-            </>
+            >
+              {score.toFixed(0)}
+            </span>
           ) : (
-            <span className="text-muted-foreground/40">Pays · Industrie</span>
+            <span className="flex items-center gap-1.5 rounded px-2 py-1 text-slate-300 ring-1 ring-slate-500/40">
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+              <span className="text-[11px] font-semibold">A+</span>
+            </span>
           )}
-        </span>
-      </div>
-
-      <div className="h-px w-full bg-white/10" />
-
-      {/* Liquidity / interest — blue (numbers shown for float & volume) */}
-      <MetricBar
-        label="Float"
-        fill={float != null ? floatFill(float) : null}
-        value={float != null ? fmtCompact(float) : null}
-        tone="blue"
-      />
-      <MetricBar
-        label="Vol/min"
-        fill={liveVol != null ? volumeFill(liveVol) : null}
-        value={liveVol != null ? fmtCompact(liveVol) : null}
-        tone="blue"
-      />
-      <MetricBar
-        label="Short int"
-        fill={cardInfo?.short_interest_score != null ? scoreFill(cardInfo.short_interest_score) : null}
-        value={null}
-        tone="blue"
-      />
-
-      {/* Dilution / manipulation risk — red (abstract scores, bar only) */}
-      <MetricBar
-        label="Capa. dil."
-        fill={cardInfo?.dilution_capacity_score != null ? scoreFill(cardInfo.dilution_capacity_score) : null}
-        value={null}
-        tone="red"
-      />
-      <MetricBar
-        label="Besoin dil."
-        fill={cardInfo?.dilution_need_score != null ? scoreFill(cardInfo.dilution_need_score) : null}
-        value={null}
-        tone="red"
-      />
-      <MetricBar
-        label="Dil. hist."
-        fill={cardInfo?.dilution_score != null ? scoreFill(cardInfo.dilution_score) : null}
-        value={null}
-        tone="red"
-      />
-      <MetricBar
-        label="Pump&Dump"
-        fill={cardInfo?.pump_dump_score != null ? scoreFill(cardInfo.pump_dump_score) : null}
-        value={null}
-        tone="red"
-      />
-
-      {/* News score — placeholder bar, wired in a later iteration. */}
-      <MetricBar label="News score" fill={null} value={null} tone="muted" />
-
-      {/* Recent headlines with a freshness badge (up to 4, newest first). */}
-      <div className="h-px w-full bg-white/10" />
-      <div className="flex flex-col gap-1">
-        {news.length > 0 ? (
-          news.slice(0, 4).map((n, i) => <NewsRow key={`${n.created_at}-${i}`} item={n} nowMs={nowMs} />)
-        ) : (
-          <span className="text-[9px] uppercase tracking-wide text-muted-foreground/40">
-            Aucune news
+          <span className="flex min-w-0 flex-col gap-0.5">
+            <span
+              className={cn(
+                "text-[11px] font-medium leading-tight",
+                score == null ? "text-sky-300" : (tone?.text ?? "text-slate-300"),
+              )}
+            >
+              {score == null
+                ? (PHASE_LABEL[phase ?? ""] ?? "analyse en cours…")
+                : passed
+                ? `retenu · seuil ${threshold != null ? threshold.toFixed(0) : "—"}`
+                : (quality?.rejection ?? "sous le seuil")}
+            </span>
+            {score != null && busy && (
+              <span className="flex items-center gap-1 text-[9px] leading-none text-sky-400">
+                <LoaderCircle className="h-2.5 w-2.5 animate-spin" />
+                {PHASE_LABEL[phase ?? ""] ?? "re-scoring…"}
+              </span>
+            )}
           </span>
-        )}
-      </div>
+        </div>
+      )}
+
+      {/* ── 2. Why ─────────────────────────────────────────────────────────── */}
+      {quality?.one_liner && (
+        <p className="text-[11px] leading-snug text-foreground/90">{quality.one_liner}</p>
+      )}
+
+      {/* ── 3. News: unread / judged / absent — never ambiguous ────────────── */}
+      {unread ? (
+        <div className="flex items-start gap-1.5 rounded bg-amber-500/10 px-1.5 py-1 ring-1 ring-amber-500/30">
+          <LoaderCircle className="mt-px h-3 w-3 shrink-0 animate-spin text-amber-300" />
+          <span className="flex min-w-0 flex-col gap-0.5">
+            <span className="text-[9px] font-semibold uppercase leading-none tracking-wide text-amber-300">
+              {busy ? "news en cours d'analyse" : "news postérieure au score"}
+            </span>
+            <span className="text-[11px] leading-snug text-amber-100/90">{unread}</span>
+          </span>
+        </div>
+      ) : quality?.news_verdict ? (
+        <div className="flex flex-col gap-0.5">
+          <div className="flex items-baseline gap-1.5">
+            <span
+              className={cn(
+                "text-[11px] font-semibold leading-tight",
+                NEWS_VERDICT_CLS[quality.news_verdict] ?? "text-foreground/80",
+              )}
+            >
+              {quality.news_verdict === "aucune"
+                ? "Aucun catalyseur"
+                : `News ${quality.news_verdict}`}
+            </span>
+            {quality.news_freshness && quality.news_freshness !== "aucune" && (
+              <span className="text-[9px] uppercase tracking-wide text-muted-foreground/60">
+                {quality.news_freshness}
+              </span>
+            )}
+          </div>
+          {/* The headline itself when the model gave no label — never both, they say
+              the same thing twice. */}
+          {!quality.catalyst_label && newest && <NewsRow item={newest} nowMs={nowMs} />}
+        </div>
+      ) : newest ? (
+        <NewsRow item={newest} nowMs={nowMs} />
+      ) : (
+        <span className="text-[10px] uppercase tracking-wide text-muted-foreground/50">
+          Aucune news
+        </span>
+      )}
+
+      {/* ── 4. The qualifiers ──────────────────────────────────────────────── */}
+      {quality != null && (
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] tabular-nums">
+          <ReportStat label="Breaking" value={breaking} suffix="/100" />
+          {/* Signed on purpose: "+25" and "−25" are opposite readings of the same
+              candidate, and an unsigned number hides which one happened. */}
+          <span className="flex items-center gap-1">
+            <span className="text-[8px] uppercase tracking-wide text-muted-foreground/50">
+              Setup
+            </span>
+            {setupDelta != null ? (
+              <span
+                className={cn(
+                  setupDelta > 0 ? "text-emerald-300"
+                  : setupDelta < 0 ? "text-rose-300"
+                  : "text-foreground/85",
+                )}
+              >
+                {setupDelta > 0 ? "+" : ""}
+                {setupDelta}
+              </span>
+            ) : (
+              <span className="text-muted-foreground/30">—</span>
+            )}
+          </span>
+          <ReportStat label="Confiance" value={quality.confidence} suffix="/100" />
+          <ReportStat label="Tenue" value={quality.sustain_prob} suffix="%" />
+        </div>
+      )}
+
+      {/* ── Toggle → complementary info ────────────────────────────────────── */}
+      {hasComplementary && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="pointer-events-auto flex items-center gap-1 self-start text-[9px] uppercase tracking-wide text-muted-foreground/60 hover:text-foreground/80"
+        >
+          <ChevronRight className={cn("h-2.5 w-2.5 transition-transform", expanded && "rotate-90")} />
+          {expanded ? "moins" : "plus"}
+        </button>
+      )}
+
+      {expanded && (
+        <div className="flex flex-col gap-1 border-t border-white/10 pt-1">
+          {quality?.catalyst_label && (
+            <span className="text-[10px] text-foreground/70">{quality.catalyst_label}</span>
+          )}
+
+          {(flags.length > 0 || (quality?.dilution_risk && quality.dilution_risk !== "faible")) && (
+            <div className="flex flex-wrap items-center gap-1">
+              {quality?.dilution_risk && quality.dilution_risk !== "faible" && (
+                <span
+                  className={cn(
+                    "rounded bg-white/5 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
+                    DILUTION_CLS[quality.dilution_risk] ?? "text-amber-300",
+                  )}
+                  title={quality.dilution_read ?? undefined}
+                >
+                  dilution {quality.dilution_risk}
+                </span>
+              )}
+              {flags.map((f) => (
+                <span
+                  key={f}
+                  className="rounded bg-white/5 px-1 py-0.5 text-[9px] leading-tight text-rose-200/80"
+                >
+                  {f}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {drivers.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {drivers.map((d) => (
+                <span
+                  key={d}
+                  className="rounded bg-white/10 px-1.5 py-0.5 text-[9px] leading-none text-foreground/80"
+                >
+                  {d}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {quality?.entry_note && (
+            <span className="text-[10px] leading-snug text-muted-foreground">
+              ⚑ {quality.entry_note}
+            </span>
+          )}
+
+          {(float != null || liveVol != null || country || industry) && (
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground/70">
+              {float != null && (
+                <span className="tabular-nums">
+                  float <span className="font-semibold text-foreground/80">{fmtCompact(float)}</span>
+                </span>
+              )}
+              {liveVol != null && (
+                <span className="tabular-nums">
+                  vol/min{" "}
+                  <span className="font-semibold text-foreground/80">{fmtCompact(liveVol)}</span>
+                </span>
+              )}
+              {(country || industry) && (
+                <span className="truncate" title={[country, industry].filter(Boolean).join(" · ")}>
+                  {[country, industry].filter(Boolean).join(" · ")}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* The audit line: every deterministic term that moved the number, plus
+              which pass spoke and under which rubric. A score adjusted by +25 must
+              never be silently different from what the model said. */}
+          {quality && (
+            <span className="text-[8px] leading-tight text-muted-foreground/50">
+              {[
+                quality.model === "deep" ? "double passe" : "triage seul",
+                quality.adjustments,
+                quality.rubric_version,
+                quality.simulated ? "replay" : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

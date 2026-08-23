@@ -44,4 +44,8 @@ impl<T: Clone> RingBuffer<T> {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    pub fn last(&self) -> Option<&T> {
+        self.data.back()
+    }
 }

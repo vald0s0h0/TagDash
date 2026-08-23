@@ -6,7 +6,7 @@ import { useActiveAlerts, useScreenerMatches, useStartScanner } from "@/queries/
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertStatusStore } from "@/stores/alertStatusStore";
 import { ScannerAlerts } from "@/components/ScannerAlerts";
-import { PanicScoreButton, ScreenerPanel, visibleMatches } from "@/components/ScreenerPanel";
+import { PanicScoreButton, ScreenerPanel, matchToAlert, visibleMatches } from "@/components/ScreenerPanel";
 import { PositionsPanel } from "@/components/PositionsPanel";
 import { OrdersPanel } from "@/components/OrdersPanel";
 import { AlarmsPanel } from "@/components/AlarmsPanel";
@@ -50,7 +50,9 @@ export function Sidebar() {
   const alertsQuery  = useActiveAlerts();
   const alerts       = alertsQuery.data ?? [];
   const placeAlert   = useLayoutStore((s) => s.placeAlert);
+  const openInActiveZone = useLayoutStore((s) => s.openInActiveZone);
   const setSelectedTicker = useUiStore((s) => s.setSelectedTicker);
+  const setActiveSession  = useUiStore((s) => s.setActiveSession);
   const dismissedScreener = useUiStore((s) => s.dismissedScreener);
   // Symbol shown in the active session's (single) chart — drives the release →
   // open-next behaviour below.
@@ -138,14 +140,24 @@ export function Sidebar() {
   // Filter displayed alerts by currently active session tab
   const sessionAlerts = alerts.filter((a) => a.session === active);
 
-  // Clicking a ticker in Positions / Orders opens the matching scanner alert
-  // (same behaviour as clicking the card in the scanner list).
+  // Clicking a ticker in Positions / Orders / À faire opens the matching scanner
+  // alert (same behaviour as clicking the card in the scanner list) in the tab for
+  // its OWN session — switching session tabs if needed, not just the active one.
+  // Pre-open tickers never show up in `alerts` (they live in the screener query
+  // instead), so that list needs its own lookup + placement path.
   function handleTickerClick(symbol: string) {
     setSelectedTicker(symbol);
     const match = alerts.find((a) => a.symbol === symbol && a.session === active)
                 ?? alerts.find((a) => a.symbol === symbol);
     if (match) {
       placeAlert(match);
+      setActiveSession(match.session);
+      return;
+    }
+    const screenerMatch = screener.find((m) => m.symbol === symbol);
+    if (screenerMatch) {
+      openInActiveZone(matchToAlert(screenerMatch));
+      setActiveSession("pre_open");
     }
   }
 
@@ -166,7 +178,7 @@ export function Sidebar() {
             /* The Panic Score launcher sits to the LEFT of the count. It only ever
                analyses the visible rows — dismissing a ticker excludes it. */
             action={
-              <PanicScoreButton symbols={visibleScreener.map((m) => m.symbol)} />
+              <PanicScoreButton matches={visibleScreener} />
             }
           />
           <div className="flex-1 overflow-y-auto">

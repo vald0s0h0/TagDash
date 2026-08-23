@@ -33,7 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::alpaca_rest::{map_status, Creds};
 use super::journal::{BrokerJournal, FillEvent};
-use super::{BrokerMirror, Environment};
+use super::{BrokerMirror, Environment, ShortCostBasis};
 use crate::chart_state::ChartState;
 use crate::config::AppConfig;
 use crate::types::Side;
@@ -159,6 +159,20 @@ pub struct JournalDeps {
     pub db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     pub chart: Arc<RwLock<ChartState>>,
     pub protection: Arc<RwLock<super::protection::ProtectionBook>>,
+    pub locate_plans: Arc<RwLock<std::collections::HashMap<String, ShortCostBasis>>>,
+}
+
+/// Shares from this execution that actually increased a short position. Using the
+/// signed position before/after the fill handles ordinary partial fills, scale-ins,
+/// and a sell that first closes a long before crossing through zero.
+fn newly_opened_short_quantity(side: Side, fill_qty: f64, resulting_position: f64) -> i64 {
+    if side != Side::Short || fill_qty <= 0.0 {
+        return 0;
+    }
+    let previous_position = resulting_position + fill_qty;
+    ((-resulting_position).max(0.0) - (-previous_position).max(0.0))
+        .max(0.0)
+        .ceil() as i64
 }
 
 fn levels_from_payload(payload: &OrderPayload) -> (Option<f64>, Option<f64>) {
@@ -396,6 +410,16 @@ async fn run_session(
                         let strategy = strategy_name_for(&deps.chart, &ev.symbol);
                         let snapshot = mirror.read().unwrap().clone();
                         let cfg = config.read().unwrap().clone();
+                        let consumed =
+                            newly_opened_short_quantity(ev.side, ev.qty, ev.position_qty);
+                        if consumed > 0 {
+                            let mut plans = deps.locate_plans.write().unwrap();
+                            if let Some(plan) = plans.get_mut(&ev.symbol) {
+                                if plan.account_id == account_id {
+                                    plan.consumed_quantity += consumed;
+                                }
+                            }
+                        }
                         let conn = deps.db.lock().unwrap();
                         deps.journal
                             .write()
@@ -495,6 +519,15 @@ mod tests {
         assert!(!changes_position("new"));
         assert!(!changes_position("canceled"));
         assert!(!changes_position("pending_new"));
+    }
+
+    #[test]
+    fn locate_consumption_counts_only_new_short_exposure() {
+        assert_eq!(newly_opened_short_quantity(Side::Short, 40.0, -40.0), 40);
+        assert_eq!(newly_opened_short_quantity(Side::Short, 25.0, -65.0), 25);
+        assert_eq!(newly_opened_short_quantity(Side::Short, 100.0, -50.0), 50);
+        assert_eq!(newly_opened_short_quantity(Side::Short, 25.0, 25.0), 0);
+        assert_eq!(newly_opened_short_quantity(Side::Long, 20.0, -30.0), 0);
     }
 
     /// A real Alpaca fill frame, parsed end to end into the row the mirror adopts.

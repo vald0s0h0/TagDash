@@ -15,11 +15,11 @@ const NEWS_URL: &str = "https://data.alpaca.markets/v1beta1/news";
 #[derive(Debug, Clone)]
 pub struct NewsArticle {
     pub created_at: DateTime<Utc>,
-    pub headline:   String,
-    pub summary:    String,
+    pub headline: String,
+    pub summary: String,
     /// Full article body, still HTML (caller strips tags).
-    pub content:    String,
-    pub source:     String,
+    pub content: String,
+    pub source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,13 +30,13 @@ struct NewsResponse {
 
 #[derive(Debug, Deserialize)]
 struct RawArticle {
-    headline:   Option<String>,
-    summary:    Option<String>,
-    content:    Option<String>,
-    source:     Option<String>,
+    headline: Option<String>,
+    summary: Option<String>,
+    content: Option<String>,
+    source: Option<String>,
     created_at: Option<String>,
     #[serde(default)]
-    symbols:    Vec<String>,
+    symbols: Vec<String>,
 }
 
 /// One headline (no article body) with the tickers it references — for the
@@ -45,9 +45,9 @@ struct RawArticle {
 #[derive(Debug, Clone)]
 pub struct NewsHeadlineLite {
     pub created_at: DateTime<Utc>,
-    pub headline:   String,
-    pub source:     String,
-    pub symbols:    Vec<String>,
+    pub headline: String,
+    pub source: String,
+    pub symbols: Vec<String>,
 }
 
 /// Fetch up to `limit` of the most recent HEADLINES for `symbol` published within
@@ -109,7 +109,7 @@ pub async fn fetch_recent_headlines(
             Some(NewsHeadlineLite {
                 created_at,
                 headline,
-                source:  a.source.unwrap_or_default(),
+                source: a.source.unwrap_or_default(),
                 symbols: a.symbols.into_iter().map(|s| s.to_uppercase()).collect(),
             })
         })
@@ -180,7 +180,7 @@ pub async fn fetch_recent_news(
                 headline,
                 summary: a.summary.unwrap_or_default(),
                 content: a.content.unwrap_or_default(),
-                source:  a.source.unwrap_or_default(),
+                source: a.source.unwrap_or_default(),
             })
         })
         .collect();

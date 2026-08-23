@@ -80,9 +80,37 @@ pub fn replace_for_day(
         "DELETE FROM panic_llm_scores WHERE day = ?1 AND simulated = ?2",
         params![day, simulated as i64],
     )?;
+    write_rows(&tx, day, simulated, rows)?;
+    tx.commit()
+}
+
+/// Merge rows into one (day, mode), leaving every symbol this run did not touch
+/// exactly as it was.
+///
+/// This is what the analysis run uses, and the distinction from `replace_for_day`
+/// matters: the button scores the tickers VISIBLE at the moment it is pressed, and
+/// the watchlist keeps changing afterwards — the 09:25 build lands, a premarket
+/// refresh replaces rows, the user dismisses a name. With a wholesale replace, a
+/// second press aimed at the newly-arrived tickers DELETED the first press's scores,
+/// so topping up a partial analysis merely moved the hole. Upserting per symbol is
+/// what lets two presses add up to a fully analysed list.
+pub fn upsert_many(
+    conn: &Connection,
+    day: &str,
+    simulated: bool,
+    rows: &[PanicLlmScore],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    write_rows(&tx, day, simulated, rows)?;
+    tx.commit()
+}
+
+/// The shared write. `INSERT OR REPLACE` so re-scoring a ticker overwrites its row
+/// (the primary key is `(symbol, day, simulated)`) instead of failing the run.
+fn write_rows(conn: &Connection, day: &str, simulated: bool, rows: &[PanicLlmScore]) -> Result<()> {
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO panic_llm_scores
+        let mut stmt = conn.prepare(
+            "INSERT OR REPLACE INTO panic_llm_scores
                  (symbol, day, simulated, panic_score, panic_score_raw, confidence_score,
                   catalyst_strength, catalyst_label, catalyst_type, reversibility,
                   one_liner, key_drivers, forced_flow, euphoria, normalization_prob,
@@ -125,7 +153,7 @@ pub fn replace_for_day(
             ])?;
         }
     }
-    tx.commit()
+    Ok(())
 }
 
 const COLUMNS: &str = "symbol, day, simulated, panic_score, panic_score_raw, confidence_score,
@@ -174,15 +202,41 @@ fn map_row(r: &rusqlite::Row) -> Result<PanicLlmScore> {
     })
 }
 
-/// Every row for one (day, mode), fundamental vetoes last and confidence-aware
-/// contextual rank first. Missing rank means unknown, never zero.
+/// Every row for one (day, mode), **panic score descending**, with unscored (N/A)
+/// tickers last. That is the ranking the user asked for and the one the screener
+/// renders, so it is the one this read returns: a missing score means "could not be
+/// established", never zero, so it sorts to the bottom instead of competing with a
+/// genuine 0. The confidence-aware `ranking_score` only breaks ties.
 pub fn get_for_day(conn: &Connection, day: &str, simulated: bool) -> Result<Vec<PanicLlmScore>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLUMNS} FROM panic_llm_scores
          WHERE day = ?1 AND simulated = ?2
-         ORDER BY fundamental_veto ASC, ranking_score IS NULL, ranking_score DESC",
+         ORDER BY panic_score IS NULL, panic_score DESC,
+                  ranking_score IS NULL, ranking_score DESC",
     ))?;
     let rows = stmt.query_map(params![day, simulated as i64], |r| map_row(r))?;
+    rows.collect()
+}
+
+/// The `limit` most recent distinct days with at least one analysed row, strictly
+/// before `day` (same mode), most recent first. Used to find "the previous 1-2
+/// sessions this ticker was scored on" without assuming yesterday = today−1
+/// calendar day (which breaks over weekends/holidays — a Monday's "veille" is
+/// Friday, not Sunday).
+pub fn distinct_days_before(
+    conn: &Connection,
+    day: &str,
+    simulated: bool,
+    limit: u32,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT day FROM panic_llm_scores
+         WHERE day < ?1 AND simulated = ?2
+         ORDER BY day DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![day, simulated as i64, limit], |r| {
+        r.get::<_, String>(0)
+    })?;
     rows.collect()
 }
 
@@ -246,7 +300,9 @@ mod tests {
     fn rows_round_trip_including_the_driver_chips() {
         let conn = db();
         replace_for_day(&conn, "2026-08-14", false, &[row("MTEN", 91.0)]).unwrap();
-        let got = get_one(&conn, "2026-08-14", false, "MTEN").unwrap().unwrap();
+        let got = get_one(&conn, "2026-08-14", false, "MTEN")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.panic_score, Some(91.0));
         assert_eq!(got.panic_score_raw, Some(88.0));
         assert_eq!(got.key_drivers, vec!["float 4M", "SI 25%"]);
@@ -254,7 +310,10 @@ mod tests {
         assert_eq!(got.trade_direction.as_deref(), Some("short"));
         assert_eq!(got.eligibility.as_deref(), Some("eligible"));
         assert!(!got.web_used);
-        assert!(got.created_at.is_some(), "the default stamp must be written");
+        assert!(
+            got.created_at.is_some(),
+            "the default stamp must be written"
+        );
     }
 
     /// The isolation that stops a backtest reordering a live trading morning.
@@ -308,6 +367,53 @@ mod tests {
             .map(|r| r.symbol)
             .collect();
         assert_eq!(order, vec!["HIGH", "LOW", "NOSCORE"]);
+    }
+
+    /// The top-up contract. The button scores what is VISIBLE when pressed, and the
+    /// watchlist keeps growing after that, so a second press must ADD to the day's
+    /// analysis. Under the old wholesale replace it deleted the first press's scores,
+    /// which merely moved the hole in the ranking.
+    #[test]
+    fn a_second_run_tops_up_instead_of_erasing_the_first() {
+        let conn = db();
+        upsert_many(&conn, "2026-08-14", false, &[row("FIRST", 70.0)]).unwrap();
+        upsert_many(&conn, "2026-08-14", false, &[row("SECOND", 90.0)]).unwrap();
+
+        let order: Vec<String> = get_for_day(&conn, "2026-08-14", false)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.symbol)
+            .collect();
+        assert_eq!(order, vec!["SECOND", "FIRST"]);
+
+        // Re-scoring a ticker overwrites its row in place — no duplicate, no failure.
+        upsert_many(&conn, "2026-08-14", false, &[row("FIRST", 95.0)]).unwrap();
+        let rows = get_for_day(&conn, "2026-08-14", false).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol, "FIRST");
+        assert_eq!(rows[0].panic_score, Some(95.0));
+    }
+
+    /// An upsert into one mode never leaks into the other.
+    #[test]
+    fn a_top_up_stays_inside_its_own_mode() {
+        let conn = db();
+        upsert_many(&conn, "2026-08-14", false, &[row("LIVE", 80.0)]).unwrap();
+        upsert_many(&conn, "2026-08-14", true, &[row("LIVE", 10.0)]).unwrap();
+        assert_eq!(
+            get_one(&conn, "2026-08-14", false, "LIVE")
+                .unwrap()
+                .unwrap()
+                .panic_score,
+            Some(80.0),
+        );
+        assert_eq!(
+            get_one(&conn, "2026-08-14", true, "LIVE")
+                .unwrap()
+                .unwrap()
+                .panic_score,
+            Some(10.0),
+        );
     }
 
     #[test]

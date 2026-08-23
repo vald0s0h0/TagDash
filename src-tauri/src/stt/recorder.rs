@@ -31,7 +31,11 @@ pub struct Recorder {
 impl Recorder {
     /// Open the input device and start capturing. Blocks only until the audio thread
     /// reports the resolved sample rate (or an error).
-    pub fn start(app: AppHandle, device_name: Option<String>, kind: JobKind) -> Result<Recorder, String> {
+    pub fn start(
+        app: AppHandle,
+        device_name: Option<String>,
+        kind: JobKind,
+    ) -> Result<Recorder, String> {
         let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
@@ -122,7 +126,9 @@ fn build_stream(
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &stream_config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| append_mono(&samples, data, channels, |s| s),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                append_mono(&samples, data, channels, |s| s)
+            },
             err_fn,
             None,
         ),
@@ -150,7 +156,12 @@ fn build_stream(
 }
 
 /// Down-mix interleaved frames to mono and append to the shared buffer.
-fn append_mono<T: Copy>(samples: &Arc<Mutex<Vec<f32>>>, data: &[T], channels: usize, to_f32: impl Fn(T) -> f32) {
+fn append_mono<T: Copy>(
+    samples: &Arc<Mutex<Vec<f32>>>,
+    data: &[T],
+    channels: usize,
+    to_f32: impl Fn(T) -> f32,
+) {
     if channels == 0 {
         return;
     }
@@ -201,7 +212,10 @@ fn emit_spectrum(app: &AppHandle, samples: &Arc<Mutex<Vec<f32>>>, fft: &dyn rust
 
     let _ = app.emit(
         super::EV_SPECTRUM,
-        SpectrumPayload { bins, level: (rms * 6.0).clamp(0.0, 1.0) },
+        SpectrumPayload {
+            bins,
+            level: (rms * 6.0).clamp(0.0, 1.0),
+        },
     );
 }
 
@@ -227,14 +241,29 @@ pub fn test_microphone(device_name: Option<String>) -> super::MicTestResult {
     match build_stream(device_name.as_deref(), samples.clone()) {
         Ok((stream, _rate)) => {
             if let Err(e) = stream.play() {
-                return super::MicTestResult { ok: false, level: 0.0, device: device_label, error: Some(e.to_string()) };
+                return super::MicTestResult {
+                    ok: false,
+                    level: 0.0,
+                    device: device_label,
+                    error: Some(e.to_string()),
+                };
             }
             std::thread::sleep(Duration::from_millis(400));
             drop(stream);
             let buf = samples.lock().unwrap();
             let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-            super::MicTestResult { ok: true, level: peak.min(1.0), device: device_label, error: None }
+            super::MicTestResult {
+                ok: true,
+                level: peak.min(1.0),
+                device: device_label,
+                error: None,
+            }
         }
-        Err(e) => super::MicTestResult { ok: false, level: 0.0, device: device_label, error: Some(e) },
+        Err(e) => super::MicTestResult {
+            ok: false,
+            level: 0.0,
+            device: device_label,
+            error: Some(e),
+        },
     }
 }

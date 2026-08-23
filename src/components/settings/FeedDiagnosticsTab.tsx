@@ -2,10 +2,10 @@
 // same query/content, just dropped the Dialog wrapper (the tab only exists in the DOM
 // while selected, so the query naturally stops polling when the user leaves it).
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, AlertTriangle, CheckCircle2, Radio } from "lucide-react";
 import { api } from "@/lib/tauri";
-import type { FeedDiagnostics } from "@/types";
+import type { FeedDiagnostics, MassiveTierStatus } from "@/types";
 import { cn } from "@/lib/utils";
 
 const STATE_STYLE: Record<string, string> = {
@@ -71,6 +71,73 @@ function interpretation(d: FeedDiagnostics): { icon: typeof Activity; cls: strin
   return { icon: Radio, cls: "text-muted-foreground", text: "Flux inactif." };
 }
 
+const TIER_LABEL: Record<"unlimited" | "basic", string> = {
+  unlimited: "Illimité (Starter+, payant) — données différées de 15 min",
+  basic:     "Basic (gratuit) — ~5 requêtes/min",
+};
+
+/** Detected vs. manually-forced Massive tier. Starter+ ("unlimited") disables the
+ *  Alpaca broker (see BrokerTab) because its data is 15-minute delayed — the
+ *  override here exists only to correct a wrong detection, not to opt back into
+ *  trading on stale data. */
+function MassiveTierRow() {
+  const qc = useQueryClient();
+  const { data: t } = useQuery({
+    queryKey: ["massive_tier_status"],
+    queryFn:  api.getMassiveTierStatus,
+    refetchInterval: 5_000,
+  });
+
+  const setOverride = async (tier: "unlimited" | "basic" | null) => {
+    await api.setMassiveTierOverride(tier);
+    qc.invalidateQueries({ queryKey: ["massive_tier_status"] });
+  };
+
+  if (!t) return null;
+
+  return (
+    <div className="rounded border border-border/40 px-3 py-1">
+      <Row
+        label="Tier Massive"
+        value={
+          <span className={t.effective === "unlimited" ? "text-amber-300" : undefined}>
+            {TIER_LABEL[t.effective]}
+          </span>
+        }
+      />
+      <Row
+        label="Détecté automatiquement"
+        value={t.detected ? TIER_LABEL[t.detected as "unlimited" | "basic"] : "— (pas de clé, ou pas encore sondé)"}
+      />
+      <div className="flex items-center justify-between py-1.5 text-sm">
+        <span className="text-muted-foreground">Forçage manuel</span>
+        <div className="flex gap-1">
+          {(["basic", "unlimited"] as const).map((tier) => (
+            <button
+              key={tier}
+              onClick={() => setOverride(t.override === tier ? null : tier)}
+              className={cn(
+                "rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors",
+                t.override === tier
+                  ? "bg-blue-900/50 text-blue-300"
+                  : "bg-zinc-800/60 text-muted-foreground hover:bg-zinc-800",
+              )}
+            >
+              Forcer {tier === "unlimited" ? "illimité" : "basic"}
+            </button>
+          ))}
+        </div>
+      </div>
+      {t.override && (
+        <p className="pb-1.5 text-[10px] text-muted-foreground/70">
+          Forçage actif — la détection automatique est ignorée jusqu'à ce que tu
+          cliques à nouveau sur le tier sélectionné pour repasser en auto.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function FeedDiagnosticsTab() {
   const { data: d } = useQuery({
     queryKey: ["feed_diagnostics"],
@@ -130,26 +197,37 @@ export function FeedDiagnosticsTab() {
           value={
             d.plan === "sip" ? "SIP (payant) — symboles illimités"
             : d.plan === "iex" ? `IEX (gratuit) — ${d.symbol_limit ?? 30} abonnements max`
+            : d.plan === "massive_unlimited"
+              ? d.broad_mode === "massive-a-universe"
+                ? "Massive Starter+ (payant) — différé 15 min, agrégats 1s, tout le marché (✱)"
+                : `Massive Starter+ (payant) — différé 15 min, agrégats 1s, ${d.symbol_limit ?? 30} symboles max`
             : "—"
           }
         />
         <Row
           label="Mode large"
           value={
-            d.symbol_limit ? "aucun (plan plafonné)"
+            d.broad_mode === "massive-a-universe" ? "agrégats 1s (✱, stratégie active)"
+            : d.symbol_limit ? "aucun (plan plafonné)"
             : d.broad_mode === "trades" ? "trades (premarket)"
             : d.broad_mode === "bars" ? "bougies 1-min (open)"
             : d.broad_mode || "—"
           }
         />
         <Row
-          label={d.symbol_limit ? "Abonnements (symbole × canal)" : "Surveillance large"}
+          label={
+            d.symbol_limit && d.broad_mode !== "massive-a-universe"
+              ? "Abonnements (symbole × canal)"
+              : "Surveillance large"
+          }
           value={
-            d.symbol_limit
-              ? `${d.subscribed_symbols} / ${d.symbol_limit}`
-              : d.subscribed_symbols > 0
-                ? d.subscribed_symbols.toLocaleString()
-                : "tout le marché (✱)"
+            d.broad_mode === "massive-a-universe"
+              ? "tout le marché (✱)"
+              : d.symbol_limit
+                ? `${d.subscribed_symbols} / ${d.symbol_limit}`
+                : d.subscribed_symbols > 0
+                  ? d.subscribed_symbols.toLocaleString()
+                  : "tout le marché (✱)"
           }
         />
         <Row label="Dernier abonnement envoyé" value={d.last_subscribe || "—"} />
@@ -184,6 +262,8 @@ export function FeedDiagnosticsTab() {
       <p className="text-[10px] text-muted-foreground/60">
         Mis à jour {relTime(d.updated_at)} · rafraîchi automatiquement.
       </p>
+
+      <MassiveTierRow />
     </div>
   );
 }

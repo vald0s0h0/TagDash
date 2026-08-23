@@ -14,10 +14,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+pub mod bars;
 pub mod news;
+pub mod plan;
 pub mod reference;
 pub mod short_interest;
 pub mod splits;
+pub mod stream;
 
 /// Free tier allows ~5 requests/minute → 1 request every 13 s (with margin).
 pub(crate) const RATE_LIMIT: Duration = Duration::from_secs(13);
@@ -89,8 +92,10 @@ pub(crate) fn with_key(url: &str, api_key: &str) -> String {
 /// Fetch the full-universe free-float dump, following `next_url` pagination.
 ///
 /// Respects the free-tier rate limit by sleeping `RATE_LIMIT` between page
-/// requests. With ~7–8k US equities at 5000/page this is ~2 pages (≈13 s).
-pub async fn fetch_float_all(api_key: &str) -> Result<Vec<MassiveFloat>, String> {
+/// requests, UNLESS `unlimited` (a confirmed Starter+ tier, see `plan::Tier`) says
+/// the account has no such limit. With ~7–8k US equities at 5000/page this is ~2
+/// pages (≈13 s throttled, near-instant unthrottled).
+pub async fn fetch_float_all(api_key: &str, unlimited: bool) -> Result<Vec<MassiveFloat>, String> {
     let client = crate::http::client();
     let mut out: Vec<MassiveFloat> = Vec::new();
 
@@ -101,7 +106,7 @@ pub async fn fetch_float_all(api_key: &str) -> Result<Vec<MassiveFloat>, String>
 
     for page in 0..MAX_PAGES {
         // Throttle every request after the first to honour the free-tier limit.
-        if page > 0 {
+        if page > 0 && !unlimited {
             tokio::time::sleep(RATE_LIMIT).await;
         }
 
@@ -342,7 +347,7 @@ mod tests {
         eprintln!("AAPL: {one:?}");
         assert!(one.float_shares > 0.0);
 
-        let all = fetch_float_all(&key).await.unwrap();
+        let all = fetch_float_all(&key, false).await.unwrap();
         eprintln!("bulk float records: {}", all.len());
         eprintln!("sample: {:?}", &all[..all.len().min(3)]);
         assert!(all.len() > 1000, "expected a full-universe dump");

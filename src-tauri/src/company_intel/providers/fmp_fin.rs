@@ -53,7 +53,10 @@ pub async fn fetch_financials(
     let income_url = format!(
         "{FMP_BASE}/income-statement?symbol={ticker}&period=quarter&limit=4&apikey={api_key}"
     );
-    if let Ok(rows) = http.get_json::<Vec<IncomeRow>>(limiter, &income_url, &[], policy).await {
+    if let Ok(rows) = http
+        .get_json::<Vec<IncomeRow>>(limiter, &income_url, &[], policy)
+        .await
+    {
         let vals: Vec<f64> = rows.iter().filter_map(|r| r.net_income).collect();
         if let Some(first) = vals.first() {
             fh.net_income_last_q = Some(*first);
@@ -74,7 +77,10 @@ pub async fn fetch_financials(
     let cf_url = format!(
         "{FMP_BASE}/cash-flow-statement?symbol={ticker}&period=annual&limit=1&apikey={api_key}"
     );
-    if let Ok(rows) = http.get_json::<Vec<CashFlowRow>>(limiter, &cf_url, &[], policy).await {
+    if let Ok(rows) = http
+        .get_json::<Vec<CashFlowRow>>(limiter, &cf_url, &[], policy)
+        .await
+    {
         fh.operating_cash_flow_ttm = rows.first().and_then(|r| r.operating_cash_flow);
     }
 
@@ -82,7 +88,10 @@ pub async fn fetch_financials(
     let bs_url = format!(
         "{FMP_BASE}/balance-sheet-statement?symbol={ticker}&period=quarter&limit=1&apikey={api_key}"
     );
-    if let Ok(rows) = http.get_json::<Vec<BalanceRow>>(limiter, &bs_url, &[], policy).await {
+    if let Ok(rows) = http
+        .get_json::<Vec<BalanceRow>>(limiter, &bs_url, &[], policy)
+        .await
+    {
         fh.cash_and_equivalents = rows.first().and_then(|r| r.cash_and_cash_equivalents);
     }
 

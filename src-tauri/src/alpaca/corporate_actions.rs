@@ -16,7 +16,7 @@ use serde_json;
 #[derive(Debug, Clone)]
 pub struct Split {
     /// Ex-date, YYYY-MM-DD — the day the split takes effect on the chart.
-    pub date:  String,
+    pub date: String,
     /// Human label: "x4" for a 4-for-1 forward split, "1:10" for a reverse.
     pub label: String,
 }
@@ -42,13 +42,13 @@ struct CorporateActions {
 #[derive(Debug, Deserialize)]
 struct RawSplit {
     #[serde(default)]
-    symbol:   Option<String>,
+    symbol: Option<String>,
     // Alpaca's split payload carries BOTH `ex_date` and `process_date`; we read the
     // ex-date by its own name. (A `process_date` alias here makes serde see two keys
     // mapping to this field → "duplicate field ex_date".) `process_date` is a fallback
     // ONLY when ex_date is absent — handled in `into_split`, not via a serde alias.
     #[serde(default)]
-    ex_date:  Option<String>,
+    ex_date: Option<String>,
     #[serde(default)]
     process_date: Option<String>,
     #[serde(default)]
@@ -100,7 +100,9 @@ pub async fn fetch_splits(
     // App clock: in replay the window ends on the simulated day, so a split with
     // an ex-date after the replayed day can never leak into the chart markers.
     let now = crate::time::now();
-    let start = (now - Duration::days(years.max(1) * 366)).format("%Y-%m-%d").to_string();
+    let start = (now - Duration::days(years.max(1) * 366))
+        .format("%Y-%m-%d")
+        .to_string();
     let end = now.format("%Y-%m-%d").to_string();
 
     let client = crate::http::client();
@@ -131,8 +133,12 @@ pub async fn fetch_splits(
         }
 
         let body = resp.text().await.map_err(|e| e.to_string())?;
-        let parsed: CorporateActionsResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("corporate-actions parse error: {e} — body: {}", &body[..body.len().min(400)]))?;
+        let parsed: CorporateActionsResponse = serde_json::from_str(&body).map_err(|e| {
+            format!(
+                "corporate-actions parse error: {e} — body: {}",
+                &body[..body.len().min(400)]
+            )
+        })?;
         if let Some(ca) = parsed.corporate_actions {
             for s in ca.forward_splits.into_iter().chain(ca.reverse_splits) {
                 if let Some(split) = s.into_split() {
@@ -199,8 +205,12 @@ pub async fn fetch_recent_split_symbols(
                 return Err(format!("Alpaca corporate-actions HTTP {status}: {body}"));
             }
             let body = resp.text().await.map_err(|e| e.to_string())?;
-            let parsed: CorporateActionsResponse = serde_json::from_str(&body)
-                .map_err(|e| format!("corporate-actions parse error: {e} — body: {}", &body[..body.len().min(400)]))?;
+            let parsed: CorporateActionsResponse = serde_json::from_str(&body).map_err(|e| {
+                format!(
+                    "corporate-actions parse error: {e} — body: {}",
+                    &body[..body.len().min(400)]
+                )
+            })?;
             if let Some(ca) = &parsed.corporate_actions {
                 for s in ca.forward_splits.iter().chain(ca.reverse_splits.iter()) {
                     if let Some(sym) = &s.symbol {
@@ -223,10 +233,10 @@ pub async fn fetch_recent_split_symbols(
 #[derive(Debug, Clone)]
 pub struct SplitEvent {
     pub symbol: String,
-    pub date: String,   // ex-date YYYY-MM-DD
-    pub from: f64,      // old_rate
-    pub to: f64,        // new_rate
-    pub label: String,  // "x4" / "1:10"
+    pub date: String,  // ex-date YYYY-MM-DD
+    pub from: f64,     // old_rate
+    pub to: f64,       // new_rate
+    pub label: String, // "x4" / "1:10"
 }
 
 /// Fetch EVERY forward/reverse split for `symbols` with an ex-date on/after `start`
@@ -272,8 +282,12 @@ pub async fn fetch_all_splits(
                 return Err(format!("Alpaca corporate-actions HTTP {status}: {body}"));
             }
             let body = resp.text().await.map_err(|e| e.to_string())?;
-            let parsed: CorporateActionsResponse = serde_json::from_str(&body)
-                .map_err(|e| format!("corporate-actions parse error: {e} — body: {}", &body[..body.len().min(400)]))?;
+            let parsed: CorporateActionsResponse = serde_json::from_str(&body).map_err(|e| {
+                format!(
+                    "corporate-actions parse error: {e} — body: {}",
+                    &body[..body.len().min(400)]
+                )
+            })?;
             if let Some(ca) = parsed.corporate_actions {
                 for s in ca.forward_splits.into_iter().chain(ca.reverse_splits) {
                     let date = s.ex_date.clone().or_else(|| s.process_date.clone());
@@ -318,7 +332,13 @@ mod tests {
         let parsed: CorporateActionsResponse = serde_json::from_str(body).unwrap();
         let ca = parsed.corporate_actions.unwrap();
         assert_eq!(ca.reverse_splits.len(), 1);
-        let split = ca.reverse_splits.into_iter().next().unwrap().into_split().unwrap();
+        let split = ca
+            .reverse_splits
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_split()
+            .unwrap();
         assert_eq!(split.date, "2026-06-18");
         assert_eq!(split.label, "1:100"); // 100→1 reverse
     }

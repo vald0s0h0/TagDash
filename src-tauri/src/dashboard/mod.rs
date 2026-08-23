@@ -18,24 +18,24 @@ use crate::tradetally::TtClient;
 /// full upstream object is kept in `raw` so new cards can read anything later.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardTrade {
-    pub tt_id:       String,
-    pub symbol:      Option<String>,
-    pub side:        Option<String>,
-    pub quantity:    Option<f64>,
+    pub tt_id: String,
+    pub symbol: Option<String>,
+    pub side: Option<String>,
+    pub quantity: Option<f64>,
     pub entry_price: Option<f64>,
-    pub exit_price:  Option<f64>,
-    pub pnl:         Option<f64>,
+    pub exit_price: Option<f64>,
+    pub pnl: Option<f64>,
     pub pnl_percent: Option<f64>,
-    pub entry_date:  Option<String>,
-    pub exit_date:   Option<String>,
-    pub commission:  Option<f64>,
-    pub fees:        Option<f64>,
-    pub status:      Option<String>,
-    pub setup:       Option<String>,
-    pub strategy:    Option<String>,
-    pub broker:      Option<String>,
-    pub tags:        Vec<String>,
-    pub raw:         Value,
+    pub entry_date: Option<String>,
+    pub exit_date: Option<String>,
+    pub commission: Option<f64>,
+    pub fees: Option<f64>,
+    pub status: Option<String>,
+    pub setup: Option<String>,
+    pub strategy: Option<String>,
+    pub broker: Option<String>,
+    pub tags: Vec<String>,
+    pub raw: Value,
 }
 
 /// The folder where the user drops background photos + the image chosen for today
@@ -43,16 +43,16 @@ pub struct DashboardTrade {
 /// set it as a `src` directly. Empty folder → no image, just the folder path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyBackground {
-    pub dir:       String,
+    pub dir: String,
     pub file_name: Option<String>,
-    pub data_url:  Option<String>,
+    pub data_url: Option<String>,
 }
 
 /// One random inspiration image, already encoded as a data-URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoodImage {
     pub file_name: String,
-    pub data_url:  String,
+    pub data_url: String,
 }
 
 /// A fresh, *random* mood pick (unlike `DailyBackground`, which is stable per day):
@@ -61,15 +61,15 @@ pub struct MoodImage {
 /// when its folder / file is empty. The paths are returned so the UI can open them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mood {
-    pub images_dir:   String,
-    pub short_path:   String,
-    pub long_path:    String,
-    pub image:        Option<MoodImage>,
+    pub images_dir: String,
+    pub short_path: String,
+    pub long_path: String,
+    pub image: Option<MoodImage>,
     pub short_phrase: Option<String>,
     /// A second short phrase, distinct from `short_phrase` when the file has ≥2
     /// lines — used by the H1 card so it never echoes the Inspiration card.
     pub heading_phrase: Option<String>,
-    pub long_phrase:  Option<String>,
+    pub long_phrase: Option<String>,
 }
 
 // ─── TradeTally sync ─────────────────────────────────────────────────────────
@@ -141,39 +141,46 @@ fn parse_trade(v: &Value) -> Option<DashboardTrade> {
     // from the exit timestamp; ISO strings sort chronologically as text.
     let exit_time = s("exit_time");
     let status = s("status").or_else(|| {
-        Some(if exit_time.is_some() { "Closed".to_string() } else { "Open".to_string() })
+        Some(if exit_time.is_some() {
+            "Closed".to_string()
+        } else {
+            "Open".to_string()
+        })
     });
 
     Some(DashboardTrade {
         tt_id,
-        symbol:      s("symbol"),
-        side:        s("side"),
-        quantity:    f("quantity"),
+        symbol: s("symbol"),
+        side: s("side"),
+        quantity: f("quantity"),
         entry_price: f("entry_price"),
-        exit_price:  f("exit_price"),
-        pnl:         f("pnl"),
+        exit_price: f("exit_price"),
+        pnl: f("pnl"),
         pnl_percent: f("pnl_percent"),
-        entry_date:  s("entry_time").or_else(|| s("trade_date")),
-        exit_date:   exit_time,
-        commission:  f("commission"),
-        fees:        f("fees"),
+        entry_date: s("entry_time").or_else(|| s("trade_date")),
+        exit_date: exit_time,
+        commission: f("commission"),
+        fees: f("fees"),
         status,
-        setup:       s("setup"),
-        strategy:    s("strategy"),
-        broker:      s("broker"),
-        tags:        parse_tags(v.get("tags")),
-        raw:         v.clone(),
+        setup: s("setup"),
+        strategy: s("strategy"),
+        broker: s("broker"),
+        tags: parse_tags(v.get("tags")),
+        raw: v.clone(),
     })
 }
 
 /// Numbers may arrive as JSON numbers or numeric strings — handle both.
 fn json_to_f64(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
 /// Tags can be an array of strings or of `{ name: "…" }` objects.
 fn parse_tags(v: Option<&Value>) -> Vec<String> {
-    let Some(Value::Array(arr)) = v else { return Vec::new() };
+    let Some(Value::Array(arr)) = v else {
+        return Vec::new();
+    };
     arr.iter()
         .filter_map(|t| match t {
             Value::String(s) => Some(s.clone()),
@@ -203,7 +210,11 @@ pub fn pick_daily_background(app_dir: &Path) -> DailyBackground {
     files.sort();
 
     if files.is_empty() {
-        return DailyBackground { dir: dir_str, file_name: None, data_url: None };
+        return DailyBackground {
+            dir: dir_str,
+            file_name: None,
+            data_url: None,
+        };
     }
 
     // Index = ET day number modulo the number of photos → same image all day,
@@ -216,27 +227,39 @@ pub fn pick_daily_background(app_dir: &Path) -> DailyBackground {
     let chosen = &files[idx];
 
     let file_name = chosen.file_name().map(|n| n.to_string_lossy().to_string());
-    let data_url = std::fs::read(chosen).ok().map(|bytes| {
-        format!("data:{};base64,{}", mime_for(chosen), base64_encode(&bytes))
-    });
+    let data_url = std::fs::read(chosen)
+        .ok()
+        .map(|bytes| format!("data:{};base64,{}", mime_for(chosen), base64_encode(&bytes)));
 
-    DailyBackground { dir: dir_str, file_name, data_url }
+    DailyBackground {
+        dir: dir_str,
+        file_name,
+        data_url,
+    }
 }
 
 fn is_image(p: &Path) -> bool {
     matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "avif")
     )
 }
 
 fn mime_for(p: &Path) -> &'static str {
-    match p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("png")  => "image/png",
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
         Some("webp") => "image/webp",
-        Some("gif")  => "image/gif",
+        Some("gif") => "image/gif",
         Some("avif") => "image/avif",
-        _            => "image/jpeg",
+        _ => "image/jpeg",
     }
 }
 
@@ -259,7 +282,9 @@ fn os_open(path: &Path) -> Result<(), String> {
     let path_str = path.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]
     // `start` is a cmd builtin; the empty "" is the (mandatory) window title.
-    let cmd = Command::new("cmd").args(["/C", "start", "", &path_str]).spawn();
+    let cmd = Command::new("cmd")
+        .args(["/C", "start", "", &path_str])
+        .spawn();
     #[cfg(target_os = "macos")]
     let cmd = Command::new("open").arg(&path_str).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -287,10 +312,7 @@ fn mood_paths(app_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::p
         );
     }
     if !long.exists() {
-        let _ = std::fs::write(
-            &long,
-            "# Une citation longue par ligne (~50 mots)\n",
-        );
+        let _ = std::fs::write(&long, "# Une citation longue par ligne (~50 mots)\n");
     }
     (images, short, long)
 }
@@ -322,13 +344,13 @@ pub fn pick_mood(app_dir: &Path) -> Mood {
     let (short_phrase, heading_phrase) = pick_two_random_lines(&short_path);
 
     Mood {
-        images_dir:   images_dir.to_string_lossy().to_string(),
-        short_path:   short_path.to_string_lossy().to_string(),
-        long_path:    long_path.to_string_lossy().to_string(),
+        images_dir: images_dir.to_string_lossy().to_string(),
+        short_path: short_path.to_string_lossy().to_string(),
+        long_path: long_path.to_string_lossy().to_string(),
         image,
         short_phrase,
         heading_phrase,
-        long_phrase:  pick_random_line(&long_path),
+        long_phrase: pick_random_line(&long_path),
     }
 }
 
@@ -396,7 +418,9 @@ pub fn seed_default_assets(resources: &Path, app_dir: &Path) {
 }
 
 fn copy_dir_if_absent(src: &Path, dst: &Path) {
-    let Ok(entries) = std::fs::read_dir(src) else { return };
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
     let _ = std::fs::create_dir_all(dst);
     for e in entries.flatten() {
         let p = e.path();
@@ -444,8 +468,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

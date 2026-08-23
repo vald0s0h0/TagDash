@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
-    pub trade_id:   String,
-    pub symbol:     String,
-    pub notes:      String,
+    pub trade_id: String,
+    pub symbol: String,
+    pub notes: String,
     pub confidence: Option<i32>,
-    pub tags:       Vec<String>,
+    pub tags: Vec<String>,
     pub updated_at: String,
 }
 
@@ -52,8 +52,17 @@ pub fn get(conn: &Connection, trade_id: &str) -> Result<Option<JournalEntry>> {
         })
         .optional()?;
 
-    Ok(result.map(|(trade_id, symbol, notes, confidence, tags_json, updated_at)| {
-        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        JournalEntry { trade_id, symbol, notes, confidence, tags, updated_at }
-    }))
+    Ok(result.map(
+        |(trade_id, symbol, notes, confidence, tags_json, updated_at)| {
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            JournalEntry {
+                trade_id,
+                symbol,
+                notes,
+                confidence,
+                tags,
+                updated_at,
+            }
+        },
+    ))
 }

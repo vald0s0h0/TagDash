@@ -1,11 +1,15 @@
-// Alpaca news WebSocket client — the premarket "news investor".
+// Alpaca news WebSocket client — the "news investor".
 // Endpoint: wss://stream.data.alpaca.markets/v1beta1/news
 //
 // One connection, subscribed to every ticker's news via the `*` wildcard. The
-// feed is only active during the premarket window (ET 04:00–09:30): outside it
+// feed is active across the extended trading day (ET 04:00–20:00): outside it
 // the task idles (no connection) and re-checks once a minute. Headlines are
 // pushed into MarketState (per-symbol for the micro_pullback correlation engine
-// + a flat log for the news debug panel).
+// and its A+ news watch, + a flat log for the news debug panel).
+//
+// The window is wider than premarket because the A+ qualification re-scores a
+// candidate the moment a headline lands, at any hour — and `recent_news` only
+// ever holds what this socket delivered.
 //
 // Auth is identical to the market-data stream (Alpaca key/secret); the news
 // stream is independent of the data feed (sip/iex/delayed_sip).
@@ -29,10 +33,10 @@ use crate::types::NewsHeadline;
 const NEWS_URL: &str = "wss://stream.data.alpaca.markets/v1beta1/news";
 /// Backoff between reconnect attempts after a transient drop.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-/// How often to poll whether we're still in the premarket window while idle.
+/// How often to poll whether we're back inside the session window while idle.
 const IDLE_POLL: Duration = Duration::from_secs(60);
-/// How often, while connected, to re-check the premarket window so we tear the
-/// connection down promptly at 09:30.
+/// How often, while connected, to re-check the session window so we tear the
+/// connection down promptly at 20:00.
 const WINDOW_REEVAL: Duration = Duration::from_secs(30);
 
 /// One decoded message from the news stream. Unused fields ignored.
@@ -41,41 +45,47 @@ struct NewsMsg {
     #[serde(rename = "T")]
     kind: String,
     // news payload
-    id:         Option<i64>,
-    headline:   Option<String>,
-    summary:    Option<String>,
-    url:        Option<String>,
-    source:     Option<String>,
+    id: Option<i64>,
+    headline: Option<String>,
+    summary: Option<String>,
+    url: Option<String>,
+    source: Option<String>,
     #[serde(default)]
-    symbols:    Vec<String>,
+    symbols: Vec<String>,
     created_at: Option<String>,
     // control
-    msg:  Option<String>,
+    msg: Option<String>,
     code: Option<i64>,
 }
 
-/// True during the premarket window (ET 04:00–09:30). ET is DST-aware (see
-/// `crate::time`).
-fn in_premarket() -> bool {
-    (240..570).contains(&crate::time::et_minutes(Utc::now()))
+/// True across the whole extended trading day (ET 04:00–20:00). ET is DST-aware
+/// (see `crate::time`).
+///
+/// This used to be premarket only. Micro Pullback's A+ qualification watches for a
+/// headline continuously — a catalyst that lands at 10:15 or at 16:40 matters just
+/// as much as one at 06:00 — and that watch reads `MarketState::recent_news`, which
+/// only ever holds what this socket delivered. Headline volume is small, so the
+/// wider window costs essentially nothing.
+fn in_session() -> bool {
+    (240..1200).contains(&crate::time::et_minutes(Utc::now()))
 }
 
-/// Run the news feed until `running` is cleared. Connects only during premarket;
-/// idles otherwise.
+/// Run the news feed until `running` is cleared. Connects only inside the session
+/// window; idles otherwise.
 pub async fn run(
-    market:  Arc<RwLock<MarketState>>,
-    key:     String,
-    secret:  String,
+    market: Arc<RwLock<MarketState>>,
+    key: String,
+    secret: String,
     running: Arc<AtomicBool>,
 ) {
-    eprintln!("[tagdash] news feed: started (premarket only)");
+    eprintln!("[tagdash] news feed: started (04:00-20:00 ET)");
 
     while running.load(Ordering::Relaxed) {
-        if !in_premarket() {
+        if !in_session() {
             {
                 let mut ms = market.write().unwrap();
                 ms.news_set_premarket(false);
-                ms.news_state("waiting_premarket");
+                ms.news_state("waiting_session");
             }
             sleep(IDLE_POLL).await;
             continue;
@@ -90,11 +100,14 @@ pub async fn run(
             }
             Err(e) => {
                 eprintln!("[tagdash] news feed: connect failed: {e}");
-                market.write().unwrap().news_error(&format!("connect failed: {e}"));
+                market
+                    .write()
+                    .unwrap()
+                    .news_error(&format!("connect failed: {e}"));
             }
         }
 
-        if running.load(Ordering::Relaxed) && in_premarket() {
+        if running.load(Ordering::Relaxed) && in_session() {
             sleep(RECONNECT_DELAY).await;
         }
     }
@@ -104,13 +117,14 @@ pub async fn run(
 }
 
 /// Drive one connection: auth → subscribe `news *` → ingest headlines. Returns
-/// when the premarket window ends, on a disconnect, or on a fatal server error.
+/// when the session window ends, on a disconnect, or on a fatal server error.
 async fn session(
-    ws:      tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    key:     &str,
-    secret:  &str,
-    market:  &Arc<RwLock<MarketState>>,
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    key: &str,
+    secret: &str,
+    market: &Arc<RwLock<MarketState>>,
     running: &Arc<AtomicBool>,
 ) {
     let (mut write, mut read) = ws.split();
@@ -132,10 +146,10 @@ async fn session(
         tokio::select! {
             biased;
 
-            // Tear down promptly once premarket ends.
+            // Tear down promptly once the session window ends.
             _ = reeval.tick() => {
-                if !in_premarket() {
-                    eprintln!("[tagdash] news feed: premarket window closed — disconnecting");
+                if !in_session() {
+                    eprintln!("[tagdash] news feed: session window closed — disconnecting");
                     market.write().unwrap().news_set_premarket(false);
                     return;
                 }

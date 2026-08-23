@@ -85,21 +85,35 @@ pub fn has_day(app_dir: &Path, day: &str) -> bool {
 pub fn calendar(app_dir: &Path) -> Vec<FlatFileDay> {
     let dir = kind_dir(app_dir, Kind::Trade);
     let mut out: Vec<FlatFileDay> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(day) = day_of_file(&name, "trade-") else { continue };
+        let Some(day) = day_of_file(&name, "trade-") else {
+            continue;
+        };
         let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let (symbol_count, bar_count, complete) = Connection::open(entry.path())
             .ok()
             .map(|c| {
-                let sc = get_meta(&c, "symbol_count").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let bc = get_meta(&c, "trade_count").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let sc = get_meta(&c, "symbol_count")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let bc = get_meta(&c, "trade_count")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
                 let complete = get_meta(&c, "complete").map(|v| v == "1").unwrap_or(false);
                 (sc, bc, complete)
             })
             .unwrap_or((0, 0, false));
-        out.push(FlatFileDay { day, bytes, symbol_count, bar_count, complete });
+        out.push(FlatFileDay {
+            day,
+            bytes,
+            symbol_count,
+            bar_count,
+            complete,
+        });
     }
     out.sort_by(|a, b| a.day.cmp(&b.day));
     out
@@ -156,7 +170,8 @@ pub async fn write_day(
     day: &str,
 ) -> Result<usize, String> {
     let cfg = crate::micro_pullback::Config::DEFAULT;
-    let nd = NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| format!("invalid date: {day}"))?;
+    let nd =
+        NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| format!("invalid date: {day}"))?;
     let noon = data::noon_utc(nd);
     let pm_start = crate::time::et_clock_utc(noon, 4, 0); // 04:00 ET
     let cash_open = crate::time::et_clock_utc(noon, 9, 30); // 09:30 ET (Micro Pullback is premarket-only)
@@ -165,10 +180,15 @@ pub async fn write_day(
     // file (already downloaded — it holds the day's top-2000-by-volume active set,
     // day-correct, not float-filtered). No Alpaca re-fetch needed.
     if !super::minute::has_day(app_dir, day) {
-        return Err(format!("le fichier minute du {day} doit être téléchargé avant le fichier trade"));
+        return Err(format!(
+            "le fichier minute du {day} doit être téléchargé avant le fichier trade"
+        ));
     }
     let bars = super::minute::read_premarket_bars(
-        app_dir, day, pm_start.timestamp_millis(), cash_open.timestamp_millis(),
+        app_dir,
+        day,
+        pm_start.timestamp_millis(),
+        cash_open.timestamp_millis(),
     )?;
     if bars.is_empty() {
         return Err(format!("aucune donnée minute premarket pour le {day}"));
@@ -184,7 +204,11 @@ pub async fn write_day(
         crate::local_db::universe_repository::get_all(&conn)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter_map(|a| a.float_shares.filter(|f| *f > 0).map(|f| (a.symbol, f as u64)))
+            .filter_map(|a| {
+                a.float_shares
+                    .filter(|f| *f > 0)
+                    .map(|f| (a.symbol, f as u64))
+            })
             .collect()
     };
 
@@ -302,9 +326,10 @@ pub async fn write_day(
         }
         let one = [sym.clone()];
         for w in wins {
-            let (Some(s), Some(e)) =
-                (ms_to_rfc3339(w.alert_ms - NEWS_LOOKBACK_MS), ms_to_rfc3339(w.alert_ms - 1_000))
-            else {
+            let (Some(s), Some(e)) = (
+                ms_to_rfc3339(w.alert_ms - NEWS_LOOKBACK_MS),
+                ms_to_rfc3339(w.alert_ms - 1_000),
+            ) else {
                 continue;
             };
             match fetch_with_retry(|| data::fetch_news_window(key, secret, &s, &e, &one)).await {
@@ -333,20 +358,30 @@ pub async fn write_day(
                 .prepare("INSERT INTO trades (symbol, t_ms, price, size) VALUES (?1,?2,?3,?4)")
                 .map_err(|e| e.to_string())?;
             for (s, ms, p, sz) in &all_trades {
-                ins_t.execute(rusqlite::params![s, ms, p, sz]).map_err(|e| e.to_string())?;
+                ins_t
+                    .execute(rusqlite::params![s, ms, p, sz])
+                    .map_err(|e| e.to_string())?;
             }
             let mut ins_q = tx
                 .prepare("INSERT INTO quotes (symbol, t_ms, bid, ask, bid_size, ask_size) VALUES (?1,?2,?3,?4,?5,?6)")
                 .map_err(|e| e.to_string())?;
             for (s, ms, bid, ask, bs, az) in &all_quotes {
-                ins_q.execute(rusqlite::params![s, ms, bid, ask, bs, az]).map_err(|e| e.to_string())?;
+                ins_q
+                    .execute(rusqlite::params![s, ms, bid, ask, bs, az])
+                    .map_err(|e| e.to_string())?;
             }
             let mut ins_f = tx
                 .prepare("INSERT OR REPLACE INTO float_snapshot (symbol, float_shares, effective_date, as_of_day, historical) VALUES (?1,?2,?3,?4,?5)")
                 .map_err(|e| e.to_string())?;
             for (s, r) in &floats {
                 ins_f
-                    .execute(rusqlite::params![s, r.float_shares, r.effective_date, day, r.historical as i64])
+                    .execute(rusqlite::params![
+                        s,
+                        r.float_shares,
+                        r.effective_date,
+                        day,
+                        r.historical as i64
+                    ])
                     .map_err(|e| e.to_string())?;
             }
             let mut ins_w = tx
@@ -355,7 +390,9 @@ pub async fn write_day(
             for (s, wins) in &kept {
                 for w in wins {
                     ins_w
-                        .execute(rusqlite::params![s, w.alert_ms, w.start_ms, w.end_ms, w.reason])
+                        .execute(rusqlite::params![
+                            s, w.alert_ms, w.start_ms, w.end_ms, w.reason
+                        ])
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -365,7 +402,12 @@ pub async fn write_day(
             for h in &all_news {
                 let syms_json = serde_json::to_string(&h.symbols).unwrap_or_else(|_| "[]".into());
                 ins_n
-                    .execute(rusqlite::params![h.id, h.headline, h.created_at.timestamp_millis(), syms_json])
+                    .execute(rusqlite::params![
+                        h.id,
+                        h.headline,
+                        h.created_at.timestamp_millis(),
+                        syms_json
+                    ])
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -379,7 +421,8 @@ pub async fn write_day(
         set_meta(&tx, "trade_count", &trade_count.to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "quote_count", &all_quotes.len().to_string()).map_err(|e| e.to_string())?;
         set_meta(&tx, "news_count", &all_news.len().to_string()).map_err(|e| e.to_string())?;
-        set_meta(&tx, "ignited_candidates", &ignited_candidates.to_string()).map_err(|e| e.to_string())?;
+        set_meta(&tx, "ignited_candidates", &ignited_candidates.to_string())
+            .map_err(|e| e.to_string())?;
         set_meta(&tx, "capped", if capped { "1" } else { "0" }).map_err(|e| e.to_string())?;
         set_meta(&tx, "complete", "1").map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -453,7 +496,13 @@ fn scan_symbol(
         let base_vol = base.iter().map(|b| b.5 as f64).sum::<f64>() / base.len() as f64;
         let base_range = base
             .iter()
-            .map(|b| if b.1 > 0.0 { (b.2 - b.3) / b.1 * 100.0 } else { 0.0 })
+            .map(|b| {
+                if b.1 > 0.0 {
+                    (b.2 - b.3) / b.1 * 100.0
+                } else {
+                    0.0
+                }
+            })
             .sum::<f64>()
             / base.len() as f64;
         let cur_range = if o > 0.0 { (h - l) / o * 100.0 } else { 0.0 };
@@ -467,7 +516,12 @@ fn scan_symbol(
             match wins.last_mut() {
                 // Merge with the previous window when they overlap/touch.
                 Some(w) if start <= w.end_ms => w.end_ms = w.end_ms.max(end),
-                _ => wins.push(Window { start_ms: start, end_ms: end, alert_ms: t_ms, reason }),
+                _ => wins.push(Window {
+                    start_ms: start,
+                    end_ms: end,
+                    alert_ms: t_ms,
+                    reason,
+                }),
             }
         }
     }
@@ -507,9 +561,17 @@ pub fn read_overlay(app_dir: &Path, day: &str) -> Option<TradeOverlay> {
 
     let mut windows: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT symbol, start_ts, end_ts FROM windows").ok()?;
+        let mut stmt = conn
+            .prepare("SELECT symbol, start_ts, end_ts FROM windows")
+            .ok()?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
             .ok()?;
         for row in rows.flatten() {
             windows.entry(row.0).or_default().push((row.1, row.2));
@@ -518,37 +580,57 @@ pub fn read_overlay(app_dir: &Path, day: &str) -> Option<TradeOverlay> {
 
     let mut events: Vec<data::TimedEvent> = Vec::new();
     {
-        let mut stmt = conn.prepare("SELECT symbol, t_ms, price, size FROM trades").ok()?;
+        let mut stmt = conn
+            .prepare("SELECT symbol, t_ms, price, size FROM trades")
+            .ok()?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, i64>(3)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })
             .ok()?;
         for row in rows.flatten() {
             let (symbol, t_ms, price, size) = row;
             events.push(data::TimedEvent {
                 ts_ms: t_ms,
-                ev: data::Event::Trade { symbol, price, size: size.max(0) as u64, prints: 1 },
+                ev: data::Event::Trade {
+                    symbol,
+                    price,
+                    size: size.max(0) as u64,
+                    prints: 1,
+                },
             });
         }
     }
     {
-        let mut stmt = conn.prepare("SELECT symbol, t_ms, bid, ask FROM quotes").ok()?;
+        let mut stmt = conn
+            .prepare("SELECT symbol, t_ms, bid, ask FROM quotes")
+            .ok()?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
             })
             .ok()?;
         for row in rows.flatten() {
             let (symbol, t_ms, bid, ask) = row;
-            events.push(data::TimedEvent { ts_ms: t_ms, ev: data::Event::Quote { symbol, bid, ask } });
+            events.push(data::TimedEvent {
+                ts_ms: t_ms,
+                ev: data::Event::Quote { symbol, bid, ask },
+            });
         }
     }
 
     // News (may be absent in older trade files).
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT id, headline, created_ms, symbols_json FROM news")
-    {
+    if let Ok(mut stmt) = conn.prepare("SELECT id, headline, created_ms, symbols_json FROM news") {
         if let Ok(rows) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, Option<i64>>(0)?,
@@ -564,8 +646,9 @@ pub fn read_overlay(app_dir: &Path, day: &str) -> Option<TradeOverlay> {
                 else {
                     continue;
                 };
-                let syms: Vec<String> =
-                    symbols_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+                let syms: Vec<String> = symbols_json
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_default();
                 events.push(data::TimedEvent {
                     ts_ms: created_ms,
                     ev: data::Event::News(crate::types::NewsHeadline {
@@ -595,7 +678,9 @@ fn ms_to_rfc3339(ms: i64) -> Option<String> {
 }
 
 fn rfc3339_to_ms(s: &str) -> Option<i64> {
-    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc).timestamp_millis())
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc).timestamp_millis())
 }
 
 #[cfg(test)]
@@ -621,7 +706,16 @@ mod tests {
     #[test]
     fn volume_spike_fires_a_window() {
         let mut bars: Vec<(i64, f64, f64, f64, f64, i64)> = (0..6)
-            .map(|i| bar(&format!("2026-06-10T08:{:02}:00Z", i), 2.0, 2.02, 1.98, 2.0, 1_000))
+            .map(|i| {
+                bar(
+                    &format!("2026-06-10T08:{:02}:00Z", i),
+                    2.0,
+                    2.02,
+                    1.98,
+                    2.0,
+                    1_000,
+                )
+            })
             .collect();
         // A sudden 50k-share, wide-range minute well in the price band.
         bars.push(bar("2026-06-10T08:06:00Z", 2.0, 2.4, 2.0, 2.35, 50_000));
@@ -638,7 +732,10 @@ mod tests {
     fn overlay_covers_overlapping_range() {
         let mut windows = HashMap::new();
         windows.insert("AAA".to_string(), vec![(1_000, 2_000)]);
-        let ov = TradeOverlay { windows, events: Vec::new() };
+        let ov = TradeOverlay {
+            windows,
+            events: Vec::new(),
+        };
         assert!(ov.covers("AAA", 1_500, 1_600));
         assert!(ov.covers("AAA", 900, 1_100));
         assert!(!ov.covers("AAA", 2_100, 2_200));

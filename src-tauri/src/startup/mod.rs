@@ -127,6 +127,10 @@ fn default_steps() -> Vec<StartupStep> {
         ),
         StartupStep::new("build_universe", "Finalize universe (all US stocks)"),
         StartupStep::new(
+            "compute_micro_rvol",
+            "Build robust Micro Pullback RVOL baseline",
+        ),
+        StartupStep::new(
             "load_replay_day",
             "Latest flat-files day available for Market Replay",
         ),
@@ -168,6 +172,56 @@ pub async fn run_pipeline(
     let has_massive = key_set(&sec.massive_api_key);
     let has_fmp = key_set(&sec.fmp_api_key); // legacy fallback for floats
     let has_sec = key_set(&sec.sec_api_key);
+
+    // ── Massive tier detection + trading safety gate ───────────────────────────
+    // Probe once per launch whether the Massive key is on a paid Starter+ tier
+    // (unlimited calls, but 15-minute delayed data — see `massive::plan`). A probe
+    // failure falls back to the last known-good value; nothing known defaults to
+    // throttled/Basic, never a guessed Unlimited (a wrong guess trips real 429s).
+    let detected_massive_tier = if has_massive {
+        let key = sec.massive_api_key.as_deref().unwrap_or_default();
+        match crate::massive::plan::probe(key).await {
+            Ok(tier) => {
+                let g = db.lock().unwrap();
+                let _ = cache_repository::set_app_meta(
+                    &g,
+                    crate::massive::plan::TIER_META_KEY,
+                    tier.as_str(),
+                );
+                Some(tier)
+            }
+            Err(_) => {
+                let g = db.lock().unwrap();
+                cache_repository::get_app_meta(&g, crate::massive::plan::TIER_META_KEY)
+                    .and_then(|s| crate::massive::plan::Tier::from_meta(&s))
+            }
+        }
+    } else {
+        None
+    };
+    let massive_override = config
+        .read()
+        .unwrap()
+        .data_source
+        .massive_tier_override
+        .as_deref()
+        .and_then(crate::massive::plan::Tier::from_meta);
+    let effective_massive_tier =
+        crate::massive::plan::effective(detected_massive_tier, massive_override);
+    let massive_unlimited = matches!(
+        effective_massive_tier,
+        crate::massive::plan::Tier::Unlimited
+    );
+
+    // Data differed by 15 minutes must never drive a real order sent to Alpaca —
+    // force the internal TagDash broker instead of failing silently later.
+    if crate::massive::plan::enforce_broker_gate(&config, &app_dir, effective_massive_tier) {
+        push_warning(
+            &state,
+            "Massive Starter+ actif (données différées de 15 min) — courtier basculé \
+             automatiquement sur TagDash, Alpaca désactivé",
+        );
+    }
 
     // ── Step 1: load_config ───────────────────────────────────────────────────
     set_step(&state, "load_config", StepStatus::Running, None);
@@ -232,7 +286,10 @@ pub async fn run_pipeline(
         );
         Vec::new()
     } else if !has_alpaca {
-        push_warning(&state, "Alpaca keys not configured — using cached assets only");
+        push_warning(
+            &state,
+            "Alpaca keys not configured — using cached assets only",
+        );
         set_step(
             &state,
             "fetch_alpaca",
@@ -336,7 +393,15 @@ pub async fn run_pipeline(
         universe_repository::get_active_symbols(&g).unwrap_or_default()
     };
     let (floats, _, _) = tokio::join!(
-        step_floats(&db, &state, &sec, &today, has_massive, has_fmp),
+        step_floats(
+            &db,
+            &state,
+            &sec,
+            &today,
+            has_massive,
+            has_fmp,
+            massive_unlimited
+        ),
         step_sec(&db, &state, &sec, &today, has_sec),
         step_daily(&db, &state, &sec, &symbols_for_bars, has_alpaca, &today),
     );
@@ -380,7 +445,7 @@ pub async fn run_pipeline(
     // floats because the two endpoints have different pagination and freshness.
     // Keep the previous classifications on a provider failure: falling back to the
     // name/exchange heuristic is safer than erasing known-good types.
-    step_security_types(&db, &state, &sec, &today, has_massive).await;
+    step_security_types(&db, &state, &sec, &today, has_massive, massive_unlimited).await;
 
     // ── Steps 7b–7e: compute + network pulls — all five in parallel ───────────
     // compute_changes and compute_metrics are CPU/DB passes (no network); they
@@ -466,7 +531,14 @@ pub async fn run_pipeline(
                 &format!("startup: ATR/prev_close {pc}, Pump&Dump scored {pd}"),
             );
         },
-        step_short_interest(&db, &state, &secrets, has_massive, &today),
+        step_short_interest(
+            &db,
+            &state,
+            &secrets,
+            has_massive,
+            massive_unlimited,
+            &today
+        ),
         step_splits_bulk(&db, &state, &sec, &symbols_for_bars, has_alpaca, &today),
         step_dilution(&db, &state, &config, &today, has_sec || has_alpaca),
     );
@@ -587,6 +659,35 @@ pub async fn run_pipeline(
     );
     let _ = log(&db, "info", "startup: universe ready (all US stocks)");
 
+    // Micro Pullback historical baseline is derived once, outside the hot scanner
+    // loop. It is strictly point-in-time (only files before today), and absence of
+    // minute history is a normal cold-start state rather than a startup failure.
+    set_step(&state, "compute_micro_rvol", StepStatus::Running, None);
+    let today = crate::time::et_date(crate::time::now());
+    match crate::flat_files::minute::ensure_rvol_baseline(&app_dir, &db, &today) {
+        Ok(profile) if !profile.is_empty() => set_step(
+            &state,
+            "compute_micro_rvol",
+            StepStatus::Success,
+            Some(&format!("{} profils ticker × tranche ET", profile.len())),
+        ),
+        Ok(_) => set_step(
+            &state,
+            "compute_micro_rvol",
+            StepStatus::Warning,
+            Some("aucun historique minute antérieur — fallback RVOL glissant"),
+        ),
+        Err(e) => {
+            push_warning(&state, &format!("baseline Micro Pullback: {e}"));
+            set_step(
+                &state,
+                "compute_micro_rvol",
+                StepStatus::Warning,
+                Some("échec baseline historique — fallback RVOL glissant"),
+            );
+        }
+    }
+
     // ── Step 17: load_replay_day ──────────────────────────────────────────────
     // Informational in both cases: which downloaded day Market Replay can open. When
     // there is no live feed to watch (offline, or no Alpaca keys), `lib.rs` parks it
@@ -646,6 +747,7 @@ async fn step_security_types(
     secrets: &Secrets,
     today: &str,
     has_massive: bool,
+    massive_unlimited: bool,
 ) {
     let (fresh, cached) = {
         let g = db.lock().unwrap();
@@ -678,9 +780,12 @@ async fn step_security_types(
     };
     // The float endpoint may just have consumed this plan's one-request-per-window
     // allowance. Waiting here prevents the first reference page from being rejected
-    // with 429 on constrained Massive plans.
-    tokio::time::sleep(crate::massive::RATE_LIMIT).await;
-    match crate::massive::reference::fetch_security_types(key).await {
+    // with 429 on constrained Massive plans. Skipped when the tier is confirmed
+    // unlimited — there is no shared window to collide with.
+    if !massive_unlimited {
+        tokio::time::sleep(crate::massive::RATE_LIMIT).await;
+    }
+    match crate::massive::reference::fetch_security_types(key, massive_unlimited).await {
         Ok(rows) => {
             let changed = {
                 let g = db.lock().unwrap();
@@ -841,6 +946,7 @@ async fn step_floats(
     today: &str,
     has_massive: bool,
     has_fmp: bool,
+    massive_unlimited: bool,
 ) -> Vec<crate::massive::MassiveFloat> {
     set_step(state, "fetch_massive", StepStatus::Running, None);
     let floats_fresh_today = {
@@ -906,9 +1012,13 @@ async fn step_floats(
             state,
             "fetch_massive",
             StepStatus::Running,
-            Some("fetching bulk float (rate-limited ~1 req/13s)…"),
+            Some(if massive_unlimited {
+                "fetching bulk float (débit illimité détecté)…"
+            } else {
+                "fetching bulk float (rate-limited ~1 req/13s)…"
+            }),
         );
-        match crate::massive::fetch_float_all(key).await {
+        match crate::massive::fetch_float_all(key, massive_unlimited).await {
             Ok(data) => data,
             Err(e) => {
                 push_warning(
@@ -929,13 +1039,13 @@ async fn step_floats(
         match crate::fmp::fetch_shares_float_all(key).await {
             Ok(data) => data
                 .into_iter()
-                    .map(|f| crate::massive::MassiveFloat {
-                        symbol: f.symbol,
-                        float_shares: f.float_shares,
-                        outstanding_shares: f.outstanding_shares,
-                        free_float: f.free_float,
-                    })
-                    .collect(),
+                .map(|f| crate::massive::MassiveFloat {
+                    symbol: f.symbol,
+                    float_shares: f.float_shares,
+                    outstanding_shares: f.outstanding_shares,
+                    free_float: f.free_float,
+                })
+                .collect(),
             Err(e) => {
                 push_warning(
                     state,
@@ -1269,6 +1379,7 @@ async fn step_short_interest(
     state: &Arc<RwLock<StartupState>>,
     secrets: &Arc<RwLock<crate::config::secrets::Secrets>>,
     has_massive: bool,
+    massive_unlimited: bool,
     today: &str,
 ) {
     const SI_KEY: &str = "short_interest_fetch_date";
@@ -1296,7 +1407,13 @@ async fn step_short_interest(
         );
         return;
     }
-    match crate::company_intel::collect_short_interest_bulk(db.clone(), secrets.clone()).await {
+    match crate::company_intel::collect_short_interest_bulk(
+        db.clone(),
+        secrets.clone(),
+        massive_unlimited,
+    )
+    .await
+    {
         Ok(n) => {
             {
                 let g = db.lock().unwrap();

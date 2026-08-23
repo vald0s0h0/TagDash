@@ -32,7 +32,9 @@ pub fn is_active() -> bool {
 /// The simulated instant. Only meaningful while `is_active()`.
 pub fn sim_now() -> DateTime<Utc> {
     let ms = SIM_MILLIS.load(Ordering::Relaxed);
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 /// Install the simulated instant (engine loop, on every tick / seek).

@@ -5,16 +5,16 @@
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 
+use super::client::TtClient;
 use crate::config::{secrets::Secrets, AppConfig};
 use crate::local_db::tradetally_queue_repository;
-use super::client::TtClient;
 
 const DRAIN_INTERVAL_SECS: u64 = 5;
 const MAX_ATTEMPTS: u32 = 5;
 
 pub async fn run(
-    db:      Arc<Mutex<rusqlite::Connection>>,
-    config:  Arc<RwLock<AppConfig>>,
+    db: Arc<Mutex<rusqlite::Connection>>,
+    config: Arc<RwLock<AppConfig>>,
     secrets: Arc<RwLock<Secrets>>,
 ) {
     // One-time cleanup of pre-v1 queued events (legacy endpoints can't be sent).
@@ -31,8 +31,8 @@ pub async fn run(
 }
 
 async fn drain_once(
-    db:      &Arc<Mutex<rusqlite::Connection>>,
-    config:  &Arc<RwLock<AppConfig>>,
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    config: &Arc<RwLock<AppConfig>>,
     secrets: &Arc<RwLock<Secrets>>,
 ) {
     let (base_url, token, tt_email, tt_password) = {
@@ -50,8 +50,7 @@ async fn drain_once(
         return;
     }
 
-    let client = TtClient::new(base_url, token)
-        .with_session_creds(tt_email, tt_password);
+    let client = TtClient::new(base_url, token).with_session_creds(tt_email, tt_password);
 
     // Snapshot pending events (holds lock only briefly)
     let pending = {
@@ -64,7 +63,9 @@ async fn drain_once(
         if event.attempts >= MAX_ATTEMPTS {
             let conn = db.lock().unwrap();
             let _ = tradetally_queue_repository::mark_failed(
-                &conn, &event.event_id, "max attempts reached",
+                &conn,
+                &event.event_id,
+                "max attempts reached",
             );
             continue;
         }
@@ -89,7 +90,7 @@ async fn drain_once(
 
         let resolved_endpoint = match tt_id_opt {
             Some(ref tt_id) => event.endpoint.replace("{TT_ID}", tt_id),
-            None            => event.endpoint.clone(),
+            None => event.endpoint.clone(),
         };
 
         let result = dispatch(
@@ -97,14 +98,17 @@ async fn drain_once(
             &event.event_type,
             &resolved_endpoint,
             &event.payload_summary,
-        ).await;
+        )
+        .await;
 
         let conn = db.lock().unwrap();
         match result {
             Ok(maybe_tt_id) => {
                 if let Some(ref tt_id) = maybe_tt_id {
                     let _ = tradetally_queue_repository::save_tt_trade_id(
-                        &conn, &event.trade_id, tt_id,
+                        &conn,
+                        &event.trade_id,
+                        tt_id,
                     );
                 }
                 let _ = tradetally_queue_repository::mark_success(&conn, &event.event_id);
@@ -118,13 +122,13 @@ async fn drain_once(
 
 // Returns Ok(Some(tt_id)) for trade creation events (so caller can persist the mapping).
 async fn dispatch(
-    client:       &TtClient,
-    event_type:   &str,
-    endpoint:     &str,
+    client: &TtClient,
+    event_type: &str,
+    endpoint: &str,
     payload_json: &str,
 ) -> Result<Option<String>, String> {
-    let payload: serde_json::Value = serde_json::from_str(payload_json)
-        .map_err(|e| format!("invalid payload JSON: {e}"))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(payload_json).map_err(|e| format!("invalid payload JSON: {e}"))?;
 
     match event_type {
         // Creates the trade and returns the server id (persisted as the mapping).
@@ -140,16 +144,30 @@ async fn dispatch(
         // Diary card: create-or-update today's TradeTally diary entry. Token-first
         // with a session-login fallback (the /api/diary route uses session auth).
         "diary_entry" => {
-            let entry_date = payload.get("entryDate").and_then(|v| v.as_str()).unwrap_or_default();
-            let title      = payload.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-            let content    = payload.get("content").and_then(|v| v.as_str()).unwrap_or_default();
-            client.create_diary_entry(entry_date, title, content).await?;
+            let entry_date = payload
+                .get("entryDate")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let title = payload
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let content = payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            client
+                .create_diary_entry(entry_date, title, content)
+                .await?;
             Ok(None)
         }
         // Screenshot: read the local PNG and upload it via a session login
         // (multipart) to /api/trades/{id}/images.
         "chart_updated" => {
-            let local_path = payload.get("localPath").and_then(|v| v.as_str()).unwrap_or_default();
+            let local_path = payload
+                .get("localPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             client.upload_images_session(endpoint, local_path).await?;
             Ok(None)
         }

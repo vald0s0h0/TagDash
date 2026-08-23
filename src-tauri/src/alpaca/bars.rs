@@ -2,13 +2,13 @@
 // Real endpoint: GET https://data.alpaca.markets/v2/stocks/bars
 // Returns HashMap<symbol, Vec<BarData>> (up to `limit` bars per symbol).
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BarData {
     pub symbol: String,
-    pub date: String,      // YYYY-MM-DD
+    pub date: String, // YYYY-MM-DD
     pub open: Option<f64>,
     pub high: Option<f64>,
     pub low: Option<f64>,
@@ -52,10 +52,9 @@ fn effective_end(tf_secs: i64, requested: Option<&str>) -> Option<String> {
         (None, c) => c,
         (Some(r), None) => Some(r.to_string()),
         (Some(r), Some(c)) => {
-            let rp = chrono::DateTime::parse_from_rfc3339(r)
-                .map(|d| d.with_timezone(&chrono::Utc));
-            let cp = chrono::DateTime::parse_from_rfc3339(&c)
-                .map(|d| d.with_timezone(&chrono::Utc));
+            let rp = chrono::DateTime::parse_from_rfc3339(r).map(|d| d.with_timezone(&chrono::Utc));
+            let cp =
+                chrono::DateTime::parse_from_rfc3339(&c).map(|d| d.with_timezone(&chrono::Utc));
             match (rp, cp) {
                 (Ok(r0), Ok(c0)) if r0 <= c0 => Some(r.to_string()),
                 _ => Some(c),
@@ -205,8 +204,8 @@ pub async fn fetch_minute_bars_since(
     symbols: &[String],
     start: &str,
 ) -> Result<HashMap<String, Vec<crate::market_state::aggregators::Bar>>, String> {
-    use chrono::{DateTime, Utc};
     use crate::market_state::aggregators::Bar;
+    use chrono::{DateTime, Utc};
 
     if symbols.is_empty() {
         return Ok(HashMap::new());
@@ -242,15 +241,17 @@ pub async fn fetch_minute_bars_since(
             for (sym, bars) in raw.bars {
                 let entry = out.entry(sym).or_default();
                 for b in bars {
-                    let Ok(time) = b.t.parse::<DateTime<Utc>>() else { continue };
+                    let Ok(time) = b.t.parse::<DateTime<Utc>>() else {
+                        continue;
+                    };
                     entry.push(Bar {
                         time,
-                        open:        b.o,
-                        high:        b.h,
-                        low:         b.l,
-                        close:       b.c,
-                        volume:      b.v.max(0) as u64,
-                        vwap:        b.vw,
+                        open: b.o,
+                        high: b.h,
+                        low: b.l,
+                        close: b.c,
+                        volume: b.v.max(0) as u64,
+                        vwap: b.vw,
                         trade_count: b.n.map(|n| n.max(0) as u64),
                     });
                 }
@@ -292,28 +293,40 @@ pub async fn fetch_premarket_daily_bar(
 
     let syms = [symbol.to_string()];
     let map = fetch_minute_bars_since(key, secret, &syms, &start).await?;
-    let Some(mbars) = map.get(symbol) else { return Ok(None) };
+    let Some(mbars) = map.get(symbol) else {
+        return Ok(None);
+    };
 
     let mut bars = mbars.iter().filter(|b| b.time < cap);
-    let Some(first) = bars.next() else { return Ok(None) };
+    let Some(first) = bars.next() else {
+        return Ok(None);
+    };
     let (mut high, mut low, mut close) = (first.high, first.low, first.close);
     let open = first.open;
     let mut volume: u64 = first.volume;
     let mut pv: f64 = first.vwap.unwrap_or(first.close) * first.volume as f64;
     let mut trades: u64 = first.trade_count.unwrap_or(0);
     for b in bars {
-        high   = high.max(b.high);
-        low    = low.min(b.low);
-        close  = b.close;
+        high = high.max(b.high);
+        low = low.min(b.low);
+        close = b.close;
         volume += b.volume;
-        pv     += b.vwap.unwrap_or(b.close) * b.volume as f64;
+        pv += b.vwap.unwrap_or(b.close) * b.volume as f64;
         trades += b.trade_count.unwrap_or(0);
     }
 
     Ok(Some(Bar {
-        time:        crate::time::et_midnight_utc(now),
-        open, high, low, close, volume,
-        vwap:        if volume > 0 { Some(pv / volume as f64) } else { None },
+        time: crate::time::et_midnight_utc(now),
+        open,
+        high,
+        low,
+        close,
+        volume,
+        vwap: if volume > 0 {
+            Some(pv / volume as f64)
+        } else {
+            None
+        },
         trade_count: Some(trades),
     }))
 }
@@ -324,10 +337,10 @@ pub fn alpaca_timeframe(tf: crate::market_state::aggregators::Timeframe) -> Opti
     use crate::market_state::aggregators::Timeframe;
     match tf {
         Timeframe::S5 | Timeframe::S10 => None,
-        Timeframe::M1    => Some("1Min"),
-        Timeframe::M2    => Some("2Min"),
-        Timeframe::M5    => Some("5Min"),
-        Timeframe::M15   => Some("15Min"),
+        Timeframe::M1 => Some("1Min"),
+        Timeframe::M2 => Some("2Min"),
+        Timeframe::M5 => Some("5Min"),
+        Timeframe::M15 => Some("15Min"),
         Timeframe::Daily => Some("1Day"),
     }
 }
@@ -346,8 +359,8 @@ pub async fn fetch_recent_bars(
     tf: crate::market_state::aggregators::Timeframe,
     limit: u32,
 ) -> Result<Vec<crate::market_state::aggregators::Bar>, String> {
-    use chrono::{DateTime, Duration, Utc};
     use crate::market_state::aggregators::Bar;
+    use chrono::{DateTime, Duration, Utc};
 
     let Some(timeframe) = alpaca_timeframe(tf) else {
         return Ok(vec![]); // sub-minute frames Alpaca's REST bars don't serve
@@ -391,12 +404,12 @@ pub async fn fetch_recent_bars(
                     let time = b.t.parse::<DateTime<Utc>>().ok()?;
                     Some(Bar {
                         time,
-                        open:        b.o,
-                        high:        b.h,
-                        low:         b.l,
-                        close:       b.c,
-                        volume:      b.v.max(0) as u64,
-                        vwap:        b.vw,
+                        open: b.o,
+                        high: b.h,
+                        low: b.l,
+                        close: b.c,
+                        volume: b.v.max(0) as u64,
+                        vwap: b.vw,
                         trade_count: b.n.map(|n| n.max(0) as u64),
                     })
                 })
@@ -421,8 +434,8 @@ pub async fn fetch_bars_before(
     end: &str,
     limit: u32,
 ) -> Result<Vec<crate::market_state::aggregators::Bar>, String> {
-    use chrono::{DateTime, Utc};
     use crate::market_state::aggregators::Bar;
+    use chrono::{DateTime, Utc};
 
     let Some(timeframe) = alpaca_timeframe(tf) else {
         return Ok(vec![]);
@@ -459,12 +472,12 @@ pub async fn fetch_bars_before(
                     let time = b.t.parse::<DateTime<Utc>>().ok()?;
                     Some(Bar {
                         time,
-                        open:        b.o,
-                        high:        b.h,
-                        low:         b.l,
-                        close:       b.c,
-                        volume:      b.v.max(0) as u64,
-                        vwap:        b.vw,
+                        open: b.o,
+                        high: b.h,
+                        low: b.l,
+                        close: b.c,
+                        volume: b.v.max(0) as u64,
+                        vwap: b.vw,
                         trade_count: b.n.map(|n| n.max(0) as u64),
                     })
                 })

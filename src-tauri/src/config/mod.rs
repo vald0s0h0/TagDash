@@ -236,6 +236,11 @@ impl Default for CompanyIntelConfig {
 pub struct DataSourceConfig {
     #[serde(default)]
     pub offline: bool,
+    /// Manual override of the auto-detected Massive subscription tier
+    /// ("unlimited" | "basic"), for when the automatic probe gets it wrong.
+    /// `None` = automatic (see `crate::massive::plan::effective`).
+    #[serde(default)]
+    pub massive_tier_override: Option<String>,
 }
 
 // ─── Broker ─────────────────────────────────────────────────────────────────

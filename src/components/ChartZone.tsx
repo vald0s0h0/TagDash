@@ -9,6 +9,7 @@ import {
   ChevronDown,
   CircleX,
   Clock,
+  DollarSign,
   LoaderCircle,
   MoreHorizontal,
   NotebookPen,
@@ -20,7 +21,7 @@ import { JournalModal } from "./JournalModal";
 import { MicDictate } from "./MicDictate";
 import { DrawingContextMenu } from "./DrawingContextMenu";
 import { useQuery } from "@tanstack/react-query";
-import type { PaneSpec, StrategyCard, Timeframe, ZoneAssignment } from "@/types";
+import type { PaneSpec, ShortCostZone, StrategyCard, Timeframe, ZoneAssignment } from "@/types";
 import { useLayoutStore, MANUAL_STRATEGY_ID } from "@/stores/layoutStore";
 import {
   useChartStore, type DrawMode, type DrawScope, type ChartLine,
@@ -33,7 +34,9 @@ import {
   registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
 import { registerZoneGamepad, getChartControl } from "@/lib/gamepadBus";
-import { useStrategyCards, useStrategies, usePanicLlmScores } from "@/queries/useScanner";
+import {
+  useStrategyCards, useStrategies, usePanicLlmScores, useMicroQualityScores,
+} from "@/queries/useScanner";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
 import { nyFilenameStamp } from "@/lib/nyTime";
@@ -76,6 +79,7 @@ const EMOJIS: { glyph: string; title: string }[] = [
 // Bollinger, info band = float / industry / country.
 const MANUAL_CARD: StrategyCard = {
   universe: "us_stocks",
+  streaming_scope: "none",
   panes: [{
     timeframe: "5m",
     symbol: null,
@@ -127,6 +131,9 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   // Capture status: idle | pending | success | error
   const [captureStatus, setCaptureStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
+  const [locateVisible, setLocateVisible] = useState(false);
+  const [locatePending, setLocatePending] = useState(false);
+  const [shortCostZone, setShortCostZone] = useState<ShortCostZone | null>(null);
 
   const releaseZone      = useLayoutStore((s) => s.releaseZone);
 
@@ -318,6 +325,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
   });
   const liveState = zone.symbol ? (snapshot?.tickers[zone.symbol] ?? null) : null;
 
+  const { data: brokerSelection } = useQuery({
+    queryKey: ["broker_selection"],
+    queryFn: () => api.getBrokerSelection(),
+    refetchInterval: 2000,
+  });
+  const alpacaSelected = brokerSelection?.broker === "alpaca";
+
   // ── Poll open positions to show entry overlay + enable Close button ────────
   const { data: positions } = useQuery({
     queryKey: ["internal_positions"],
@@ -327,6 +341,40 @@ export function ChartZone({ zone }: ChartZoneProps) {
   });
   const openPosition = positions?.find((p) => p.symbol === zone.symbol) ?? null;
   const hasPosition  = openPosition != null;
+
+  // Once the user has explicitly paid/reserved locates, refresh only the cheap
+  // local cost projection. Alpaca's position mirror supplies actual average entry
+  // and partial-fill quantity; no additional locate is ever bought by this poll.
+  useEffect(() => {
+    if (!shortCostZone || !zone.symbol) return;
+    let alive = true;
+    const refresh = () => {
+      api.getShortCostZone(zone.zone_id)
+        .then((value) => { if (alive) setShortCostZone(value); })
+        .catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [shortCostZone != null, zone.zone_id, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    setLocateVisible(false);
+    setLocatePending(false);
+    setShortCostZone(null);
+  }, [zone.symbol]);
+
+  const shortCostBand = useMemo(() => {
+    if (!locateVisible || !shortCostZone) return null;
+    const known = shortCostZone.total_known_cost.toFixed(2);
+    const source = shortCostZone.source === "position" ? "fills Alpaca" : "estimé";
+    return {
+      entryPrice: shortCostZone.entry_price,
+      breakEvenPrice: shortCostZone.break_even_price,
+      complete: shortCostZone.costs_complete,
+      label: `Déficit ${source} · coûts ${known}$${shortCostZone.costs_complete ? "" : " min."} · BE ${shortCostZone.break_even_price.toFixed(4)}`,
+    };
+  }, [locateVisible, shortCostZone]);
 
   // ── Poll pending orders for limit-price lines on the chart ──────────────
   const { data: pendingOrders } = useQuery({
@@ -370,6 +418,14 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // never appears in live mode. `undefined` (not yet analysed) collapses to null.
   const { bySymbol: panicScores } = usePanicLlmScores();
   const panicScore = zone.symbol ? panicScores[zone.symbol] ?? null : null;
+
+  // ── Micro Pullback A+ verdict + what the qualification layer is doing now ────
+  // Same contract as the panic board: day- and mode-scoped server-side, so a
+  // replay's judgements never leak into live. The live half is what lets the
+  // overlay draw a spinner instead of an empty pane while the models are running.
+  const { bySymbol: microQuality, liveBySymbol: microQualityLive } = useMicroQualityScores();
+  const microRow  = zone.symbol ? microQuality[zone.symbol] ?? null : null;
+  const microLive = zone.symbol ? microQualityLive[zone.symbol] ?? null : null;
 
   // ── HOD Drive draft (suggested) trade levels ──────────────────────────────────
   // Initialized once when gates_pass flips true; local state not re-synced on each
@@ -432,19 +488,6 @@ export function ChartZone({ zone }: ChartZoneProps) {
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
-
-  // ── Current (forming) bar volume on the displayed timeframe ────────────────
-  // Polls the live ring buffer (forming bar included) so the common info bar's
-  // "Vol barre" updates as the candle fills.
-  const { data: tfBars } = useQuery({
-    queryKey: ["tf_bars_vol", zone.symbol, timeframe],
-    queryFn:  () => api.getTickerBars(zone.symbol!, timeframe),
-    enabled:  !!zone.symbol,
-    refetchInterval: 1500,
-  });
-  const currentBarVolume = tfBars && tfBars.length > 0
-    ? tfBars[tfBars.length - 1].volume
-    : null;
 
   // ── Load existing context when zone symbol changes ─────────────────────────
   useEffect(() => {
@@ -531,18 +574,26 @@ export function ChartZone({ zone }: ChartZoneProps) {
     }).catch(() => {});
   }, [zone.zone_id, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Seed the interactive pane's timeframe from the strategy card when a new
-  //    alert lands in this zone. Re-seeds only on a new alert_id, so the user's
-  //    manual timeframe changes persist for the current alert. ────────────────
+  // ── Seed the interactive pane's timeframe from the strategy card, but only for
+  //    the very FIRST alert this zone ever shows. After that, the toolbar's
+  //    timeframe is a standing user preference — switching to a different alert
+  //    (a new ticker from the screener, gamepad nav, …) must never snap it back to
+  //    the strategy's static default. A genuine per-alert signal (e.g. Perfect
+  //    Pullback's triggering timeframe, carried in `display_timeframe`) is real
+  //    alert-specific data, not a preference reset, so it still always applies —
+  //    unlike Panic Mean Reversion, whose card default is static and whose alerts
+  //    never carry a `display_timeframe`, so it must never re-seed after the first
+  //    alert. ─────────────────────────────────────────────────────────────────
   const seededAlertRef = useRef<string | null>(null);
   useEffect(() => {
-    // Per-alert timeframe override (e.g. Perfect Pullback's triggering timeframe)
-    // wins over the card's static pane timeframe.
-    const tf0 = (zone.display_timeframe as Timeframe | null) ?? card?.panes?.[interactiveIdx]?.timeframe;
-    if (tf0 && zone.alert_id && seededAlertRef.current !== zone.alert_id) {
+    if (!zone.alert_id || seededAlertRef.current === zone.alert_id) return;
+    const isFirstSeed = seededAlertRef.current === null;
+    const tf0 = (zone.display_timeframe as Timeframe | null)
+      ?? (isFirstSeed ? card?.panes?.[interactiveIdx]?.timeframe : null);
+    if (tf0) {
       chartStore.setTimeframe(zone.zone_id, tf0 as Timeframe);
-      seededAlertRef.current = zone.alert_id;
     }
+    seededAlertRef.current = zone.alert_id;
   }, [card, interactiveIdx, zone.alert_id, zone.zone_id, zone.display_timeframe]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── On position close, refetch the context. The backend clears the zone's
@@ -925,6 +976,26 @@ export function ChartZone({ zone }: ChartZoneProps) {
       notifyError(e, "Ordre");
     }
   }, [zone.zone_id, hasSl, orderMode, chartStore]);
+
+  // Explicit paid action. A second click only hides the visual band; it can never
+  // cancel/refund a locate (Alpaca locates are non-refundable).
+  const handleLocate = useCallback(async () => {
+    if (locateVisible) {
+      setLocateVisible(false);
+      return;
+    }
+    if (!hasSl || locatePending) return;
+    setLocatePending(true);
+    try {
+      const zoneCost = await api.prepareShortLocate(zone.zone_id);
+      setShortCostZone(zoneCost);
+      setLocateVisible(true);
+    } catch (e) {
+      notifyError(e, "Locate Alpaca");
+    } finally {
+      setLocatePending(false);
+    }
+  }, [locateVisible, hasSl, locatePending, zone.zone_id]);
 
   // ── Chart click finalises a pending limit order ──────────────────────────
   const handleLimitOrderClick = useCallback(async (price: number) => {
@@ -1311,6 +1382,31 @@ export function ChartZone({ zone }: ChartZoneProps) {
     </TBtn>
   );
 
+  const tbLocate = (
+    <TBtn
+      key="locate"
+      title={!alpacaSelected
+        ? "Sélectionne le broker Alpaca pour utiliser les locates"
+        : !hasSl
+        ? "Place d'abord le SL"
+        : locateVisible
+          ? `Masquer la zone de déficit${shortCostZone
+              ? ` · ${shortCostZone.located_quantity} actions localisées · locate $${shortCostZone.locate_fee.toFixed(2)}${shortCostZone.costs_complete ? ` · borrow $${(shortCostZone.borrow_fee ?? 0).toFixed(2)}` : " · taux borrow non fourni par Alpaca"}`
+              : ""}`
+          : "Réserver automatiquement les lots HTB Alpaca et afficher le seuil de rentabilité"
+      }
+      disabled={!alpacaSelected || !hasSl || locatePending}
+      active={locateVisible}
+      onClick={handleLocate}
+      className={locateVisible ? "text-red-300" : undefined}
+    >
+      {locatePending
+        ? <LoaderCircle className="h-3 w-3 animate-spin" />
+        : <DollarSign className="h-3 w-3" />}
+      {!narrowToolbar && <span>Locate</span>}
+    </TBtn>
+  );
+
   const tbAlarm = (
     <TBtn key="alarm" title="Placer une alarme de prix" active={drawMode === "alarm"}
       onClick={() => toggleMode("alarm")}
@@ -1423,7 +1519,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
   );
 
   // Primary = always visible; secondary = in overflow when narrow
-  const primaryButtons  = [tbRelease, tbSl, tbTp, tbAlarm, tbClock];
+  const primaryButtons  = [tbRelease, tbSl, tbTp, tbLocate, tbAlarm, tbClock];
   const secondaryButtons = [tbLine, tbText, tbEmoji, tbSize25, tbSize50, tbSize100, tbOrderMode, tbClose, tbCapture, tbJournal, tbAudioNote];
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -1442,15 +1538,24 @@ export function ChartZone({ zone }: ChartZoneProps) {
         ref={headerRef}
         className="flex min-w-0 items-center gap-1 border-b border-border bg-card/80 px-1.5 py-0.5"
       >
-        {/* Symbol + priority */}
-        <span className="shrink-0 text-sm font-bold tabular-nums tracking-tight">
+        {/* Symbol. Priority no longer renders here (kept on the zone for later —
+            see `styles` below, still driving the outer accent) but the badge
+            itself is retired from the header. */}
+        <span className="mr-2 shrink-0 text-sm font-bold tabular-nums tracking-tight">
           {zone.symbol}
         </span>
-        {zone.priority != null && styles && (
-          <span className={cn("shrink-0 rounded px-1 py-0.5 text-[9px] font-bold uppercase", styles.badge)}>
-            P{zone.priority}
-          </span>
-        )}
+
+        {/* ── Common info bar — merged onto this line, identical for every
+            strategy: strategy badge · country · industry · float · gap · rvol ·
+            volume since 04:00 ET. Wrapped in infoBandRef (forwarded) so the
+            screenshot capture can include just this segment. */}
+        <ChartInfoBar
+          bandRef={infoBandRef}
+          zone={zone}
+          cardInfo={cardInfo ?? null}
+          enrichment={enrichment ?? null}
+          live={liveState}
+        />
 
         {/* Timeframe + side badge (e.g. Perfect Pullback timeframe × long/short) */}
         {zone.display_timeframe && (
@@ -1579,39 +1684,6 @@ export function ChartZone({ zone }: ChartZoneProps) {
         </div>
       </div>
 
-      {/* ── Common info bar — identical for every strategy ─────────────────── */}
-      {/* Strategy badge · Bollinger Z · premarket vol · current-bar vol · news ·
-          IA analysis (context/verdict). Strategy-specific fields are drawn on the
-          chart itself (StrategyInfoOverlay), not here. Wrapped in infoBandRef so
-          the screenshot capture can include it. */}
-      <div ref={infoBandRef}>
-        <ChartInfoBar
-          zone={zone}
-          card={card}
-          cardInfo={cardInfo ?? null}
-          enrichment={enrichment ?? null}
-          dayVolume={liveState?.volume_day ?? null}
-          currentBarVolume={currentBarVolume}
-          onRunLlm={() => {
-            if (zone.symbol && zone.strategy_id) {
-              api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
-            }
-          }}
-        />
-
-        {/* Reason + LLM summary */}
-        {zone.reason && (
-          <div className="line-clamp-1 px-2 text-[9px] leading-tight text-muted-foreground/60">
-            {zone.reason}
-          </div>
-        )}
-        {zone.llm_summary && (
-          <div className="mx-2 mb-1 rounded bg-blue-900/20 px-1.5 py-1 text-[10px] leading-relaxed text-blue-300">
-            {zone.llm_summary}
-          </div>
-        )}
-      </div>
-
       {/* ── Chart area: panes from the strategy card ───────────────────────── */}
       {/* Every pane is tool-interactive: SL / TP / alarms / lines can be placed
           (and dragged) from ANY pane — they're price levels shared by the zone, so
@@ -1710,6 +1782,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
                         cardInfo={cardInfo ?? null}
                         enrichment={enrichment ?? null}
                         news={tickerNews ?? []}
+                        quality={microRow}
+                        live={microLive}
                       />
                     ) : isHod ? (
                       <HodDriveInfoOverlay
@@ -1747,6 +1821,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     slPrice={context?.stop_loss ?? null}
                     tpPrice={context?.take_profit ?? null}
                     entryPrice={openPosition?.avg_entry_price ?? null}
+                    shortCostBand={paneSymbol === zone.symbol ? shortCostBand : null}
                     bid={liveState?.bid ?? null}
                     ask={liveState?.ask ?? null}
                     ordersActive={hasPosition}

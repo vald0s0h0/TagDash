@@ -22,6 +22,15 @@ export function SessionClock() {
     refetchInterval: 1000,
   });
 
+  // Massive Starter+ tier: 15-minute delayed data, so the on-screen prices lag
+  // the clock. No need to poll fast — the tier rarely changes mid-session.
+  const { data: massiveTier } = useQuery({
+    queryKey: ["massive_tier_status"],
+    queryFn:  () => api.getMassiveTierStatus(),
+    refetchInterval: 30_000,
+  });
+  const isDelayed = massiveTier?.effective === "unlimited";
+
   const isReplay = !!replay?.active && !!replay.sim_time;
   const instant: Date = isReplay ? new Date(replay!.sim_time!) : new Date();
 
@@ -33,6 +42,14 @@ export function SessionClock() {
       {isReplay && (
         <span className="rounded bg-amber-900/40 px-1 py-px text-[8px] font-semibold uppercase tracking-wider text-amber-400">
           Replay
+        </span>
+      )}
+      {isDelayed && (
+        <span
+          className="rounded bg-amber-900/40 px-1 py-px text-[8px] font-semibold uppercase tracking-wider text-amber-400"
+          title="Prix différés de 15 min (Massive Starter+) — les news restent en temps réel (Alpaca)"
+        >
+          15 min
         </span>
       )}
       <span className="text-muted-foreground/50">{nyDayMonth(instant)}</span>

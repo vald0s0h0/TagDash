@@ -23,14 +23,8 @@ struct RawFmpFloat {
 
 pub async fn fetch_shares_float_all(api_key: &str) -> Result<Vec<FmpFloat>, String> {
     let client = crate::http::client();
-    let url = format!(
-        "https://financialmodelingprep.com/stable/shares-float-all?apikey={api_key}"
-    );
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let url = format!("https://financialmodelingprep.com/stable/shares-float-all?apikey={api_key}");
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
 
     if !resp.status().is_success() {
         let status = resp.status();

@@ -111,7 +111,9 @@ async fn fetch_by_exchange(token: &str, exchange: &str) -> Result<Vec<RawCompany
         let snippet = &body[..body.len().min(200)];
         return Err(format!("sec-api HTTP {status}: {snippet}"));
     }
-    resp.json::<Vec<RawCompany>>().await.map_err(|e| e.to_string())
+    resp.json::<Vec<RawCompany>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Fetch all configured exchanges and resolve to a per-symbol metadata map.
@@ -166,14 +168,26 @@ mod tests {
 
     #[test]
     fn country_extraction() {
-        assert_eq!(country_from_location("California; U.S.A").as_deref(), Some("U.S.A"));
+        assert_eq!(
+            country_from_location("California; U.S.A").as_deref(),
+            Some("U.S.A")
+        );
         assert_eq!(country_from_location("China").as_deref(), Some("China"));
-        assert_eq!(country_from_location("Hong Kong").as_deref(), Some("Hong Kong"));
-        assert_eq!(country_from_location("1 Main St; NYC; New York; U.S.A").as_deref(), Some("U.S.A"));
+        assert_eq!(
+            country_from_location("Hong Kong").as_deref(),
+            Some("Hong Kong")
+        );
+        assert_eq!(
+            country_from_location("1 Main St; NYC; New York; U.S.A").as_deref(),
+            Some("U.S.A")
+        );
         assert_eq!(country_from_location(""), None);
         assert_eq!(country_from_location("  ; "), None);
         // Trailing separator: still resolve the real last segment.
-        assert_eq!(country_from_location("Texas; U.S.A;").as_deref(), Some("U.S.A"));
+        assert_eq!(
+            country_from_location("Texas; U.S.A;").as_deref(),
+            Some("U.S.A")
+        );
     }
 
     #[test]
@@ -190,7 +204,10 @@ mod tests {
         assert_eq!(nio.country.as_deref(), Some("China"));
         assert_eq!(nio.sic.as_deref(), Some("3711"));
         // SEC official title from the SIC table, not the API's sicIndustry.
-        assert_eq!(nio.industry.as_deref(), Some("MOTOR VEHICLES & PASSENGER CAR BODIES"));
+        assert_eq!(
+            nio.industry.as_deref(),
+            Some("MOTOR VEHICLES & PASSENGER CAR BODIES")
+        );
         assert_eq!(nio.sector.as_deref(), Some("Consumer Cyclical"));
     }
 
@@ -215,7 +232,10 @@ mod tests {
         let raws: Vec<RawCompany> = serde_json::from_str(body).unwrap();
         let map = resolve(raws);
         // 0001 isn't in the SEC table → fall back to sicIndustry.
-        assert_eq!(map.get("BAR").unwrap().industry.as_deref(), Some("Some Sec Industry"));
+        assert_eq!(
+            map.get("BAR").unwrap().industry.as_deref(),
+            Some("Some Sec Industry")
+        );
     }
 
     // Live integration test — what does sec-api actually return?

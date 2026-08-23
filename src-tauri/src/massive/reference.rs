@@ -30,7 +30,12 @@ struct RawTicker {
 }
 
 /// All active US stock-market ticker type codes, sorted/paginated by Massive.
-pub async fn fetch_security_types(api_key: &str) -> Result<Vec<(String, String)>, String> {
+/// Skips the inter-page throttle when `unlimited` (a confirmed Starter+ tier, see
+/// `plan::Tier`) says the account has no rate limit to respect.
+pub async fn fetch_security_types(
+    api_key: &str,
+    unlimited: bool,
+) -> Result<Vec<(String, String)>, String> {
     if api_key.trim().is_empty() {
         return Err("clé Massive absente".into());
     }
@@ -45,7 +50,7 @@ pub async fn fetch_security_types(api_key: &str) -> Result<Vec<(String, String)>
     let mut out = Vec::new();
 
     for page in 0..MAX_PAGES {
-        if page > 0 {
+        if page > 0 && !unlimited {
             tokio::time::sleep(RATE_LIMIT).await;
         }
         let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;

@@ -70,39 +70,42 @@ pub async fn fetch_tags(token: &str, base_url: &str) -> Result<Vec<String>, Stri
             return Ok(tags.into_iter().map(TagObject::into_string).collect());
         }
     }
-    Err(format!("unrecognised tags response: {}", &text[..text.len().min(200)]))
+    Err(format!(
+        "unrecognised tags response: {}",
+        &text[..text.len().min(200)]
+    ))
 }
 
 // ─── Queue event enqueue helpers ─────────────────────────────────────────────
 
 fn new_event_id() -> String {
-    let ms  = Utc::now().timestamp_millis();
+    let ms = Utc::now().timestamp_millis();
     let rnd: u32 = rand::thread_rng().gen();
     format!("{ms}-{rnd:08x}")
 }
 
 /// Low-level enqueue: stores a JSON payload in the sync queue.
 pub fn enqueue_event(
-    conn:       &Connection,
+    conn: &Connection,
     event_type: &str,
-    trade_id:   &str,
-    symbol:     &str,
-    endpoint:   &str,
-    payload:    serde_json::Value,
+    trade_id: &str,
+    symbol: &str,
+    endpoint: &str,
+    payload: serde_json::Value,
 ) {
     let now = Utc::now().to_rfc3339();
     let row = SyncQueueRow {
-        event_id:        new_event_id(),
-        timestamp:       now.clone(),
-        trade_id:        trade_id.to_string(),
-        symbol:          symbol.to_string(),
-        event_type:      event_type.to_string(),
-        endpoint:        endpoint.to_string(),
+        event_id: new_event_id(),
+        timestamp: now.clone(),
+        trade_id: trade_id.to_string(),
+        symbol: symbol.to_string(),
+        event_type: event_type.to_string(),
+        endpoint: endpoint.to_string(),
         payload_summary: payload.to_string(),
-        status:          "pending".into(),
-        error_message:   None,
-        attempts:        0,
-        created_at:      now,
+        status: "pending".into(),
+        error_message: None,
+        attempts: 0,
+        created_at: now,
     };
     let _ = tradetally_queue_repository::enqueue(conn, &row);
 }
@@ -155,18 +158,18 @@ fn executions_json(fills: &[Fill], cfg: &AppConfig) -> Vec<serde_json::Value> {
 /// First fill of a trade → create the trade in TradeTally.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_trade_created(
-    conn:          &Connection,
-    trade_id:      &str,
-    symbol:        &str,
+    conn: &Connection,
+    trade_id: &str,
+    symbol: &str,
     strategy_name: &str,
-    side:          Side,
-    entry_price:   f64,
-    quantity:      i64,
-    entry_time:    &str, // RFC3339
-    stop_loss:     Option<f64>,
-    take_profit:   Option<f64>,
-    all_fills:     &[Fill],
-    cfg:           &AppConfig,
+    side: Side,
+    entry_price: f64,
+    quantity: i64,
+    entry_time: &str, // RFC3339
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    all_fills: &[Fill],
+    cfg: &AppConfig,
 ) {
     let side_str = if side == Side::Long { "long" } else { "short" };
     let payload = json!({
@@ -191,13 +194,13 @@ pub fn enqueue_trade_created(
 
 /// Subsequent entry fill (scale-in) → update executions + avg entry + net qty.
 pub fn enqueue_fill_added(
-    conn:      &Connection,
-    trade_id:  &str,
-    symbol:    &str,
+    conn: &Connection,
+    trade_id: &str,
+    symbol: &str,
     avg_entry: f64,
-    quantity:  i64,
+    quantity: i64,
     all_fills: &[Fill],
-    cfg:       &AppConfig,
+    cfg: &AppConfig,
 ) {
     let payload = json!({
         "entryPrice": avg_entry,
@@ -212,16 +215,16 @@ pub fn enqueue_fill_added(
 /// (positive magnitudes) observed while the position was open.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_trade_closed(
-    conn:       &Connection,
-    trade_id:   &str,
-    symbol:     &str,
+    conn: &Connection,
+    trade_id: &str,
+    symbol: &str,
     exit_price: f64,
-    exit_time:  &str, // RFC3339
-    exit_qty:   i64,
-    mae:        Option<f64>,
-    mfe:        Option<f64>,
-    all_fills:  &[Fill],
-    cfg:        &AppConfig,
+    exit_time: &str, // RFC3339
+    exit_qty: i64,
+    mae: Option<f64>,
+    mfe: Option<f64>,
+    all_fills: &[Fill],
+    cfg: &AppConfig,
 ) {
     let payload = json!({
         "exitPrice":      exit_price,
@@ -242,9 +245,9 @@ pub fn enqueue_trade_closed(
 /// that later value must never reach TradeTally — so this partial PUT carries
 /// `takeProfit` only and deliberately omits `stopLoss`.
 pub fn enqueue_levels_updated(
-    conn:        &Connection,
-    trade_id:    &str,
-    symbol:      &str,
+    conn: &Connection,
+    trade_id: &str,
+    symbol: &str,
     take_profit: Option<f64>,
 ) {
     let payload = json!({ "takeProfit": round_level(take_profit) });
@@ -253,12 +256,12 @@ pub fn enqueue_levels_updated(
 
 /// Journal saved → update notes / confidence / tags on the trade.
 pub fn enqueue_note_updated(
-    conn:       &Connection,
-    trade_id:   &str,
-    symbol:     &str,
-    notes:      &str,
+    conn: &Connection,
+    trade_id: &str,
+    symbol: &str,
+    notes: &str,
     confidence: Option<i32>,
-    tags:       &[String],
+    tags: &[String],
 ) {
     let payload = json!({
         "notes":      notes,
@@ -271,12 +274,7 @@ pub fn enqueue_note_updated(
 /// Journal/diary card → create-or-update today's TradeTally diary entry. Not tied
 /// to a trade (uses the `/api/diary` route, `createOrUpdateEntry`). Routed through
 /// the same resilient queue as trade events so a transient failure just retries.
-pub fn enqueue_diary_entry(
-    conn:       &Connection,
-    entry_date: &str,
-    title:      &str,
-    content:    &str,
-) {
+pub fn enqueue_diary_entry(conn: &Connection, entry_date: &str, title: &str, content: &str) {
     let payload = json!({
         "entryDate": entry_date,
         "title":     title,
@@ -288,12 +286,14 @@ pub fn enqueue_diary_entry(
 /// Screenshot captured → upload it to the trade's image gallery. Only the local
 /// file path is queued; the worker logs in (session) and POSTs the PNG at send
 /// time. Uses the non-v1 /images route (the only image-upload endpoint).
-pub fn enqueue_chart_updated(
-    conn:       &Connection,
-    trade_id:   &str,
-    symbol:     &str,
-    local_path: &str,
-) {
+pub fn enqueue_chart_updated(conn: &Connection, trade_id: &str, symbol: &str, local_path: &str) {
     let payload = json!({ "localPath": local_path });
-    enqueue_event(conn, "chart_updated", trade_id, symbol, "/api/trades/{TT_ID}/images", payload);
+    enqueue_event(
+        conn,
+        "chart_updated",
+        trade_id,
+        symbol,
+        "/api/trades/{TT_ID}/images",
+        payload,
+    );
 }

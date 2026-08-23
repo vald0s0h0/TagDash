@@ -304,7 +304,13 @@ fn consecutive_closes(bars: &[Bar], end: usize) -> Option<i32> {
         return None;
     }
     let first = bars[end].close - bars[end - 1].close;
-    let dir = if first > 0.0 { 1 } else if first < 0.0 { -1 } else { return Some(0) };
+    let dir = if first > 0.0 {
+        1
+    } else if first < 0.0 {
+        -1
+    } else {
+        return Some(0);
+    };
     let mut run = 1;
     let mut i = end - 1;
     while i > 0 {
@@ -318,7 +324,13 @@ fn consecutive_closes(bars: &[Bar], end: usize) -> Option<i32> {
     Some(run * dir)
 }
 
-fn volume_expansion(bars: &[Bar], base_a: usize, base_b: usize, move_a: usize, move_b: usize) -> Option<f64> {
+fn volume_expansion(
+    bars: &[Bar],
+    base_a: usize,
+    base_b: usize,
+    move_a: usize,
+    move_b: usize,
+) -> Option<f64> {
     if base_b < base_a || move_b < move_a || move_b >= bars.len() {
         return None;
     }
@@ -360,8 +372,7 @@ fn baseline_stability(bars: &[Bar], a: usize, b: usize, base_close: f64) -> Opti
     if !mean.is_finite() || mean <= 0.0 {
         return None;
     }
-    let variance = ranges.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-        / ranges.len() as f64;
+    let variance = ranges.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ranges.len() as f64;
     let sd = variance.sqrt();
     let quiet = 1.0 - (mean / 0.08).clamp(0.0, 1.0);
     let regular = 1.0 - (sd / mean.max(1e-9)).clamp(0.0, 1.0);
@@ -372,9 +383,10 @@ fn quality_factor(stability: f64, volume_exp: Option<f64>, efficiency: Option<f6
     let stable = 0.9 + 0.2 * (stability / 100.0).clamp(0.0, 1.0);
     let flow = 0.9
         + 0.1 * efficiency.unwrap_or(0.5).clamp(0.0, 1.0)
-        + 0.1 * volume_exp
-            .map(|v| (v.max(1.0).ln() / 3.0).clamp(0.0, 1.0))
-            .unwrap_or(0.0);
+        + 0.1
+            * volume_exp
+                .map(|v| (v.max(1.0).ln() / 3.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
     stable * flow
 }
 
@@ -429,26 +441,15 @@ pub fn panic_score(bars: &[Bar]) -> Option<PanicScore> {
         if !sigma.is_finite() || !atr_exp.is_finite() {
             continue;
         }
-        let stability_score = baseline_stability(
-            bars,
-            pre + 1 - ATR_PERIOD.min(pre),
-            pre,
-            base_close,
-        )
-        .unwrap_or(50.0);
-        let volume_exp = volume_expansion(
-            bars,
-            pre + 1 - BASELINE,
-            pre,
-            pre + 1,
-            t,
-        );
+        let stability_score =
+            baseline_stability(bars, pre + 1 - ATR_PERIOD.min(pre), pre, base_close)
+                .unwrap_or(50.0);
+        let volume_exp = volume_expansion(bars, pre + 1 - BASELINE, pre, pre + 1, t);
         let efficiency = directional_efficiency(bars, pre, t);
         // sqrt(ATR expansion) avoids counting the same shock twice at full strength;
         // sigma remains the dominant amplitude term.
-        let score = sigma
-            * atr_exp.sqrt()
-            * quality_factor(stability_score, volume_exp, efficiency);
+        let score =
+            sigma * atr_exp.sqrt() * quality_factor(stability_score, volume_exp, efficiency);
         if best.map(|b| score > b.score).unwrap_or(true) {
             best = Some(PanicScore {
                 score,
@@ -490,13 +491,8 @@ fn premarket_panic_score(bars: &[Bar], pm: &PremarketStat) -> Option<PanicScore>
         .max((low - prev_close).abs());
     let sigma = ret.abs() / sd;
     let atr_exp = current_tr / atr_pre;
-    let stability_score = baseline_stability(
-        bars,
-        n - ATR_PERIOD,
-        n - 1,
-        prev_close,
-    )
-    .unwrap_or(50.0);
+    let stability_score =
+        baseline_stability(bars, n - ATR_PERIOD, n - 1, prev_close).unwrap_or(50.0);
     let baseline_volume = median(
         bars[n - BASELINE..]
             .iter()
@@ -643,13 +639,18 @@ pub fn compute_watchlist(
         // The current premarket shock is a first-class candidate. It competes with
         // the completed multiday shock; it is not merely a directional multiplier.
         // A reversal therefore never erases the extension that created the setup.
-        let daily = panic_score(bars)
-            .filter(|p| p.sigma >= MIN_SIGMA && p.atr_exp >= MIN_ATR_EXP);
+        let daily = panic_score(bars).filter(|p| p.sigma >= MIN_SIGMA && p.atr_exp >= MIN_ATR_EXP);
         let today = pm
             .and_then(|p| premarket_panic_score(bars, p))
             .filter(|p| p.sigma >= MIN_SIGMA && p.atr_exp >= MIN_ATR_EXP);
         let p = match (daily, today) {
-            (Some(a), Some(b)) => if b.score > a.score { b } else { a },
+            (Some(a), Some(b)) => {
+                if b.score > a.score {
+                    b
+                } else {
+                    a
+                }
+            }
             (Some(a), None) => a,
             (None, Some(b)) => b,
             (None, None) => continue,
@@ -765,7 +766,10 @@ async fn fetch_snapshot_prices(
             }
         };
         for (symbol, snap) in page {
-            let price = snap.latest_trade.map(|t| t.p).or_else(|| snap.minute_bar.map(|b| b.c));
+            let price = snap
+                .latest_trade
+                .map(|t| t.p)
+                .or_else(|| snap.minute_bar.map(|b| b.c));
             if let Some(price) = price.filter(|p| p.is_finite() && *p > 0.0) {
                 out.insert(symbol, price);
             }
@@ -843,7 +847,13 @@ async fn fetch_premarket(
             }
             let mut run = 1_i32;
             let last_step = closes[closes.len() - 1] - closes[closes.len() - 2];
-            let dir = if last_step > 0.0 { 1 } else if last_step < 0.0 { -1 } else { 0 };
+            let dir = if last_step > 0.0 {
+                1
+            } else if last_step < 0.0 {
+                -1
+            } else {
+                0
+            };
             if dir != 0 {
                 for w in closes[..closes.len() - 1].windows(2).rev() {
                     let step = w[1] - w[0];
@@ -939,8 +949,7 @@ pub async fn build_and_store(
     let mut pm_symbols: std::collections::HashSet<String> = candidates
         .iter()
         .filter(|(_, bars)| {
-            panic_score(bars)
-                .is_some_and(|p| p.sigma >= MIN_SIGMA && p.atr_exp >= MIN_ATR_EXP)
+            panic_score(bars).is_some_and(|p| p.sigma >= MIN_SIGMA && p.atr_exp >= MIN_ATR_EXP)
         })
         .map(|(s, _)| s.clone())
         .collect();
@@ -950,7 +959,11 @@ pub async fn build_and_store(
         pm_symbols.extend(all_symbols.iter().cloned());
     } else {
         for (symbol, price) in &snapshots {
-            let Some(prev) = candidates.get(symbol).and_then(|b| b.last()).map(|b| b.close) else {
+            let Some(prev) = candidates
+                .get(symbol)
+                .and_then(|b| b.last())
+                .map(|b| b.close)
+            else {
                 continue;
             };
             if prev > 0.0
@@ -1196,7 +1209,10 @@ mod tests {
             grind.push(bar(open, px * 1.002, open * 0.998, px));
         }
         if let Some(g) = panic_score(&grind) {
-            assert!(g.atr_exp < MIN_ATR_EXP, "a steady grind must fail the expansion gate");
+            assert!(
+                g.atr_exp < MIN_ATR_EXP,
+                "a steady grind must fail the expansion gate"
+            );
         }
 
         let mut crash = calm(24, 10.0);

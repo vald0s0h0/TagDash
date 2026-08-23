@@ -365,6 +365,126 @@ CREATE TABLE IF NOT EXISTS panic_llm_scores (
 CREATE INDEX IF NOT EXISTS idx_panic_llm_day
     ON panic_llm_scores(day, simulated, panic_score DESC);
 
+-- Micro Pullback "Qualité A+" judgements. Keyed by (symbol, day, SESSION, simulated):
+-- the engine's lock is per session, so one ticker can legitimately be judged twice in
+-- a day — premarket and again at the open — on two different moves. Keying on the day
+-- alone would let the second silently overwrite the first.
+-- `pass1_score` (fast triage) and `pass2_score` (deep analysis) are kept side by side
+-- so it stays answerable, weeks later, whether the deep pass ever changed an outcome.
+CREATE TABLE IF NOT EXISTS micro_quality_scores (
+    symbol          TEXT NOT NULL,
+    day             TEXT NOT NULL,
+    session         TEXT NOT NULL,
+    simulated       INTEGER NOT NULL DEFAULT 0,
+    pass1_score     REAL,
+    pass2_score     REAL,
+    final_score     REAL,
+    threshold       REAL,
+    passed          INTEGER NOT NULL DEFAULT 0,
+    adjustments     TEXT,   -- human-readable term-by-term audit trail
+    confidence      REAL,
+    sustain_prob    REAL,
+    news_verdict    TEXT,
+    news_freshness  TEXT,
+    catalyst_type   TEXT,
+    catalyst_label  TEXT,
+    dilution_risk   TEXT,
+    dilution_read   TEXT,
+    financial_read  TEXT,
+    red_flags       TEXT,   -- JSON array
+    key_drivers     TEXT,   -- JSON array
+    one_liner       TEXT,
+    entry_note      TEXT,
+    tempo_depth     TEXT,   -- JSON array of tempo seconds
+    rejection       TEXT,   -- why it was turned away, NULL when it passed
+    rubric_version  TEXT,
+    model           TEXT,
+    -- MARKET time of the verdict (replay clock in a replay), not wall time. The UI
+    -- compares it with a headline's publication time to tell "already scored with
+    -- this news" from "a headline landed after the score" — `created_at` cannot do
+    -- that job because it is wall time and a replay's two clocks disagree.
+    scored_at       TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, day, session, simulated)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_quality_day
+    ON micro_quality_scores(day, simulated, final_score DESC);
+
+-- Micro Pullback v2 event ledger. One row per attention/direction event sent toward
+-- A+ (or served from its cache), so a silent morning can be reconstructed without
+-- persisting every Top-10 refresh.
+CREATE TABLE IF NOT EXISTS micro_attention_events (
+    event_id             TEXT PRIMARY KEY NOT NULL,
+    symbol               TEXT NOT NULL,
+    market_time          TEXT NOT NULL,
+    received_at          TEXT NOT NULL,
+    tempo_secs           INTEGER NOT NULL,
+    tempo_depth          TEXT NOT NULL,
+    attention_score      REAL NOT NULL,
+    direction_score      REAL NOT NULL,
+    dominance_z          REAL NOT NULL,
+    head_size            INTEGER NOT NULL,
+    flow_rank            REAL NOT NULL,
+    range_rank           REAL NOT NULL,
+    relative_rank        REAL,
+    tempo_rvol           REAL,
+    baseline_windows     INTEGER NOT NULL DEFAULT 0,
+    continuity           REAL NOT NULL,
+    distribution_quality REAL NOT NULL,
+    evidence_ok           INTEGER NOT NULL,
+    already_alerted      INTEGER NOT NULL DEFAULT 0,
+    outcome              TEXT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_micro_attention_market_time
+    ON micro_attention_events(market_time DESC, attention_score DESC);
+
+-- Aggregated forensic trace: at most 10 rows x 6 tempos every 30 seconds. This is
+-- small enough to retain while still answering "what led the market at 04:07?"
+-- without recording the whole US tape.
+CREATE TABLE IF NOT EXISTS micro_attention_snapshots (
+    market_time          TEXT NOT NULL,
+    tempo_secs           INTEGER NOT NULL,
+    rank                 INTEGER NOT NULL,
+    symbol               TEXT NOT NULL,
+    attention_score      REAL NOT NULL,
+    direction_score      REAL NOT NULL,
+    dominance_z          REAL NOT NULL,
+    head_size            INTEGER NOT NULL,
+    dominant             INTEGER NOT NULL,
+    flow_rank            REAL NOT NULL,
+    range_rank           REAL NOT NULL,
+    relative_rank        REAL,
+    tempo_rvol           REAL,
+    baseline_windows     INTEGER NOT NULL DEFAULT 0,
+    continuity           REAL NOT NULL,
+    distribution_quality REAL NOT NULL,
+    evidence_ok           INTEGER NOT NULL,
+    already_alerted      INTEGER NOT NULL,
+    received_at          TEXT NOT NULL,
+    PRIMARY KEY (market_time, tempo_secs, rank)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_attention_snap_symbol
+    ON micro_attention_snapshots(symbol, market_time DESC);
+
+-- Point-in-time Micro Pullback RVOL baseline. One target replay/live day owns a
+-- profile computed strictly from minute flat files BEFORE that day. Ten-minute ET
+-- buckets are fine enough to model the thin 04:00 tape without pretending a minute
+-- flat file contains historical seconds; the strategy scales the expectation to
+-- each 10/20/40/60/120/300-second observation window.
+CREATE TABLE IF NOT EXISTS micro_rvol_baselines (
+    target_day       TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    et_bucket_minute INTEGER NOT NULL,
+    median_volume_10m REAL NOT NULL,
+    mad_volume_10m    REAL NOT NULL,
+    sample_days       INTEGER NOT NULL,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (target_day, symbol, et_bucket_minute)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_rvol_target
+    ON micro_rvol_baselines(target_day, symbol);
+
 -- Trade executions (internal simulated fills), persisted per ticker so the chart
 -- can draw the entry/scale/exit triangles even days later / across restarts.
 -- `quantity` is the SIGNED share delta of the fill (+ buy/long, − sell/short),
@@ -647,6 +767,17 @@ const ALTERS: &[&str] = &[
     // Launch-time TP, added after the original-SL column (green counterpart of the
     // original-SL chart segment).
     "ALTER TABLE trade_levels ADD COLUMN original_tp REAL",
+    // Micro Pullback v2 anti-noise evidence flag was added after the first local
+    // telemetry draft; keep databases opened during that draft writable.
+    "ALTER TABLE micro_attention_events ADD COLUMN evidence_ok INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE micro_attention_snapshots ADD COLUMN evidence_ok INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE micro_attention_events ADD COLUMN tempo_rvol REAL",
+    "ALTER TABLE micro_attention_events ADD COLUMN baseline_windows INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE micro_attention_snapshots ADD COLUMN tempo_rvol REAL",
+    "ALTER TABLE micro_attention_snapshots ADD COLUMN baseline_windows INTEGER NOT NULL DEFAULT 0",
+    // Market-time stamp of an A+ verdict, so the overlay can tell a score that
+    // already saw the latest headline from one that predates it.
+    "ALTER TABLE micro_quality_scores ADD COLUMN scored_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_executions_trade ON executions(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_screenshot_files_trade ON screenshot_files(trade_id)",
 ];

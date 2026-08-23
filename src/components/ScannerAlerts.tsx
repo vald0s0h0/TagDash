@@ -9,6 +9,12 @@ import { useChartStore } from "@/stores/chartStore";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
+/** Tempo label as the engine prints it: seconds under a minute, minutes above.
+ *  Mirrors `micro_pullback::fmt_tempo` so a badge here and the alert text agree. */
+function fmtTempo(secs: number): string {
+  return secs < 60 ? `${secs}s` : `${secs / 60}m`;
+}
+
 // ─── Priority badge colours (the P1…P5 chip; the left state-bar is separate) ────
 
 const PRIORITY_BADGE: Record<number, string> = {
@@ -156,6 +162,33 @@ function AlertRow({ alert: a, state, position, onOpen, onRelease }: AlertRowProp
                 a.side === "long" ? "bg-emerald-900/50 text-emerald-300" : "bg-red-900/50 text-red-300",
               )}>
                 {a.side}
+              </span>
+            )}
+            {/* Tempo depth (Micro Pullback). Only worth the space once more than one
+                tempo has fired: "10s" alone is already the display_timeframe chip.
+                The first entry is the tempo that triggered, hence the emphasis —
+                the rest are windows that independently agreed, which is what makes
+                a move look like more than a one-second spike. */}
+            {a.tempo_depth && a.tempo_depth.length > 1 && (
+              <span
+                className="flex items-center gap-0.5"
+                title={`${a.tempo_depth.length} tempos déclenchés : ${a.tempo_depth
+                  .map(fmtTempo)
+                  .join(", ")}`}
+              >
+                {a.tempo_depth.map((secs, i) => (
+                  <span
+                    key={secs}
+                    className={cn(
+                      "rounded px-1 py-0.5 text-[9px] tabular-nums",
+                      i === 0
+                        ? "bg-amber-900/60 font-bold text-amber-300"
+                        : "bg-amber-900/25 text-amber-400/80",
+                    )}
+                  >
+                    {fmtTempo(secs)}
+                  </span>
+                ))}
               </span>
             )}
             {a.rvol != null && (

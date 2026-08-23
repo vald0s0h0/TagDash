@@ -183,11 +183,91 @@ pub struct OrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shortability {
     pub symbol: String,
+    /// Broker whose rules produced this answer. Borrow classifications are not
+    /// portable between venues, so the UI always displays this alongside ETB/HTB.
+    pub broker: BrokerId,
     /// False ⇒ the venue will reject a short. This is Alpaca's `shortable` flag.
     pub shortable: bool,
-    /// Alpaca's `easy_to_borrow`. A shortable-but-hard-to-borrow name can still be
-    /// refused at submit time, so the two are shown separately.
-    pub easy_to_borrow: bool,
+    /// Venue-native borrow classification, normalised only for display/routing.
+    pub borrow_status: BorrowStatus,
     /// True when the answer comes from a cached asset row rather than a live call.
     pub from_cache: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorrowStatus {
+    EasyToBorrow,
+    HardToBorrow,
+    Unavailable,
+    Unknown,
+}
+
+/// One Alpaca locate quote. At present Alpaca returns one account-specific,
+/// aggregated quote per symbol (not a lender-by-lender marketplace).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocateQuote {
+    pub broker: BrokerId,
+    pub symbol: String,
+    pub available_qty: i64,
+    pub price_per_share: f64,
+    pub quoted_at: Option<DateTime<Utc>>,
+    /// Reserved for broker responses that expose the annualised HTB rate. Alpaca's
+    /// public examples currently omit it; `None` must never be treated as zero.
+    pub annual_borrow_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocateRecord {
+    pub id: String,
+    pub broker: BrokerId,
+    pub symbol: String,
+    pub requested_qty: i64,
+    pub located_qty: i64,
+    /// Remaining quantity when supplied by the venue. A just-created locate falls
+    /// back to `located_qty`; historical rows without this field do not.
+    pub available_qty: Option<i64>,
+    pub price_per_share: f64,
+    pub total_fee: f64,
+    pub status: String,
+    pub created_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Cost basis captured when the user explicitly reserves locate inventory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShortCostBasis {
+    pub account_id: String,
+    pub symbol: String,
+    pub planned_quantity: i64,
+    pub located_quantity: i64,
+    /// Highest quantity observed as consumed by a short. Locates are single-use;
+    /// this never decreases when the position is partially or fully covered.
+    pub consumed_quantity: i64,
+    pub locate_fee: f64,
+    pub annual_borrow_rate: Option<f64>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub locates: Vec<LocateRecord>,
+}
+
+/// Horizontal loss band shown on a short chart. For a short, prices between
+/// `break_even_price` and `entry_price` are still loss-making after known costs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShortCostZone {
+    pub broker: BrokerId,
+    pub symbol: String,
+    /// `estimate` before the first fill, `position` once Alpaca reports a position.
+    pub source: String,
+    pub entry_price: f64,
+    pub stop_loss: f64,
+    pub quantity: i64,
+    pub located_quantity: i64,
+    pub locate_fee: f64,
+    pub annual_borrow_rate: Option<f64>,
+    pub borrow_days: u32,
+    pub borrow_fee: Option<f64>,
+    pub total_known_cost: f64,
+    pub break_even_price: f64,
+    pub costs_complete: bool,
+    pub locates: Vec<LocateRecord>,
 }

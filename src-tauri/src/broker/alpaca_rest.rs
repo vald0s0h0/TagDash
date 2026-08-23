@@ -136,7 +136,53 @@ struct RawAsset {
     #[serde(default)]
     shortable: bool,
     #[serde(default)]
-    easy_to_borrow: bool,
+    easy_to_borrow: Option<bool>,
+    #[serde(default)]
+    borrow_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocateQuote {
+    symbol: String,
+    available_qty: i64,
+    price: String,
+    quoted_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocateQuoteError {
+    symbol: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocateQuotes {
+    #[serde(default)]
+    quotes: Vec<RawLocateQuote>,
+    #[serde(default)]
+    errors: Vec<RawLocateQuoteError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocate {
+    id: String,
+    symbol: String,
+    requested_qty: i64,
+    located_qty: i64,
+    #[serde(default, alias = "remaining_qty")]
+    available_qty: Option<i64>,
+    located_price: Option<String>,
+    total_fee: Option<String>,
+    status: String,
+    created_at: Option<String>,
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocateList {
+    #[serde(default)]
+    locates: Vec<RawLocate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -656,14 +702,10 @@ pub async fn positions(creds: &Creds) -> Result<Vec<BrokerPosition>, String> {
 /// exit so a stale mirror cannot turn a close into a new opposite position.
 pub async fn position(creds: &Creds, symbol: &str) -> Result<Option<BrokerPosition>, String> {
     let sym = symbol.trim().to_uppercase();
-    let resp = request(
-        creds,
-        reqwest::Method::GET,
-        &format!("/v2/positions/{sym}"),
-    )
-    .send()
-    .await
-    .map_err(|e| format!("Alpaca injoignable (position {sym}) : {e}"))?;
+    let resp = request(creds, reqwest::Method::GET, &format!("/v2/positions/{sym}"))
+        .send()
+        .await
+        .map_err(|e| format!("Alpaca injoignable (position {sym}) : {e}"))?;
     if resp.status().as_u16() == 404 {
         return Ok(None);
     }
@@ -741,12 +783,172 @@ pub async fn shortability(creds: &Creds, symbol: &str) -> Result<Shortability, S
         .map_err(|e| format!("Alpaca injoignable (asset) : {e}"))?;
     let text = check(resp, "asset").await?;
     let r: RawAsset = serde_json::from_str(&text).map_err(|e| format!("asset illisible : {e}"))?;
+    let borrow_status =
+        normalize_borrow_status(r.shortable, r.borrow_status.as_deref(), r.easy_to_borrow);
     Ok(Shortability {
         symbol: r.symbol,
+        broker: BrokerId::Alpaca,
         shortable: r.shortable,
-        easy_to_borrow: r.easy_to_borrow,
+        borrow_status,
         from_cache: false,
     })
+}
+
+fn normalize_borrow_status(
+    shortable: bool,
+    borrow_status: Option<&str>,
+    easy_to_borrow: Option<bool>,
+) -> BorrowStatus {
+    if !shortable {
+        BorrowStatus::Unavailable
+    } else {
+        match borrow_status {
+            Some("easy_to_borrow") => BorrowStatus::EasyToBorrow,
+            Some("hard_to_borrow") => BorrowStatus::HardToBorrow,
+            // Backward compatibility until Alpaca removes `easy_to_borrow`.
+            _ => match easy_to_borrow {
+                Some(true) => BorrowStatus::EasyToBorrow,
+                Some(false) => BorrowStatus::HardToBorrow,
+                None => BorrowStatus::Unknown,
+            },
+        }
+    }
+}
+
+fn locate_record(r: RawLocate) -> Result<LocateRecord, String> {
+    let active = r.status.eq_ignore_ascii_case("active");
+    let price_per_share = r
+        .located_price
+        .as_deref()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0);
+    let total_fee = r
+        .total_fee
+        .as_deref()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0);
+    if active && (price_per_share.is_none() || total_fee.is_none() || r.expires_at.is_none()) {
+        return Err("locate actif incomplet (prix, frais ou expiration absents)".into());
+    }
+    Ok(LocateRecord {
+        id: r.id,
+        broker: BrokerId::Alpaca,
+        symbol: r.symbol,
+        requested_qty: r.requested_qty,
+        located_qty: r.located_qty,
+        available_qty: r.available_qty,
+        price_per_share: price_per_share.unwrap_or(0.0),
+        total_fee: total_fee.unwrap_or(0.0),
+        status: r.status,
+        created_at: ts(&r.created_at),
+        expires_at: ts(&r.expires_at),
+    })
+}
+
+/// Current account-specific Alpaca locate quote for one HTB symbol.
+pub async fn locate_quote(creds: &Creds, symbol: &str) -> Result<LocateQuote, String> {
+    let sym = symbol.trim().to_uppercase();
+    let resp = request(
+        creds,
+        reqwest::Method::GET,
+        &format!("/v1/locates/quotes?symbols={sym}"),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("Alpaca injoignable (quote locate) : {e}"))?;
+    let text = check(resp, "quote locate").await?;
+    let mut body: RawLocateQuotes =
+        serde_json::from_str(&text).map_err(|e| format!("quote locate illisible : {e}"))?;
+    if let Some(q) = body
+        .quotes
+        .drain(..)
+        .find(|q| q.symbol.eq_ignore_ascii_case(&sym))
+    {
+        let price_per_share = q
+            .price
+            .parse::<f64>()
+            .map_err(|e| format!("prix de locate illisible : {e}"))?;
+        return Ok(LocateQuote {
+            broker: BrokerId::Alpaca,
+            symbol: q.symbol,
+            available_qty: q.available_qty,
+            price_per_share,
+            quoted_at: ts(&q.quoted_at),
+            // Alpaca documents locate price here, but not the separate daily HTB
+            // borrow rate. Keep it unknown rather than guessing a fee or unit.
+            annual_borrow_rate: None,
+        });
+    }
+    let detail = body
+        .errors
+        .into_iter()
+        .find(|e| {
+            e.symbol
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(&sym))
+        })
+        .map(|e| {
+            let code = e.code.map(|c| format!(" [{c}]")).unwrap_or_default();
+            format!(
+                "{}{}",
+                e.message.unwrap_or_else(|| "quote indisponible".into()),
+                code
+            )
+        })
+        .unwrap_or_else(|| "aucune quote retournée".into());
+    Err(format!("locate {sym} indisponible : {detail}"))
+}
+
+/// Active/recent locate records for one symbol. The venue remains authoritative
+/// about remaining inventory; records without a remaining quantity are handled
+/// conservatively by the planning layer.
+pub async fn locates(creds: &Creds, symbol: &str) -> Result<Vec<LocateRecord>, String> {
+    let sym = symbol.trim().to_uppercase();
+    let resp = request(
+        creds,
+        reqwest::Method::GET,
+        &format!("/v1/locates?symbol={sym}&limit=100"),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("Alpaca injoignable (locates) : {e}"))?;
+    let text = check(resp, "liste des locates").await?;
+    let body: RawLocateList =
+        serde_json::from_str(&text).map_err(|e| format!("locates illisibles : {e}"))?;
+    body.locates.into_iter().map(locate_record).collect()
+}
+
+/// Reserve HTB inventory. The quote price is passed as a hard ceiling and the
+/// idempotency key makes an ambiguous network retry safe from duplicate fees.
+pub async fn create_locate(
+    creds: &Creds,
+    symbol: &str,
+    quantity: i64,
+    limit_price: f64,
+    idempotency_key: &str,
+) -> Result<LocateRecord, String> {
+    let sym = symbol.trim().to_uppercase();
+    let resp = request(creds, reqwest::Method::POST, "/v1/locates")
+        .header("Idempotency-Key", idempotency_key)
+        .json(&json!({
+            "symbol": sym,
+            "qty": quantity,
+            "limit_price": price_string(limit_price),
+            "all_or_none": true,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Alpaca injoignable (création locate) : {e}"))?;
+    let text = check(resp, "création du locate").await?;
+    let raw: RawLocate =
+        serde_json::from_str(&text).map_err(|e| format!("locate illisible : {e}"))?;
+    let mut located = locate_record(raw)?;
+    // The documented create response omits `available_qty`; immediately after a
+    // successful all-or-none reservation the full located amount is available.
+    if located.available_qty.is_none() && located.status.eq_ignore_ascii_case("active") {
+        located.available_qty = Some(located.located_qty);
+    }
+    Ok(located)
 }
 
 /// A random, collision-free-enough suffix for a client order id.
@@ -778,6 +980,29 @@ pub fn prefixed_client_order_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrow_status_never_overrides_a_non_shortable_asset() {
+        // Alpaca currently returns this exact combination for several watchlist
+        // names: `hard_to_borrow` describes scarcity, but `shortable=false` is the
+        // final permission and must render as NS, never as actionable HTB.
+        assert_eq!(
+            normalize_borrow_status(false, Some("hard_to_borrow"), Some(false)),
+            BorrowStatus::Unavailable,
+        );
+    }
+
+    #[test]
+    fn a_shortable_htb_asset_remains_distinct_from_etb() {
+        assert_eq!(
+            normalize_borrow_status(true, Some("hard_to_borrow"), Some(false)),
+            BorrowStatus::HardToBorrow,
+        );
+        assert_eq!(
+            normalize_borrow_status(true, Some("easy_to_borrow"), Some(true)),
+            BorrowStatus::EasyToBorrow,
+        );
+    }
 
     fn base_req() -> OrderRequest {
         OrderRequest {

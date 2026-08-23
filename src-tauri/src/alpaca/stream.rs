@@ -196,6 +196,8 @@ pub async fn run(
         let mut ms = market.write().unwrap();
         ms.feed_set_feed(&feed);
         ms.feed_set_plan(plan.as_str(), plan.symbol_limit().unwrap_or(0));
+        // Real prints: prints/second is a genuine trade rate here.
+        ms.set_tape_kind(crate::types::TapeKind::Prints);
         ms.feed_state("connecting");
     }
 
@@ -480,7 +482,7 @@ fn strict_watch_symbols(
 
 /// The effective focus set to subscribe tick-by-tick: displayed chart symbols
 /// union `strict_watch_symbols`.
-fn watch_set(
+pub(crate) fn watch_set(
     focus: &HashSet<String>,
     internal_book: &RwLock<InternalBook>,
     broker_mirror: &RwLock<BrokerMirror>,
@@ -507,7 +509,7 @@ fn watch_set(
 ///
 /// Truncation is reported: over-budget at step 1 means orders themselves don't fit,
 /// and silently dropping one would leave a live SL unwatched.
-fn capped_watch_list(
+pub(crate) fn capped_watch_list(
     focus: &HashSet<String>,
     internal_book: &RwLock<InternalBook>,
     broker_mirror: &RwLock<BrokerMirror>,
@@ -766,7 +768,7 @@ async fn send_channel(
 /// wildcard so it doesn't care, but `trades`/`quotes` subscriptions only deliver
 /// data when the symbol matches exactly — a stray space or lower-case letter
 /// silently yields zero ticks with no error.
-fn clean_symbols<'a>(it: impl Iterator<Item = &'a String>) -> HashSet<String> {
+pub(crate) fn clean_symbols<'a>(it: impl Iterator<Item = &'a String>) -> HashSet<String> {
     it.map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())
         .collect()
@@ -785,10 +787,30 @@ fn fmt_sub(list: &Option<Vec<String>>) -> String {
     }
 }
 
-/// Broad-tier channel for now: `trades` during the premarket window (ET
-/// 04:00–09:30), `bars` (1-minute) otherwise. ET is DST-aware (see `crate::time`).
+/// Broad-tier channel for now: `trades` while the consolidated tape is thin,
+/// `bars` (1-minute) otherwise. ET is DST-aware (see `crate::time`).
+///
+/// The market-wide `trades` wildcard is what lets a discovery scanner such as Micro
+/// Pullback build 10-second candles for symbols nobody is watching. It is affordable
+/// in the premarket (04:00–09:30) and after the close (16:00–20:00), where the tape
+/// is a trickle. It is NOT affordable during the regular session: the full SIP tape
+/// at midday runs to tens of thousands of messages a second, which would swamp the
+/// ingestion path for a strategy that only cares about a handful of small caps.
+///
+/// So between 09:30 and 16:00 the broad tier drops to 1-minute `bars` and the
+/// per-second detail comes only from the focus tier — the day's watch list, orders,
+/// positions and charts on screen (see `capped_watch_list`). Discovery is genuinely
+/// narrower in that window on this provider; the Massive `A.*` wildcard, at one
+/// message per symbol per second, carries the universe all day instead.
 fn broad_mode_now() -> &'static str {
-    if (240..570).contains(&crate::time::et_minutes(Utc::now())) {
+    broad_mode_at(crate::time::et_minutes(Utc::now()))
+}
+
+/// `broad_mode_now` split out on its ET minute-of-day, so the schedule is testable.
+fn broad_mode_at(et_min: u32) -> &'static str {
+    const PREMARKET: std::ops::Range<u32> = 240..570; // 04:00–09:30
+    const AFTERHOURS: std::ops::Range<u32> = 960..1200; // 16:00–20:00
+    if PREMARKET.contains(&et_min) || AFTERHOURS.contains(&et_min) {
         "trades"
     } else {
         "bars"
@@ -800,6 +822,40 @@ fn parse_ts(ts: Option<&str>) -> DateTime<Utc> {
     ts.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now)
+}
+
+#[cfg(test)]
+mod broad_tier_tests {
+    use super::broad_mode_at;
+
+    // The market-wide `trades` wildcard is what lets a discovery scanner see symbols
+    // nobody is watching. It is taken only where the consolidated tape is thin.
+    #[test]
+    fn the_whole_market_tape_is_taken_only_when_it_is_thin() {
+        // Premarket 04:00–09:30 and afterhours 16:00–20:00.
+        for et_min in [240, 400, 569, 960, 1100, 1199] {
+            assert_eq!(broad_mode_at(et_min), "trades", "ET minute {et_min}");
+        }
+        // The regular session would be tens of thousands of messages a second, and
+        // overnight there is nothing to stream.
+        for et_min in [570, 700, 959, 1200, 0, 239] {
+            assert_eq!(broad_mode_at(et_min), "bars", "ET minute {et_min}");
+        }
+    }
+
+    // The boundaries are the ones the rest of the app reasons on — an off-by-one here
+    // would leave micro_pullback blind for a minute at exactly the wrong time.
+    #[test]
+    fn boundaries_are_half_open_on_the_session_edges() {
+        assert_eq!(broad_mode_at(239), "bars"); // 03:59
+        assert_eq!(broad_mode_at(240), "trades"); // 04:00
+        assert_eq!(broad_mode_at(569), "trades"); // 09:29
+        assert_eq!(broad_mode_at(570), "bars"); // 09:30
+        assert_eq!(broad_mode_at(959), "bars"); // 15:59
+        assert_eq!(broad_mode_at(960), "trades"); // 16:00
+        assert_eq!(broad_mode_at(1199), "trades"); // 19:59
+        assert_eq!(broad_mode_at(1200), "bars"); // 20:00
+    }
 }
 
 #[cfg(test)]

@@ -3,12 +3,11 @@
 
 use std::time::Duration;
 
-use crate::types::{
-    AlertSignal, Session, StrategyCard, StrategyContext, StrategyRiskConfig,
-};
+use crate::types::{AlertSignal, Session, StrategyCard, StrategyContext, StrategyRiskConfig};
 
 pub mod backside_parabolic;
 pub mod hod_drive;
+pub mod issuer_profile;
 pub mod micro_pullback;
 pub mod panic_mean_reversion;
 pub mod perfect_pullback;

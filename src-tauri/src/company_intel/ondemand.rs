@@ -92,7 +92,11 @@ pub async fn run_worker(
         };
 
         if let Err(e) = collect_one(&db, &http, &rl, &policy, &symbol, &cik).await {
-            log(&db, "info", &format!("company_intel ondemand: {symbol} failed: {e}"));
+            log(
+                &db,
+                "info",
+                &format!("company_intel ondemand: {symbol} failed: {e}"),
+            );
         }
     }
 }
@@ -162,7 +166,8 @@ async fn collect_one(
             let _ = repo::upsert_filing(&conn, f);
         }
     }
-    let dil = sec_edgar::summarize_dilution(http, rl, policy, &filings, SCAN_LATEST_DILUTION_DOC).await;
+    let dil =
+        sec_edgar::summarize_dilution(http, rl, policy, &filings, SCAN_LATEST_DILUTION_DOC).await;
     let today = crate::time::et_date(crate::time::now());
     {
         let conn = db.lock().unwrap();

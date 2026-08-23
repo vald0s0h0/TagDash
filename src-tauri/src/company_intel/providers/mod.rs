@@ -5,5 +5,8 @@
 // `company_intel` module lift cleanly into a standalone background worker later.
 
 pub mod fmp_fin;
+pub mod massive_company;
+pub mod massive_filings;
+pub mod massive_fin;
 pub mod massive_si;
 pub mod sec_edgar;

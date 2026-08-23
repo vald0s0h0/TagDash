@@ -32,11 +32,17 @@ pub struct PanicRunState {
     pub day: String,
     /// Whether the run was made under a replay clock.
     pub simulated: bool,
+    /// Tickers this run actually has to score — the visible list MINUS the ones a
+    /// previous press already scored under the current rubric.
     pub total: usize,
+    /// Tickers whose score was kept from an earlier press of the same day. Reported so
+    /// `total` never reads as "the analysis forgot the rest of my list".
+    pub carried: usize,
     /// Tickers whose scoring call has returned (success or failure).
     pub done: usize,
-    /// Symbols whose scoring call failed. The run still completes for the rest — one
-    /// bad ticker must not cost the user the whole analysis.
+    /// Symbols that end the run WITHOUT a score: the call failed, or the payload was
+    /// too thin to judge. They are still written, as N/A at the bottom of the ranking,
+    /// so the list never hides a ticker it could not read.
     pub failed: Vec<String>,
     /// Set when the run itself could not proceed (no key, no symbols, model refused).
     pub error: Option<String>,
@@ -54,6 +60,7 @@ impl Default for PanicRunState {
             day: String::new(),
             simulated: false,
             total: 0,
+            carried: 0,
             done: 0,
             failed: Vec::new(),
             error: None,

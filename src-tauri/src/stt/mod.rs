@@ -214,7 +214,10 @@ impl SttShared {
             model_ctx: Mutex::new(None),
             downloading: AtomicBool::new(false),
             download_progress: Mutex::new(0.0),
-            worker_state: Mutex::new(WorkerState { state: "idle".into(), paused_reason: None }),
+            worker_state: Mutex::new(WorkerState {
+                state: "idle".into(),
+                paused_reason: None,
+            }),
             last_error: Mutex::new(None),
             wake: Notify::new(),
         }
@@ -267,7 +270,12 @@ impl SttShared {
 fn prune_finished(jobs: &mut VecDeque<SttJob>, app_dir: &Path) {
     let finished: Vec<String> = jobs
         .iter()
-        .filter(|j| matches!(j.state, JobState::Done | JobState::Error | JobState::Cancelled))
+        .filter(|j| {
+            matches!(
+                j.state,
+                JobState::Done | JobState::Error | JobState::Cancelled
+            )
+        })
         .map(|j| j.id.clone())
         .collect();
     if finished.len() <= KEEP_FINISHED {
@@ -303,7 +311,11 @@ pub fn start_recording(
 
     let rec = Recorder::start(app.clone(), device, kind)?;
     *shared.recorder.lock().unwrap() = Some(rec);
-    *shared.pending.lock().unwrap() = Some(PendingRecording { kind, trade_id, symbol });
+    *shared.pending.lock().unwrap() = Some(PendingRecording {
+        kind,
+        trade_id,
+        symbol,
+    });
     let _ = app.emit(EV_CHANGED, ());
     Ok(())
 }

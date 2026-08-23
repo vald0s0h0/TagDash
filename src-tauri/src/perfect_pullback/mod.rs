@@ -131,7 +131,7 @@ const NEW_EXTREME_ATR_MULT: f64 = 1.0;
 /// NEW candidate names during its own 09:30–12:30 window, but a memorised ticker
 /// stays tradeable here until 16:00.
 const SESSION_START_MIN: u32 = 9 * 60 + 30; // 570
-const SESSION_END_MIN:   u32 = 16 * 60;     // 960
+const SESSION_END_MIN: u32 = 16 * 60; // 960
 
 /// Drop a per-symbol state that hasn't seen a new bar in this many seconds.
 const STATE_STALE_SECS: i64 = 30 * 60;
@@ -139,35 +139,35 @@ const STATE_STALE_SECS: i64 = 30 * 60;
 /// Per-symbol snapshot read from MarketState once per loop, then evaluated outside the
 /// read lock.
 struct TickerInput {
-    symbol:         String,
+    symbol: String,
     /// Closed 1-minute bars (oldest → newest); the 5-minute series is built from these.
-    m1:             Vec<Bar>,
-    price:          f64,
-    volume_day:     u64,
+    m1: Vec<Bar>,
+    price: f64,
+    volume_day: u64,
     change_day_pct: Option<f64>,
-    avg_vol:        u64,
+    avg_vol: u64,
 }
 
 // ─── Per-symbol anti-spam state ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 struct SymbolState {
-    cooldown_until:   Option<DateTime<Utc>>,
+    cooldown_until: Option<DateTime<Utc>>,
     /// The 5m bar that last triggered — so a given bar fires at most once.
     last_trigger_bar: Option<DateTime<Utc>>,
     /// The impulse extreme at the last trigger (re-arm reference).
-    armed_extreme:    Option<f64>,
-    armed_side:       Option<Side>,
+    armed_extreme: Option<f64>,
+    armed_side: Option<Side>,
     /// Last 5m bar seen for this symbol (memory-prune key).
-    last_seen:        Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
 }
 
 /// A qualified impulse leg: the swing pivot and the impulse extreme it ran to.
 struct Impulse {
     pivot_idx: usize,
-    ext_idx:   usize,
-    pivot_px:  f64, // pivot low (long) / pivot high (short)
-    ext_px:    f64, // impulse high (long) / impulse low (short)
+    ext_idx: usize,
+    pivot_px: f64, // pivot low (long) / pivot high (short)
+    ext_px: f64,   // impulse high (long) / impulse low (short)
 }
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
@@ -178,13 +178,13 @@ impl PerfectPullbackEngine {
     /// Spawn the background loop. Returns immediately.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        running:          Arc<AtomicBool>,
-        market:           Arc<RwLock<MarketState>>,
-        db:               Arc<Mutex<rusqlite::Connection>>,
-        active_alerts:    Arc<RwLock<Vec<AlertSignal>>>,
-        alert_history:    Arc<RwLock<Vec<AlertSignal>>>,
+        running: Arc<AtomicBool>,
+        market: Arc<RwLock<MarketState>>,
+        db: Arc<Mutex<rusqlite::Connection>>,
+        active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
+        alert_history: Arc<RwLock<Vec<AlertSignal>>>,
         strategy_enabled: Arc<RwLock<HashMap<String, bool>>>,
-        attention:        Arc<RwLock<Vec<AttentionEntry>>>,
+        attention: Arc<RwLock<Vec<AttentionEntry>>>,
     ) {
         // Use the Tauri-managed runtime so this can be launched from the sync
         // `setup` hook (a bare `tokio::spawn` there panics: no reactor running).
@@ -298,8 +298,12 @@ impl PerfectPullbackEngine {
 
                 let mut fires: Vec<AlertSignal> = Vec::new();
                 for inp in inputs {
-                    let m1: Vec<Bar> =
-                        inp.m1.iter().filter(|b| b.time >= session_open).cloned().collect();
+                    let m1: Vec<Bar> = inp
+                        .m1
+                        .iter()
+                        .filter(|b| b.time >= session_open)
+                        .cloned()
+                        .collect();
                     let (bars, vwaps) = session_5m(&m1, now);
                     let st = states.entry(inp.symbol.clone()).or_default();
                     if let Some(fire) = evaluate(st, &inp, &bars, &vwaps, now) {
@@ -327,11 +331,11 @@ impl PerfectPullbackEngine {
 /// Run the four-gate pipeline for one symbol on its closed 5m series. Returns a fire
 /// signal when a fresh pullback trigger passes every gate (and anti-spam allows it).
 fn evaluate(
-    st:    &mut SymbolState,
-    inp:   &TickerInput,
-    bars:  &[Bar],
+    st: &mut SymbolState,
+    inp: &TickerInput,
+    bars: &[Bar],
     vwaps: &[f64],
-    now:   DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> Option<AlertSignal> {
     st.last_seen = bars.last().map(|b| b.time);
     if bars.len() < MIN_BARS_5M {
@@ -352,7 +356,15 @@ fn evaluate(
     // Gate 2 — Impulse.
     let imp = impulse_gate(side, bars, atr)?;
     // Gate 3 — Pullback (returns the retracement fraction).
-    let retrace = pullback_gate(side, bars, *ema20.last().unwrap(), vwap_now, price, &imp, atr)?;
+    let retrace = pullback_gate(
+        side,
+        bars,
+        *ema20.last().unwrap(),
+        vwap_now,
+        price,
+        &imp,
+        atr,
+    )?;
     // Gate 4 — Trigger.
     if !trigger_ready(side, bars, &imp, atr) {
         return None;
@@ -369,7 +381,7 @@ fn evaluate(
     if let Some(until) = st.cooldown_until {
         if now < until {
             let new_extreme = match (side, st.armed_extreme) {
-                (Side::Long, Some(e))  => imp.ext_px > e + NEW_EXTREME_ATR_MULT * atr,
+                (Side::Long, Some(e)) => imp.ext_px > e + NEW_EXTREME_ATR_MULT * atr,
                 (Side::Short, Some(e)) => imp.ext_px < e - NEW_EXTREME_ATR_MULT * atr,
                 _ => true,
             };
@@ -380,16 +392,24 @@ fn evaluate(
         }
     }
 
-    st.cooldown_until   = Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
+    st.cooldown_until = Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
     st.last_trigger_bar = Some(trigger_bar_time);
-    st.armed_extreme    = Some(imp.ext_px);
-    st.armed_side       = Some(side);
+    st.armed_extreme = Some(imp.ext_px);
+    st.armed_side = Some(side);
 
     let rvol = (inp.avg_vol > 0).then(|| inp.volume_day as f64 / inp.avg_vol as f64);
     let move_dollar = (imp.ext_px - imp.pivot_px).abs();
     Some(make_alert(
-        &inp.symbol, side, retrace, move_dollar, atr, price,
-        inp.volume_day, inp.change_day_pct, rvol, now,
+        &inp.symbol,
+        side,
+        retrace,
+        move_dollar,
+        atr,
+        price,
+        inp.volume_day,
+        inp.change_day_pct,
+        rvol,
+        now,
     ))
 }
 
@@ -397,11 +417,11 @@ fn evaluate(
 
 /// A clean directional regime → the side to trade, or None (no direction / choppy).
 fn direction_side(
-    bars:     &[Bar],
-    ema9:     &[f64],
-    ema20:    &[f64],
-    vwaps:    &[f64],
-    price:    f64,
+    bars: &[Bar],
+    ema9: &[f64],
+    ema20: &[f64],
+    vwaps: &[f64],
+    price: f64,
     vwap_now: f64,
 ) -> Option<Side> {
     let n = bars.len();
@@ -445,12 +465,17 @@ fn impulse_gate(side: Side, bars: &[Bar], atr: f64) -> Option<Impulse> {
             let pivot_idx = last_swing_low(bars, PIVOT_SPAN)?;
             let pivot_px = bars[pivot_idx].low;
             // Impulse extreme = highest high from the pivot onward.
-            let (ext_idx, ext_px) = bars[pivot_idx..]
-                .iter()
-                .enumerate()
-                .fold((pivot_idx, f64::MIN), |acc, (i, b)| {
-                    if b.high > acc.1 { (pivot_idx + i, b.high) } else { acc }
-                });
+            let (ext_idx, ext_px) =
+                bars[pivot_idx..]
+                    .iter()
+                    .enumerate()
+                    .fold((pivot_idx, f64::MIN), |acc, (i, b)| {
+                        if b.high > acc.1 {
+                            (pivot_idx + i, b.high)
+                        } else {
+                            acc
+                        }
+                    });
             if ext_idx <= pivot_idx || (ext_px - pivot_px) < IMPULSE_ATR_MULT * atr {
                 return None;
             }
@@ -464,18 +489,28 @@ fn impulse_gate(side: Side, bars: &[Bar], atr: f64) -> Option<Impulse> {
                     return None;
                 }
             }
-            Some(Impulse { pivot_idx, ext_idx, pivot_px, ext_px })
+            Some(Impulse {
+                pivot_idx,
+                ext_idx,
+                pivot_px,
+                ext_px,
+            })
         }
         Side::Short => {
             let pivot_idx = last_swing_high(bars, PIVOT_SPAN)?;
             let pivot_px = bars[pivot_idx].high;
             // Impulse extreme = lowest low from the pivot onward.
-            let (ext_idx, ext_px) = bars[pivot_idx..]
-                .iter()
-                .enumerate()
-                .fold((pivot_idx, f64::MAX), |acc, (i, b)| {
-                    if b.low < acc.1 { (pivot_idx + i, b.low) } else { acc }
-                });
+            let (ext_idx, ext_px) =
+                bars[pivot_idx..]
+                    .iter()
+                    .enumerate()
+                    .fold((pivot_idx, f64::MAX), |acc, (i, b)| {
+                        if b.low < acc.1 {
+                            (pivot_idx + i, b.low)
+                        } else {
+                            acc
+                        }
+                    });
             if ext_idx <= pivot_idx || (pivot_px - ext_px) < IMPULSE_ATR_MULT * atr {
                 return None;
             }
@@ -488,7 +523,12 @@ fn impulse_gate(side: Side, bars: &[Bar], atr: f64) -> Option<Impulse> {
                     return None;
                 }
             }
-            Some(Impulse { pivot_idx, ext_idx, pivot_px, ext_px })
+            Some(Impulse {
+                pivot_idx,
+                ext_idx,
+                pivot_px,
+                ext_px,
+            })
         }
     }
 }
@@ -500,13 +540,13 @@ fn impulse_gate(side: Side, bars: &[Bar], atr: f64) -> Option<Impulse> {
 /// drift), with falling volume, compressing ranges, the higher low unbroken, price
 /// holding above EMA20/VWAP and no violent counter bar.
 fn pullback_gate(
-    side:     Side,
-    bars:     &[Bar],
+    side: Side,
+    bars: &[Bar],
     ema_slow: f64,
     vwap_now: f64,
-    price:    f64,
-    imp:      &Impulse,
-    atr:      f64,
+    price: f64,
+    imp: &Impulse,
+    atr: f64,
 ) -> Option<f64> {
     let n = bars.len();
     if imp.ext_idx + 1 >= n {
@@ -544,13 +584,29 @@ fn pullback_gate(
     }
     // Higher-low / lower-high not broken on a close.
     match side {
-        Side::Long  => if pb.iter().any(|b| b.close < imp.pivot_px) { return None; },
-        Side::Short => if pb.iter().any(|b| b.close > imp.pivot_px) { return None; },
+        Side::Long => {
+            if pb.iter().any(|b| b.close < imp.pivot_px) {
+                return None;
+            }
+        }
+        Side::Short => {
+            if pb.iter().any(|b| b.close > imp.pivot_px) {
+                return None;
+            }
+        }
     }
     // Price still holding above EMA20 or VWAP (long) / below (short).
     match side {
-        Side::Long  => if !(price > ema_slow || price > vwap_now) { return None; },
-        Side::Short => if !(price < ema_slow || price < vwap_now) { return None; },
+        Side::Long => {
+            if !(price > ema_slow || price > vwap_now) {
+                return None;
+            }
+        }
+        Side::Short => {
+            if !(price < ema_slow || price < vwap_now) {
+                return None;
+            }
+        }
     }
     // Ranges compressing / slowing.
     let imp_range = mean_range(imp_leg);
@@ -647,7 +703,11 @@ fn efficiency_ratio(closes: &[f64], window: usize) -> f64 {
     let slice = &closes[n - w - 1..];
     let net = (slice[slice.len() - 1] - slice[0]).abs();
     let path: f64 = slice.windows(2).map(|p| (p[1] - p[0]).abs()).sum();
-    if path <= 0.0 { 0.0 } else { net / path }
+    if path <= 0.0 {
+        0.0
+    } else {
+        net / path
+    }
 }
 
 /// Number of times the close crossed its (cumulative session) VWAP in the last
@@ -764,13 +824,13 @@ fn session_5m(m1: &[Bar], now: DateTime<Utc>) -> (Vec<Bar>, Vec<f64>) {
             }
             _ => {
                 bars.push(Bar {
-                    time:        Utc.timestamp_opt(bucket, 0).single().unwrap_or(b.time),
-                    open:        b.open,
-                    high:        b.high,
-                    low:         b.low,
-                    close:       b.close,
-                    volume:      b.volume,
-                    vwap:        None,
+                    time: Utc.timestamp_opt(bucket, 0).single().unwrap_or(b.time),
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                    vwap: None,
                     trade_count: Some(b.trade_count.unwrap_or(0)),
                 });
                 vwaps.push(cum_vwap);
@@ -792,38 +852,42 @@ fn session_5m(m1: &[Bar], now: DateTime<Utc>) -> (Vec<Bar>, Vec<f64>) {
 /// Build the fire signal for a completed pullback trigger.
 #[allow(clippy::too_many_arguments)]
 fn make_alert(
-    symbol:         &str,
-    side:           Side,
-    retrace:        f64,
-    move_dollar:    f64,
-    atr:            f64,
-    price:          f64,
-    volume_day:     u64,
+    symbol: &str,
+    side: Side,
+    retrace: f64,
+    move_dollar: f64,
+    atr: f64,
+    price: f64,
+    volume_day: u64,
     change_day_pct: Option<f64>,
-    rvol:           Option<f64>,
-    now:            DateTime<Utc>,
+    rvol: Option<f64>,
+    now: DateTime<Utc>,
 ) -> AlertSignal {
-    let side_str = if matches!(side, Side::Long) { "Long" } else { "Short" };
+    let side_str = if matches!(side, Side::Long) {
+        "Long"
+    } else {
+        "Short"
+    };
     let mult = if atr > 0.0 { move_dollar / atr } else { 0.0 };
     let rvol_str = rvol.map(|r| format!(" RVOL ×{r:.1},")).unwrap_or_default();
     AlertSignal {
-        alert_id:      format!("pp-{}-{}-{}", now.timestamp_millis(), symbol, TF_LABEL),
-        timestamp:     now,
-        symbol:        symbol.to_string(),
-        strategy_id:   STRATEGY_ID.to_string(),
+        alert_id: format!("pp-{}-{}-{}", now.timestamp_millis(), symbol, TF_LABEL),
+        timestamp: now,
+        symbol: symbol.to_string(),
+        strategy_id: STRATEGY_ID.to_string(),
         strategy_name: "Perfect Pullback".to_string(),
-        priority:      2,
-        session:       Session::Open,
-        price:         Some(price),
-        bid:           None,
-        ask:           None,
-        spread:        None,
-        volume:        Some(volume_day),
+        priority: 2,
+        session: Session::Open,
+        price: Some(price),
+        bid: None,
+        ask: None,
+        spread: None,
+        volume: Some(volume_day),
         rvol,
         change_day_pct,
-        float_shares:  None,
-        news_today:    false,
-        halted:        Some(false),
+        float_shares: None,
+        news_today: false,
+        halted: Some(false),
         latency_ui_ms: None,
         reason: format!(
             "Perfect Pullback {side_str} {TF_LABEL} — impulsion {move_dollar:.2}$ \
@@ -831,7 +895,8 @@ fn make_alert(
             retrace * 100.0,
         ),
         display_timeframe: Some(TF_LABEL.to_string()),
-        side:          Some(side),
+        side: Some(side),
+        tempo_depth: None,
     }
 }
 
@@ -844,7 +909,11 @@ fn load_avg_volumes(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, u6
     universe_repository::get_all(&conn)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|a| a.avg_volume.filter(|v| *v > 0).map(|v| (a.symbol, v as u64)))
+        .filter_map(|a| {
+            a.avg_volume
+                .filter(|v| *v > 0)
+                .map(|v| (a.symbol, v as u64))
+        })
         .collect()
 }
 
@@ -863,11 +932,22 @@ mod tests {
     use super::*;
 
     fn t(i: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + i * BUCKET_SECS, 0).single().unwrap()
+        Utc.timestamp_opt(1_700_000_000 + i * BUCKET_SECS, 0)
+            .single()
+            .unwrap()
     }
 
     fn bar(i: i64, o: f64, h: f64, l: f64, c: f64, vol: u64) -> Bar {
-        Bar { time: t(i), open: o, high: h, low: l, close: c, volume: vol, vwap: Some(c), trade_count: Some(10) }
+        Bar {
+            time: t(i),
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: vol,
+            vwap: Some(c),
+            trade_count: Some(10),
+        }
     }
 
     #[test]
@@ -910,7 +990,7 @@ mod tests {
     #[test]
     fn vwap_crosses_counts_sign_changes() {
         let closes = vec![10.0, 9.0, 11.0, 9.0];
-        let vwaps  = vec![10.0, 10.0, 10.0, 10.0];
+        let vwaps = vec![10.0, 10.0, 10.0, 10.0];
         // below, above, below → 2 crossings over the window.
         assert_eq!(vwap_crosses(&closes, &vwaps, 6), 2);
     }
@@ -920,17 +1000,21 @@ mod tests {
     fn clean_long_setup_triggers() {
         let bars = vec![
             bar(0, 100.0, 100.2, 99.9, 100.0, 1000),
-            bar(1, 100.0, 100.0, 99.5, 99.8, 1000),  // swing low pivot
-            bar(2, 99.6, 101.0, 99.6, 100.9, 3000),  // impulse up
-            bar(3, 101.0, 102.5, 100.9, 102.4, 3500),// impulse high
-            bar(4, 102.4, 102.4, 102.0, 102.1, 1500),// pullback 1 (red, small)
-            bar(5, 102.1, 102.2, 101.8, 101.9, 1200),// pullback 2 (red, small)
-            bar(6, 101.9, 102.0, 101.7, 101.8, 1000),// pullback 3 (red, small) → trigger
+            bar(1, 100.0, 100.0, 99.5, 99.8, 1000), // swing low pivot
+            bar(2, 99.6, 101.0, 99.6, 100.9, 3000), // impulse up
+            bar(3, 101.0, 102.5, 100.9, 102.4, 3500), // impulse high
+            bar(4, 102.4, 102.4, 102.0, 102.1, 1500), // pullback 1 (red, small)
+            bar(5, 102.1, 102.2, 101.8, 101.9, 1200), // pullback 2 (red, small)
+            bar(6, 101.9, 102.0, 101.7, 101.8, 1000), // pullback 3 (red, small) → trigger
         ];
         let vwaps = vec![99.0; bars.len()]; // price well above VWAP throughout
         let inp = TickerInput {
-            symbol: "AAA".into(), m1: vec![], price: 101.8,
-            volume_day: 0, change_day_pct: None, avg_vol: 0,
+            symbol: "AAA".into(),
+            m1: vec![],
+            price: 101.8,
+            volume_day: 0,
+            change_day_pct: None,
+            avg_vol: 0,
         };
         let mut st = SymbolState::default();
         let fire = evaluate(&mut st, &inp, &bars, &vwaps, t(7));
@@ -952,8 +1036,12 @@ mod tests {
         }
         let vwaps = vec![100.5; bars.len()];
         let inp = TickerInput {
-            symbol: "BBB".into(), m1: vec![], price: 100.0,
-            volume_day: 0, change_day_pct: None, avg_vol: 0,
+            symbol: "BBB".into(),
+            m1: vec![],
+            price: 100.0,
+            volume_day: 0,
+            change_day_pct: None,
+            avg_vol: 0,
         };
         let mut st = SymbolState::default();
         assert!(evaluate(&mut st, &inp, &bars, &vwaps, t(9)).is_none());

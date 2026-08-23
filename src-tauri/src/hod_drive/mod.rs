@@ -59,72 +59,72 @@ use crate::types::{AlertSignal, Session, Side};
 #[derive(Debug, Clone, Copy)]
 pub struct TfConfig {
     /// Display + alert label ("5m") and the bucket length in seconds.
-    pub label:        &'static str,
-    pub bucket_secs:  i64,
+    pub label: &'static str,
+    pub bucket_secs: i64,
     /// Master on/off for this timeframe (only 5m is on by default in V1).
-    pub enabled:      bool,
+    pub enabled: bool,
 
     // ── Active window ──
     /// Bars that must have closed before the pipeline runs (spec: 3).
-    pub min_closed_bars:   usize,
+    pub min_closed_bars: usize,
     /// Active duration since the open = min(timeframe × 20, 120 min). Precomputed
     /// here in seconds (5m → 100 min).
-    pub active_secs:       i64,
+    pub active_secs: i64,
 
     // ── Gate 1 — Universe ──
-    pub min_price:            f64,   // ≥ 2$
-    pub min_volume_since_open: u64,  // ≥ 200k shares
+    pub min_price: f64,                    // ≥ 2$
+    pub min_volume_since_open: u64,        // ≥ 200k shares
     pub min_dollar_volume_since_open: f64, // OR ≥ 200k$
 
     // ── Gate 2 — Risk Ratio (closed bars only) ──
     pub max_retracement: f64, // ≤ 0.60
-    pub min_risk_ratio:  f64, // ≥ 2.0
+    pub min_risk_ratio: f64,  // ≥ 2.0
 
     // ── Gate 3 — Clear Pattern ──
-    pub min_range_dollars:    f64, // (HOD-LOD) ≥ 0.50$ ...
-    pub min_range_pct:        f64, // ... OR (HOD-LOD)/open ≥ 5%
+    pub min_range_dollars: f64, // (HOD-LOD) ≥ 0.50$ ...
+    pub min_range_pct: f64,     // ... OR (HOD-LOD)/open ≥ 5%
     /// A red bar is tolerated inside the bullish sequence iff its body ≤ this share
     /// of its range, its low holds the previous low, and its close holds within
     /// `red_close_tol` × previous range of the previous close.
-    pub red_body_max_ratio:   f64, // ≤ 0.30
-    pub red_close_tol:        f64, // 0.25
+    pub red_body_max_ratio: f64, // ≤ 0.30
+    pub red_close_tol: f64,     // 0.25
     /// Tolerance caps: at most 1 red OR ≤ this fraction of the sequence red.
-    pub red_max_fraction:     f64, // 0.20
-    pub min_series_share:     f64, // series_range / open_range ≥ 0.50
-    pub min_power_score:      f64, // ≥ 0.60
+    pub red_max_fraction: f64, // 0.20
+    pub min_series_share: f64,  // series_range / open_range ≥ 0.50
+    pub min_power_score: f64,   // ≥ 0.60
 
     // ── Gate 4 — Live liquidity (5-second hold) ──
-    pub liquidity_hold_secs:   i64, // 5
-    pub max_spread_pct:        f64, // ≤ 2%
-    pub min_dollar_volume_5s:  f64, // ≥ 10k$ over the hold
+    pub liquidity_hold_secs: i64,  // 5
+    pub max_spread_pct: f64,       // ≤ 2%
+    pub min_dollar_volume_5s: f64, // ≥ 10k$ over the hold
 }
 
 /// 5-minute timeframe (the only one wired in V1). active = min(5m×20, 120m) = 100 min.
 pub const CFG_5M: TfConfig = TfConfig {
-    label:        "5m",
-    bucket_secs:  300,
-    enabled:      true,
+    label: "5m",
+    bucket_secs: 300,
+    enabled: true,
 
-    min_closed_bars:   3,
-    active_secs:       100 * 60,
+    min_closed_bars: 3,
+    active_secs: 100 * 60,
 
-    min_price:                        2.0,
-    min_volume_since_open:            200_000,
-    min_dollar_volume_since_open:     200_000.0,
+    min_price: 2.0,
+    min_volume_since_open: 200_000,
+    min_dollar_volume_since_open: 200_000.0,
 
     max_retracement: 0.60,
-    min_risk_ratio:  2.0,
+    min_risk_ratio: 2.0,
 
-    min_range_dollars:  0.50,
-    min_range_pct:      0.05,
+    min_range_dollars: 0.50,
+    min_range_pct: 0.05,
     red_body_max_ratio: 0.30,
-    red_close_tol:      0.25,
-    red_max_fraction:   0.20,
-    min_series_share:   0.50,
-    min_power_score:    0.60,
+    red_close_tol: 0.25,
+    red_max_fraction: 0.20,
+    min_series_share: 0.50,
+    min_power_score: 0.60,
 
-    liquidity_hold_secs:  5,
-    max_spread_pct:       0.02,
+    liquidity_hold_secs: 5,
+    max_spread_pct: 0.02,
     min_dollar_volume_5s: 10_000.0,
 };
 
@@ -147,8 +147,8 @@ pub const COOLDOWN_SECS: u64 = 600;
 
 // ── Suggested-trade offsets (fractions of the pullback bar's risk = high−low) ──
 const ENTRY_OFFSET: f64 = 0.05; // limit entry slightly above last.high
-const SL_OFFSET:    f64 = 0.10; // SL slightly below last.low
-const TP_OFFSET:    f64 = 0.10; // TP slightly below HOD
+const SL_OFFSET: f64 = 0.10; // SL slightly below last.low
+const TP_OFFSET: f64 = 0.10; // TP slightly below HOD
 
 /// How often the engine evaluates (seconds). Structural decisions only change on a
 /// new closed bar; a short loop keeps the 5-second liquidity hold responsive.
@@ -162,7 +162,7 @@ const STATE_STALE_SECS: i64 = 30 * 60;
 
 /// Regular cash session in ET wall-clock minutes since midnight: 09:30–16:00.
 const SESSION_START_MIN: u32 = 9 * 60 + 30; // 570
-const SESSION_END_MIN:   u32 = 16 * 60;     // 960
+const SESSION_END_MIN: u32 = 16 * 60; // 960
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Pure pipeline — computed once per symbol from its closed timeframe bars. Reused
@@ -173,60 +173,60 @@ const SESSION_END_MIN:   u32 = 16 * 60;     // 960
 #[derive(Debug, Clone)]
 pub struct HodDriveEval {
     // Gate 2/overlay levels.
-    pub open_price:        f64,
-    pub hod:               f64,
-    pub lod:               f64,
-    pub hod_bar_idx:       usize,
-    pub lod_bar_idx:       usize,
-    pub retracement:       f64,
-    pub risk_ratio:        f64,
+    pub open_price: f64,
+    pub hod: f64,
+    pub lod: f64,
+    pub hod_bar_idx: usize,
+    pub lod_bar_idx: usize,
+    pub retracement: f64,
+    pub risk_ratio: f64,
 
     // Gate 3 / overlay.
     /// series_range / (HOD-LOD), 0..1.
-    pub series_share:      f64,
-    pub series_volume:     u64,
-    pub pullback_volume:   u64,
+    pub series_share: f64,
+    pub series_volume: u64,
+    pub pullback_volume: u64,
     /// pullback_volume / series_volume (1.0 = equal, 0.5 = half, 2.0 = double).
     pub pullback_vol_ratio: f64,
-    pub power_score:       f64,
+    pub power_score: f64,
     pub directional_efficiency: f64,
 
     /// Indices (into the closed-bar slice) of bars belonging to the green series —
     /// each gets a small cross under it on the chart.
-    pub series_bar_idxs:   Vec<usize>,
+    pub series_bar_idxs: Vec<usize>,
 
     /// Did every structural gate (1-3) pass? Gate 4 is the live 5s hold, handled
     /// statefully by the engine and not part of this pure pass.
-    pub gates_pass:        bool,
+    pub gates_pass: bool,
     /// The closed bar this evaluation keys on (anti-spam: one fire per bar).
-    pub last_bar_time:     DateTime<Utc>,
+    pub last_bar_time: DateTime<Utc>,
 
     // ── Suggested trade levels (R-based offsets from the pullback bar) ──
-    pub suggested_entry:   Option<f64>,
-    pub suggested_sl:      Option<f64>,
-    pub suggested_tp:      Option<f64>,
-    pub suggested_rr:      Option<f64>,
+    pub suggested_entry: Option<f64>,
+    pub suggested_sl: Option<f64>,
+    pub suggested_tp: Option<f64>,
+    pub suggested_rr: Option<f64>,
 }
 
 /// The longest bullish sequence found off the open.
 struct Series {
-    start:        usize,
-    end:          usize, // inclusive
-    high:         f64,
-    low:          f64,
-    volume:       u64,
-    power_score:  f64,
-    idxs:         Vec<usize>,
+    start: usize,
+    end: usize, // inclusive
+    high: f64,
+    low: f64,
+    volume: u64,
+    power_score: f64,
+    idxs: Vec<usize>,
 }
 
 /// Run Gates 1-3 on a symbol's CLOSED timeframe bars. `now`, `price`, `open_price`
 /// come from the live snapshot. Returns the full evaluation (with `gates_pass`) when
 /// there is enough structure, else None (not enough bars / degenerate range).
 pub fn evaluate(
-    cfg:         &TfConfig,
-    bars:        &[Bar],
-    price:       f64,
-    volume_since_open:        u64,
+    cfg: &TfConfig,
+    bars: &[Bar],
+    price: f64,
+    volume_since_open: u64,
     dollar_volume_since_open: f64,
 ) -> Option<HodDriveEval> {
     if bars.len() < cfg.min_closed_bars {
@@ -241,8 +241,14 @@ pub fn evaluate(
     let mut hod_bar_idx = 0;
     let mut lod_bar_idx = 0;
     for (i, b) in bars.iter().enumerate() {
-        if b.high > hod { hod = b.high; hod_bar_idx = i; }
-        if b.low  < lod { lod = b.low;  lod_bar_idx = i; }
+        if b.high > hod {
+            hod = b.high;
+            hod_bar_idx = i;
+        }
+        if b.low < lod {
+            lod = b.low;
+            lod_bar_idx = i;
+        }
     }
     let open_range = hod - lod;
     if open_range <= 0.0 {
@@ -263,13 +269,19 @@ pub fn evaluate(
     let g2 = retracement <= cfg.max_retracement && risk_ratio >= cfg.min_risk_ratio;
 
     // ── Gate 3 — Clear Pattern ──
-    let g3_range = open_range >= cfg.min_range_dollars
-        || (open_range / open_price) >= cfg.min_range_pct;
+    let g3_range =
+        open_range >= cfg.min_range_dollars || (open_range / open_price) >= cfg.min_range_pct;
     let series = longest_bullish_series(cfg, bars);
     let (series_share, series_volume, power_score, series_idxs, series_end) = match &series {
         Some(s) => {
             let series_range = s.high - s.low;
-            (series_range / open_range, s.volume, s.power_score, s.idxs.clone(), s.end)
+            (
+                series_range / open_range,
+                s.volume,
+                s.power_score,
+                s.idxs.clone(),
+                s.end,
+            )
         }
         None => (0.0, 0, 0.0, Vec::new(), 0),
     };
@@ -309,10 +321,14 @@ pub fn evaluate(
     let base_risk = last.high - last.low;
     let (s_entry, s_sl, s_tp, s_rr) = if base_risk > 0.0 {
         let entry = last.high + ENTRY_OFFSET * base_risk;
-        let sl    = last.low  - SL_OFFSET * base_risk;
-        let tp    = hod       - TP_OFFSET * base_risk;
-        let risk  = entry - sl;
-        let rr    = if risk > 0.0 && tp > entry { (tp - entry) / risk } else { 0.0 };
+        let sl = last.low - SL_OFFSET * base_risk;
+        let tp = hod - TP_OFFSET * base_risk;
+        let risk = entry - sl;
+        let rr = if risk > 0.0 && tp > entry {
+            (tp - entry) / risk
+        } else {
+            0.0
+        };
         (Some(entry), Some(sl), Some(tp), Some(rr))
     } else {
         (None, None, None, None)
@@ -336,9 +352,9 @@ pub fn evaluate(
         gates_pass: g1 && g2 && g3,
         last_bar_time: last.time,
         suggested_entry: s_entry,
-        suggested_sl:    s_sl,
-        suggested_tp:    s_tp,
-        suggested_rr:    s_rr,
+        suggested_sl: s_sl,
+        suggested_tp: s_tp,
+        suggested_rr: s_rr,
     })
 }
 
@@ -381,14 +397,14 @@ fn ema(values: &[f64], period: usize) -> Vec<f64> {
 /// "closed" (exhausted), plus a 0..1 strength normalised against the session's
 /// peak histogram magnitude.
 pub struct MacdStatus {
-    pub open:     bool,
+    pub open: bool,
     pub strength: f64,
 }
 
 pub fn macd_status(closes: &[f64]) -> Option<MacdStatus> {
     const FAST: usize = 12;
     const SLOW: usize = 26;
-    const SIG:  usize = 9;
+    const SIG: usize = 9;
 
     if closes.len() < SLOW {
         return None;
@@ -483,8 +499,14 @@ fn longest_bullish_series(cfg: &TfConfig, bars: &[Bar]) -> Option<Series> {
             e += 1;
         }
 
-        let high = bars[start..=end].iter().map(|b| b.high).fold(f64::MIN, f64::max);
-        let low  = bars[start..=end].iter().map(|b| b.low).fold(f64::MAX, f64::min);
+        let high = bars[start..=end]
+            .iter()
+            .map(|b| b.high)
+            .fold(f64::MIN, f64::max);
+        let low = bars[start..=end]
+            .iter()
+            .map(|b| b.low)
+            .fold(f64::MAX, f64::min);
         let range = high - low;
         let len = end - start + 1;
         let better = match &best {
@@ -497,8 +519,11 @@ fn longest_bullish_series(cfg: &TfConfig, bars: &[Bar]) -> Option<Series> {
         if better {
             let volume = bars[start..=end].iter().map(|b| b.volume).sum();
             // Power score over the sequence: Σ|close-open| / Σ(high-low).
-            let body: f64 = bars[start..=end].iter().map(|b| (b.close - b.open).abs()).sum();
-            let rng:  f64 = bars[start..=end].iter().map(|b| b.high - b.low).sum();
+            let body: f64 = bars[start..=end]
+                .iter()
+                .map(|b| (b.close - b.open).abs())
+                .sum();
+            let rng: f64 = bars[start..=end].iter().map(|b| b.high - b.low).sum();
             let power_score = if rng > 0.0 { body / rng } else { 0.0 };
             best = Some(Series {
                 start,
@@ -527,18 +552,17 @@ pub fn session_bars(cfg: &TfConfig, m1: &[Bar], now: DateTime<Utc>) -> Vec<Bar> 
                 last.low = last.low.min(b.low);
                 last.close = b.close;
                 last.volume += b.volume;
-                last.trade_count =
-                    Some(last.trade_count.unwrap_or(0) + b.trade_count.unwrap_or(0));
+                last.trade_count = Some(last.trade_count.unwrap_or(0) + b.trade_count.unwrap_or(0));
             }
             _ => {
                 bars.push(Bar {
-                    time:        Utc.timestamp_opt(bucket, 0).single().unwrap_or(b.time),
-                    open:        b.open,
-                    high:        b.high,
-                    low:         b.low,
-                    close:       b.close,
-                    volume:      b.volume,
-                    vwap:        None,
+                    time: Utc.timestamp_opt(bucket, 0).single().unwrap_or(b.time),
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                    vwap: None,
                     trade_count: Some(b.trade_count.unwrap_or(0)),
                 });
             }
@@ -561,13 +585,13 @@ pub fn session_bars(cfg: &TfConfig, m1: &[Bar], now: DateTime<Utc>) -> Vec<Bar> 
 
 /// Per-symbol state read once per loop, then evaluated outside the read lock.
 struct TickerInput {
-    symbol:         String,
-    m1:             Vec<Bar>,
-    price:          f64,
-    bid:            Option<f64>,
-    ask:            Option<f64>,
-    spread:         Option<f64>,
-    volume_day:     u64,
+    symbol: String,
+    m1: Vec<Bar>,
+    price: f64,
+    bid: Option<f64>,
+    ask: Option<f64>,
+    spread: Option<f64>,
+    volume_day: u64,
     change_day_pct: Option<f64>,
 }
 
@@ -576,13 +600,13 @@ struct SymbolState {
     /// The bar currently held in the 5-second liquidity confirmation, plus when the
     /// hold started and the day volume snapshot at that moment (to measure the 5s
     /// dollar volume).
-    pending_bar:       Option<DateTime<Utc>>,
-    pending_since:     Option<DateTime<Utc>>,
-    pending_vol_day:   u64,
+    pending_bar: Option<DateTime<Utc>>,
+    pending_since: Option<DateTime<Utc>>,
+    pending_vol_day: u64,
     /// The bar that last fired — so a given bar fires at most once.
-    last_trigger_bar:  Option<DateTime<Utc>>,
-    cooldown_until:    Option<DateTime<Utc>>,
-    last_seen:         Option<DateTime<Utc>>,
+    last_trigger_bar: Option<DateTime<Utc>>,
+    cooldown_until: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
 }
 
 pub struct HodDriveEngine;
@@ -590,10 +614,10 @@ pub struct HodDriveEngine;
 impl HodDriveEngine {
     /// Spawn the background loop. Returns immediately.
     pub fn start(
-        running:          Arc<AtomicBool>,
-        market:           Arc<RwLock<MarketState>>,
-        active_alerts:    Arc<RwLock<Vec<AlertSignal>>>,
-        alert_history:    Arc<RwLock<Vec<AlertSignal>>>,
+        running: Arc<AtomicBool>,
+        market: Arc<RwLock<MarketState>>,
+        active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
+        alert_history: Arc<RwLock<Vec<AlertSignal>>>,
         strategy_enabled: Arc<RwLock<HashMap<String, bool>>>,
     ) {
         tauri::async_runtime::spawn(async move {
@@ -678,8 +702,12 @@ impl HodDriveEngine {
 
                 let mut fires: Vec<AlertSignal> = Vec::new();
                 for inp in inputs {
-                    let m1: Vec<Bar> =
-                        inp.m1.iter().filter(|b| b.time >= session_open).cloned().collect();
+                    let m1: Vec<Bar> = inp
+                        .m1
+                        .iter()
+                        .filter(|b| b.time >= session_open)
+                        .cloned()
+                        .collect();
                     let bars = session_bars(cfg, &m1, now);
                     if bars.is_empty() {
                         continue;
@@ -687,9 +715,16 @@ impl HodDriveEngine {
                     let st = states.entry(inp.symbol.clone()).or_default();
                     st.last_seen = bars.last().map(|b| b.time);
 
-                    if let Some(fire) =
-                        step(cfg, st, &inp, &bars, session_open, active_until, now, live_active)
-                    {
+                    if let Some(fire) = step(
+                        cfg,
+                        st,
+                        &inp,
+                        &bars,
+                        session_open,
+                        active_until,
+                        now,
+                        live_active,
+                    ) {
                         fires.push(fire);
                     }
                 }
@@ -717,14 +752,14 @@ impl HodDriveEngine {
 /// Gate 4 is skipped: gates 1-3 fire directly.
 #[allow(clippy::too_many_arguments)]
 fn step(
-    cfg:          &TfConfig,
-    st:           &mut SymbolState,
-    inp:          &TickerInput,
-    bars:         &[Bar],
+    cfg: &TfConfig,
+    st: &mut SymbolState,
+    inp: &TickerInput,
+    bars: &[Bar],
     session_open: DateTime<Utc>,
     active_until: DateTime<Utc>,
-    now:          DateTime<Utc>,
-    live_active:  bool,
+    now: DateTime<Utc>,
+    live_active: bool,
 ) -> Option<AlertSignal> {
     // Active window: ≥ 3 closed bars AND within active_duration since the open.
     if bars.len() < cfg.min_closed_bars {
@@ -745,7 +780,13 @@ fn step(
         .map(|b| ((b.high + b.low + b.close) / 3.0) * b.volume as f64)
         .sum();
 
-    let eval = evaluate(cfg, bars, inp.price, volume_since_open, dollar_volume_since_open)?;
+    let eval = evaluate(
+        cfg,
+        bars,
+        inp.price,
+        volume_since_open,
+        dollar_volume_since_open,
+    )?;
     let bar_time = eval.last_bar_time;
 
     // One fire per bar; respect the post-fire cooldown.
@@ -776,7 +817,13 @@ fn step(
         st.last_trigger_bar = Some(bar_time);
         st.cooldown_until = Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
         return Some(make_alert(
-            cfg, &inp.symbol, &eval, inp.price, inp.volume_day, inp.change_day_pct, now,
+            cfg,
+            &inp.symbol,
+            &eval,
+            inp.price,
+            inp.volume_day,
+            inp.change_day_pct,
+            now,
         ));
     }
 
@@ -800,8 +847,7 @@ fn step(
             };
             // Dollar volume traded during the hold (Δ day volume × price). Trade count
             // over 5s isn't available from minute bars in V1, so it's not gated here.
-            let dvol_5s =
-                inp.volume_day.saturating_sub(st.pending_vol_day) as f64 * inp.price;
+            let dvol_5s = inp.volume_day.saturating_sub(st.pending_vol_day) as f64 * inp.price;
             let liquidity_ok = spread_ok && dvol_5s >= cfg.min_dollar_volume_5s;
 
             st.pending_bar = None;
@@ -811,7 +857,15 @@ fn step(
             }
             st.last_trigger_bar = Some(bar_time);
             st.cooldown_until = Some(now + ChronoDuration::seconds(COOLDOWN_SECS as i64));
-            Some(make_alert(cfg, &inp.symbol, &eval, inp.price, inp.volume_day, inp.change_day_pct, now))
+            Some(make_alert(
+                cfg,
+                &inp.symbol,
+                &eval,
+                inp.price,
+                inp.volume_day,
+                inp.change_day_pct,
+                now,
+            ))
         }
         _ => {
             // Start the 5-second hold for this bar.
@@ -827,46 +881,47 @@ fn step(
 /// the reason string so they're visible immediately; the on-chart overlay recomputes
 /// them live via the overlay command.
 fn make_alert(
-    cfg:            &TfConfig,
-    symbol:         &str,
-    eval:           &HodDriveEval,
-    price:          f64,
-    volume_day:     u64,
+    cfg: &TfConfig,
+    symbol: &str,
+    eval: &HodDriveEval,
+    price: f64,
+    volume_day: u64,
     change_day_pct: Option<f64>,
-    now:            DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> AlertSignal {
     AlertSignal {
-        alert_id:      format!("hod-{}-{}-{}", now.timestamp_millis(), symbol, cfg.label),
-        timestamp:     now,
-        symbol:        symbol.to_string(),
-        strategy_id:   STRATEGY_ID.to_string(),
+        alert_id: format!("hod-{}-{}-{}", now.timestamp_millis(), symbol, cfg.label),
+        timestamp: now,
+        symbol: symbol.to_string(),
+        strategy_id: STRATEGY_ID.to_string(),
         strategy_name: "HOD Drive".to_string(),
-        priority:      PRIORITY,
-        session:       Session::Open,
-        price:         Some(price),
-        bid:           None,
-        ask:           None,
-        spread:        None,
-        volume:        Some(volume_day),
-        rvol:          None,
+        priority: PRIORITY,
+        session: Session::Open,
+        price: Some(price),
+        bid: None,
+        ask: None,
+        spread: None,
+        volume: Some(volume_day),
+        rvol: None,
         change_day_pct,
-        float_shares:  None,
-        news_today:    false,
-        halted:        Some(false),
+        float_shares: None,
+        news_today: false,
+        halted: Some(false),
         latency_ui_ms: None,
         reason: format!(
             "HOD Drive {tf} — série {share:.0}% du range · power {power:.0}% · \
              eff. {eff:.0}% · R/R {rr:.1} · retrace {ret:.0}% · vol PB {pbr:.0}% — ${price:.2}",
-            tf    = cfg.label,
+            tf = cfg.label,
             share = eval.series_share * 100.0,
             power = eval.power_score * 100.0,
-            eff   = eval.directional_efficiency * 100.0,
-            rr    = eval.risk_ratio,
-            ret   = eval.retracement * 100.0,
-            pbr   = eval.pullback_vol_ratio * 100.0,
+            eff = eval.directional_efficiency * 100.0,
+            rr = eval.risk_ratio,
+            ret = eval.retracement * 100.0,
+            pbr = eval.pullback_vol_ratio * 100.0,
         ),
         display_timeframe: Some(cfg.label.to_string()),
-        side:          Some(Side::Long),
+        side: Some(Side::Long),
+        tempo_depth: None,
     }
 }
 
@@ -875,11 +930,22 @@ mod tests {
     use super::*;
 
     fn t(i: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + i * 300, 0).single().unwrap()
+        Utc.timestamp_opt(1_700_000_000 + i * 300, 0)
+            .single()
+            .unwrap()
     }
 
     fn bar(i: i64, o: f64, h: f64, l: f64, c: f64, vol: u64) -> Bar {
-        Bar { time: t(i), open: o, high: h, low: l, close: c, volume: vol, vwap: Some(c), trade_count: Some(50) }
+        Bar {
+            time: t(i),
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: vol,
+            vwap: Some(c),
+            trade_count: Some(50),
+        }
     }
 
     /// A clean 4-bar drive off the open with a single shallow pullback bar passes all
@@ -893,8 +959,7 @@ mod tests {
             bar(3, 2.85, 2.86, 2.80, 2.81, 60_000),  // small shallow pullback (last closed)
         ];
         let vol: u64 = bars.iter().map(|b| b.volume).sum();
-        let eval = evaluate(&CFG_5M, &bars, 2.81, vol, 1_000_000.0)
-            .expect("enough structure");
+        let eval = evaluate(&CFG_5M, &bars, 2.81, vol, 1_000_000.0).expect("enough structure");
         assert!(eval.gates_pass, "clean drive should pass gates 1-3");
         // HOD on bar 2, LOD on bar 0.
         assert_eq!(eval.hod_bar_idx, 2);

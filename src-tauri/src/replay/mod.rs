@@ -1,5 +1,11 @@
 // Market Replay — rejoue une journée historique à travers toute la plateforme.
 //
+// SOURCE DE DONNÉES — même priorité qu'en live/paper (voir `data::Provider` et
+// `commands::spawn_live_feed`) : Alpaca SIP d'abord, puis Massive Starter+, puis
+// les flat files locaux. Le replay n'a donc pas de « mode » à lui : il rejoue la
+// journée avec le meilleur tape auquel le compte a droit, et chaque source
+// dégrade proprement vers la suivante si elle ne peut pas répondre.
+//
 // Quand un replay est actif :
 //   • les flux live (WebSocket données + news) sont arrêtés ;
 //   • l'horloge de l'app (`crate::time::now()`) devient l'horloge simulée ;
@@ -57,8 +63,12 @@ pub struct ReplayStatus {
     pub state: String,
     /// ET date being replayed (YYYY-MM-DD).
     pub day: Option<String>,
-    /// "tape" (trades réels enregistrés) | "minutes" (barres 1 min synthétisées).
+    /// "tape" (trades réels enregistrés) | "seconds" (agrégats 1 s réels) |
+    /// "minutes" (barres 1 min synthétisées) | "daily" (barres journalières).
     pub source: Option<String>,
+    /// D'OÙ viennent les données — "alpaca_sip" | "massive" | "alpaca_iex" |
+    /// "flat_files" | "daily_cache". Voir `data::Provider`.
+    pub provider: Option<String>,
     pub sim_time: Option<DateTime<Utc>>,
     pub speed: f64,
     pub playing: bool,
@@ -78,6 +88,7 @@ impl Default for ReplayStatus {
             state: "idle".into(),
             day: None,
             source: None,
+            provider: None,
             sim_time: None,
             speed: 1.0,
             playing: false,
@@ -146,6 +157,7 @@ pub struct ReplayDeps {
     pub secrets: Arc<RwLock<Secrets>>,
     pub internal_book: Arc<RwLock<crate::internal_trading::InternalBook>>,
     pub broker_mirror: Arc<RwLock<crate::broker::BrokerMirror>>,
+    pub strategy_enabled: Arc<RwLock<std::collections::HashMap<String, bool>>>,
     pub chart: Arc<RwLock<crate::chart_state::ChartState>>,
     pub live_feed_running: Arc<AtomicBool>,
     pub news_feed_running: Arc<AtomicBool>,
@@ -165,6 +177,53 @@ struct TickEvent {
     ts: i64,
 }
 
+// ─── Source resolution ──────────────────────────────────────────────────────────
+
+/// Pick the day-loading source for this replay session, with the SAME priority the
+/// live feed uses: Alpaca SIP > Massive Starter+ > flat files (see `data::Provider`).
+///
+/// Read once at start and reused for every day of the session, « jour suivant »
+/// included, so a replay cannot silently change tape mid-run.
+///
+/// Credentials stay optional, always. Nothing here can refuse to start: a key that
+/// is missing simply removes its step from `data::attempt_order`, and the walk ends
+/// on the flat files / daily-bars fallback — which is exactly the offline replay the
+/// flat files exist for. `offline` short-circuits to the local files without a probe.
+fn resolve_sources(deps: &ReplayDeps) -> data::Sources {
+    let offline = deps.config.read().unwrap().data_source.offline;
+    let (alpaca, massive_key) = {
+        let s = deps.secrets.read().unwrap();
+        let alpaca = s
+            .alpaca_key
+            .clone()
+            .zip(s.alpaca_secret.clone())
+            .filter(|(k, sec)| !k.is_empty() && !sec.is_empty());
+        let massive = s.massive_api_key.clone().filter(|k| !k.trim().is_empty());
+        (alpaca, massive)
+    };
+    // The last PROBED Alpaca subscription, not a guess — `Provider::resolve` only
+    // promotes to the SIP path on a positive answer.
+    let alpaca_plan = {
+        let conn = deps.db.lock().unwrap();
+        crate::local_db::cache_repository::get_app_meta(&conn, crate::alpaca::plan::PLAN_META_KEY)
+            .as_deref()
+            .and_then(crate::alpaca::plan::Plan::from_meta)
+    };
+    let massive_tier = crate::massive::plan::effective_from_app_state(&deps.db, &deps.config);
+    let provider = data::Provider::resolve(
+        offline,
+        alpaca.is_some(),
+        alpaca_plan,
+        massive_key.is_some(),
+        massive_tier,
+    );
+    data::Sources {
+        provider: Some(provider),
+        alpaca: (!offline).then_some(alpaca).flatten(),
+        massive_key: (!offline).then_some(massive_key).flatten(),
+    }
+}
+
 // ─── Engine ─────────────────────────────────────────────────────────────────────
 
 /// Start a replay of `day` at `start_min` ET minutes (240/420/570). Returns an
@@ -182,20 +241,13 @@ pub fn start(
         }
     }
     NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "date invalide".to_string())?;
-    // Credentials are optional, always. `load_day` reads a complete flat file
-    // straight from disk when it has one, uses the API only to fill what's missing,
-    // and falls back to a daily-bars-only session (`data::load_day_from_daily_cache`)
-    // for a day with no per-day minute file — erroring clearly only when there is no
-    // local daily bar for it either. Refusing to start on missing keys would block
-    // exactly the offline replay the flat files exist for.
-    let (key, secret) = {
-        let s = deps.secrets.read().unwrap();
-        let offline = deps.config.read().unwrap().data_source.offline;
-        match (s.alpaca_key.clone(), s.alpaca_secret.clone()) {
-            (Some(k), Some(sec)) if !offline && !k.is_empty() && !sec.is_empty() => (k, sec),
-            _ => (String::new(), String::new()),
-        }
-    };
+    let sources = resolve_sources(&deps);
+    eprintln!(
+        "[tagdash] replay {day}: source prioritaire = {}",
+        sources
+            .provider
+            .map_or("flat_files", data::Provider::as_str),
+    );
 
     let (tx, rx) = mpsc::unbounded_channel::<ReplayCmd>();
     *shared.cmd_tx.lock().unwrap() = Some(tx);
@@ -207,7 +259,7 @@ pub fn start(
         st.day = Some(day.clone());
     }
 
-    tauri::async_runtime::spawn(engine(shared, deps, key, secret, day, start_min, rx));
+    tauri::async_runtime::spawn(engine(shared, deps, sources, day, start_min, rx));
     Ok(())
 }
 
@@ -215,8 +267,7 @@ pub fn start(
 async fn engine(
     shared: Arc<ReplayShared>,
     deps: ReplayDeps,
-    key: String,
-    secret: String,
+    sources: data::Sources,
     mut day: String,
     start_min: u32,
     mut rx: mpsc::UnboundedReceiver<ReplayCmd>,
@@ -262,8 +313,7 @@ async fn engine(
             let loaded = data::load_day(
                 &deps.app_dir,
                 &deps.db,
-                &key,
-                &secret,
+                &sources,
                 &d,
                 &focus_now,
                 move |f| {
@@ -361,6 +411,7 @@ async fn engine(
                         st.state = "paused".into();
                         st.playing = false;
                         st.source = Some(dd.source.to_string());
+                        st.provider = Some(dd.provider.to_string());
                         st.symbols = dd.symbols;
                         st.events_total = dd.events.len();
                         st.events_done = cursor;
@@ -613,6 +664,7 @@ async fn engine(
         deps.db.clone(),
         deps.internal_book.clone(),
         deps.broker_mirror.clone(),
+        deps.strategy_enabled.clone(),
         deps.live_feed_running.clone(),
         deps.focus_rx_restart.clone(),
         deps.app.clone(),
@@ -634,6 +686,12 @@ async fn engine(
 fn reset_market(deps: &ReplayDeps, dd: &data::DayData, now: DateTime<Utc>) {
     let mut ms = deps.market.write().unwrap();
     ms.reset_data();
+    // Le tape rejoué porte de VRAIS compteurs de trades — le `n` de la barre 1 min
+    // réparti sur ses tranches, ou le `n` de l'agrégat 1 s tel quel. Sans cette
+    // déclaration, une session Massive live précédente aurait laissé
+    // `SecondAggregates`, et les mesures de rythme du tape seraient lues comme
+    // « on ne sait pas » alors que l'information est là.
+    ms.set_tape_kind(crate::types::TapeKind::Prints);
     for (sym, close) in &dd.prev_closes {
         ms.set_previous_close(sym, *close, now);
     }

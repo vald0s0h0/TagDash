@@ -19,7 +19,7 @@ import { AlertTriangle, Check, CircleDollarSign, FlaskConical, Radio, ServerCog 
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import type { BrokerMirror, BrokerSelection } from "@/types";
+import type { BrokerMirror, BrokerSelection, MassiveTierStatus } from "@/types";
 
 const BROKERS = [
   {
@@ -39,9 +39,19 @@ const BROKERS = [
   },
 ];
 
-export function BrokerTab() {
+export function BrokerTab({
+  onPersisted,
+}: {
+  /** Fired right after the broker/environment is written to disk, so the parent
+   *  Settings modal can keep its own `draft.broker` in sync. This tab persists
+   *  immediately on click — bypassing the modal's draft/Save flow entirely — so
+   *  without this callback a later click on the modal's global Save button would
+   *  send the modal's stale draft and silently revert the change made here. */
+  onPersisted?: (broker: "tagdash" | "alpaca", environment: "paper" | "live") => void;
+}) {
   const [sel, setSel] = useState<BrokerSelection | null>(null);
   const [mirror, setMirror] = useState<BrokerMirror | null>(null);
+  const [massiveTier, setMassiveTier] = useState<MassiveTierStatus | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [confirmLive, setConfirmLive] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -49,6 +59,7 @@ export function BrokerTab() {
   const refresh = () => {
     api.getBrokerSelection().then(setSel).catch((e) => setErr(String(e)));
     api.getBrokerMirror().then(setMirror).catch(() => {});
+    api.getMassiveTierStatus().then(setMassiveTier).catch(() => {});
   };
 
   useEffect(() => {
@@ -63,7 +74,9 @@ export function BrokerTab() {
     setErr(null);
     setBusy(true);
     try {
-      setSel(await api.setBrokerSelection(broker, environment));
+      const next = await api.setBrokerSelection(broker, environment);
+      setSel(next);
+      onPersisted?.(next.broker, next.environment);
       setConfirmLive(false);
     } catch (e) {
       setErr(String(e));
@@ -102,27 +115,41 @@ export function BrokerTab() {
           <ServerCog className="h-4 w-4" /> Broker
         </div>
         <div className="space-y-2">
-          {BROKERS.map((b) => (
-            <button
-              key={b.id}
-              disabled={busy}
-              onClick={() => apply(b.id, b.id === "tagdash" ? "paper" : sel.environment)}
-              className={cn(
-                "flex w-full items-start gap-2 rounded border p-2.5 text-left transition-colors",
-                sel.broker === b.id
-                  ? "border-blue-500/60 bg-blue-950/30"
-                  : "border-border/50 hover:bg-accent/40",
-              )}
-            >
-              <div className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
-                {sel.broker === b.id && <Check className="h-3.5 w-3.5 text-blue-400" />}
-              </div>
-              <div className="min-w-0">
-                <div className="text-xs font-medium">{b.label}</div>
-                <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{b.blurb}</p>
-              </div>
-            </button>
-          ))}
+          {BROKERS.map((b) => {
+            const massiveLocked = b.id === "alpaca" && massiveTier?.effective === "unlimited";
+            return (
+              <button
+                key={b.id}
+                disabled={busy || massiveLocked}
+                title={
+                  massiveLocked
+                    ? "Massive Starter+ actif (données différées de 15 min) — repasse-le en Basic dans Diagnostics du flux pour réactiver Alpaca"
+                    : undefined
+                }
+                onClick={() => apply(b.id, b.id === "tagdash" ? "paper" : sel.environment)}
+                className={cn(
+                  "flex w-full items-start gap-2 rounded border p-2.5 text-left transition-colors",
+                  sel.broker === b.id
+                    ? "border-blue-500/60 bg-blue-950/30"
+                    : "border-border/50 hover:bg-accent/40",
+                  massiveLocked && "cursor-not-allowed opacity-40",
+                )}
+              >
+                <div className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                  {sel.broker === b.id && <Check className="h-3.5 w-3.5 text-blue-400" />}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-xs font-medium">{b.label}</div>
+                  <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{b.blurb}</p>
+                  {massiveLocked && (
+                    <p className="mt-0.5 text-[11px] leading-snug text-amber-400">
+                      Indisponible — Massive Starter+ actif (données différées de 15 min).
+                    </p>
+                  )}
+                </div>
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -210,6 +237,11 @@ export function BrokerTab() {
           données, donc le compte choisi ci-dessus est celui dont le flux de marché
           s'authentifie. Changer de compte peut changer l'abonnement détecté —
           <strong> redémarre TagDash</strong> pour l'appliquer partout.
+        </p>
+        <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">
+          Exception : le tier Massive (Réglages → Diagnostics du flux) DÉCIDE bien du
+          broker — Starter+ (payant, données différées de 15 min) désactive Alpaca et
+          force TagDash, pour qu'un ordre réel ne parte jamais sur un prix périmé.
         </p>
       </div>
 

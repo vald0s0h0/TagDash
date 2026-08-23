@@ -1,20 +1,22 @@
 // Micro Pullback — metadata-only ScanStrategy entry.
 //
-// The real detection logic is NOT here: it is a stateful per-ticker state machine
-// (COLD → ARMED → [ignition] → CONFIRMING → ALERTED/LOCKED) that lives in
-// `crate::micro_pullback` and runs in its own tokio task during the premarket
-// window. It watches every dormant low-float small cap for the *first* state change
-// of the session — measured silence → a 10s ignition spike → a 30s confirmation —
-// and fires exactly one alert per ticker per session, then locks it. That can't fit
-// the stateless per-ticker `should_alert(ctx)` contract, so the engine pushes its
-// AlertSignals straight into the active-alert list (the same escape hatch Perfect
-// Pullback and the price-alarm watcher use).
+// The real detection logic is NOT here: it is a stateful per-ticker engine living in
+// `crate::micro_pullback`, running in its own tokio task across the whole extended
+// trading day. V2 ranks <=100M-float US common stocks by cross-sectional attention
+// on six parallel tempos (10s/20s/40s/1m/2m/5m), isolates a genuinely detached
+// one-to-three-name head, then requires a clean upward path before handing the event
+// to Qualité A+. A ticker may form another event after attention resets; unchanged
+// catalyst analysis is reused rather than paid for twice.
+//
+// That can't fit the stateless per-ticker `should_alert(ctx)` contract, so the
+// engine pushes its AlertSignals straight into the active-alert list (the same
+// escape hatch Perfect Pullback and the price-alarm watcher use).
 //
 // This file exists so the strategy still has a proper identity in the registry: a
-// Settings on/off toggle, name + priority + risk, the premarket session gate, and
-// the identity card the UI uses to lay out the chart panes + indicators + info band
-// (and the async enrichment + LLM reads) when an alert lands. `should_alert`
-// therefore always returns None — the engine is the only firer.
+// Settings on/off toggle, name + priority + risk, the session gate, and the identity
+// card the UI uses to lay out the chart panes + indicators + info band (and the
+// async enrichment + LLM reads) when an alert lands. `should_alert` therefore always
+// returns None — the engine is the only firer.
 
 use std::time::Duration;
 
@@ -22,7 +24,7 @@ use crate::strategies::ScanStrategy;
 use crate::types::{
     AlertSignal, EnrichmentProvider, EnrichmentSpec, IndicatorKind, InfoField, InfoSource, LlmSpec,
     PaneIndicator, PaneSpec, Session, StrategyCard, StrategyContext, StrategyRiskConfig,
-    UniverseKey,
+    StreamingScope, UniverseKey,
 };
 
 // ─── Identity (kept in sync with the engine's Config) ─────────────────────────
@@ -33,10 +35,20 @@ const ENABLED: bool = true;
 /// Priority 5 = "Critical" on the 1..=5 scale.
 const PRIORITY: u8 = 5;
 const MAX_RISK_DOLLARS: f64 = 100.0;
-/// Premarket only — the engine additionally restricts firing to 04:00–09:30 ET, the
-/// window during which the live feed streams the whole market's trades (so the 10s
-/// bars the engine reasons on actually flow).
-const SESSIONS: &[Session] = &[Session::Premarket];
+/// The whole extended trading day. The engine restricts firing to 04:00–20:00 ET and
+/// stamps each alert with the session it actually fired in, so it lands in that tab.
+///
+/// Premarket remains the primary use; the regular session is the second; afterhours
+/// is rare but legitimate. Coverage is NOT uniform across them on the Alpaca feed —
+/// the market-wide `trades` tier only runs when the tape is thin (premarket and
+/// afterhours), so during the regular session detection is limited to the day's watch
+/// list on that provider. See `alpaca::stream::broad_mode_at`.
+const SESSIONS: &[Session] = &[
+    Session::Premarket,
+    Session::PreOpen,
+    Session::Open,
+    Session::Afterhours,
+];
 
 pub struct MicroPullback;
 
@@ -62,8 +74,8 @@ impl ScanStrategy for MicroPullback {
     }
 
     fn cooldown(&self) -> Duration {
-        // Unused: the engine fires at most once per ticker per session (LOCK), with
-        // no cooldown — it isn't routed through the scanner's AlertEngine.
+        // Unused: v2 owns an event lifecycle + release hysteresis and is not routed
+        // through the scanner's stateless AlertEngine.
         Duration::from_secs(0)
     }
 
@@ -76,8 +88,15 @@ impl ScanStrategy for MicroPullback {
 
     fn card(&self) -> StrategyCard {
         StrategyCard {
-            // Premarket low-float observation, tick to tick.
+            // Whole-US-stock discovery; the runtime applies <=100M known float and
+            // the user's current-price band (unknown float stays explicitly tagged).
             universe: UniverseKey::LowFloat,
+            // The whole market, wherever the provider offers a wildcard. This engine
+            // is a discovery scanner: it has to see names nobody is watching yet.
+            //
+            // Massive Starter's aggregate has no trade count; v2 uses continuity,
+            // volume distribution and market-relative ranks, all supported by A.*.
+            streaming_scope: StreamingScope::Universe,
             // Left column (stacked): daily context (SMA 200/20, volume, red dots on
             // split days) on top, a 5-minute context chart (volume) below — both
             // read-only. Right column: the 10s execution pane (volume) the engine
@@ -86,29 +105,44 @@ impl ScanStrategy for MicroPullback {
             // the enrichment payload; all bars load through the unified path.
             panes: vec![
                 PaneSpec {
-                    timeframe:   "daily".into(),
-                    symbol:      None,
-                    indicators:  vec![
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(200) },
-                        PaneIndicator { kind: IndicatorKind::Sma,    period: Some(20) },
-                        PaneIndicator { kind: IndicatorKind::Volume, period: None },
+                    timeframe: "daily".into(),
+                    symbol: None,
+                    indicators: vec![
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(200),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Sma,
+                            period: Some(20),
+                        },
+                        PaneIndicator {
+                            kind: IndicatorKind::Volume,
+                            period: None,
+                        },
                     ],
                     interactive: false,
-                    column:      Some(0),
+                    column: Some(0),
                 },
                 PaneSpec {
-                    timeframe:   "5m".into(),
-                    symbol:      None,
-                    indicators:  vec![PaneIndicator { kind: IndicatorKind::Volume, period: None }],
+                    timeframe: "5m".into(),
+                    symbol: None,
+                    indicators: vec![PaneIndicator {
+                        kind: IndicatorKind::Volume,
+                        period: None,
+                    }],
                     interactive: false,
-                    column:      Some(0),
+                    column: Some(0),
                 },
                 PaneSpec {
-                    timeframe:   "10s".into(),
-                    symbol:      None,
-                    indicators:  vec![PaneIndicator { kind: IndicatorKind::Volume, period: None }],
+                    timeframe: "10s".into(),
+                    symbol: None,
+                    indicators: vec![PaneIndicator {
+                        kind: IndicatorKind::Volume,
+                        period: None,
+                    }],
                     interactive: true,
-                    column:      Some(1),
+                    column: Some(1),
                 },
             ],
             // Strategy-specific overlay fields (shown top-left on the left pane).
@@ -117,11 +151,31 @@ impl ScanStrategy for MicroPullback {
             // current volume, news presence + IA analysis (context/verdict) — live
             // in the shared info bar and are NOT listed here.
             info_fields: vec![
-                InfoField { key: "float_shares".into(),    label: "Float".into(),    source: InfoSource::Enrichment },
-                InfoField { key: "country".into(),         label: "Pays".into(),     source: InfoSource::Enrichment },
-                InfoField { key: "industry".into(),        label: "Industrie".into(),source: InfoSource::Enrichment },
-                InfoField { key: "days_since_split".into(),label: "Split".into(),    source: InfoSource::Enrichment },
-                InfoField { key: "classification".into(),  label: "Profil".into(),   source: InfoSource::Enrichment },
+                InfoField {
+                    key: "float_shares".into(),
+                    label: "Float".into(),
+                    source: InfoSource::Enrichment,
+                },
+                InfoField {
+                    key: "country".into(),
+                    label: "Pays".into(),
+                    source: InfoSource::Enrichment,
+                },
+                InfoField {
+                    key: "industry".into(),
+                    label: "Industrie".into(),
+                    source: InfoSource::Enrichment,
+                },
+                InfoField {
+                    key: "days_since_split".into(),
+                    label: "Split".into(),
+                    source: InfoSource::Enrichment,
+                },
+                InfoField {
+                    key: "classification".into(),
+                    label: "Profil".into(),
+                    source: InfoSource::Enrichment,
+                },
             ],
             // Declared so the info-bar "Analyse IA" button shows for this strategy.
             // Two Deepseek calls (prompts FR), user-triggered only — see
@@ -139,7 +193,11 @@ impl ScanStrategy for MicroPullback {
             enrichments: vec![
                 EnrichmentSpec {
                     provider: EnrichmentProvider::Massive,
-                    produces: vec!["split_label".into(), "days_since_split".into(), "news_title".into()],
+                    produces: vec![
+                        "split_label".into(),
+                        "days_since_split".into(),
+                        "news_title".into(),
+                    ],
                 },
                 EnrichmentSpec {
                     provider: EnrichmentProvider::SecApi,

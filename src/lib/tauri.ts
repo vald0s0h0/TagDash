@@ -42,6 +42,8 @@ import type {
   Strategy,
   StrategyCard,
   StrategyRiskConfig,
+  MicroPullbackOptions,
+  MicroAttentionEntry,
   StreamableSymbol,
   SyncQueueStatus,
   TickerTableRow,
@@ -54,9 +56,12 @@ import type {
   BrokerAccount,
   BrokerMirror,
   BrokerSelection,
+  MassiveTierStatus,
   Shortability,
+  ShortCostZone,
   PanicRunState,
   PanicLlmScore,
+  MicroQualityBoard,
 } from "@/types";
 
 export const api = {
@@ -204,6 +209,13 @@ export const api = {
   setStrategyRisk: (strategy_id: string, risk: StrategyRiskConfig) =>
     invoke<void>("set_strategy_risk", { strategy_id, risk }),
   getStrategyCards: () => invoke<Record<string, StrategyCard>>("get_strategy_cards"),
+  testNtfy: () => invoke<void>("test_ntfy"),
+  getMicroPullbackOptions: () =>
+    invoke<MicroPullbackOptions>("get_micro_pullback_options"),
+  setMicroPullbackOptions: (options: MicroPullbackOptions) =>
+    invoke<void>("set_micro_pullback_options", { options }),
+  getMicroPullbackAttention: () =>
+    invoke<MicroAttentionEntry[]>("get_micro_pullback_attention"),
   startAlertEnrichment: (symbol: string, strategy_id: string) =>
     invoke<void>("start_alert_enrichment", { symbol, strategy_id }),
   runAlertLlm: (symbol: string, strategy_id: string) =>
@@ -232,13 +244,17 @@ export const api = {
   startScanner:    () => invoke<void>("start_scanner"),
   stopScanner:     () => invoke<void>("stop_scanner"),
 
-  // Panic Score — LLM ranking of the VISIBLE pre-open watchlist. The symbol list is
-  // passed in deliberately: the backend's screener list still holds the rows the user
-  // dismissed today, and re-deriving it would spend a model call per discarded name.
-  runPanicLlmAnalysis: (symbols: string[]) =>
-    invoke<void>("run_panic_llm_analysis", { symbols }),
+  // Panic Score — LLM ranking of the VISIBLE pre-open watchlist. Both lists are passed
+  // in deliberately: dismissals exist only in the UI, so the backend cannot derive
+  // either one. `symbols` is what to score; `dismissed` is what the run's catch-up wave
+  // must NOT score when the watchlist is rebuilt mid-run.
+  runPanicLlmAnalysis: (symbols: string[], dismissed: string[]) =>
+    invoke<void>("run_panic_llm_analysis", { symbols, dismissed }),
   getPanicLlmRun:      () => invoke<PanicRunState>("get_panic_llm_run"),
   getPanicLlmScores:   () => invoke<PanicLlmScore[]>("get_panic_llm_scores"),
+  // Micro Pullback A+: the day's verdicts AND what is still in flight, in one call —
+  // polled separately the two would disagree for a tick and the pane would flicker.
+  getMicroQualityScores: () => invoke<MicroQualityBoard>("get_micro_quality_scores"),
   hasWebSearchProvider: () => invoke<boolean>("has_web_search_provider"),
 
   // Chart / zone trade context
@@ -321,6 +337,9 @@ export const api = {
   setBrokerSelection: (broker_id: string, environment: string) =>
     invoke<BrokerSelection>("set_broker_selection", { broker_id, environment }),
   getBrokerMirror:    () => invoke<BrokerMirror>("get_broker_mirror"),
+  getMassiveTierStatus:   () => invoke<MassiveTierStatus>("get_massive_tier_status"),
+  setMassiveTierOverride: (tier: "unlimited" | "basic" | null) =>
+    invoke<MassiveTierStatus>("set_massive_tier_override", { tier }),
   getBrokerAccount:   () => invoke<BrokerAccount | null>("get_broker_account"),
   brokerCancelOrder:  (order_id: string) =>
     invoke<void>("broker_cancel_order", { order_id }),
@@ -329,6 +348,10 @@ export const api = {
   getShortability:    (symbol: string) =>
     invoke<Shortability>("get_shortability", { symbol }),
   getNonShortableSymbols: () => invoke<string[]>("get_non_shortable_symbols"),
+  prepareShortLocate: (zone_id: string) =>
+    invoke<ShortCostZone>("prepare_short_locate", { zone_id }),
+  getShortCostZone: (zone_id: string) =>
+    invoke<ShortCostZone | null>("get_short_cost_zone", { zone_id }),
 
   getFlatFilesStatus:   () => invoke<FlatFilesStatus>("get_flat_files_status"),
   getFlatFilesCalendar: (kind: FlatFilesKind) =>
