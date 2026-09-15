@@ -1071,13 +1071,68 @@ impl Provider {
     }
 }
 
-/// One way of building a day. `attempt_order` turns a resolved `Provider` into the
-/// ordered list of these to try.
+/// What the user picked in the day-picker before starting a replay: let the app take
+/// its best source, or force one of the local flat-file datasets.
+///
+/// The forced modes exist because "best available" is not always what the trader
+/// wants. A Massive Starter subscription answers every day at 1-second resolution,
+/// while the trade flat files on disk hold real prints AND quotes over the ignition
+/// windows — a finer tape on the days they cover, and the only source at all offline.
+/// Neither dominates the other, so the arbitration is the user's, not the ranking's.
+///
+/// A forced mode is EXCLUSIVE: it never degrades to the network nor to the daily
+/// cache. Quietly replaying an API day when the trade file was asked for would
+/// invalidate the very comparison the toggle exists to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceChoice {
+    /// Ranked walk: SIP > Massive > flat files > daily cache (`attempt_order`).
+    #[default]
+    Api,
+    /// `trade/trade-<day>.db` overlaid on the day's minute file — refuses a day with
+    /// no complete trade file.
+    FlatTrades,
+    /// `minute/minute-<day>.db` alone: synthetic 10 s slices, overlay ignored even
+    /// when a trade file exists.
+    FlatMinutes,
+}
+
+impl SourceChoice {
+    pub fn from_str(s: &str) -> Option<SourceChoice> {
+        match s {
+            "api" => Some(SourceChoice::Api),
+            "flat_trades" => Some(SourceChoice::FlatTrades),
+            "flat_minutes" => Some(SourceChoice::FlatMinutes),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceChoice::Api => "api",
+            SourceChoice::FlatTrades => "flat_trades",
+            SourceChoice::FlatMinutes => "flat_minutes",
+        }
+    }
+
+    /// True when the choice must not touch the network.
+    pub fn is_local(self) -> bool {
+        matches!(self, SourceChoice::FlatTrades | SourceChoice::FlatMinutes)
+    }
+}
+
+/// One way of building a day. `attempt_order` turns a resolved `Provider` and the
+/// user's `SourceChoice` into the ordered list of these to try.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Alpaca,
     Massive,
+    /// Minute file, with the trade file overlaid on its ignition windows when the day
+    /// happens to have one — the automatic local fallback.
     FlatFiles,
+    /// Minute + trade overlay, the overlay REQUIRED (forced mode).
+    FlatTrades,
+    /// Minute file only, any overlay ignored (forced mode).
+    FlatMinutes,
     DailyCache,
 }
 
@@ -1088,7 +1143,18 @@ enum Step {
 /// Two orderings, and the difference is the whole point of the ranking: on the paid
 /// tiers the API is the better tape and a local flat file is the safety net, while on
 /// free-tier Alpaca a downloaded day beats what IEX would answer live.
-fn attempt_order(provider: Provider) -> &'static [Step] {
+///
+/// All of it applies to `SourceChoice::Api` only — a forced choice bypasses the
+/// ranking entirely.
+fn attempt_order(provider: Provider, choice: SourceChoice) -> &'static [Step] {
+    // A forced dataset short-circuits the whole walk into a single step: the user
+    // asked for THAT tape, so a day it cannot serve is an error to show, not a source
+    // to swap behind their back.
+    match choice {
+        SourceChoice::FlatTrades => return &[Step::FlatTrades],
+        SourceChoice::FlatMinutes => return &[Step::FlatMinutes],
+        SourceChoice::Api => {}
+    }
     match provider {
         Provider::AlpacaSip => &[
             Step::Alpaca,
@@ -1116,6 +1182,10 @@ pub struct Sources {
     pub alpaca: Option<(String, String)>,
     /// None when unset or `offline`.
     pub massive_key: Option<String>,
+    /// What the user picked in the day-picker. `Api` runs the ranked walk; the flat
+    /// variants pin the load to that local dataset for every day of the session,
+    /// « jour suivant » included.
+    pub choice: SourceChoice,
 }
 
 impl Sources {
@@ -1156,7 +1226,7 @@ pub async fn load_day(
     let provider = sources.provider();
     let mut refusals: Vec<String> = Vec::new();
 
-    for step in attempt_order(provider) {
+    for step in attempt_order(provider, sources.choice) {
         progress(0.0);
         let attempt = match step {
             Step::Alpaca => match sources.alpaca.as_ref() {
@@ -1187,6 +1257,14 @@ pub async fn load_day(
                 } else {
                     Err(format!("aucun flat file minute pour le {day}"))
                 }
+            }
+            Step::FlatTrades => {
+                progress(0.1);
+                crate::flat_files::read_day_trades(app_dir, day)
+            }
+            Step::FlatMinutes => {
+                progress(0.1);
+                crate::flat_files::read_day_minutes(app_dir, day)
             }
             Step::DailyCache => load_day_from_daily_cache(db, day, focus),
         };
@@ -2207,7 +2285,7 @@ mod tests {
             Provider::AlpacaIex,
             Provider::FlatFiles,
         ] {
-            let order = attempt_order(p);
+            let order = attempt_order(p, SourceChoice::Api);
             assert_eq!(order.last(), Some(&Step::DailyCache), "{p:?}");
             assert!(!order.is_empty());
         }
@@ -2219,7 +2297,7 @@ mod tests {
     #[test]
     fn the_ranked_source_is_tried_first_except_on_free_alpaca() {
         assert_eq!(
-            attempt_order(Provider::AlpacaSip),
+            attempt_order(Provider::AlpacaSip, SourceChoice::Api),
             &[
                 Step::Alpaca,
                 Step::Massive,
@@ -2227,12 +2305,65 @@ mod tests {
                 Step::DailyCache
             ],
         );
-        assert_eq!(attempt_order(Provider::Massive)[0], Step::Massive);
-        assert_eq!(attempt_order(Provider::AlpacaIex)[0], Step::FlatFiles);
-        assert_eq!(attempt_order(Provider::FlatFiles)[0], Step::FlatFiles);
+        assert_eq!(
+            attempt_order(Provider::Massive, SourceChoice::Api)[0],
+            Step::Massive
+        );
+        assert_eq!(
+            attempt_order(Provider::AlpacaIex, SourceChoice::Api)[0],
+            Step::FlatFiles
+        );
+        assert_eq!(
+            attempt_order(Provider::FlatFiles, SourceChoice::Api)[0],
+            Step::FlatFiles
+        );
         // A flat-files session must not silently reach the network as a fallback.
-        assert!(!attempt_order(Provider::FlatFiles).contains(&Step::Alpaca));
-        assert!(!attempt_order(Provider::FlatFiles).contains(&Step::Massive));
+        let local = attempt_order(Provider::FlatFiles, SourceChoice::Api);
+        assert!(!local.contains(&Step::Alpaca));
+        assert!(!local.contains(&Step::Massive));
+    }
+
+    /// A forced dataset is exactly one step, whatever the account could otherwise
+    /// reach: no network, and no daily-cache consolation prize either. Replaying a
+    /// day off the wrong tape while the badge says "flat files" is worse than an
+    /// error telling the user the file isn't there.
+    #[test]
+    fn a_forced_choice_pins_the_load_to_that_dataset() {
+        for p in [
+            Provider::AlpacaSip,
+            Provider::Massive,
+            Provider::AlpacaIex,
+            Provider::FlatFiles,
+        ] {
+            assert_eq!(
+                attempt_order(p, SourceChoice::FlatTrades),
+                &[Step::FlatTrades],
+                "{p:?}",
+            );
+            assert_eq!(
+                attempt_order(p, SourceChoice::FlatMinutes),
+                &[Step::FlatMinutes],
+                "{p:?}",
+            );
+        }
+    }
+
+    /// The toggle's wire values round-trip: the frontend sends `as_str`, the command
+    /// parses it back, and an unknown string is rejected rather than silently
+    /// falling back to the API.
+    #[test]
+    fn source_choices_round_trip_over_the_wire() {
+        for c in [
+            SourceChoice::Api,
+            SourceChoice::FlatTrades,
+            SourceChoice::FlatMinutes,
+        ] {
+            assert_eq!(SourceChoice::from_str(c.as_str()), Some(c));
+        }
+        assert_eq!(SourceChoice::from_str("flat_files"), None);
+        assert!(!SourceChoice::Api.is_local());
+        assert!(SourceChoice::FlatTrades.is_local());
+        assert!(SourceChoice::FlatMinutes.is_local());
     }
 
     /// Massive news ships no id. Replaying the same day twice must not produce two

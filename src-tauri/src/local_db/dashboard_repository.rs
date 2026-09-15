@@ -50,9 +50,29 @@ pub fn upsert_trade(conn: &Connection, t: &DashboardTrade) -> Result<()> {
     Ok(())
 }
 
-/// Upsert a whole batch in one transaction.
-pub fn upsert_trades_bulk(conn: &mut Connection, trades: &[DashboardTrade]) -> Result<usize> {
+/// Reconcile the whole cache against a full API fetch, in one transaction:
+/// upsert every incoming trade, then delete any cached row whose id was absent
+/// from the fetch. Returns `(upserted, deleted)`.
+///
+/// The prune is what makes an upstream deletion visible here. TradeTally is the
+/// source of truth but exposes no "deleted trades" feed, so a trade the user
+/// removed there can only be detected by its absence from a complete sync —
+/// without this, a deleted trade stayed in the KPI cards forever.
+///
+/// Guard: an empty `trades` slice deletes nothing. A full page-through that
+/// yields zero trades is far more likely to be an auth or transport failure than
+/// a user who deleted their entire journal, and wiping the cache on that would
+/// be unrecoverable without a working API.
+pub fn sync_trades_bulk(conn: &mut Connection, trades: &[DashboardTrade]) -> Result<(usize, usize)> {
     let tx = conn.transaction()?;
+
+    // Ids seen in this fetch. A temp table (rather than a giant `NOT IN (?,?,…)`)
+    // keeps the delete a single statement no matter how large the journal grows.
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS tt_sync_keep (tt_id TEXT PRIMARY KEY NOT NULL);
+         DELETE FROM tt_sync_keep;",
+    )?;
+
     for t in trades {
         let tags_json = serde_json::to_string(&t.tags).unwrap_or_else(|_| "[]".into());
         let raw_json = serde_json::to_string(&t.raw).unwrap_or_else(|_| "{}".into());
@@ -77,9 +97,23 @@ pub fn upsert_trades_bulk(conn: &mut Connection, trades: &[DashboardTrade]) -> R
                 t.setup, t.strategy, t.broker, tags_json, raw_json,
             ],
         )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tt_sync_keep (tt_id) VALUES (?1)",
+            params![t.tt_id],
+        )?;
     }
+
+    let deleted = if trades.is_empty() {
+        0
+    } else {
+        tx.execute(
+            "DELETE FROM tt_trades WHERE tt_id NOT IN (SELECT tt_id FROM tt_sync_keep)",
+            [],
+        )?
+    };
+
     tx.commit()?;
-    Ok(trades.len())
+    Ok((trades.len(), deleted))
 }
 
 /// All cached trades, oldest first (by exit then entry date) so the frontend can

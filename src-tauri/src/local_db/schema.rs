@@ -369,7 +369,7 @@ CREATE INDEX IF NOT EXISTS idx_panic_llm_day
 -- the engine's lock is per session, so one ticker can legitimately be judged twice in
 -- a day — premarket and again at the open — on two different moves. Keying on the day
 -- alone would let the second silently overwrite the first.
--- `pass1_score` (fast triage) and `pass2_score` (deep analysis) are kept side by side
+-- `pass1_score` (news scoring) and `pass2_score` (deep analysis) are kept side by side
 -- so it stays answerable, weeks later, whether the deep pass ever changed an outcome.
 CREATE TABLE IF NOT EXISTS micro_quality_scores (
     symbol          TEXT NOT NULL,
@@ -404,11 +404,38 @@ CREATE TABLE IF NOT EXISTS micro_quality_scores (
     -- this news" from "a headline landed after the score" — `created_at` cannot do
     -- that job because it is wall time and a replay's two clocks disagree.
     scored_at       TEXT,
+    rvol_score      REAL,
+    attention_score REAL,
+    news_score      REAL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (symbol, day, session, simulated)
 );
 CREATE INDEX IF NOT EXISTS idx_micro_quality_day
     ON micro_quality_scores(day, simulated, final_score DESC);
+
+-- Micro Pullback's own news-scoring table. Deliberately separate from
+-- micro_quality_scores (Dislocation's) rather than a shared table keyed by an added
+-- strategy_id: the two engines already keep their runtime options under distinct
+-- app_meta keys for the same reason (see micro_pullback::options header) — sharing a
+-- table would mean rebuilding its primary key to avoid a symbol/day/session collision
+-- between the two strategies, for no benefit over just not sharing it.
+CREATE TABLE IF NOT EXISTS micro_pullback_quality_scores (
+    symbol      TEXT NOT NULL,
+    day         TEXT NOT NULL,
+    session     TEXT NOT NULL,
+    simulated   INTEGER NOT NULL DEFAULT 0,
+    score       REAL,
+    verdict     TEXT,
+    freshness   TEXT,
+    red_flags   TEXT,   -- JSON array
+    one_liner   TEXT,
+    model       TEXT,
+    scored_at   TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, day, session, simulated)
+);
+CREATE INDEX IF NOT EXISTS idx_micro_pullback_quality_day
+    ON micro_pullback_quality_scores(day, simulated, score DESC);
 
 -- Micro Pullback v2 event ledger. One row per attention/direction event sent toward
 -- A+ (or served from its cache), so a silent morning can be reconstructed without
@@ -778,6 +805,11 @@ const ALTERS: &[&str] = &[
     // Market-time stamp of an A+ verdict, so the overlay can tell a score that
     // already saw the latest headline from one that predates it.
     "ALTER TABLE micro_quality_scores ADD COLUMN scored_at TEXT",
+    // The three thirds of the score, stored separately: the pane shows them side by
+    // side, and a single collapsed total cannot be re-split after the fact.
+    "ALTER TABLE micro_quality_scores ADD COLUMN rvol_score REAL",
+    "ALTER TABLE micro_quality_scores ADD COLUMN attention_score REAL",
+    "ALTER TABLE micro_quality_scores ADD COLUMN news_score REAL",
     "CREATE INDEX IF NOT EXISTS idx_executions_trade ON executions(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_screenshot_files_trade ON screenshot_files(trade_id)",
 ];

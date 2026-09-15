@@ -33,7 +33,15 @@ pub struct QualityRow {
     pub final_score: Option<f64>,
     pub threshold: Option<f64>,
     pub passed: bool,
+    /// The three thirds, as one auditable line. Kept alongside the numeric columns
+    /// so a row still reads correctly in a SQL client.
     pub adjustments: Option<String>,
+    /// The RVOL third, 0..100, as measured by the tick that nominated the candidate.
+    pub rvol_score: Option<f64>,
+    /// The attention third, 0..100, same tick.
+    pub attention_score: Option<f64>,
+    /// The news third, 0..100: the model's note decayed by the headline's age.
+    pub news_score: Option<f64>,
     pub confidence: Option<f64>,
     pub sustain_prob: Option<f64>,
     pub news_verdict: Option<String>,
@@ -62,23 +70,23 @@ pub struct QualityRow {
 /// Write (or update) one candidate's row from a verdict.
 ///
 /// Which score column is written depends on the pass, so a deep re-score never
-/// erases what the triage pass thought — `COALESCE` keeps whichever half this call
+/// erases what the news pass thought — `COALESCE` keeps whichever half this call
 /// isn't carrying.
 pub fn upsert(
     conn: &Connection,
     symbol: &str,
-    cand: &crate::micro_pullback::quality::Candidate,
-    v: &crate::micro_pullback::quality::Verdict,
+    cand: &crate::dislocation::quality::Candidate,
+    v: &crate::dislocation::quality::Verdict,
 ) -> Result<()> {
     use crate::quality_llm::Pass;
 
     let now = crate::time::now();
     let day = crate::time::et_date(now);
-    let session = crate::micro_pullback::quality::session_label(now);
+    let session = crate::dislocation::quality::session_label(now);
     let simulated = crate::replay::clock::is_active() as i64;
     let a = &v.answer;
     let (p1, p2) = match v.pass {
-        Pass::Triage => (Some(a.quality_score), None),
+        Pass::News => (Some(a.quality_score), None),
         Pass::Deep => (None, Some(a.quality_score)),
     };
     let json = |v: &Vec<String>| serde_json::to_string(v).ok();
@@ -90,9 +98,10 @@ pub fn upsert(
             confidence, sustain_prob, news_verdict, news_freshness,
             catalyst_type, catalyst_label, dilution_risk, dilution_read, financial_read,
             red_flags, key_drivers, one_liner, entry_note, tempo_depth,
-            rejection, rubric_version, model, scored_at
+            rejection, rubric_version, model, scored_at,
+            rvol_score, attention_score, news_score
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
-                   ?20,?21,?22,?23,?24,?25,?26,?27,?28)
+                   ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)
          ON CONFLICT(symbol, day, session, simulated) DO UPDATE SET
             -- COALESCE(new, old): a pass only overwrites the half it produced.
             pass1_score     = COALESCE(excluded.pass1_score, pass1_score),
@@ -118,7 +127,10 @@ pub fn upsert(
             rejection       = excluded.rejection,
             rubric_version  = excluded.rubric_version,
             model           = excluded.model,
-            scored_at       = excluded.scored_at",
+            scored_at       = excluded.scored_at,
+            rvol_score      = excluded.rvol_score,
+            attention_score = excluded.attention_score,
+            news_score      = excluded.news_score",
         params![
             symbol,
             day,
@@ -129,7 +141,7 @@ pub fn upsert(
             v.final_score,
             v.threshold,
             v.passed() as i64,
-            v.adjustments.describe(),
+            v.scores.describe(),
             a.confidence,
             a.sustain_prob,
             a.news_verdict,
@@ -148,6 +160,9 @@ pub fn upsert(
             crate::quality_llm::rubric::version(),
             v.pass.as_str(),
             now.to_rfc3339(),
+            v.scores.rvol,
+            v.scores.attention,
+            v.scores.news,
         ],
     )?;
     Ok(())
@@ -162,7 +177,8 @@ pub fn get_for_day(conn: &Connection, day: &str, simulated: bool) -> Result<Vec<
                 confidence, sustain_prob, news_verdict, news_freshness,
                 catalyst_type, catalyst_label, dilution_risk, dilution_read, financial_read,
                 red_flags, key_drivers, one_liner, entry_note, tempo_depth,
-                rejection, rubric_version, model, scored_at
+                rejection, rubric_version, model, scored_at,
+                rvol_score, attention_score, news_score
            FROM micro_quality_scores
           WHERE day = ?1 AND simulated = ?2
           ORDER BY final_score IS NULL, final_score DESC",
@@ -198,6 +214,9 @@ pub fn get_for_day(conn: &Connection, day: &str, simulated: bool) -> Result<Vec<
                 rubric_version: r.get(25)?,
                 model: r.get(26)?,
                 scored_at: r.get(27)?,
+                rvol_score: r.get(28)?,
+                attention_score: r.get(29)?,
+                news_score: r.get(30)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;

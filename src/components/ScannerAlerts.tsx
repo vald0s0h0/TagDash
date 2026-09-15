@@ -164,7 +164,7 @@ function AlertRow({ alert: a, state, position, onOpen, onRelease }: AlertRowProp
                 {a.side}
               </span>
             )}
-            {/* Tempo depth (Micro Pullback). Only worth the space once more than one
+            {/* Tempo depth. Only worth the space once more than one
                 tempo has fired: "10s" alone is already the display_timeframe chip.
                 The first entry is the tempo that triggered, hence the emphasis —
                 the rest are windows that independently agreed, which is what makes

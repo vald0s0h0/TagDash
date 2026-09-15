@@ -65,6 +65,8 @@ impl ScannerEngine {
             let mut floats = load_floats(&db);
             let mut avg_volumes = load_avg_volumes(&db);
             let mut company_meta = load_company_meta(&db);
+            let mut market_caps = load_market_caps(&db);
+            let mut inst_ownership = load_institutional_ownership(&db);
             let mut floats_loaded = Instant::now();
 
             // Panic Mean Reversion watchlist rows (pre-open screener). Refreshed in
@@ -140,6 +142,8 @@ impl ScannerEngine {
                     floats = load_floats(&db);
                     avg_volumes = load_avg_volumes(&db);
                     company_meta = load_company_meta(&db);
+                    market_caps = load_market_caps(&db);
+                    inst_ownership = load_institutional_ownership(&db);
                     floats_loaded = Instant::now();
                 }
                 if alarms_loaded.elapsed() >= ALARM_REFRESH {
@@ -204,6 +208,8 @@ impl ScannerEngine {
                         change_day_pct: ticker.change_day_pct,
                         rvol,
                         float_shares: floats.get(&ticker.symbol).copied(),
+                        market_cap: market_caps.get(&ticker.symbol).copied(),
+                        institutional_ownership_pct: inst_ownership.get(&ticker.symbol).copied(),
                     };
 
                     for strategy in strategies {
@@ -231,7 +237,7 @@ impl ScannerEngine {
                                         price: ctx.price,
                                         gap_pct: ctx.change_day_pct,
                                         rvol: ctx.rvol,
-                                        volume: ctx.volume_day,
+                                        volume: Some(ctx.volume_day),
                                         float_shares: ctx.float_shares,
                                         industry: company_meta
                                             .get(&ctx.symbol)
@@ -316,7 +322,7 @@ impl ScannerEngine {
                                     .filter(|&&v| v > 0)
                                     .map(|&v| t.volume_day as f64 / v as f64)
                             }),
-                            volume: t.map(|t| t.volume_day).unwrap_or(0),
+                            volume: t.map(|t| t.volume_day),
                             float_shares: floats.get(sym).copied(),
                             industry: company_meta.get(sym).and_then(|m| m.0.clone()),
                             country: company_meta.get(sym).and_then(|m| m.1.clone()),
@@ -362,10 +368,6 @@ impl ScannerEngine {
                                 .as_deref()
                                 .is_none_or(|v| v == expected_side)
                         });
-                        // The card shows the PREVIOUS day's volume (the move this
-                        // screener is built on happened yesterday), not the (often
-                        // zero pre-open) live day volume.
-                        let prev_volume = row.prev_volume.unwrap_or(0).max(0) as u64;
                         screener_now.push(ScreenerMatch {
                             symbol: row.symbol.clone(),
                             strategy_id: panic_mean_reversion::ID.to_string(),
@@ -373,17 +375,18 @@ impl ScannerEngine {
                             priority: panic_priority,
                             price: t.and_then(|t| t.last_price),
                             gap_pct: t.and_then(|t| t.change_day_pct),
-                            // Live premarket volume so far vs the symbol's average daily
-                            // volume — same formula as the generic per-tick screener path.
-                            // `volume` above stays yesterday's total (the shock this
-                            // ranking is built on); rvol is a separate, live signal.
+                            // Live cumulative volume since 04:00 ET vs the symbol's average
+                            // daily volume — same formula as the generic per-tick screener
+                            // path, and the same live counter the "volume" field below uses,
+                            // so the card's Vol and RVol agree with every other volume
+                            // readout in the UI (chart info bar, on-chart overlay).
                             rvol: t.and_then(|t| {
                                 avg_volumes
                                     .get(&row.symbol)
                                     .filter(|&&v| v > 0)
                                     .map(|&v| t.volume_day as f64 / v as f64)
                             }),
-                            volume: prev_volume,
+                            volume: t.map(|t| t.volume_day),
                             float_shares: floats.get(&row.symbol).copied(),
                             industry: company_meta.get(&row.symbol).and_then(|m| m.0.clone()),
                             country: company_meta.get(&row.symbol).and_then(|m| m.1.clone()),
@@ -573,6 +576,31 @@ fn load_avg_volumes(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, u6
                 .map(|v| (a.symbol, v as u64))
         })
         .collect()
+}
+
+/// Load the per-symbol market cap (dollars) from the universe table. Computed
+/// once at startup (`shares_outstanding × prev_close`, see `startup::run`) and
+/// barely changes intraday, so the same slow `FLOAT_REFRESH` cadence as
+/// `load_floats` is enough. Symbols with no known cap are omitted — callers
+/// treat absence as "unknown", never as "zero".
+fn load_market_caps(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, i64> {
+    let conn = db.lock().unwrap();
+    universe_repository::get_all(&conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| a.market_cap.filter(|c| *c > 0).map(|c| (a.symbol, c)))
+        .collect()
+}
+
+/// Load per-symbol institutional ownership (0..100) from the company_intel
+/// cache (SEC 13D/13G, FMP/Massive fallback). Slow-changing fundamental data —
+/// refreshed on the same cadence as `load_floats`, no day-rollover needed.
+/// Symbols never collected are omitted, so callers read absence as "unknown"
+/// rather than "0% owned".
+fn load_institutional_ownership(db: &Arc<Mutex<rusqlite::Connection>>) -> HashMap<String, f64> {
+    let conn = db.lock().unwrap();
+    crate::local_db::company_intel_repository::all_institutional_ownership(&conn)
+        .unwrap_or_default()
 }
 
 /// Load per-symbol (industry, country) from the sec-api company_meta cache, for
@@ -793,7 +821,7 @@ mod tests {
             price: Some(10.0),
             gap_pct: Some(5.0),
             rvol: None,
-            volume: 1_000_000,
+            volume: Some(1_000_000),
             float_shares: None,
             industry: None,
             country: None,

@@ -2,11 +2,16 @@
 //
 // The real detection logic is NOT here: it is a stateful per-ticker engine living in
 // `crate::micro_pullback`, running in its own tokio task across the whole extended
-// trading day. V2 ranks <=100M-float US common stocks by cross-sectional attention
-// on six parallel tempos (10s/20s/40s/1m/2m/5m), isolates a genuinely detached
-// one-to-three-name head, then requires a clean upward path before handing the event
-// to Qualité A+. A ticker may form another event after attention resets; unchanged
-// catalyst analysis is reused rather than paid for twice.
+// trading day. It measures each ticker against ITS OWN rolling baseline on six
+// parallel tempos (10s/20s/40s/1m/2m/5m), trips a tempo when the absolute minimums
+// are met and n of the acceleration ratios clear, then hands the armed ticker to a
+// tape watch that must see the prints before anything reaches the screen. One alert
+// per ticker per session, then locked.
+//
+// NO MODEL IN THE PATH. That is the design, not an omission: both halves of the
+// question are measurable from the tape alone. The catalyst read is a button the
+// trader presses afterwards from the info bar. The engine that scores a catalyst is
+// Dislocation, next door.
 //
 // That can't fit the stateless per-ticker `should_alert(ctx)` contract, so the
 // engine pushes its AlertSignals straight into the active-alert list (the same
@@ -22,7 +27,7 @@ use std::time::Duration;
 
 use crate::strategies::ScanStrategy;
 use crate::types::{
-    AlertSignal, EnrichmentProvider, EnrichmentSpec, IndicatorKind, InfoField, InfoSource, LlmSpec,
+    AlertSignal, EnrichmentProvider, EnrichmentSpec, IndicatorKind, InfoField, InfoSource,
     PaneIndicator, PaneSpec, Session, StrategyCard, StrategyContext, StrategyRiskConfig,
     StreamingScope, UniverseKey,
 };
@@ -177,18 +182,13 @@ impl ScanStrategy for MicroPullback {
                     source: InfoSource::Enrichment,
                 },
             ],
-            // Declared so the info-bar "Analyse IA" button shows for this strategy.
-            // Two Deepseek calls (prompts FR), user-triggered only — see
-            // `enrichment::run_micro_pullback_llm` (the template below is documentary).
-            llm: Some(LlmSpec {
-                prompt_template: "1) Si une news est détectée pour {symbol}, lis-la et dis très \
-                    brièvement en français si elle est du bluff ou solide (mots-clés, arguments). \
-                    2) Quels sont les risques récents autour de {symbol}, surtout la dilution \
-                    (contexte: scalping intraday, pas d'analyse long terme) ? Réponds en quelques \
-                    mots en français."
-                    .into(),
-                produces: vec!["llm_news".into(), "llm_dilution".into()],
-            }),
+            // No generic "Analyse IA" button: Micro Pullback owns its own catalyst
+            // read now (`micro_pullback::quality`) — automatic when `llm_auto` is on
+            // in Settings, a dedicated button on the alert when it's off. Declaring
+            // `llm` here would show the OLD free-text button alongside the new
+            // structured score, which is exactly the double-button confusion this
+            // replaced.
+            llm: None,
             // Supplementary data: Massive (splits + news), sec-api (country + industry).
             enrichments: vec![
                 EnrichmentSpec {

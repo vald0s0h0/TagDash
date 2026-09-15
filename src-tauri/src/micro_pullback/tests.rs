@@ -78,14 +78,33 @@ fn eval_outcome(
     seed: Option<&Seed>,
     tape: &dyn Fn(i64) -> TapeWindow,
 ) -> Option<Outcome> {
-    evaluate(m, inp, cfg, now, seed, TapeKind::Prints, &tape_only, tape)
+    evaluate(m, inp, cfg, now, seed, PRINTS, &tape_only, tape)
 }
 
 fn alert_of(o: Outcome) -> AlertSignal {
     match o {
-        Outcome::Fired { alert, .. } | Outcome::DepthUpdated(alert) => alert,
+        Outcome::Fired(alert) | Outcome::DepthUpdated(alert) => alert,
     }
 }
+
+/// A real-trade tape: one message per print, so the count is native.
+const PRINTS: TapeShape = TapeShape {
+    kind: TapeKind::Prints,
+    counts_trades: true,
+};
+/// A per-second aggregate tape that cannot say how many trades a second held —
+/// the pre-`z` Massive frame, and the only case where the dollars-and-continuity
+/// fallback is the right answer.
+const AGG_NO_COUNT: TapeShape = TapeShape {
+    kind: TapeKind::SecondAggregates,
+    counts_trades: false,
+};
+/// A per-second aggregate tape carrying `z`, so the count is reconstructed and the
+/// engine takes exactly the same path as on prints.
+const AGG_WITH_COUNT: TapeShape = TapeShape {
+    kind: TapeKind::SecondAggregates,
+    counts_trades: true,
+};
 
 // ── Final-gate stubs ──
 // Every window carries plenty of dollars unless the test is specifically about the
@@ -156,16 +175,16 @@ fn window_metrics_basic() {
 #[test]
 fn gate1_universe_respects_unknown_float_toggle() {
     // Price band.
-    assert!(!gate1_tradeable(0.50, Some(1_000_000), &CFG));
-    assert!(!gate1_tradeable(30.0, Some(1_000_000), &CFG));
+    assert!(!gate1_tradeable(0.50, Some(1_000_000), IssuerProfile::default(), &CFG));
+    assert!(!gate1_tradeable(30.0, Some(1_000_000), IssuerProfile::default(), &CFG));
     // Known float.
-    assert!(gate1_tradeable(5.0, Some(10_000_000), &CFG));
-    assert!(!gate1_tradeable(5.0, Some(40_000_000), &CFG));
+    assert!(gate1_tradeable(5.0, Some(10_000_000), IssuerProfile::default(), &CFG));
+    assert!(!gate1_tradeable(5.0, Some(40_000_000), IssuerProfile::default(), &CFG));
     // Unknown float: admitted only when allowed.
     let mut deny = CFG;
     deny.allow_unknown_float = false;
-    assert!(gate1_tradeable(5.0, None, &CFG)); // default: true
-    assert!(!gate1_tradeable(5.0, None, &deny));
+    assert!(gate1_tradeable(5.0, None, IssuerProfile::default(), &CFG)); // default: true
+    assert!(!gate1_tradeable(5.0, None, IssuerProfile::default(), &deny));
 }
 
 #[test]
@@ -311,7 +330,7 @@ fn a_tempo_switched_off_cannot_fire() {
         &cfg,
         now,
         None,
-        TapeKind::Prints,
+        PRINTS,
         &tape_only,
         &hot_tape,
     );
@@ -345,7 +364,7 @@ fn two_of_three_ratio_rule_blocks_single_ratio() {
     bars.push(bar(30, 5.00, 5.078, 5.072, 5.075, 15_000, 20));
 
     let tempo = &CFG.tempos[0]; // 10s
-    let mtr = eval_tempo(&bars, tempo, &CFG, None, TapeKind::Prints).unwrap();
+    let mtr = eval_tempo(&bars, tempo, &CFG, None, PRINTS).unwrap();
     assert!(
         mtr.volume_ratio >= tempo.volume_ratio_min,
         "volume ratio should clear"
@@ -359,7 +378,7 @@ fn two_of_three_ratio_rule_blocks_single_ratio() {
         "range must not clear"
     );
     assert!(
-        !gate3_trips(&mtr, tempo),
+        !gate3_trips(&mtr, tempo, CFG.ratios_required),
         "1-of-3 ratios must not trip the gate"
     );
 
@@ -524,7 +543,7 @@ fn a_busy_tape_of_worthless_size_is_not_liquidity() {
 
 /// Drive `confirm_liquidity` directly on the aggregate tape.
 fn confirm_agg(win: TapeWindow) -> Option<LiquidityProof> {
-    confirm_liquidity(&CFG, TapeKind::SecondAggregates, &|_| win)
+    confirm_liquidity(&CFG, AGG_NO_COUNT, &|_| win)
 }
 
 #[test]
@@ -584,7 +603,7 @@ fn gate3_needs_both_ratios_when_the_trade_rate_is_unavailable() {
         range_ratio: 5.0,
     };
     assert!(
-        gate3_trips(&base, tempo),
+        gate3_trips(&base, tempo, CFG.ratios_required),
         "both available ratios clear → trips"
     );
 
@@ -595,7 +614,7 @@ fn gate3_needs_both_ratios_when_the_trade_rate_is_unavailable() {
         ..base
     };
     assert!(
-        !gate3_trips(&one_short, tempo),
+        !gate3_trips(&one_short, tempo, CFG.ratios_required),
         "2-of-2 is required on the aggregate tape"
     );
     let rescued = TempoMetrics {
@@ -603,7 +622,7 @@ fn gate3_needs_both_ratios_when_the_trade_rate_is_unavailable() {
         ..one_short
     };
     assert!(
-        gate3_trips(&rescued, tempo),
+        gate3_trips(&rescued, tempo, CFG.ratios_required),
         "on prints, the trade rate is the third vote"
     );
 }
@@ -620,14 +639,15 @@ fn gate3_requires_both_the_share_and_the_dollar_minimum() {
         trade_rate_ratio: Some(10.0),
         range_ratio: 5.0,
     };
-    assert!(gate3_trips(&ok, tempo));
+    assert!(gate3_trips(&ok, tempo, CFG.ratios_required));
     // A $1.20 name: 15 000 shares is only $18k — plenty of shares, no size.
     assert!(!gate3_trips(
         &TempoMetrics {
             current_dollars: 18_000.0,
             ..ok
         },
-        tempo
+        tempo,
+        CFG.ratios_required
     ));
     // A $24 name: $80k is only 3 300 shares — plenty of dollars, no shares.
     assert!(!gate3_trips(
@@ -635,7 +655,8 @@ fn gate3_requires_both_the_share_and_the_dollar_minimum() {
             current_volume: 3_300.0,
             ..ok
         },
-        tempo
+        tempo,
+        CFG.ratios_required
     ));
 }
 
@@ -683,4 +704,296 @@ fn the_ui_tempo_list_matches_the_engines() {
     );
     // And each tempo must be a whole number of detection bars.
     assert!(engine.iter().all(|s| s % BAR_SECS == 0));
+}
+
+// ─── The tape shape drives the gate, not the provider ─────────────────────────
+
+/// The same aggregate window, judged twice: once by a feed that cannot count trades
+/// and once by one that can. This is the whole point of `TapeShape` — Massive's `A`
+/// frame carries `z`, so "aggregates" and "no trade count" stopped being the same
+/// statement and the engine must stop treating them as one.
+/// END-TO-END on the shape Massive Starter actually delivers, through a real
+/// `MarketState` instead of a stub window.
+///
+/// Every other final-gate test here injects a `TapeWindow` directly, which proves the
+/// gate's arithmetic and nothing about the WIRING it depends on: `z` → reconstructed
+/// count → `on_second_aggregate` → per-second buckets → `tape_window_stats`. That
+/// chain is what has to hold for this provider to ever fire the last gate, and until
+/// now no test crossed it.
+///
+/// The aggregates are stamped 15 minutes before their receipt instant, as Starter's
+/// delayed feed sends them. The engine evaluates on the FEED clock (the event
+/// watermark, see `MarketState::strategy_market_now` and its own test) — spelled out
+/// here as `last_event` rather than read back, because the replay clock it consults
+/// is process-global and another test may hold it.
+#[test]
+fn a_massive_second_stream_confirms_the_final_gate_through_market_state() {
+    use crate::market_state::MarketState;
+    use crate::massive::stream::reconstruct_prints;
+
+    let first = t0();
+    let receipt = first + ChronoDuration::minutes(15);
+
+    let mut ms = MarketState::new();
+    ms.set_tape_kind(TapeKind::SecondAggregates);
+
+    // Ten consecutive traded seconds: 800 shares at ~$5.30 with an average trade
+    // size of 100 — i.e. 8 real trades a second, a plausible premarket runner.
+    let mut last_event = first;
+    for i in 0..10 {
+        let event = first + ChronoDuration::seconds(i);
+        let prints = reconstruct_prints(800, Some(100.0));
+        assert_eq!(prints, Some(8), "z must restore the count");
+        if ms.tape_counts_trades() != prints.is_some() {
+            ms.set_tape_counts_trades(prints.is_some());
+        }
+        ms.on_second_aggregate(
+            "TEST",
+            5.30,
+            5.34,
+            5.29,
+            5.32,
+            Some(5.30),
+            800,
+            prints.unwrap_or(1),
+            event,
+            receipt + ChronoDuration::seconds(i),
+            1_000,
+            2_000,
+        );
+        last_event = event;
+    }
+
+    let now = last_event;
+    let shape = TapeShape::of(&ms);
+    assert!(
+        shape.counts_trades,
+        "the aggregate tape carries z, so the gate must take the rate path"
+    );
+
+    let tape_fn = |secs: i64| {
+        let s = ms.tape_window_stats("TEST", secs, now).unwrap_or_default();
+        TapeWindow {
+            prints: s.prints,
+            active_seconds: s.active_seconds,
+            dollars: s.dollars,
+            max_second_dollars: s.max_second_dollars,
+        }
+    };
+
+    // The count survives ingestion: 8 prints in the current second, 40 over five.
+    assert_eq!(tape_fn(1).prints, 8);
+    assert_eq!(tape_fn(5).prints, 40);
+    assert_eq!(tape_fn(5).active_seconds, 5);
+    // Notional comes from the aggregate's VWAP, not from its close.
+    assert!((tape_fn(5).dollars - 5.30 * 800.0 * 5.0).abs() < 1e-6);
+
+    let proof = confirm_liquidity(&CFG, shape, &tape_fn)
+        .expect("8 prints/s and $4 240/s must clear the final gate");
+    assert_eq!(proof.source, TapeKind::SecondAggregates);
+    // 8/s clears the fast layer (5/s) on the very first second.
+    assert_eq!(proof.window_secs, CFG.watch_fast_window_secs);
+    assert_eq!(proof.rate_per_sec, Some(8.0));
+    // The dollar floor always reads the slow window, even when fast confirmed.
+    assert!((proof.dollar_per_sec - 4_240.0).abs() < 1e-6);
+}
+
+/// Same wiring, a name that only LOOKS alive: it prints every single second, so the
+/// continuity fallback would wave it through, but 100 shares a second at $5.30 is
+/// $530/s. The dollar floor is what stops it, and it must still bite once the count
+/// is available — an aggregate feed makes a dead micro-cap look busy precisely
+/// because one message per second is one message per second whatever crossed.
+#[test]
+fn a_continuous_but_worthless_aggregate_tape_still_fails_the_dollar_floor() {
+    use crate::market_state::MarketState;
+    use crate::massive::stream::reconstruct_prints;
+
+    let first = t0();
+    let mut ms = MarketState::new();
+    ms.set_tape_kind(TapeKind::SecondAggregates);
+    ms.set_tape_counts_trades(true);
+
+    let mut last_event = first;
+    for i in 0..10 {
+        let event = first + ChronoDuration::seconds(i);
+        let prints = reconstruct_prints(100, Some(100.0)).unwrap_or(1);
+        ms.on_second_aggregate(
+            "TEST", 5.30, 5.31, 5.29, 5.30, Some(5.30), 100, prints, event, event, 1_000, 2_000,
+        );
+        last_event = event;
+    }
+
+    let now = last_event;
+    let tape_fn = |secs: i64| {
+        let s = ms.tape_window_stats("TEST", secs, now).unwrap_or_default();
+        TapeWindow {
+            prints: s.prints,
+            active_seconds: s.active_seconds,
+            dollars: s.dollars,
+            max_second_dollars: s.max_second_dollars,
+        }
+    };
+    assert_eq!(tape_fn(10).active_seconds, 10, "prints in every second");
+    assert!(confirm_liquidity(&CFG, TapeShape::of(&ms), &tape_fn).is_none());
+}
+
+#[test]
+fn an_aggregate_tape_that_counts_trades_takes_the_rate_path() {
+    // A name printing steadily: 4 trades and $6k every second, in 5 of the last 10
+    // seconds. Length-aware so the fast (1s) and slow (5s) layers see what they
+    // would really see.
+    let tape = |secs: i64| {
+        let active = (secs as u32).min(5);
+        window(4 * active as u64, active, 6_000.0 * active as f64, 6_000.0)
+    };
+
+    // Blind, this is refused: only 5 of the fallback's 10 seconds printed, $30k is
+    // exactly at its minimum and no single second is fat enough to carry it alone.
+    assert!(
+        confirm_liquidity(&CFG, AGG_NO_COUNT, &tape).is_none(),
+        "la voie de repli ne voit qu'une bande discontinue"
+    );
+
+    // Counting, the same tape is 4 prints/s sustained — over the slow layer, under
+    // the fast one — and it confirms on the measurement rather than on a proxy.
+    let counted = confirm_liquidity(&CFG, AGG_WITH_COUNT, &tape)
+        .expect("un vrai taux confirme sur toute bande capable de le mesurer");
+    assert_eq!(
+        counted.rate_per_sec,
+        Some(4.0),
+        "20 prints sur 5 s = 4/s, mesurés et non devinés"
+    );
+    assert_eq!(counted.window_secs, CFG.watch_slow_window_secs);
+    assert_eq!(
+        counted.source,
+        TapeKind::SecondAggregates,
+        "la provenance reste la provenance"
+    );
+}
+
+/// The pre-`z` behaviour, pinned: a tape with no count still confirms on dollars and
+/// continuity, so losing `z` degrades the engine instead of muting it.
+#[test]
+fn losing_the_count_falls_back_instead_of_going_silent() {
+    let thin = window(1, 2, 5_000.0, 3_000.0);
+    assert!(
+        confirm_liquidity(&CFG, AGG_NO_COUNT, &|_| thin).is_none(),
+        "deux secondes actives ne sont pas une bande"
+    );
+    let alive = window(1, 8, 40_000.0, 9_000.0);
+    assert!(
+        confirm_liquidity(&CFG, AGG_NO_COUNT, &|_| alive).is_some(),
+        "huit secondes sur dix et 40 k$ restent une confirmation"
+    );
+}
+
+// ─── The two issuer switches ──────────────────────────────────────────────────
+
+#[test]
+fn hot_industry_only_excludes_what_we_have_never_collected() {
+    let hot = IssuerProfile {
+        sector_hot: true,
+        sector_bucket: Some("biotech"),
+        country_risk: false,
+    };
+    let unknown = IssuerProfile::default();
+    let mut cfg = CFG;
+    cfg.hot_industry_only = true;
+
+    assert!(gate1_tradeable(5.0, Some(10_000_000), hot, &cfg));
+    assert!(
+        !gate1_tradeable(5.0, Some(10_000_000), unknown, &cfg),
+        "une industrie inconnue n'est pas porteuse — le bord tranchant de l'option"
+    );
+    // Off, it changes nothing at all.
+    assert!(gate1_tradeable(5.0, Some(10_000_000), unknown, &CFG));
+}
+
+#[test]
+fn excluding_risk_domiciles_never_bans_on_a_gap_in_our_data() {
+    let risky = IssuerProfile {
+        country_risk: true,
+        ..Default::default()
+    };
+    let unknown = IssuerProfile::default();
+    let mut cfg = CFG;
+    cfg.exclude_risk_domicile = true;
+
+    assert!(!gate1_tradeable(5.0, Some(10_000_000), risky, &cfg));
+    assert!(
+        gate1_tradeable(5.0, Some(10_000_000), unknown, &cfg),
+        "un domicile inconnu survit — on exclut sur ce qu'on sait"
+    );
+}
+
+// ─── The detection thresholds as settings ─────────────────────────────────────
+
+#[test]
+fn the_multipliers_move_the_grid_without_changing_its_shape() {
+    let opts = crate::micro_pullback::MicroPullbackOptions {
+        return_min_scale: 2.0,
+        volume_min_scale: 0.5,
+        ratio_min_scale: 0.5,
+        ..Default::default()
+    };
+    let base = Config::DEFAULT;
+    let tuned = Config::DEFAULT.with_options(&opts);
+    for (b, t) in base.tempos.iter().zip(tuned.tempos.iter()) {
+        assert_eq!(t.secs, b.secs);
+        assert!((t.return_min_pct - b.return_min_pct * 2.0).abs() < 1e-9);
+        assert!((t.volume_min - b.volume_min * 0.5).abs() < 1e-9);
+        assert!((t.dollar_volume_min - b.dollar_volume_min * 0.5).abs() < 1e-9);
+        assert!((t.volume_ratio_min - b.volume_ratio_min * 0.5).abs() < 1e-9);
+    }
+    // The slope survives: the long tempo still asks for more movement than the short.
+    assert!(tuned.tempos[5].return_min_pct > tuned.tempos[0].return_min_pct);
+    assert!(tuned.tempos[5].volume_ratio_min < tuned.tempos[0].volume_ratio_min);
+}
+
+#[test]
+fn asking_for_more_ratios_than_the_feed_has_tightens_rather_than_mutes() {
+    let tempo = &CFG.tempos[0];
+    // Both available ratios clear; the trade rate does not exist.
+    let both = TempoMetrics {
+        current_volume: 15_000.0,
+        current_dollars: 80_000.0,
+        current_trades: 40,
+        price_return: 1.5,
+        volume_ratio: 10.0,
+        trade_rate_ratio: None,
+        range_ratio: 5.0,
+    };
+    assert!(
+        gate3_trips(&both, tempo, 3),
+        "3 sur 3 avec seulement deux ratios veut dire « les deux »"
+    );
+    let one = TempoMetrics {
+        range_ratio: 1.0,
+        ..both
+    };
+    assert!(!gate3_trips(&one, tempo, 3));
+    assert!(
+        gate3_trips(&one, tempo, 1),
+        "un seul ratio suffit quand l'utilisateur le demande"
+    );
+}
+
+#[test]
+fn the_universe_settings_reach_the_engine() {
+    let opts = crate::micro_pullback::MicroPullbackOptions {
+        price_min: 2.0,
+        price_max: 9.0,
+        float_max: 5_000_000,
+        allow_unknown_float: false,
+        watch_fast_rate_per_sec: 12.0,
+        watch_min_dollar_per_sec: 500.0,
+        ..Default::default()
+    };
+    let cfg = Config::DEFAULT.with_options(&opts);
+    assert!(!gate1_tradeable(1.5, Some(1_000_000), IssuerProfile::default(), &cfg));
+    assert!(gate1_tradeable(5.0, Some(1_000_000), IssuerProfile::default(), &cfg));
+    assert!(!gate1_tradeable(5.0, Some(6_000_000), IssuerProfile::default(), &cfg));
+    assert!(!gate1_tradeable(5.0, None, IssuerProfile::default(), &cfg));
+    assert_eq!(cfg.watch_fast_rate_per_sec, 12.0);
+    assert_eq!(cfg.watch_min_dollar_per_sec, 500.0);
 }

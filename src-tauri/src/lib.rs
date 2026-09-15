@@ -6,6 +6,7 @@ pub mod commands;
 pub mod company_intel;
 pub mod config;
 pub mod dashboard;
+pub mod dislocation;
 pub mod enrichment;
 pub mod flat_files;
 pub mod fmp;
@@ -123,6 +124,10 @@ pub fn run() {
     // two maps above which are generic across strategies. See
     // `micro_pullback::options` for why it isn't a generic channel.
     let micro_pullback_options = micro_pullback::MicroPullbackOptions::load(&db);
+    let dislocation_options = dislocation::DislocationOptions::load(&db);
+    // Backside has no engine loop, so its options don't live in AppState — just
+    // seed the module-static once here; `should_alert()` reads it directly.
+    strategies::backside::init_options(&db);
 
     // ── Restore the internal trading book + chart contexts ───────────────────
     // Positions can be held across several days, so the book (positions, resting
@@ -171,16 +176,18 @@ pub fn run() {
         hod_drive_running: Arc::new(AtomicBool::new(false)),
         market_attention_running: Arc::new(AtomicBool::new(false)),
         micro_pullback_running: Arc::new(AtomicBool::new(false)),
+        dislocation_running: Arc::new(AtomicBool::new(false)),
         panic_watchlist_running: Arc::new(AtomicBool::new(false)),
         trading_loop_running: Arc::new(AtomicBool::new(false)),
         strategy_enabled: Arc::new(RwLock::new(strategy_enabled)),
         strategy_risk: Arc::new(RwLock::new(strategy_risk)),
         micro_pullback_options: Arc::new(RwLock::new(micro_pullback_options)),
+        dislocation_options: Arc::new(RwLock::new(dislocation_options)),
         active_alerts: Arc::new(RwLock::new(Vec::new())),
         alert_history: Arc::new(RwLock::new(Vec::new())),
         screener: Arc::new(RwLock::new(Vec::new())),
         attention: Arc::new(RwLock::new(Vec::new())),
-        micro_attention: Arc::new(RwLock::new(Vec::new())),
+        dislocation_attention: Arc::new(RwLock::new(Vec::new())),
         chart: Arc::new(RwLock::new(chart_state)),
         internal_book: Arc::new(RwLock::new(internal_book)),
         enrichments: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -434,11 +441,10 @@ pub fn run() {
                 );
             }
 
-            // 3b. Micro Pullback v2: ranks the whole eligible US-stock tape on six
-            //    tempos, keeps only a genuinely detached attention head, verifies a
-            //    clean upward impulse, then optionally runs catalyst quality A+.
-            //    Runs 04:00–20:00 ET on the feed-event clock (including Massive's
-            //    deliberate 15-minute delay).
+            // 3b. Micro Pullback: the boolean-cascade detector. Six parallel tempos
+            //     against each ticker's own rolling baseline, a two-of-three
+            //     acceleration rule, then a tape watch that must see the prints
+            //     before anything reaches the screen. No model in the path.
             {
                 let mp_running = state.micro_pullback_running.clone();
                 let market = state.market.clone();
@@ -449,7 +455,6 @@ pub fn run() {
                 let strategy_enabled = state.strategy_enabled.clone();
                 let mp_options = state.micro_pullback_options.clone();
                 let mp_config = state.config.clone();
-                let mp_attention = state.micro_attention.clone();
                 mp_running.store(true, std::sync::atomic::Ordering::Relaxed);
                 micro_pullback::MicroPullbackEngine::start(
                     mp_running,
@@ -461,7 +466,37 @@ pub fn run() {
                     strategy_enabled,
                     mp_options,
                     mp_config,
-                    mp_attention,
+                );
+            }
+
+            // 3b-bis. Dislocation: ranks the whole eligible tape on six tempos and
+            //     scores it out of 100 in three thirds — RVOL, attention, news —
+            //     spending a bounded model budget from the top of the ranking.
+            //     Runs 04:00–20:00 ET on the feed-event clock (including Massive's
+            //     deliberate 15-minute delay).
+            {
+                let dl_running = state.dislocation_running.clone();
+                let market = state.market.clone();
+                let db = state.db.clone();
+                let secrets = state.secrets.clone();
+                let active_alerts = state.active_alerts.clone();
+                let alert_history = state.alert_history.clone();
+                let strategy_enabled = state.strategy_enabled.clone();
+                let dl_options = state.dislocation_options.clone();
+                let dl_config = state.config.clone();
+                let dl_attention = state.dislocation_attention.clone();
+                dl_running.store(true, std::sync::atomic::Ordering::Relaxed);
+                dislocation::DislocationEngine::start(
+                    dl_running,
+                    market,
+                    db,
+                    secrets,
+                    active_alerts,
+                    alert_history,
+                    strategy_enabled,
+                    dl_options,
+                    dl_config,
+                    dl_attention,
                 );
             }
 
@@ -611,16 +646,22 @@ pub fn run() {
             commands::test_ntfy,
             commands::get_micro_pullback_options,
             commands::set_micro_pullback_options,
-            commands::get_micro_pullback_attention,
+            commands::get_dislocation_options,
+            commands::set_dislocation_options,
+            commands::get_backside_options,
+            commands::set_backside_options,
+            commands::get_dislocation_attention,
             commands::get_strategy_cards,
             commands::start_alert_enrichment,
             commands::run_alert_llm,
+            commands::run_micro_pullback_news_score,
+            commands::get_micro_pullback_scores,
             commands::get_alert_enrichment,
             // Panic Score — LLM ranking of the visible pre-open watchlist
             commands::run_panic_llm_analysis,
             commands::get_panic_llm_run,
             commands::get_panic_llm_scores,
-            commands::get_micro_quality_scores,
+            commands::get_dislocation_scores,
             commands::has_web_search_provider,
             commands::get_active_alerts,
             commands::get_alert_history,

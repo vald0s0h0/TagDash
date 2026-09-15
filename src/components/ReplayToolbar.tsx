@@ -19,7 +19,7 @@ import { cn } from "@/lib/utils";
 import { nyTime } from "@/lib/nyTime";
 import { useUiStore } from "@/stores/uiStore";
 import { DayPickerModal } from "@/components/DayPickerModal";
-import type { ReplayStatus } from "@/types";
+import type { ReplaySource, ReplayStatus } from "@/types";
 
 const SPEEDS = [0.5, 1, 2, 5, 10, 30, 60, 120];
 const SESSION_STARTS = ["04:00", "07:00", "09:30"] as const;
@@ -31,6 +31,12 @@ const GRANULARITY: Record<string, Badge> = {
   tape: {
     label: "TAPE",
     title: "Trades réels enregistrés (granularité fine)",
+    className: "bg-emerald-500/20 text-emerald-300",
+  },
+  trades: {
+    label: "TRADES",
+    title:
+      "Flat file trade — vrais prints et quotes sur les fenêtres d'ignition, tranches 10 s synthétisées sur le reste de la séance",
     className: "bg-emerald-500/20 text-emerald-300",
   },
   seconds: {
@@ -86,6 +92,13 @@ const PROVIDERS: Record<string, Badge> = {
       "Dernier recours : aucune source intraday n'a répondu, la séance est reconstruite depuis la seule barre daily locale",
     className: "bg-amber-500/20 text-amber-300",
   },
+};
+
+/** Compact label for the tape picked in the day-picker, shown before starting. */
+const SOURCE_LABELS: Record<ReplaySource, string> = {
+  api: "API",
+  flat_trades: "Flat Trades",
+  flat_minutes: "Flat Minutes",
 };
 
 function EditableTime({
@@ -161,6 +174,7 @@ export function ReplayToolbar() {
 
   const [status, setStatus] = useState<ReplayStatus | null>(null);
   const [day, setDay] = useState<string | null>(null);
+  const [source, setSource] = useState<ReplaySource>("api");
   const [startHm, setStartHm] = useState<string>("04:00");
   const [startErr, setStartErr] = useState<string | null>(null);
   const [localPlaying, setLocalPlaying] = useState<boolean | null>(null);
@@ -196,7 +210,7 @@ export function ReplayToolbar() {
     if (!day) return;
     setStartErr(null);
     try {
-      await api.replayStart(day, startHm);
+      await api.replayStart(day, startHm, source);
     } catch (e) {
       setStartErr(String(e));
     }
@@ -271,6 +285,14 @@ export function ReplayToolbar() {
             <CalendarDays className="h-3.5 w-3.5" />
             {day ?? "Sélectionner un jour"}
           </button>
+          {day && (
+            <span
+              title="Tape utilisé pour charger la séance (modifiable dans « Choisir un jour »)"
+              className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted-foreground"
+            >
+              {SOURCE_LABELS[source]}
+            </span>
+          )}
           {day && (
             <>
               <select
@@ -442,8 +464,13 @@ export function ReplayToolbar() {
 
       <DayPickerModal
         open={calendarOpen}
+        source={source}
+        // Availability differs per source, so a day picked under the previous one
+        // may not exist under the new: drop it rather than let « Démarrer » fail on
+        // a selection the calendar would now grey out.
+        onSourceChange={(s) => { setSource(s); setDay(null); }}
         onClose={() => setCalendarOpen(false)}
-        onSelect={(d) => setDay(d)}
+        onSelect={(d, s) => { setDay(d); setSource(s); }}
       />
     </div>
   );

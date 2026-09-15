@@ -32,16 +32,79 @@ export interface AlertSignal {
   display_timeframe: string | null;
   /** Directional bias of the alert; drives a side badge. */
   side: Side | null;
-  /** Micro Pullback only: every detection tempo (seconds) that fired, ascending.
+  /** Micro Pullback and Dislocation: every tempo (seconds) that fired, ascending.
    *  Depth is signal — a move that trips 10s/20s/40s has more behind it than one
    *  that only spikes the 10s. The list widens in place as the move develops. */
   tempo_depth: number[] | null;
 }
 
-/** Micro Pullback's own Settings panel. Strategy-specific rather than a generic
- *  per-strategy channel: the knobs are particular to this engine and not all of
- *  them are booleans. Mirrors `micro_pullback::options::MicroPullbackOptions`. */
+/** Micro Pullback's own Settings panel (mirrors `micro_pullback::options`).
+ *
+ *  The boolean-cascade detector: six tempos against each ticker's own rolling
+ *  baseline, an n-of-three acceleration rule, then a tape watch. No model in the
+ *  decision path. */
 export interface MicroPullbackOptions {
+  // ── Univers ──
+  price_min: number;
+  price_max: number;
+  /** Free-float ceiling in shares. A KNOWN float above this excludes the ticker. */
+  float_max: number;
+  /** Watch tickers whose float we have never collected; the alert carries a
+   *  `FLOAT_UNKNOWN` tag so the decision stays with the trader. */
+  allow_unknown_float: boolean;
+  /** Only watch structurally crowded industries. An industry we have never
+   *  collected is NOT hot, so it is excluded too — the sharpest edge of this. */
+  hot_industry_only: boolean;
+  /** Drop the four pump & dump base-rate jurisdictions. A domicile we have never
+   *  collected is NOT flagged, so it survives. */
+  exclude_risk_domicile: boolean;
+
+  // ── Seuils de détection: multiplicateurs sur la grille compilée ──
+  /** × on every tempo's minimum price return. 1 = the compiled grid. */
+  return_min_scale: number;
+  /** × on every tempo's absolute share AND dollar minimum. */
+  volume_min_scale: number;
+  /** × on every tempo's three acceleration ratio minimums. */
+  ratio_min_scale: number;
+  /** How many of the three ratios must clear for a tempo to trip. 2 is the
+   *  historical rule; on a feed with no trade count only two ratios exist and a
+   *  value of 3 means "both of the two there are". */
+  ratios_required: number;
+
+  // ── Montre de tape ──
+  /** How long an armed ticker may wait for the tape before the watch is dropped. */
+  watch_max_secs: number;
+  /** Instantaneous rate (1-second window) that fires on the spot. */
+  watch_fast_rate_per_sec: number;
+  /** Sustained rate (5-second window). */
+  watch_slow_rate_per_sec: number;
+  /** Dollars per second the window must carry whichever layer confirms. */
+  watch_min_dollar_per_sec: number;
+
+  // ── Scoring IA ──
+  /** When on, every fresh departure gets the fast News-only LLM pass automatically
+   *  (budgeted below). When off, a button on the alert triggers it manually — never
+   *  both at once. */
+  llm_auto: boolean;
+  /** Rolling budget for the auto path only: at most this many calls in any trailing
+   *  5 minutes. A manual click is a human's own budget and ignores this. */
+  llm_budget_per_5min: number;
+
+  ntfy_alerts: boolean;
+
+  tempo_10s: boolean;
+  tempo_20s: boolean;
+  tempo_40s: boolean;
+  tempo_1m: boolean;
+  tempo_2m: boolean;
+  tempo_5m: boolean;
+}
+
+/** Dislocation's own Settings panel (mirrors `dislocation::options`).
+ *
+ *  The scoring engine, formerly "Micro Pullback v2": one 0–100 number made of three
+ *  equal thirds — RVOL, attention, news — and a bounded model budget. */
+export interface DislocationOptions {
   /** Current event-price universe band. */
   price_min: number;
   price_max: number;
@@ -54,21 +117,23 @@ export interface MicroPullbackOptions {
    *  it is excluded too. */
   hot_industry_only: boolean;
   /** Drop tickers domiciled in the four pump & dump base-rate jurisdictions: China
-   *  (incl. Hong Kong), Cayman Islands, British Virgin Islands. Off = they are still
-   *  watched with a −25 penalty. An unknown domicile is never excluded. */
+   *  (incl. Hong Kong), Cayman Islands, British Virgin Islands. Off = they are
+   *  watched exactly like the others; the score has no jurisdiction term. An unknown
+   *  domicile is never excluded. */
   exclude_risk_domicile: boolean;
-  /** Catalyst qualification (live intel, LLM scoring and news watch). Price, VWAP,
-   *  volume and splits remain context rather than hidden A+ vetoes. */
+  /** Qualité A+ — and now only that: the second, deeper LLM pass (fundamentals,
+   *  dilution, filings). Off by default. It no longer gates the pipeline: the news
+   *  pass owns a third of the score and runs whenever there is a fresh headline. */
   quality_aplus: boolean;
   /** Keep watching for a headline after qualification and re-score when one lands —
-   *  including for a candidate that was turned away for having no news. */
+   *  including for a candidate whose news third was a measured zero. */
   news_watch: boolean;
-  /** Run the second, deeper LLM pass (fundamentals, dilution, filings). */
-  deep_llm: boolean;
   /** false (default) = the LLM score gates the alert; true = publish immediately and
    *  let the scores update the row in place. */
   alert_before_score: boolean;
-  /** Final score (bonuses/penalties included) required to reach the screen. */
+  /** Total score — the mean of the three thirds — required to reach the screen.
+   *  With no headline in the window the news third is a measured zero, so a
+   *  candidate caps at 66 however violent the tape. */
   alert_score_threshold: number;
   /** How many candidates may be sent to the model per rolling 5 minutes of market
    *  time. Candidates are ranked by priority and the budget is spent from the top;
@@ -83,6 +148,19 @@ export interface MicroPullbackOptions {
   tempo_1m: boolean;
   tempo_2m: boolean;
   tempo_5m: boolean;
+}
+
+/** Backside's own Settings panel (mirrors `strategies::backside::BacksideOptions`).
+ *  Only three knobs — no engine loop, so these are read directly by `should_alert`
+ *  from a module-static rather than an AppState field. */
+export interface BacksideOptions {
+  /** Minimum % change vs the previous day's close to alert. Default 60. */
+  change_min_pct: number;
+  /** Market cap ceiling in dollars — a candidate must be BELOW this. Default
+   *  150,000,000 (the actual Gate 1 rule is "< 150M", a ceiling on small caps). */
+  market_cap_max: number;
+  /** Minimum price in dollars — a candidate must be AT OR ABOVE this. Default 1. */
+  price_min: number;
 }
 
 export interface MicroAttentionEntry {
@@ -104,6 +182,11 @@ export interface MicroAttentionEntry {
   head_size: number;
   dominant: boolean;
   already_alerted: boolean;
+  /** RVOL third of the score, 0..100. Computed backend-side so the number shown
+   *  every second and the number persisted with a verdict share one function. */
+  rvol_third: number;
+  /** Attention third of the score, 0..100. */
+  attention_third: number;
   market_time: string;
   received_at: string;
 }
@@ -130,7 +213,9 @@ export interface ScreenerMatch {
   gap_pct:       number | null;
   /** Relative volume (day volume / average daily volume). */
   rvol:          number | null;
-  volume:        number;
+  /** Cumulative session volume since 04:00 ET today, live. Null when the symbol
+   *  has no live ticker data yet (not zero — genuinely unknown). */
+  volume:        number | null;
   float_shares:  number | null;
   /** SIC industry + country of origin (sec-api company_meta cache). */
   industry:      string | null;
@@ -227,7 +312,7 @@ export interface PanicLlmScore {
   catalyst_direction: string | null;
 }
 
-/** One Micro Pullback A+ judgement (mirrors QualityRow in quality_repository.rs).
+/** One Dislocation judgement (mirrors QualityRow in quality_repository.rs).
  *
  *  `red_flags`, `key_drivers` and `tempo_depth` cross the bridge as JSON strings,
  *  exactly as they are stored — the overlay parses them defensively. */
@@ -238,14 +323,24 @@ export interface MicroQualityRow {
    *  two judgements in one day and they are about two different moves. */
   session:        string;
   simulated:      boolean;
-  /** Fast-pass score, kept even when the deep pass overrode it. */
+  /** The news pass's own note on the headline, kept even when the deep pass
+   *  overrode it. NOT the news third: this one is not decayed by the age. */
   pass1_score:    number | null;
   pass2_score:    number | null;
-  /** Model score + deterministic adjustments, clamped 0..100. The verdict. */
+  /** The mean of the three thirds, 0..100. The verdict. */
   final_score:    number | null;
   threshold:      number | null;
   passed:         boolean;
+  /** The three thirds as one readable line, for the audit view. */
   adjustments:    string | null;
+  /** RVOL third at the instant of the verdict, 0..100. The pane prefers the live
+   *  attention board for this one — it moves every second. */
+  rvol_score:      number | null;
+  /** Attention third at the instant of the verdict, 0..100. */
+  attention_score: number | null;
+  /** News third: the model's note decayed by the headline's age, 0..100. This one
+   *  does NOT move afterwards, and it is what the chart pastille shows. */
+  news_score:      number | null;
   confidence:     number | null;
   sustain_prob:   number | null;
   /** "solide" | "faible" | "bluff" | "aucune" */
@@ -268,7 +363,7 @@ export interface MicroQualityRow {
   tempo_depth:    string | null;
   rejection:      string | null;
   rubric_version: string | null;
-  /** "triage" | "deep" — which pass produced `final_score`. */
+  /** "news" | "deep" — which pass produced `final_score`. */
   model:          string | null;
   /** MARKET time of the verdict (replay clock in a replay). Compared with a
    *  headline's publication time to tell a current score from a stale one. */
@@ -279,7 +374,7 @@ export interface MicroQualityRow {
  *  means nothing is in flight and the persisted verdict is current. */
 export interface MicroQualityLive {
   symbol:              string;
-  /** "queued" | "triage" | "deep" | "rescoring", or null once the pass ends. */
+  /** "queued" | "news" | "deep" | "rescoring", or null once the pass ends. */
   phase:               string | null;
   /** A headline that landed after the displayed score and has not been folded in. */
   pending_headline:    string | null;
@@ -290,6 +385,28 @@ export interface MicroQualityLive {
 export interface MicroQualityBoard {
   rows: MicroQualityRow[];
   live: MicroQualityLive[];
+}
+
+/** One Micro Pullback catalyst read (mirrors MicroPullbackQualityRow in
+ *  micro_pullback_quality_repository.rs). Deliberately lighter than
+ *  {@link MicroQualityRow}: Micro Pullback has no RVOL/attention thirds and no
+ *  pass/fail threshold — `score` IS the model's `quality_score`, shown as-is. */
+export interface MicroPullbackQualityRow {
+  symbol:     string;
+  day:        string;
+  session:    string;
+  simulated:  boolean;
+  /** The model's quality_score, 0..100. No blending, no threshold. */
+  score:      number | null;
+  /** "solide" | "faible" | "bluff" | "aucune" */
+  verdict:    string | null;
+  /** "breaking" | "fraiche" | "recente" | "ancienne" | "posterieure" | "aucune" */
+  freshness:  string | null;
+  /** JSON array. */
+  red_flags:  string | null;
+  one_liner:  string | null;
+  model:      string | null;
+  scored_at:  string | null;
 }
 
 /** Decoded `data_quality` blob. Every field optional — it is stored as free JSON. */
@@ -359,7 +476,7 @@ export interface CardInfo {
   /** Most recent live headline text, if any. */
   news_title:        string | null;
   // ── Behavioural / risk scores (0..100, 100 = worst; null = inputs not
-  //    collected). NO LONGER DRAWN: the Micro Pullback overlay used to render these
+  //    collected). NO LONGER DRAWN: the Dislocation overlay used to render these
   //    five as unlabelled bars, three of them saying the same thing about dilution.
   //    The A+ deep pass reads the same filings and answers in one word
   //    (`MicroQualityRow.dilution_risk`) with a sentence behind it, which is what
@@ -414,7 +531,7 @@ export interface HodDriveOverlay {
   macd_strength:          number | null;
 }
 
-/** One headline for the Micro Pullback overlay (mirrors CardNews in
+/** One headline for the Dislocation overlay (mirrors CardNews in
  *  commands/mod.rs), fetched per displayed ticker via Alpaca REST. `created_at`
  *  is the publish time (RFC 3339). */
 export interface CardNews {
@@ -595,6 +712,9 @@ export interface Position {
   unrealized_pnl:  number | null;
   r_multiple:      number | null;
   opened_at:       string;
+  /** Entry legs filled so far vs. still resting for this trade (scaled entries). */
+  filled_entries:  number;
+  pending_entries: number;
 }
 
 export interface Fill {
@@ -1171,6 +1291,13 @@ export interface MarketSnapshot {
 export interface FeedDiagnostics {
   state: string; // idle|connecting|authenticating|authenticated|subscribed|streaming|error|reconnecting|stopped
   feed: string;
+  /** What the tape physically is: "prints" (one message per real trade) or
+   *  "second_aggregates" (one message per symbol per second, Massive). */
+  tape_kind?: string;
+  /** Whether a trade COUNT is available. Always true on prints; on Massive it turns
+   *  true once a frame carries the average trade size `z`, from which the count is
+   *  reconstructed. False → the tape gates fall back to dollars + continuity. */
+  tape_counts_trades?: boolean;
   /** Subscription detected at connect time: "sip" (paid) | "iex" (free) |
    *  "massive_unlimited" (Massive Starter+ replacing IEX — 15-min delayed,
    *  per-second bars, no trades/quotes). */
@@ -1226,6 +1353,13 @@ export interface NewsDiagnostics {
 
 // ─── Market Replay ─────────────────────────────────────────────────────────────
 
+/**
+ * Which tape a replay reads — the day-picker toggle, mirrors `SourceChoice` in
+ * replay/data.rs. "api" runs the ranked walk (SIP > Massive > flat files); the two
+ * flat variants pin the session to that local dataset and never fall back.
+ */
+export type ReplaySource = "api" | "flat_trades" | "flat_minutes";
+
 /** Mirrors ReplayStatus in replay/mod.rs (polled by the replay toolbar). */
 export interface ReplayStatus {
   active: boolean;
@@ -1234,8 +1368,10 @@ export interface ReplayStatus {
   day: string | null;
   /**
    * Granularity of the replayed price path: "tape" (recorded real trades) |
-   * "seconds" (real 1-second aggregates) | "minutes" (synthesized from 1-min
-   * bars) | "daily" (the day's single OHLCV bar walked across the session).
+   * "seconds" (real 1-second aggregates) | "trades" (real prints + quotes over the
+   * ignition windows, synthetic minute slices elsewhere) | "minutes" (synthesized
+   * from 1-min bars) | "daily" (the day's single OHLCV bar walked across the
+   * session).
    */
   source: string | null;
   /**

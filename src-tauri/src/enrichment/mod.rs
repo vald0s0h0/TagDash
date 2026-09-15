@@ -21,9 +21,6 @@ use crate::types::{AlertEnrichment, SplitMarker};
 /// Daily bars fetched for the left pane — enough history for a 200-day SMA.
 const DAILY_FETCH_DAYS: u32 = 250;
 
-const SYSTEM_FR: &str =
-    "Tu es un assistant de trading intraday small-cap. Réponds en français, de façon très concise (une phrase maximum).";
-
 /// System prompt for the panic mean-reversion read (allowed two short lines).
 const SYSTEM_PANIC_FR: &str =
     "Tu es un assistant de trading intraday spécialisé en mean-reversion sur small-caps. \
@@ -57,10 +54,12 @@ pub async fn run(
 
     // Hydrate the last persisted LLM result so a re-opened zone shows the previous
     // read immediately, without re-calling the model. A fresh button click
-    // overwrites it (and appends a new history row). Both panic (context/verdict)
-    // and micro_pullback (dilution/news) results are appended to the same table;
-    // map them back to the fields each strategy's card actually reads.
-    if strategy_id == crate::strategies::panic_mean_reversion::ID {
+    // overwrites it (and appends a new history row). Panic only now — Micro
+    // Pullback moved to its own table (`micro_pullback_quality_scores`) when its
+    // catalyst read stopped being this free-text mechanism.
+    if strategy_id == crate::strategies::panic_mean_reversion::ID
+        || strategy_id == crate::strategies::backside::ID
+    {
         let latest = {
             let conn = db.lock().unwrap();
             crate::local_db::llm_repository::get_latest(&conn, &symbol)
@@ -73,24 +72,11 @@ pub async fn run(
                 e.llm_reversion = a.verdict;
             });
         }
-    } else if strategy_id == crate::strategies::micro_pullback::ID {
-        let latest = {
-            let conn = db.lock().unwrap();
-            crate::local_db::llm_repository::get_latest(&conn, &symbol)
-                .ok()
-                .flatten()
-        };
-        if let Some(a) = latest {
-            update(&store, &symbol, |e| {
-                e.llm_dilution = a.context;
-                e.llm_news = a.verdict;
-            });
-        }
     }
 
     // Snapshot the secrets we need (don't hold the lock across awaits). The
-    // Deepseek key isn't needed here — both strategies' LLM reads are
-    // user-triggered (see `run_panic_llm` / `run_micro_pullback_llm`).
+    // Deepseek key isn't needed here — this strategy's LLM read is
+    // user-triggered (see `run_panic_llm`).
     let (alpaca_key, alpaca_secret) = {
         let s = secrets.read().unwrap();
         (s.alpaca_key.clone(), s.alpaca_secret.clone())
@@ -183,9 +169,10 @@ pub async fn run(
         e.news_checked = true;
     });
 
-    // Neither strategy auto-runs the LLM step — both reads are user-triggered via
-    // the info-bar button (see `run_panic_llm` / `run_micro_pullback_llm` + the
-    // `run_alert_llm` command).
+    // Panic doesn't auto-run the LLM step — the read is user-triggered via the
+    // info-bar button (see `run_panic_llm` + the `run_alert_llm` command). Micro
+    // Pullback and Dislocation each own their own catalyst scoring now, outside
+    // this module — see `micro_pullback::quality` / `dislocation::quality`.
     update(&store, &symbol, |e| e.status = "done".into());
 }
 
@@ -195,15 +182,19 @@ const PANIC_NEWS_DAYS: i64 = 5;
 const PANIC_NEWS_LIMIT: u32 = 10;
 const PANIC_CONTENT_CHARS: usize = 900;
 
-/// On-demand panic mean-reversion LLM read (button-triggered, never automatic).
-/// On click we (1) call the Alpaca news REST API for the ticker's articles over
-/// the last 5 days (with full content), (2) read the last 5 daily OHLC bars, then
-/// (3) hand both to Deepseek, which returns two short French lines — a context
-/// summary (why the stock is moving / which news pushed it) and a mean-reversion
-/// verdict (solid vs bluff + probability of a return to equilibrium). The model is
-/// told that some of the articles are noise and to use only the relevant ones.
+/// On-demand mean-reversion LLM read (button-triggered, never automatic).
+/// Originally Panic-only; also used verbatim by Backside (same call, same
+/// prompt, same scoring — only `strategy_id`, used for attribution when
+/// persisting the result, differs). On click we (1) call the Alpaca news REST
+/// API for the ticker's articles over the last 5 days (with full content), (2)
+/// read the last 5 daily OHLC bars, then (3) hand both to Deepseek, which
+/// returns two short French lines — a context summary (why the stock is moving
+/// / which news pushed it) and a mean-reversion verdict (solid vs bluff +
+/// probability of a return to equilibrium). The model is told that some of the
+/// articles are noise and to use only the relevant ones.
 pub async fn run_panic_llm(
     symbol: String,
+    strategy_id: String,
     db: Arc<Mutex<rusqlite::Connection>>,
     secrets: Arc<RwLock<Secrets>>,
     store: Store,
@@ -284,7 +275,7 @@ pub async fn run_panic_llm(
                 let _ = crate::local_db::llm_repository::insert_result(
                     &conn,
                     &symbol,
-                    crate::strategies::panic_mean_reversion::ID,
+                    &strategy_id,
                     ctx.as_deref(),
                     verdict.as_deref(),
                 );
@@ -299,69 +290,6 @@ pub async fn run_panic_llm(
                 e.llm_context = Some(format!("Erreur LLM: {err}"))
             });
         }
-    }
-
-    update(&store, &symbol, |e| {
-        e.llm_pending = false;
-        e.status = "done".into();
-    });
-}
-
-/// On-demand micro_pullback LLM read (button-triggered, never automatic). Used
-/// to fire on every alert — that hammered the Deepseek quota on a busy scanner
-/// day, so the read is now a click like panic's. Reuses the news headline
-/// already gathered by the automatic enrichment steps instead of re-fetching it.
-pub async fn run_micro_pullback_llm(
-    symbol: String,
-    db: Arc<Mutex<rusqlite::Connection>>,
-    secrets: Arc<RwLock<Secrets>>,
-    store: Store,
-) {
-    let deepseek_key = secrets.read().unwrap().deepseek_api_key.clone();
-    let Some(dk) = deepseek_key else { return };
-
-    update(&store, &symbol, |e| e.llm_pending = true);
-    let ds = crate::llm::deepseek::Deepseek::new(dk);
-    let news_title = store
-        .read()
-        .unwrap()
-        .get(&symbol)
-        .and_then(|e| e.news_title.clone());
-
-    // (a) Recent risks, dilution-focused (always).
-    let dilution_prompt = format!(
-        "Quels sont les risques récents autour de {symbol}, surtout la dilution \
-         (contexte: scalping intraday, pas d'analyse long terme) ? Réponds en quelques mots."
-    );
-    let dilution_ans = ds.complete(SYSTEM_FR, &dilution_prompt).await.ok();
-    if let Some(ans) = &dilution_ans {
-        update(&store, &symbol, |e| e.llm_dilution = Some(ans.clone()));
-    }
-
-    // (b) News bluff vs solid (only when a news item was found).
-    let mut news_ans = None;
-    if let Some(headline) = &news_title {
-        let news_prompt = format!(
-            "Voici une news sur {symbol}: \"{headline}\". Est-ce du bluff ou solide ? \
-             Réponds très brièvement (mots-clés, arguments)."
-        );
-        news_ans = ds.complete(SYSTEM_FR, &news_prompt).await.ok();
-        if let Some(ans) = &news_ans {
-            update(&store, &symbol, |e| e.llm_news = Some(ans.clone()));
-        }
-    }
-
-    // Persist only the outputs, appended to history (mirrors `run_panic_llm`),
-    // so a re-opened zone hydrates the last read without re-calling the model.
-    {
-        let conn = db.lock().unwrap();
-        let _ = crate::local_db::llm_repository::insert_result(
-            &conn,
-            &symbol,
-            crate::strategies::micro_pullback::ID,
-            dilution_ans.as_deref(),
-            news_ans.as_deref(),
-        );
     }
 
     update(&store, &symbol, |e| {

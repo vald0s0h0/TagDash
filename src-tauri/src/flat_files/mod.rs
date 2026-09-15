@@ -262,6 +262,34 @@ pub fn read_day(app_dir: &Path, day: &str) -> Result<data::DayData, String> {
     minute::read_day(app_dir, day, overlay)
 }
 
+/// Same read, but the trade overlay is REQUIRED — the « Flat Files Trades » replay
+/// mode. Refuses a day whose trade file is missing or incomplete instead of quietly
+/// serving the synthetic minute slices: that silent degradation is exactly what the
+/// explicit choice is there to rule out.
+pub fn read_day_trades(app_dir: &Path, day: &str) -> Result<data::DayData, String> {
+    ensure_layout(app_dir);
+    if !minute::has_day(app_dir, day) {
+        return Err(format!(
+            "aucun flat file minute pour le {day} (le mode Trades s'appuie dessus \
+             hors des fenêtres d'ignition)"
+        ));
+    }
+    let overlay = trade::read_overlay(app_dir, day)
+        .ok_or_else(|| format!("aucun flat file trade complet pour le {day}"))?;
+    minute::read_day(app_dir, day, Some(overlay))
+}
+
+/// Minute file alone, any trade file on disk ignored — the « Flat Files Minutes »
+/// replay mode. Useful to replay a day the way the broad scan saw it, and to compare
+/// a strategy's behaviour on synthetic slices against the same day on real prints.
+pub fn read_day_minutes(app_dir: &Path, day: &str) -> Result<data::DayData, String> {
+    ensure_layout(app_dir);
+    if !minute::has_day(app_dir, day) {
+        return Err(format!("aucun flat file minute pour le {day}"));
+    }
+    minute::read_day(app_dir, day, None)
+}
+
 // ─── SQLite meta helpers (shared by the writers) ───────────────────────────────
 
 pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {

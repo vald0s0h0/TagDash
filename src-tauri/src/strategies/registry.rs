@@ -4,8 +4,9 @@
 use std::sync::OnceLock;
 
 use crate::strategies::{
-    backside_parabolic::BacksideParabolic, hod_drive::HodDrive, micro_pullback::MicroPullback,
-    panic_mean_reversion::PanicMeanReversion, perfect_pullback::PerfectPullback, ScanStrategy,
+    backside::Backside, dislocation::Dislocation, hod_drive::HodDrive,
+    micro_pullback::MicroPullback, panic_mean_reversion::PanicMeanReversion,
+    perfect_pullback::PerfectPullback, ScanStrategy,
 };
 
 /// One shared instance of every compiled strategy, enabled or not. The strategies
@@ -18,7 +19,8 @@ pub fn all_strategies() -> &'static [Box<dyn ScanStrategy>] {
     REGISTRY.get_or_init(|| {
         vec![
             Box::new(MicroPullback) as Box<dyn ScanStrategy>,
-            Box::new(BacksideParabolic),
+            Box::new(Dislocation),
+            Box::new(Backside),
             Box::new(PanicMeanReversion),
             Box::new(PerfectPullback),
             Box::new(HodDrive),

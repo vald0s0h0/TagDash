@@ -56,6 +56,7 @@ pub struct AppState {
     /// → upward impulse → optional A+ catalyst qualification; see
     /// `crate::micro_pullback`).
     pub micro_pullback_running: Arc<AtomicBool>,
+    pub dislocation_running: Arc<AtomicBool>,
     /// Controls the Panic Mean Reversion watchlist scheduler (builds the day's
     /// two-list watchlist at 09:00 ET; see `crate::panic_watchlist`).
     pub panic_watchlist_running: Arc<AtomicBool>,
@@ -71,11 +72,14 @@ pub struct AppState {
     /// Settings and persisted in the `app_config` table). Position sizing reads
     /// this live so edits take effect on the very next order.
     pub strategy_risk: Arc<RwLock<HashMap<String, crate::types::StrategyRiskConfig>>>,
-    /// Micro Pullback's own options (active tempos, Qualité A+ and its sub-settings).
-    /// Strategy-specific rather than a generic channel — see
+    /// Micro Pullback's own options (universe, detection thresholds, tape watch,
+    /// active tempos). Strategy-specific rather than a generic channel — see
     /// `crate::micro_pullback::options`. Persisted in `app_meta`; the engine re-reads
     /// it every tick so a Settings change lands on the next second.
     pub micro_pullback_options: Arc<RwLock<crate::micro_pullback::MicroPullbackOptions>>,
+    /// Dislocation's own options (active tempos, score threshold, model budget,
+    /// Qualité A+). Same contract as above, its own blob.
+    pub dislocation_options: Arc<RwLock<crate::dislocation::DislocationOptions>>,
     /// Current active alerts (newest first, capped at 100).
     pub active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
     /// Full alert history for the session (newest first, capped at 500).
@@ -87,9 +91,10 @@ pub struct AppState {
     /// minute 09:30–12:30 ET). Consumed by the Perfect Pullback engine as its
     /// candidate source; exposed read-only via `get_market_attention` for debug.
     pub attention: Arc<RwLock<Vec<AttentionEntry>>>,
-    /// Micro Pullback v2 Top 10 for every enabled tempo, refreshed on each closed
-    /// 10-second market bucket and exposed in its Settings diagnostics.
-    pub micro_attention: Arc<RwLock<Vec<crate::types::MicroAttentionEntry>>>,
+    /// Dislocation's Top 10 for every enabled tempo, refreshed on each closed
+    /// 10-second market bucket. Read by its Settings diagnostics and by the chart
+    /// pane, which needs the two tape thirds live rather than as of the last verdict.
+    pub dislocation_attention: Arc<RwLock<Vec<crate::types::MicroAttentionEntry>>>,
     /// Per-zone trade context (SL, TP, tradeID) stored in RAM.
     pub chart: Arc<RwLock<ChartState>>,
     /// Internal simulated order book (no real broker orders in V1).

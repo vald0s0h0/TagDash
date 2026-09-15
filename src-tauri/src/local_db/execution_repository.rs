@@ -2,7 +2,7 @@
 // Trades can span several days and survive restarts, so the chart's execution
 // markers are reconstructed from these rows rather than from the in-RAM book.
 
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 
 use crate::types::{Fill, Side};
 
@@ -63,6 +63,16 @@ pub fn set_original_tp(conn: &Connection, trade_id: &str, symbol: &str, tp: f64)
         params![trade_id, symbol, tp],
     )?;
     Ok(())
+}
+
+/// Original (launch-time) stop loss for a single trade, if one was stamped.
+pub fn original_sl_for_trade(conn: &Connection, trade_id: &str) -> Result<Option<f64>> {
+    conn.query_row(
+        "SELECT original_sl FROM trade_levels WHERE trade_id = ?1 AND original_sl IS NOT NULL",
+        params![trade_id],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Original stop loss per trade for a symbol, as (trade_id, original_sl) pairs.

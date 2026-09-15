@@ -81,6 +81,10 @@ fn position_of(
         // does not silently reprice them.
         auto_be_applied: false,
         auto_tp_applied: false,
+        // The venue doesn't expose a per-leg fill breakdown here — stay honest
+        // and don't fabricate a partial-fill count for an Alpaca position.
+        filled_entries: 0,
+        pending_entries: 0,
     }
 }
 

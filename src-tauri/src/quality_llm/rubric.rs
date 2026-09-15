@@ -1,7 +1,7 @@
 // The rubrics as EDITABLE FILES, with the compiled-in texts as the seed and the
 // fallback.
 //
-//   <app data>/prompts/micro_pullback_triage.txt
+//   <app data>/prompts/micro_pullback_news.txt
 //   <app data>/prompts/micro_pullback_deep.txt
 //
 // WHY THIS DOES NOT BREAK THE FROZEN-RUBRIC CONTRACT. `prompt`'s whole discipline is
@@ -27,7 +27,7 @@
 
 use std::path::PathBuf;
 
-use super::prompt::{RUBRIC_VERSION, SYSTEM_DEEP, SYSTEM_TRIAGE};
+use super::prompt::{RUBRIC_VERSION, SYSTEM_DEEP, SYSTEM_NEWS};
 use super::Pass;
 
 /// Directory holding the editable rubrics.
@@ -37,7 +37,7 @@ pub fn dir() -> PathBuf {
 
 pub fn path(pass: Pass) -> PathBuf {
     dir().join(match pass {
-        Pass::Triage => "micro_pullback_triage.txt",
+        Pass::News => "micro_pullback_news.txt",
         Pass::Deep => "micro_pullback_deep.txt",
     })
 }
@@ -46,7 +46,7 @@ pub fn path(pass: Pass) -> PathBuf {
 /// missing or blank file falls back to.
 pub fn builtin(pass: Pass) -> &'static str {
     match pass {
-        Pass::Triage => SYSTEM_TRIAGE,
+        Pass::News => SYSTEM_NEWS,
         Pass::Deep => SYSTEM_DEEP,
     }
 }
@@ -58,7 +58,7 @@ pub fn ensure_seeded() -> Vec<PathBuf> {
     let dir = dir();
     let _ = std::fs::create_dir_all(&dir);
     let mut out = Vec::new();
-    for pass in [Pass::Triage, Pass::Deep] {
+    for pass in [Pass::News, Pass::Deep] {
         let p = path(pass);
         if !p.exists() {
             let _ = std::fs::write(&p, builtin(pass));
@@ -93,12 +93,12 @@ pub fn is_customised(pass: Pass) -> bool {
 /// threading the option down here, and a version that changed because of the OTHER
 /// rubric is a false alarm, not a wrong answer.
 pub fn version() -> String {
-    let triage = text(Pass::Triage);
+    let news = text(Pass::News);
     let deep = text(Pass::Deep);
-    if triage == SYSTEM_TRIAGE && deep == SYSTEM_DEEP {
+    if news == SYSTEM_NEWS && deep == SYSTEM_DEEP {
         return RUBRIC_VERSION.to_string();
     }
-    let mut h = fnv1a(&triage);
+    let mut h = fnv1a(&news);
     h ^= fnv1a(&deep).rotate_left(17);
     format!("{RUBRIC_VERSION}+perso-{h:x}")
 }
@@ -122,11 +122,11 @@ mod tests {
     fn a_missing_or_blank_file_falls_back_to_the_built_in_text() {
         // Reading through a path that cannot exist exercises the same branch a
         // deleted file takes: never send an empty system prompt.
-        let missing = std::fs::read_to_string("/nonexistent/tagdash/triage.txt")
+        let missing = std::fs::read_to_string("/nonexistent/tagdash/news.txt")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| builtin(Pass::Triage).to_string());
-        assert_eq!(missing, SYSTEM_TRIAGE);
+            .unwrap_or_else(|| builtin(Pass::News).to_string());
+        assert_eq!(missing, SYSTEM_NEWS);
 
         let blank: Option<String> = Some("   \n\t ".to_string());
         let resolved = blank
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn the_two_passes_never_share_a_file() {
-        assert_ne!(path(Pass::Triage), path(Pass::Deep));
+        assert_ne!(path(Pass::News), path(Pass::Deep));
     }
 
     #[test]

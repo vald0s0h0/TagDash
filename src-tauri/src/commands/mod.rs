@@ -1839,6 +1839,10 @@ pub async fn test_ntfy(state: tauri::State<'_, AppState>) -> Result<(), String> 
 
 /// Micro Pullback's own options. Strategy-specific rather than a generic
 /// per-strategy channel — see `crate::micro_pullback::options` for why.
+///
+/// Two engines, two blobs: `get_dislocation_options` below is the other one. They
+/// were one struct while Dislocation was called "Micro Pullback v2", which is
+/// exactly the confusion this split removes.
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_micro_pullback_options(
     state: tauri::State<'_, AppState>,
@@ -1867,13 +1871,61 @@ pub fn set_micro_pullback_options(
     Ok(())
 }
 
-/// Live Top 10 per Micro Pullback tempo, including dominance and directional
+/// Dislocation's own options, same contract as Micro Pullback's above.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_dislocation_options(
+    state: tauri::State<'_, AppState>,
+) -> crate::dislocation::DislocationOptions {
+    *state.dislocation_options.read().unwrap()
+}
+
+/// Replace Dislocation's options. Persisted in `app_meta`; the engine re-reads the
+/// struct every tick, so a change lands on the next second without a restart.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_dislocation_options(
+    options: crate::dislocation::DislocationOptions,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let clean = options.sanitized();
+    {
+        let db = state.db.lock().unwrap();
+        clean.save(&db)?;
+    }
+    *state.dislocation_options.write().unwrap() = clean;
+    Ok(())
+}
+
+/// Backside's own options. Unlike Dislocation/Micro Pullback, Backside has no
+/// engine loop — its options live in a module-static (`strategies::backside`),
+/// not `AppState`, because `should_alert()` has no state parameter to read one
+/// from. `set_` persists then writes through to that static, so the very next
+/// scan tick sees the change.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_backside_options() -> crate::strategies::backside::BacksideOptions {
+    crate::strategies::backside::current_options()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_backside_options(
+    options: crate::strategies::backside::BacksideOptions,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let clean = options.sanitized();
+    {
+        let db = state.db.lock().unwrap();
+        clean.save(&db)?;
+    }
+    crate::strategies::backside::set_options(clean);
+    Ok(())
+}
+
+/// Live Top 10 per Dislocation tempo, including the two tape thirds, dominance and
 /// diagnostics. Read-only and cheap: the engine replaces one RAM vector every 10s.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn get_micro_pullback_attention(
+pub async fn get_dislocation_attention(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<crate::types::MicroAttentionEntry>, String> {
-    let rows = state.micro_attention.clone();
+    let rows = state.dislocation_attention.clone();
     tokio::task::spawn_blocking(move || rows.read().unwrap().clone())
         .await
         .map_err(|e| e.to_string())
@@ -1928,10 +1980,11 @@ pub fn start_alert_enrichment(
 
 /// User-triggered LLM read for the displayed alert (NOT automatic). A button in
 /// the info band fires this for any strategy whose card declares an `llm` spec
-/// (currently panic_mean_reversion and micro_pullback) — one Deepseek call (or
-/// two, for micro_pullback) producing a short context/verdict pair (see
-/// `enrichment::run_panic_llm` / `enrichment::run_micro_pullback_llm`). Ignored
-/// while a call is already in flight.
+/// (currently panic_mean_reversion only — Micro Pullback and Dislocation each own
+/// their own structured scoring now, see `run_micro_pullback_news_score` and
+/// Dislocation's automatic quality pipeline). One Deepseek call producing a short
+/// context/verdict pair (see `enrichment::run_panic_llm`). Ignored while a call is
+/// already in flight.
 #[tauri::command(rename_all = "snake_case")]
 pub fn run_alert_llm(symbol: String, strategy_id: String, state: tauri::State<'_, AppState>) {
     // Don't stack calls if one is already running for this symbol.
@@ -1943,13 +1996,90 @@ pub fn run_alert_llm(symbol: String, strategy_id: String, state: tauri::State<'_
     let db = state.db.clone();
     let secrets = state.secrets.clone();
     let store = state.enrichments.clone();
-    if strategy_id == crate::strategies::panic_mean_reversion::ID {
-        tauri::async_runtime::spawn(crate::enrichment::run_panic_llm(symbol, db, secrets, store));
-    } else if strategy_id == crate::strategies::micro_pullback::ID {
-        tauri::async_runtime::spawn(crate::enrichment::run_micro_pullback_llm(
-            symbol, db, secrets, store,
+    if strategy_id == crate::strategies::panic_mean_reversion::ID
+        || strategy_id == crate::strategies::backside::ID
+    {
+        tauri::async_runtime::spawn(crate::enrichment::run_panic_llm(
+            symbol,
+            strategy_id,
+            db,
+            secrets,
+            store,
         ));
     }
+}
+
+/// Micro Pullback's manual catalyst read — used only when `llm_auto` is off in
+/// Settings (when it's on, the engine already spawns this same call on every fresh
+/// fire; see `micro_pullback::mod`'s `Outcome::Fired` handling). Fire-and-forget:
+/// the frontend polls `get_micro_pullback_scores` for the result. Double-clicking,
+/// or clicking while the auto path is already scoring this symbol, is a no-op —
+/// `quality::run_news_scoring`'s in-flight guard covers both.
+#[tauri::command(rename_all = "snake_case")]
+pub fn run_micro_pullback_news_score(symbol: String, state: tauri::State<'_, AppState>) {
+    let alert = state
+        .active_alerts
+        .read()
+        .unwrap()
+        .iter()
+        .find(|a| a.symbol == symbol && a.strategy_id == crate::strategies::micro_pullback::ID)
+        .cloned();
+    let Some(alert) = alert else {
+        return;
+    };
+    let now = crate::time::now();
+    // The tempo/tape metrics that produced this alert live only inside the engine's
+    // private per-ticker state (`Machine::emitted`), not on `AlertSignal` itself — the
+    // auto path (which runs inside the engine loop) carries the real numbers, this
+    // manual path only has what the alert already publishes. `tempo_depth` survives on
+    // the alert; the finer trigger/tape numbers fall back to 0/None, which costs the
+    // payload's "what exactly fired" block but not the news/price/issuer context the
+    // rubric grades on — those come from live market state, not from `cand`.
+    let tempo_secs = alert
+        .display_timeframe
+        .as_deref()
+        .and_then(|tf| tf.strip_suffix('s'))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let cand = crate::micro_pullback::quality::candidate_from_fire(
+        alert,
+        tempo_secs,
+        0.0,
+        0.0,
+        None,
+        0.0,
+        crate::types::TapeKind::Prints,
+        None,
+        0.0,
+        None,
+        0,
+        now,
+    );
+    let deps = crate::dislocation::quality::Deps {
+        db: state.db.clone(),
+        config: state.config.clone(),
+        secrets: state.secrets.clone(),
+        market: state.market.clone(),
+        active_alerts: state.active_alerts.clone(),
+        alert_history: state.alert_history.clone(),
+    };
+    let opts = *state.micro_pullback_options.read().unwrap();
+    tauri::async_runtime::spawn(crate::micro_pullback::quality::run_news_scoring(
+        deps, cand, opts, false,
+    ));
+}
+
+/// Micro Pullback's news judgements for the current app-clock day and mode. Day- and
+/// mode-scoped exactly like `get_dislocation_scores`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_micro_pullback_scores(
+    state: tauri::State<'_, AppState>,
+) -> Vec<crate::local_db::micro_pullback_quality_repository::MicroPullbackQualityRow> {
+    let day = crate::time::et_date(crate::time::now());
+    let simulated = crate::replay::clock::is_active();
+    let conn = state.db.lock().unwrap();
+    crate::local_db::micro_pullback_quality_repository::get_for_day(&conn, &day, simulated)
+        .unwrap_or_default()
 }
 
 /// Current progressive enrichment for a symbol (polled by the info band).
@@ -2022,9 +2152,9 @@ pub fn get_panic_llm_scores(
 /// polled separately the two would disagree for a poll interval and the pane would
 /// flicker between a stale score and a spinner.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_micro_quality_scores(
+pub fn get_dislocation_scores(
     state: tauri::State<'_, AppState>,
-) -> crate::micro_pullback::quality::QualityBoard {
+) -> crate::dislocation::quality::QualityBoard {
     let day = crate::time::et_date(crate::time::now());
     let simulated = crate::replay::clock::is_active();
     let rows = {
@@ -2032,9 +2162,9 @@ pub fn get_micro_quality_scores(
         crate::local_db::quality_repository::get_for_day(&conn, &day, simulated)
             .unwrap_or_default()
     };
-    crate::micro_pullback::quality::QualityBoard {
+    crate::dislocation::quality::QualityBoard {
         rows,
-        live: crate::micro_pullback::live_status::snapshot(),
+        live: crate::dislocation::live_status::snapshot(),
     }
 }
 
@@ -2229,8 +2359,10 @@ pub struct CardInfo {
     /// 1-minute ring buffer. None when no premarket bars are on file.
     pub premarket_volume: Option<i64>,
     /// Cumulative volume since 04:00 ET today (premarket + regular + any
-    /// after-hours so far), summed from the live 1-minute ring buffer. Backs the
-    /// chart top bar's single "Vol" chip. None when no bars are on file yet.
+    /// after-hours so far), read straight from `TickerLiveState::volume_day` — the
+    /// same live counter every other "Vol" reading in the UI is built on (screener
+    /// cards, on-chart overlay). Backs the chart top bar's single "Vol" chip. None
+    /// when the symbol has no live ticker state yet (no data, not zero).
     pub volume_since_4am: Option<i64>,
     /// Relative volume: today's cumulative volume (`TickerLiveState::volume_day`)
     /// over the symbol's average daily volume (universe table). Same formula as
@@ -2306,15 +2438,9 @@ pub async fn get_card_info(
 
             let now = crate::time::now();
             let today = crate::time::et_date(now);
-            let now_mins = crate::time::et_minutes(now);
             let m1 = market.get_bars(&symbol, crate::market_state::aggregators::Timeframe::M1);
             let mut pm_sum: i64 = 0;
             let mut pm_any = false;
-            // Cumulative volume since 04:00 ET today — same premarket sum widened
-            // to run through "now" instead of stopping at the 09:30 open, so it
-            // reads as one running total across premarket + regular + after-hours.
-            let mut since_4am_sum: i64 = 0;
-            let mut since_4am_any = false;
             for b in &m1 {
                 if crate::time::et_date(b.time) != today {
                     continue;
@@ -2324,20 +2450,19 @@ pub async fn get_card_info(
                     pm_sum += b.volume as i64;
                     pm_any = true;
                 }
-                if mins >= 240 && mins <= now_mins {
-                    since_4am_sum += b.volume as i64;
-                    since_4am_any = true;
-                }
             }
             let premarket_volume = if pm_any { Some(pm_sum) } else { None };
-            let volume_since_4am = if since_4am_any {
-                Some(since_4am_sum)
-            } else {
-                None
-            };
+            // Cumulative volume since 04:00 ET today, straight from the live running
+            // counter (`TickerLiveState::volume_day`, incremented on every trade/bar
+            // regardless of session) rather than re-summed from the M1 ring buffer:
+            // the ring only holds RING_CAP (600) minutes, so a resummed total quietly
+            // drops the earliest premarket bars — and diverges from every other "Vol"
+            // reading in the UI (screener cards, on-chart overlay) — once the session
+            // runs past ~10h. This single counter is what backs all of them now.
+            let volume_day = market.tickers.get(&symbol).map(|t| t.volume_day);
+            let volume_since_4am = volume_day.map(|v| v as i64);
             // Same formula as the scanner's live rvol (StrategyContext::rvol):
             // today's cumulative volume over the symbol's average daily volume.
-            let volume_day = market.tickers.get(&symbol).map(|t| t.volume_day);
             let rvol = match (volume_day, avg_volume_asof) {
                 (Some(v), Some(avg)) if avg > 0 => Some(v as f64 / avg as f64),
                 _ => None,
@@ -3524,21 +3649,44 @@ pub fn get_internal_positions(state: tauri::State<'_, AppState>) -> Vec<Position
     // With Alpaca active, every row on screen is a position Alpaca actually holds.
     // Projected here rather than in each of the six frontend consumers, so no panel
     // can be forgotten and quietly keep showing the simulator's book.
-    if alpaca_active(&state) {
+    let mut positions = if alpaca_active(&state) {
         let mirror = state.broker.snapshot();
         let chart = state.chart.read().unwrap();
         let journal = state.broker.journal.read().unwrap();
-        return crate::broker::projection::positions(&mirror, &chart, &journal);
+        crate::broker::projection::positions(&mirror, &chart, &journal)
+    } else {
+        // Pure read: fills, bracket sync and TradeTally mirroring are owned by the
+        // backend trading loop (`spawn_trading_loop`). Here we only refresh live PnL
+        // (and MAE/MFE watermarks) from the latest prices and return the positions.
+        let prices = all_market_prices(&state.market);
+        state
+            .internal_book
+            .write()
+            .unwrap()
+            .positions_with_pnl(&prices)
+    };
+
+    // The sidebar's R must never move just because the SL was dragged after
+    // entry — same guarantee TradeTally already gets from `trade_levels`
+    // (`original_sl`, stamped once on the first fill, never overwritten). Swap
+    // the live-SL-based `r_multiple` for one computed against that frozen SL
+    // whenever we have one; a position with no stamp yet (or restored from a
+    // book saved before this field existed) just keeps its live-SL number.
+    let db = state.db.lock().unwrap();
+    for pos in positions.iter_mut() {
+        let Some(pnl) = pos.unrealized_pnl else { continue };
+        let Ok(Some(sl0)) = execution_repository::original_sl_for_trade(&db, &pos.trade_id) else {
+            continue;
+        };
+        let risk = (pos.avg_entry_price - sl0).abs();
+        let qty = pos.quantity.unsigned_abs() as f64;
+        if risk > 1e-8 && qty > 0.0 {
+            pos.r_multiple = Some(pnl / (risk * qty));
+        }
     }
-    // Pure read: fills, bracket sync and TradeTally mirroring are owned by the
-    // backend trading loop (`spawn_trading_loop`). Here we only refresh live PnL
-    // (and MAE/MFE watermarks) from the latest prices and return the positions.
-    let prices = all_market_prices(&state.market);
-    state
-        .internal_book
-        .write()
-        .unwrap()
-        .positions_with_pnl(&prices)
+    drop(db);
+
+    positions
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -3697,14 +3845,25 @@ pub fn delete_drawing(id: String, state: tauri::State<'_, AppState>) -> Result<(
 /// Start replaying `day` (YYYY-MM-DD, ET trading date) from `start_hm`
 /// ("04:00" | "07:00" | "09:30"). Stops the live feeds, switches the app clock
 /// to simulated time and loads the day's data (progress via get_replay_status).
+///
+/// `source` is the day-picker toggle — "api" (ranked walk, the default when the
+/// argument is absent), "flat_trades" or "flat_minutes". An unknown value is an
+/// error rather than a silent fallback to the API: a replay run on a source the
+/// user did not pick is a wrong answer, not a degraded one.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn replay_start(
     day: String,
     start_hm: String,
+    source: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let start_min = parse_hm(&start_hm)?;
+    let choice = match source.as_deref() {
+        None => crate::replay::data::SourceChoice::default(),
+        Some(s) => crate::replay::data::SourceChoice::from_str(s)
+            .ok_or_else(|| format!("source de replay inconnue : {s}"))?,
+    };
     let deps = crate::replay::ReplayDeps {
         app_dir: state.app_dir.clone(),
         market: state.market.clone(),
@@ -3724,9 +3883,11 @@ pub async fn replay_start(
         app,
     };
     let replay = state.replay.clone();
-    tokio::task::spawn_blocking(move || crate::replay::start(replay, deps, day, start_min))
-        .await
-        .map_err(|e| e.to_string())?
+    tokio::task::spawn_blocking(move || {
+        crate::replay::start(replay, deps, day, start_min, choice)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn parse_hm(hm: &str) -> Result<u32, String> {
@@ -3945,7 +4106,9 @@ pub fn get_tickers_table(
 
 /// Re-sync the user's trades from TradeTally (source of truth) into the local
 /// `tt_trades` cache. Called every time the dashboard tab opens, and on demand via
-/// the Refresh button. Returns the number of trades upserted.
+/// the Refresh button. Reconciles both ways: trades removed upstream are pruned
+/// from the cache, not just the present ones refreshed. Returns the number of
+/// trades upserted.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn sync_tradetally_trades(state: tauri::State<'_, AppState>) -> Result<usize, String> {
     // Build the TradeTally client the same way the background worker does.
@@ -3969,14 +4132,21 @@ pub async fn sync_tradetally_trades(state: tauri::State<'_, AppState>) -> Result
     // Network fetch happens with no DB lock held.
     let trades = crate::dashboard::sync_trades(&client).await?;
 
-    let count = {
+    let (count, deleted) = {
         let mut guard = state.db.lock().unwrap();
-        let n = dashboard_repository::upsert_trades_bulk(&mut guard, &trades)
+        let counts = dashboard_repository::sync_trades_bulk(&mut guard, &trades)
             .map_err(|e| e.to_string())?;
         let _ =
             cache_repository::set_app_meta(&guard, "tt_trades_synced_at", &Utc::now().to_rfc3339());
-        n
+        counts
     };
+    // Deletions are the quiet half of a sync — surfaced in the log so a cache that
+    // suddenly shrinks is traceable to the fetch that shrank it.
+    if deleted > 0 {
+        eprintln!(
+            "[tagdash] sync TradeTally : {count} trades à jour, {deleted} lignes obsolètes purgées"
+        );
+    }
     Ok(count)
 }
 

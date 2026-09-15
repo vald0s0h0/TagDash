@@ -2,7 +2,8 @@ import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
 import type {
-  MicroPullbackOptions, MicroQualityLive, MicroQualityRow, PanicLlmScore, StrategyRiskConfig,
+  BacksideOptions, DislocationOptions, MicroAttentionEntry, MicroPullbackOptions,
+  MicroPullbackQualityRow, MicroQualityLive, MicroQualityRow, PanicLlmScore, StrategyRiskConfig,
 } from "@/types";
 
 export function useStrategies() {
@@ -153,7 +154,7 @@ export function usePanicLlmScores() {
   return { ...query, bySymbol };
 }
 
-/** Micro Pullback's A+ board for the current day + mode, keyed by symbol.
+/** Dislocation's verdict board for the current day + mode, keyed by symbol.
  *
  *  Polled at 1 s rather than the panic board's 2 s: this one carries an in-flight
  *  phase, and a spinner that lingers a second after the score has landed is exactly
@@ -164,10 +165,10 @@ export function usePanicLlmScores() {
  *  name that ran in the premarket is a fresh candidate at the open, and those are two
  *  verdicts about two different moves. The overlay wants the CURRENT one, so the
  *  reduce keeps the latest `scored_at` rather than the best score. */
-export function useMicroQualityScores() {
+export function useDislocationScores() {
   const query = useQuery({
-    queryKey: ["micro-quality-scores"],
-    queryFn:  api.getMicroQualityScores,
+    queryKey: ["dislocation-scores"],
+    queryFn:  api.getDislocationScores,
     refetchInterval: 1000,
   });
   const bySymbol = useMemo(() => {
@@ -186,6 +187,36 @@ export function useMicroQualityScores() {
     return map;
   }, [query.data]);
   return { ...query, bySymbol, liveBySymbol };
+}
+
+/** Dislocation's live attention board, keyed by symbol.
+ *
+ *  The two tape thirds of the score — RVOL and attention — are recomputed by the
+ *  engine on every tick, so they are read from here rather than from the persisted
+ *  verdict: the verdict is a snapshot of the instant a model was called, and these
+ *  two numbers have moved since. One entry per symbol, the tempo with the best
+ *  combined tape score, which is the same row the engine ranks on.
+ *
+ *  Polled at 1 s to match: "RVOL et ATTENTION sont des scores qui s'ajustent à la
+ *  seconde, car les données changent très vite". */
+export function useDislocationTape() {
+  const query = useQuery({
+    queryKey: ["dislocation-attention"],
+    queryFn:  api.getDislocationAttention,
+    refetchInterval: 1000,
+  });
+  const bySymbol = useMemo(() => {
+    const map: Record<string, MicroAttentionEntry> = {};
+    for (const e of query.data ?? []) {
+      const seen = map[e.symbol];
+      const better =
+        !seen
+        || e.rvol_third + e.attention_third > seen.rvol_third + seen.attention_third;
+      if (better) map[e.symbol] = e;
+    }
+    return map;
+  }, [query.data]);
+  return { ...query, bySymbol };
 }
 
 /** Launch the analysis over an explicit symbol list (the visible watchlist).
@@ -234,7 +265,43 @@ export function useStopScanner() {
   });
 }
 
-/** Micro Pullback's own options (active tempos + Qualité A+). Strategy-specific,
+/** Micro Pullback's own catalyst reads for the current day + mode, keyed by symbol.
+ *
+ *  Unlike Dislocation's board this one carries no "in-flight" phase — the pass is a
+ *  single fast call, so the button/checkbox that triggered it is the only spinner
+ *  the trader needs. */
+export function useMicroPullbackScores() {
+  const query = useQuery({
+    queryKey: ["micro-pullback-scores"],
+    queryFn:  api.getMicroPullbackScores,
+    refetchInterval: 2000,
+  });
+  const bySymbol = useMemo(() => {
+    const map: Record<string, MicroPullbackQualityRow> = {};
+    for (const r of query.data ?? []) {
+      const seen = map[r.symbol];
+      if (!seen || (r.scored_at ?? "") >= (seen.scored_at ?? "")) map[r.symbol] = r;
+    }
+    return map;
+  }, [query.data]);
+  return { ...query, bySymbol };
+}
+
+/** Manual trigger for Micro Pullback's catalyst read — only meaningful when
+ *  `llm_auto` is off (see `MicroPullbackPanel`); the backend ignores a click while a
+ *  call for the same symbol is already in flight, auto or manual. */
+export function useRunMicroPullbackNewsScore() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (symbol: string) => api.runMicroPullbackNewsScore(symbol),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["micro-pullback-scores"] });
+    },
+  });
+}
+
+/** Micro Pullback's own options (universe, detection thresholds, tape watch,
+ *  active tempos). Strategy-specific,
  *  not a generic per-strategy channel — see `micro_pullback::options` for why. */
 export function useMicroPullbackOptions() {
   return useQuery({
@@ -256,10 +323,49 @@ export function useSetMicroPullbackOptions() {
   });
 }
 
-export function useMicroPullbackAttention() {
+/** The same board, polled slowly for the Settings diagnostics table. */
+export function useDislocationAttention() {
   return useQuery({
-    queryKey: ["micro-pullback-attention"],
-    queryFn: api.getMicroPullbackAttention,
+    queryKey: ["dislocation-attention-slow"],
+    queryFn: api.getDislocationAttention,
     refetchInterval: 5_000,
+  });
+}
+
+/** Dislocation's options. Same contract as Micro Pullback's above, its own blob:
+ *  two engines, two panels, two persisted structs. */
+export function useDislocationOptions() {
+  return useQuery({
+    queryKey: ["dislocation-options"],
+    queryFn: api.getDislocationOptions,
+    staleTime: Infinity,
+  });
+}
+
+export function useSetDislocationOptions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (options: DislocationOptions) => api.setDislocationOptions(options),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dislocation-options"] });
+    },
+  });
+}
+
+export function useBacksideOptions() {
+  return useQuery({
+    queryKey: ["backside-options"],
+    queryFn: api.getBacksideOptions,
+    staleTime: Infinity,
+  });
+}
+
+export function useSetBacksideOptions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (options: BacksideOptions) => api.setBacksideOptions(options),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["backside-options"] });
+    },
   });
 }

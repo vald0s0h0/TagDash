@@ -401,6 +401,19 @@ pub fn count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM company_intel", [], |r| r.get(0))
 }
 
+/// `symbol → institutional_ownership_pct` for every symbol where it's known
+/// (SEC 13D/13G, FMP/Massive fallback). Used by the scanner to gate the
+/// Backside strategy's ownership criterion; a symbol absent from this map is
+/// "unknown", not "0% owned".
+pub fn all_institutional_ownership(conn: &Connection) -> Result<HashMap<String, f64>> {
+    let mut stmt = conn.prepare(
+        "SELECT symbol, institutional_ownership_pct FROM company_intel \
+         WHERE institutional_ownership_pct IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?;
+    rows.collect()
+}
+
 // ─── Tickers data table (wide reporting join) ──────────────────────────────────
 
 /// The full tickers data table: every tradable universe asset LEFT-JOINed with its

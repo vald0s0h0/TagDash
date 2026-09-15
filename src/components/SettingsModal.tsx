@@ -38,6 +38,8 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { BacksidePanel } from "@/components/settings/BacksidePanel";
+import { DislocationPanel } from "@/components/settings/DislocationPanel";
 import { MicroPullbackPanel } from "@/components/settings/MicroPullbackPanel";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
 import { useSecretsStatus, useUpdateSecrets } from "@/queries/useSecretsStatus";
@@ -554,6 +556,37 @@ function OpacityRow({
   );
 }
 
+/** One labelled sensitivity slider (0.2× – 4×), for the chart-navigation group. */
+function SensRow({
+  label,
+  value,
+  onChange,
+}: {
+  label: ReactNode;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-0.5">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <div className="flex items-center gap-2">
+        <input
+          type="range"
+          min={SENS_MIN}
+          max={SENS_MAX}
+          step={0.1}
+          value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value))}
+          className="w-32 accent-blue-500"
+        />
+        <span className="w-9 text-right text-[10px] tabular-nums text-muted-foreground">
+          {value.toFixed(1)}×
+        </span>
+      </div>
+    </div>
+  );
+}
+
 /** A titled group of appearance rows. */
 function ThemeGroup({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -576,14 +609,18 @@ function AppearanceTab() {
   const [copied, setCopied] = useState(false);
 
   // Wheel / trackpad tuning (frontend pref, persisted in chartInputStore).
-  const mouseSensitivity  = useChartInput((s) => s.mouseSensitivity);
-  const zoomSensitivity   = useChartInput((s) => s.zoomSensitivity);
-  const zoomInvert        = useChartInput((s) => s.zoomInvert);
-  const scrollSwapAxes    = useChartInput((s) => s.scrollSwapAxes);
-  const setMouseSensitivity = useChartInput((s) => s.setMouseSensitivity);
-  const setZoomSensitivity  = useChartInput((s) => s.setZoomSensitivity);
-  const setZoomInvert       = useChartInput((s) => s.setZoomInvert);
-  const setScrollSwapAxes   = useChartInput((s) => s.setScrollSwapAxes);
+  const mouseSensitivityX    = useChartInput((s) => s.mouseSensitivityX);
+  const mouseSensitivityY    = useChartInput((s) => s.mouseSensitivityY);
+  const trackpadSensitivityX = useChartInput((s) => s.trackpadSensitivityX);
+  const trackpadSensitivityY = useChartInput((s) => s.trackpadSensitivityY);
+  const zoomInvert           = useChartInput((s) => s.zoomInvert);
+  const scrollSwapAxes       = useChartInput((s) => s.scrollSwapAxes);
+  const setMouseSensitivityX    = useChartInput((s) => s.setMouseSensitivityX);
+  const setMouseSensitivityY    = useChartInput((s) => s.setMouseSensitivityY);
+  const setTrackpadSensitivityX = useChartInput((s) => s.setTrackpadSensitivityX);
+  const setTrackpadSensitivityY = useChartInput((s) => s.setTrackpadSensitivityY);
+  const setZoomInvert           = useChartInput((s) => s.setZoomInvert);
+  const setScrollSwapAxes       = useChartInput((s) => s.setScrollSwapAxes);
 
   // Typed thin wrappers so each row stays a one-liner.
   function color<S extends ChartThemeSection>(section: S, key: keyof ChartTheme[S]) {
@@ -614,44 +651,10 @@ function AppearanceTab() {
       </p>
       <div className="space-y-3">
         <ThemeGroup title="Navigation (molette / trackpad)">
-          <div className="flex items-center justify-between gap-3 py-0.5">
-            <span className="text-xs text-muted-foreground">
-              Molette souris — sensibilité
-            </span>
-            <div className="flex items-center gap-2">
-              <input
-                type="range"
-                min={SENS_MIN}
-                max={SENS_MAX}
-                step={0.1}
-                value={mouseSensitivity}
-                onChange={(e) => setMouseSensitivity(parseFloat(e.target.value))}
-                className="w-32 accent-blue-500"
-              />
-              <span className="w-9 text-right text-[10px] tabular-nums text-muted-foreground">
-                {mouseSensitivity.toFixed(1)}×
-              </span>
-            </div>
-          </div>
-          <div className="flex items-center justify-between gap-3 py-0.5">
-            <span className="text-xs text-muted-foreground">
-              Scroll 2 doigts — sensibilité
-            </span>
-            <div className="flex items-center gap-2">
-              <input
-                type="range"
-                min={SENS_MIN}
-                max={SENS_MAX}
-                step={0.1}
-                value={zoomSensitivity}
-                onChange={(e) => setZoomSensitivity(parseFloat(e.target.value))}
-                className="w-32 accent-blue-500"
-              />
-              <span className="w-9 text-right text-[10px] tabular-nums text-muted-foreground">
-                {zoomSensitivity.toFixed(1)}×
-              </span>
-            </div>
-          </div>
+          <SensRow label="Molette souris — axe X (horizontal)" value={mouseSensitivityX} onChange={setMouseSensitivityX} />
+          <SensRow label="Molette souris — axe Y (vertical)" value={mouseSensitivityY} onChange={setMouseSensitivityY} />
+          <SensRow label="Trackpad 2 doigts — axe X (horizontal)" value={trackpadSensitivityX} onChange={setTrackpadSensitivityX} />
+          <SensRow label="Trackpad 2 doigts — axe Y (vertical)" value={trackpadSensitivityY} onChange={setTrackpadSensitivityY} />
           <div className="flex items-center justify-between gap-3 py-0.5">
             <span className="text-xs text-muted-foreground">
               Scroll 2 doigts — inverser le sens du zoom
@@ -1005,10 +1008,12 @@ export function SettingsModal({ open, onClose }: Props) {
                         disabled={setStrategyRisk.isPending}
                         onCommit={(risk) => setStrategyRisk.mutate({ id: s.id, risk })}
                       />
-                      {/* Strategy-specific options. Only Micro Pullback has any —
-                          deliberately not a generic channel, see
-                          `micro_pullback::options`. */}
+                      {/* Strategy-specific options. Two engines have them, with
+                          completely different sets — deliberately not a generic
+                          channel, see `micro_pullback::options`. */}
                       {s.id === "micro_pullback" && <MicroPullbackPanel />}
+                      {s.id === "dislocation" && <DislocationPanel />}
+                      {s.id === "backside" && <BacksidePanel />}
                     </div>
                   ))}
                 </div>
@@ -1103,8 +1108,11 @@ export function SettingsModal({ open, onClose }: Props) {
                     <div className="min-w-0">
                       <div className="text-sm font-medium">Son de notification</div>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        Joue un son léger et discret à chaque alerte du scanner. Choisis
-                        le moment de la session et le son ci-dessous (▶ pour l'écouter).
+                        Joue un son à chaque alerte du scanner. Choisis le moment de la
+                        session et le son ci-dessous (▶ pour l'écouter). Les sonneries
+                        durent ~9&nbsp;s pour s'entendre depuis une autre pièce&nbsp;; une
+                        sonnerie déjà en cours n'est jamais redoublée par l'alerte
+                        suivante.
                       </p>
                     </div>
                     <AttentionSelect
@@ -1113,35 +1121,52 @@ export function SettingsModal({ open, onClose }: Props) {
                     />
                   </div>
                   <div className="mt-2 space-y-1">
-                    {NOTIF_SOUNDS.map((s) => {
+                    {NOTIF_SOUNDS.map((s, i) => {
                       const selected = draft.ui.alert_sound === s.id;
+                      // The catalog is ordered discreet → insistent; label the point
+                      // where the short cues give way to the ringtones.
+                      const opensRingtones =
+                        s.sustained && !NOTIF_SOUNDS[i - 1]?.sustained;
                       return (
-                        <div
-                          key={s.id}
-                          className={cn(
-                            "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5",
-                            selected ? "border-blue-500/70 bg-blue-900/20" : "border-border/60",
+                        <div key={s.id}>
+                          {opensRingtones && (
+                            <div className="px-0.5 pb-1 pt-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+                              Sonneries longues — hors de la pièce
+                            </div>
                           )}
-                        >
-                          <button
-                            onClick={() => set("ui", "alert_sound", s.id)}
-                            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                          <div
+                            className={cn(
+                              "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5",
+                              selected ? "border-blue-500/70 bg-blue-900/20" : "border-border/60",
+                            )}
                           >
-                            <span
-                              className={cn(
-                                "h-2.5 w-2.5 shrink-0 rounded-full border",
-                                selected ? "border-blue-400 bg-blue-400" : "border-muted-foreground/40",
+                            <button
+                              onClick={() => set("ui", "alert_sound", s.id)}
+                              className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                            >
+                              <span
+                                className={cn(
+                                  "h-2.5 w-2.5 shrink-0 rounded-full border",
+                                  selected ? "border-blue-400 bg-blue-400" : "border-muted-foreground/40",
+                                )}
+                              />
+                              <span className="truncate text-xs">{s.label}</span>
+                              {s.sustained && (
+                                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                                  ~{s.secs}&nbsp;s
+                                </span>
                               )}
-                            />
-                            <span className="truncate text-xs">{s.label}</span>
-                          </button>
-                          <button
-                            onClick={() => playNotifSound(s.id)}
-                            title="Écouter"
-                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
-                          >
-                            <Play className="h-3 w-3" />
-                          </button>
+                            </button>
+                            <button
+                              // `restart` so auditioning one ringtone after another
+                              // cuts the previous instead of being swallowed by it.
+                              onClick={() => playNotifSound(s.id, { restart: true })}
+                              title="Écouter"
+                              className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                            >
+                              <Play className="h-3 w-3" />
+                            </button>
+                          </div>
                         </div>
                       );
                     })}

@@ -29,6 +29,7 @@ import type {
   Position,
   PrevDayLevels,
   PriceAlarm,
+  ReplaySource,
   ReplayStatus,
   MicTestResult,
   ScreenerMatch,
@@ -43,6 +44,8 @@ import type {
   StrategyCard,
   StrategyRiskConfig,
   MicroPullbackOptions,
+  DislocationOptions,
+  BacksideOptions,
   MicroAttentionEntry,
   StreamableSymbol,
   SyncQueueStatus,
@@ -62,6 +65,7 @@ import type {
   PanicRunState,
   PanicLlmScore,
   MicroQualityBoard,
+  MicroPullbackQualityRow,
 } from "@/types";
 
 export const api = {
@@ -214,8 +218,15 @@ export const api = {
     invoke<MicroPullbackOptions>("get_micro_pullback_options"),
   setMicroPullbackOptions: (options: MicroPullbackOptions) =>
     invoke<void>("set_micro_pullback_options", { options }),
-  getMicroPullbackAttention: () =>
-    invoke<MicroAttentionEntry[]>("get_micro_pullback_attention"),
+  getDislocationAttention: () =>
+    invoke<MicroAttentionEntry[]>("get_dislocation_attention"),
+  getDislocationOptions: () =>
+    invoke<DislocationOptions>("get_dislocation_options"),
+  setDislocationOptions: (options: DislocationOptions) =>
+    invoke<void>("set_dislocation_options", { options }),
+  getBacksideOptions: () => invoke<BacksideOptions>("get_backside_options"),
+  setBacksideOptions: (options: BacksideOptions) =>
+    invoke<void>("set_backside_options", { options }),
   startAlertEnrichment: (symbol: string, strategy_id: string) =>
     invoke<void>("start_alert_enrichment", { symbol, strategy_id }),
   runAlertLlm: (symbol: string, strategy_id: string) =>
@@ -254,7 +265,12 @@ export const api = {
   getPanicLlmScores:   () => invoke<PanicLlmScore[]>("get_panic_llm_scores"),
   // Micro Pullback A+: the day's verdicts AND what is still in flight, in one call —
   // polled separately the two would disagree for a tick and the pane would flicker.
-  getMicroQualityScores: () => invoke<MicroQualityBoard>("get_micro_quality_scores"),
+  getDislocationScores: () => invoke<MicroQualityBoard>("get_dislocation_scores"),
+  // Micro Pullback's own (lighter, News-only) catalyst reads for the day.
+  getMicroPullbackScores: () =>
+    invoke<MicroPullbackQualityRow[]>("get_micro_pullback_scores"),
+  runMicroPullbackNewsScore: (symbol: string) =>
+    invoke<void>("run_micro_pullback_news_score", { symbol }),
   hasWebSearchProvider: () => invoke<boolean>("has_web_search_provider"),
 
   // Chart / zone trade context
@@ -308,8 +324,8 @@ export const api = {
     invoke<void>("update_alarm_price", { id, price }),
 
   // Market Replay
-  replayStart: (day: string, start_hm: string) =>
-    invoke<void>("replay_start", { day, start_hm }),
+  replayStart: (day: string, start_hm: string, source: ReplaySource = "api") =>
+    invoke<void>("replay_start", { day, start_hm, source }),
   replayStop:       () => invoke<void>("replay_stop"),
   replaySetPlaying: (playing: boolean) =>
     invoke<void>("replay_set_playing", { playing }),

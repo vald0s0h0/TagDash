@@ -383,6 +383,8 @@ impl InternalBook {
                     low_water: fill_price,
                     auto_be_applied: false,
                     auto_tp_applied: false,
+                    filled_entries: 0,
+                    pending_entries: 0,
                 },
             );
         }
@@ -821,6 +823,25 @@ impl InternalBook {
                     }
                 });
             }
+            // Entry legs filled vs. still resting for this trade — lets the
+            // sidebar show "2/3" while a scaled entry is partially working.
+            // Entries land on the position's own side; exits/brackets are the
+            // opposite side by construction (see `sync_bracket_orders`), so this
+            // never double-counts an SL/TP fill as another entry.
+            pos.filled_entries = self
+                .fills
+                .iter()
+                .filter(|f| f.trade_id == pos.trade_id && f.side == pos.side)
+                .count() as i64;
+            pos.pending_entries = self
+                .orders
+                .values()
+                .filter(|o| {
+                    o.trade_id.as_deref() == Some(pos.trade_id.as_str())
+                        && o.status == OrderStatus::Pending
+                        && !o.reduce_only
+                })
+                .count() as i64;
         }
         self.positions.values().cloned().collect()
     }

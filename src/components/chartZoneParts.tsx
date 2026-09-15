@@ -9,7 +9,7 @@ import type { RefObject } from "react";
 import { Ban, ChevronRight, LoaderCircle } from "lucide-react";
 import type {
   AlertEnrichment, CardInfo, CardNews, HodDriveOverlay, InfoField, StrategyCard,
-  MicroQualityLive, MicroQualityRow,
+  MicroAttentionEntry, MicroQualityLive, MicroQualityRow, MicroPullbackQualityRow,
   PanicDataQuality, PanicLlmScore, TickerLiveState, Timeframe, ZoneAssignment,
 } from "@/types";
 import { api } from "@/lib/tauri";
@@ -95,6 +95,11 @@ export function resolveFieldValue(
       return enr?.industry ?? extras?.industry ?? null;
     case "country":
       return enr?.country ?? extras?.country ?? null;
+    case "rotation": {
+      const float = extras?.float_shares ?? enr?.float_shares ?? null;
+      if (!live?.volume_day || !float) return null;
+      return `${(live.volume_day / float).toFixed(2)}×`;
+    }
   }
   if (!live) return null;
   switch (key) {
@@ -141,7 +146,7 @@ const STRATEGY_BADGE: Record<string, string> = {
   panic_mean_reversion: "bg-red-900/60 text-red-300",
   perfect_pullback:     "bg-emerald-900/60 text-emerald-300",
   hod_drive:            "bg-teal-900/60 text-teal-300",
-  backside_parabolic:   "bg-sky-900/60 text-sky-300",
+  backside:             "bg-sky-900/60 text-sky-300",
   premarket_gapper:     "bg-violet-900/60 text-violet-300",
   premarket_frd_runner: "bg-violet-900/60 text-violet-300",
   low_float_runner:     "bg-fuchsia-900/60 text-fuchsia-300",
@@ -749,13 +754,51 @@ function jsonList(raw: string | null): string[] {
 /** What the pipeline is doing, in the trader's words. */
 const PHASE_LABEL: Record<string, string> = {
   queued:    "en file",
-  triage:    "lecture de la news…",
+  news:      "lecture de la news…",
   deep:      "analyse approfondie…",
   rescoring: "re-scoring sur news…",
 };
 
+/** One third of the score: a label, a 0..100 number and a bar the eye can compare
+ *  without reading. `null` is "not measured", drawn as an empty track rather than
+ *  as a zero — the two are opposite statements. */
+function ScoreThird({ label, value, pending }: {
+  label:    string;
+  value:    number | null;
+  pending?: boolean;
+}) {
+  const pct = value == null ? 0 : Math.max(0, Math.min(100, value));
+  return (
+    <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+      <span className="flex items-baseline justify-between gap-1">
+        <span className="text-[8px] uppercase leading-none tracking-wide text-muted-foreground/60">
+          {label}
+        </span>
+        {pending ? (
+          <LoaderCircle className="h-2.5 w-2.5 animate-spin text-sky-400" />
+        ) : (
+          <span
+            className={cn(
+              "text-[11px] font-semibold leading-none tabular-nums",
+              value == null ? "text-muted-foreground/30" : "text-foreground/90",
+            )}
+          >
+            {value == null ? "—" : value.toFixed(0)}
+          </span>
+        )}
+      </span>
+      <span className="h-[3px] w-full overflow-hidden rounded-full bg-white/10">
+        <span
+          className="block h-full rounded-full bg-foreground/60"
+          style={{ width: `${pct}%` }}
+        />
+      </span>
+    </span>
+  );
+}
+
 /** News verdict → colour. `aucune` is deliberately NOT red: it is a fact about the
- *  setup, not a fault. It does cap the Score Breaking at 10, so it will already be
+ *  setup, not a fault. It does cap the model's note at 10, so it will already be
  *  visible in the number. */
 const NEWS_VERDICT_CLS: Record<string, string> = {
   solide: "text-emerald-300",
@@ -779,22 +822,170 @@ function microTone(score: number, threshold: number): { ring: string; text: stri
   return { ring: "ring-slate-500/40", text: "text-slate-300" };
 }
 
-/** The Micro Pullback A+ report, drawn top-left of the right (sub-minute) pane.
+function microPullbackTone(score: number): { ring: string; text: string } {
+  if (score >= 70) return { ring: "ring-emerald-500/60", text: "text-emerald-200" };
+  if (score >= 50) return { ring: "ring-amber-500/50", text: "text-amber-200" };
+  return { ring: "ring-slate-500/40", text: "text-slate-300" };
+}
+
+/** Micro Pullback's catalyst read — deliberately lighter than {@link
+ *  DislocationOverlay}: Micro Pullback has no RVOL/attention thirds and no pass/fail
+ *  threshold, so `quality.score` IS the model's own note, shown as-is rather than
+ *  blended or measured against a bar. No pipeline phase either — the News pass is a
+ *  single ~2-4 s call, so a spinner on the button itself is enough.
+ *
+ *  With `llm_auto` off and no score yet, this is the ONLY way to trigger the read —
+ *  see `MicroPullbackPanel`'s "Scoring IA" section for the checkbox. */
+export function MicroPullbackQualityOverlay({
+  quality,
+  autoEnabled,
+  pending,
+  onScore,
+}: {
+  quality: MicroPullbackQualityRow | null;
+  autoEnabled: boolean;
+  pending: boolean;
+  onScore: () => void;
+}) {
+  // Auto mode: nothing to show until the engine has scored it — no separate
+  // "in flight" phase to poll for a call this short, and no manual button either
+  // (that is exactly the double-trigger this split is meant to avoid).
+  if (quality == null && autoEnabled && !pending) {
+    return null;
+  }
+  const score = quality?.score ?? null;
+  const tone = score != null ? microPullbackTone(score) : null;
+  const flags = jsonList(quality?.red_flags ?? null).slice(0, 4);
+
+  return (
+    <div
+      data-capture-overlay
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[280px] max-w-[68%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
+    >
+      <div className="flex items-center gap-2">
+        {score != null ? (
+          <span
+            className={cn(
+              "rounded px-2 py-0.5 text-[22px] font-bold leading-none tabular-nums ring-1",
+              tone?.ring ?? "ring-slate-500/40",
+              tone?.text ?? "text-slate-300",
+            )}
+          >
+            {score.toFixed(0)}
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={onScore}
+            disabled={pending || autoEnabled}
+            className="pointer-events-auto flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-semibold text-sky-300 ring-1 ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-60"
+          >
+            {pending && <LoaderCircle className="h-3.5 w-3.5 animate-spin" />}
+            {pending ? "analyse…" : "Analyser (IA)"}
+          </button>
+        )}
+        {quality?.verdict && (
+          <span className="text-[11px] font-medium leading-tight text-foreground/80">
+            {quality.verdict}
+            {quality.freshness ? ` · ${quality.freshness}` : ""}
+          </span>
+        )}
+      </div>
+      {quality?.one_liner && (
+        <p className="text-[11px] leading-snug text-foreground/90">{quality.one_liner}</p>
+      )}
+      {flags.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {flags.map((f) => (
+            <span
+              key={f}
+              className="rounded bg-rose-500/15 px-1 py-0.5 text-[9px] leading-none text-rose-300"
+            >
+              {f}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The Backside info band — deliberately minimal ("afficher que l'essentiel"):
+ *  the freshest headline when one is under 2 days old, and a button that
+ *  triggers the SAME LLM call/prompt/scoring as Panic's per-ticker read
+ *  (`enrichment::run_panic_llm`, generalized to take a `strategy_id` —  no new
+ *  prompt was written for this strategy). Rotation and Change% are NOT
+ *  duplicated here: they're already covered by the generic `info_fields`
+ *  mechanism (see `resolveFieldValue`'s `"rotation"`/`"change_day_pct"` cases). */
+export function BacksideOverlay({
+  news,
+  enrichment,
+  pending,
+  onAnalyze,
+}: {
+  news: CardNews[];
+  enrichment: AlertEnrichment | null;
+  pending: boolean;
+  onAnalyze: () => void;
+}) {
+  const nowMs = useMarketNowMs();
+  const newest = news.length > 0 ? news[0] : null;
+  const headlineFresh = newest != null
+    && Number.isFinite(Date.parse(newest.created_at))
+    && nowMs - Date.parse(newest.created_at) < 2 * 86_400_000;
+
+  const hasResult = Boolean(enrichment?.llm_context || enrichment?.llm_reversion);
+
+  return (
+    <div
+      data-capture-overlay
+      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[260px] max-w-[68%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
+    >
+      {headlineFresh && newest && <NewsRow item={newest} nowMs={nowMs} />}
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onAnalyze}
+          disabled={pending}
+          className="pointer-events-auto flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-semibold text-sky-300 ring-1 ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-60"
+        >
+          {pending && <LoaderCircle className="h-3.5 w-3.5 animate-spin" />}
+          {pending ? "analyse…" : "Analyser news"}
+        </button>
+      </div>
+      {hasResult && (
+        <div className="flex flex-col gap-0.5">
+          {enrichment?.llm_context && (
+            <p className="text-[11px] leading-snug text-foreground/90">{enrichment.llm_context}</p>
+          )}
+          {enrichment?.llm_reversion && (
+            <p className="text-[10px] leading-snug text-muted-foreground/80">{enrichment.llm_reversion}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The Dislocation report, drawn top-left of the right (sub-minute) pane.
  *
  *  Same information hierarchy as `PanicReportOverlay`, deliberately — the two
  *  strategies put a model verdict on a chart pane and the trader reads both the same
  *  way, in the seconds before deciding:
- *    1. the final score, biggest thing on the pane, against the trader's own bar;
+ *    1. the total, biggest thing on the pane, against the trader's own bar, with the
+ *       three thirds that make it directly under;
  *    2. the one-sentence explanation — the only prose worth reading in ten seconds;
- *    3. the news state, which for THIS strategy is the subject of the score;
- *    4. the qualifiers — Score Breaking, setup points, confidence;
+ *    3. the news state, which for THIS strategy is one third of the score;
+ *    4. the qualifiers — confidence, sustain;
  *    5. everything else behind a "plus" toggle, including the audit line.
  *
- *  WHAT THE NUMBERS MEAN. The model grades the CATALYST alone and returns the Score
- *  Breaking (0–100). The deterministic setup points — hot industry, risk domicile,
- *  exceptional RVOL, detached attention, tempo depth — are added outside it. Showing
- *  both, and their difference, is the only way a trader can tell "the news is strong"
- *  from "the news is thin but the setup carried it".
+ *  WHAT THE NUMBERS MEAN. The score is the mean of three thirds and nothing else:
+ *  RVOL (the ticker against its own past), attention (the ticker against the market
+ *  right now) and news (the model's note on the headline, decayed by its age). The
+ *  first two are recomputed every second and are read from the live attention board;
+ *  the third is frozen the moment the model answers. Showing all three is the only
+ *  way a trader can tell "the tape is violent but there is no catalyst" from "the
+ *  catalyst is real but nobody is trading it".
  *
  *  NEWS IS NEVER LEFT AMBIGUOUS, because "no headline" and "a headline we have not
  *  read yet" call for opposite decisions and used to look identical (an empty list):
@@ -813,18 +1004,22 @@ function microTone(score: number, threshold: number): { ring: string; text: stri
  *
  *  With Qualité A+ off, no judgement exists and none is invented: the pane falls back
  *  to the structural facts plus the headlines. */
-export function MicroInfoOverlay({
+export function DislocationOverlay({
   cardInfo,
   enrichment,
   news,
   quality,
   live,
+  attention,
 }: {
   cardInfo: CardInfo | null;
   enrichment: AlertEnrichment | null;
   news: CardNews[];
   quality: MicroQualityRow | null;
   live: MicroQualityLive | null;
+  /** The live tape row for this symbol. The two tape thirds move every second, so
+   *  they are read from here; the persisted verdict is only the fallback. */
+  attention: MicroAttentionEntry | null;
 }) {
   const [expanded, setExpanded] = useState(false);
   const nowMs = useMarketNowMs();
@@ -851,21 +1046,30 @@ export function MicroInfoOverlay({
       : null;
   const unread = unreadFromPipeline ?? unreadFromClock;
 
-  const score     = quality?.final_score ?? null;
   const threshold = quality?.threshold ?? null;
   const passed    = quality?.passed ?? false;
   const flags     = jsonList(quality?.red_flags ?? null).slice(0, 4);
   const drivers   = jsonList(quality?.key_drivers ?? null);
 
-  // The model's own number, and what the deterministic terms did to it. Derived
-  // rather than stored: the difference IS the adjustment total, and `adjustments`
-  // already carries the term-by-term audit line for the expanded view.
-  const breaking =
+  // ── The three thirds ──────────────────────────────────────────────────────
+  // RVOL and attention are recomputed on every tick, so the live board wins over
+  // the verdict's frozen copy. The news third is the opposite: once the model has
+  // spoken it does not move, and it is the only one that costs money.
+  const rvolThird = attention?.rvol_third ?? quality?.rvol_score ?? null;
+  const attThird  = attention?.attention_third ?? quality?.attention_score ?? null;
+  const newsThird = quality?.news_score ?? null;
+  const hasTape   = rvolThird != null || attThird != null;
+  const score =
+    hasTape || newsThird != null
+      ? ((rvolThird ?? 0) + (attThird ?? 0) + (newsThird ?? 0)) / 3
+      : null;
+  // The model's own note on the headline, before the freshness decay. Worth showing
+  // separately: "excellent news, already 15 minutes old" and "mediocre news, fresh"
+  // can land on the same third and are not the same candidate.
+  const modelNews =
     quality == null ? null : quality.model === "deep" ? quality.pass2_score : quality.pass1_score;
-  const setupDelta =
-    breaking != null && score != null ? Math.round(score - breaking) : null;
 
-  const hasAplus = quality != null || busy;
+  const hasAplus = quality != null || busy || hasTape;
   if (!hasAplus && float == null && liveVol == null && news.length === 0 && !country && !industry) {
     return null;
   }
@@ -889,46 +1093,56 @@ export function MicroInfoOverlay({
       data-capture-overlay
       className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[300px] max-w-[68%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
     >
-      {/* ── 1. The verdict ─────────────────────────────────────────────────── */}
+      {/* ── 1. The score: three thirds, and their mean in large type ───────── */}
       {hasAplus && (
-        <div className="flex items-baseline gap-2">
-          {score != null ? (
-            <span
-              className={cn(
-                "rounded px-2 py-0.5 text-[26px] font-bold leading-none tabular-nums ring-1",
-                tone?.ring ?? "ring-slate-500/40",
-                tone?.text ?? "text-slate-300",
-              )}
-            >
-              {score.toFixed(0)}
-            </span>
-          ) : (
-            <span className="flex items-center gap-1.5 rounded px-2 py-1 text-slate-300 ring-1 ring-slate-500/40">
-              <LoaderCircle className="h-4 w-4 animate-spin" />
-              <span className="text-[11px] font-semibold">A+</span>
-            </span>
-          )}
-          <span className="flex min-w-0 flex-col gap-0.5">
-            <span
-              className={cn(
-                "text-[11px] font-medium leading-tight",
-                score == null ? "text-sky-300" : (tone?.text ?? "text-slate-300"),
-              )}
-            >
-              {score == null
-                ? (PHASE_LABEL[phase ?? ""] ?? "analyse en cours…")
-                : passed
-                ? `retenu · seuil ${threshold != null ? threshold.toFixed(0) : "—"}`
-                : (quality?.rejection ?? "sous le seuil")}
-            </span>
-            {score != null && busy && (
-              <span className="flex items-center gap-1 text-[9px] leading-none text-sky-400">
-                <LoaderCircle className="h-2.5 w-2.5 animate-spin" />
-                {PHASE_LABEL[phase ?? ""] ?? "re-scoring…"}
+        <>
+          <div className="flex items-baseline gap-2">
+            {score != null ? (
+              <span
+                className={cn(
+                  "rounded px-2 py-0.5 text-[26px] font-bold leading-none tabular-nums ring-1",
+                  tone?.ring ?? "ring-slate-500/40",
+                  tone?.text ?? "text-slate-300",
+                )}
+              >
+                {score.toFixed(0)}
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 rounded px-2 py-1 text-slate-300 ring-1 ring-slate-500/40">
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+                <span className="text-[11px] font-semibold">score</span>
               </span>
             )}
-          </span>
-        </div>
+            <span className="flex min-w-0 flex-col gap-0.5">
+              <span
+                className={cn(
+                  "text-[11px] font-medium leading-tight",
+                  quality == null ? "text-sky-300" : (tone?.text ?? "text-slate-300"),
+                )}
+              >
+                {quality == null
+                  ? (PHASE_LABEL[phase ?? ""] ?? "tape mesurée · news en attente")
+                  : passed
+                  ? `retenu · seuil ${threshold != null ? threshold.toFixed(0) : "—"}`
+                  : (quality.rejection ?? "sous le seuil")}
+              </span>
+              {quality != null && busy && (
+                <span className="flex items-center gap-1 text-[9px] leading-none text-sky-400">
+                  <LoaderCircle className="h-2.5 w-2.5 animate-spin" />
+                  {PHASE_LABEL[phase ?? ""] ?? "re-scoring…"}
+                </span>
+              )}
+            </span>
+          </div>
+
+          {/* The three that make it. Reading them takes no longer than reading the
+              total, and it is the only way to see WHICH third is missing. */}
+          <div className="flex items-end gap-2">
+            <ScoreThird label="RVOL" value={rvolThird} />
+            <ScoreThird label="Attention" value={attThird} />
+            <ScoreThird label="News" value={newsThird} pending={newsThird == null && busy} />
+          </div>
+        </>
       )}
 
       {/* ── 2. Why ─────────────────────────────────────────────────────────── */}
@@ -981,28 +1195,6 @@ export function MicroInfoOverlay({
       {/* ── 4. The qualifiers ──────────────────────────────────────────────── */}
       {quality != null && (
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] tabular-nums">
-          <ReportStat label="Breaking" value={breaking} suffix="/100" />
-          {/* Signed on purpose: "+25" and "−25" are opposite readings of the same
-              candidate, and an unsigned number hides which one happened. */}
-          <span className="flex items-center gap-1">
-            <span className="text-[8px] uppercase tracking-wide text-muted-foreground/50">
-              Setup
-            </span>
-            {setupDelta != null ? (
-              <span
-                className={cn(
-                  setupDelta > 0 ? "text-emerald-300"
-                  : setupDelta < 0 ? "text-rose-300"
-                  : "text-foreground/85",
-                )}
-              >
-                {setupDelta > 0 ? "+" : ""}
-                {setupDelta}
-              </span>
-            ) : (
-              <span className="text-muted-foreground/30">—</span>
-            )}
-          </span>
           <ReportStat label="Confiance" value={quality.confidence} suffix="/100" />
           <ReportStat label="Tenue" value={quality.sustain_prob} suffix="%" />
         </div>
@@ -1022,6 +1214,16 @@ export function MicroInfoOverlay({
 
       {expanded && (
         <div className="flex flex-col gap-1 border-t border-white/10 pt-1">
+          {modelNews != null && (
+            <span className="text-[10px] text-foreground/70">
+              Note du modèle sur la news : {modelNews.toFixed(0)}/100
+              {newsThird != null && newsThird < modelNews - 0.5 && (
+                <span className="text-muted-foreground/60">
+                  {" "}· décotée à {newsThird.toFixed(0)} par l'âge du titre
+                </span>
+              )}
+            </span>
+          )}
           {quality?.catalyst_label && (
             <span className="text-[10px] text-foreground/70">{quality.catalyst_label}</span>
           )}
@@ -1090,13 +1292,12 @@ export function MicroInfoOverlay({
             </div>
           )}
 
-          {/* The audit line: every deterministic term that moved the number, plus
-              which pass spoke and under which rubric. A score adjusted by +25 must
-              never be silently different from what the model said. */}
+          {/* The audit line: the three thirds as they stood at the verdict, plus
+              which pass spoke and under which rubric. */}
           {quality && (
             <span className="text-[8px] leading-tight text-muted-foreground/50">
               {[
-                quality.model === "deep" ? "double passe" : "triage seul",
+                quality.model === "deep" ? "double passe" : "passe news",
                 quality.adjustments,
                 quality.rubric_version,
                 quality.simulated ? "replay" : null,

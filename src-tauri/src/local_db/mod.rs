@@ -15,6 +15,7 @@ pub mod execution_repository;
 pub mod journal_repository;
 pub mod llm_repository;
 pub mod micro_attention_repository;
+pub mod micro_pullback_quality_repository;
 pub mod panic_llm_repository;
 pub mod quality_repository;
 pub mod schema;

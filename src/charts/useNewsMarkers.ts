@@ -4,6 +4,7 @@ import type { Bar, Timeframe } from "@/types";
 import { api } from "@/lib/tauri";
 import type { NewsPrimitive, NewsMark } from "@/charts/newsPrimitive";
 import { toUTC } from "@/charts/chartOptions";
+import { useDislocationScores } from "@/queries/useScanner";
 
 /** Index of the largest bar time (sec) ≤ `t` — the bar that was forming when the
  *  news hit. Returns -1 when `t` predates every loaded bar (off the back-filled
@@ -24,7 +25,14 @@ function barIndexAtOrBefore(barTimes: number[], t: number): number {
  *  (timeframe-agnostic, deduped by react-query across panes). Daily panes get one
  *  dot per day; intraday panes place the single per-bar dot at the PRECISE publish
  *  moment (interpolated between the bar and the next). One pastille marks one OR
- *  more headlines in a bar — they are never stacked. */
+ *  more headlines in a bar — they are never stacked.
+ *
+ *  THE NUMBER UNDER THE DOT is Dislocation's news third — what the LLM NEWS
+ *  SCORING pass made of that headline, decayed by its age. It is attached to the
+ *  LAST pastille at or before the verdict's market time, because that is the
+ *  headline the model was actually shown. It comes from `micro_quality_scores`, so
+ *  it survives a restart and a re-entry into the same replay; a headline no model
+ *  has judged keeps a bare dot, which is not the same thing as a score of zero. */
 export function useNewsMarkers(
   newsPrimRef: MutableRefObject<NewsPrimitive | null>,
   symbol: string,
@@ -37,6 +45,11 @@ export function useNewsMarkers(
     enabled:  !!symbol,
     staleTime: 5 * 60 * 1000,
   });
+  // Deduped by react-query with the pane overlay's own use of the same key.
+  const { bySymbol: quality } = useDislocationScores();
+  const verdict  = symbol ? quality[symbol] ?? null : null;
+  const newsScore = verdict?.news_score ?? null;
+  const scoredAt  = verdict?.scored_at ? Date.parse(verdict.scored_at) / 1000 : null;
 
   useEffect(() => {
     const prim = newsPrimRef.current;
@@ -61,6 +74,23 @@ export function useNewsMarkers(
       if (!existing || frac < existing.frac) byBar.set(t0, { t0, t1, frac });
     }
 
-    prim.setData([...byBar.values()].sort((a, b) => a.t0 - b.t0 || a.frac - b.frac));
-  }, [news, bars, timeframe]); // eslint-disable-line react-hooks/exhaustive-deps
+    const marks = [...byBar.values()].sort((a, b) => a.t0 - b.t0 || a.frac - b.frac);
+
+    // The score belongs to the headline the model read: the newest one published at
+    // or before the verdict. Attaching it to every dot would claim the model judged
+    // headlines it never saw.
+    if (newsScore != null && scoredAt != null) {
+      let target = -1;
+      for (const n of news) {
+        if (n.time > scoredAt) continue;
+        const i = barIndexAtOrBefore(barTimes, n.time);
+        if (i < 0) continue;
+        const at = marks.findIndex((m) => m.t0 === barTimes[i]);
+        if (at >= 0 && at > target) target = at;
+      }
+      if (target >= 0) marks[target] = { ...marks[target], score: newsScore };
+    }
+
+    prim.setData(marks);
+  }, [news, bars, timeframe, newsScore, scoredAt]); // eslint-disable-line react-hooks/exhaustive-deps
 }

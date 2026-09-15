@@ -249,7 +249,7 @@ pub struct QualityPayload {
     pub float_and_short: FloatAndShort,
     pub news: Vec<NewsItem>,
     pub risk: Risk,
-    /// Deep pass only; always present, empty on the triage pass.
+    /// Deep pass only.
     pub sec_filings: Vec<Filing>,
     pub financials: Financials,
     pub splits: Splits,
@@ -263,36 +263,40 @@ impl QualityPayload {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// The triage pass is the one the trader waits on, so it carries only what can be
-    /// read in a couple of seconds: the filing list and the deep-only financial detail
-    /// are dropped. The KEY SET is unchanged — `sec_filings` becomes an empty array
-    /// and the deep-only financial fields become explicit nulls listed in `missing`,
-    /// exactly as they would be for a ticker the SEC has nothing on.
-    pub fn for_triage(&self) -> Self {
-        let mut p = self.clone();
-        p.sec_filings = Vec::new();
-        p.financials = Financials {
-            net_income_last_q: None,
-            net_income_ttm: None,
-            negative_quarters_last4: None,
-            operating_cash_flow_ttm: None,
-            cash_and_equivalents: None,
-            period_end: None,
-            cash_runway_quarters: None,
-        };
-        p.data_quality
-            .sources
-            .insert("sec_filings".into(), Source::Missing);
-        p.data_quality
-            .sources
-            .insert("financials".into(), Source::Missing);
-        for key in ["sec_filings", "financials"] {
-            if !p.data_quality.missing.iter().any(|m| m == key) {
-                p.data_quality.missing.push(key.to_string());
-            }
+    /// What the NEWS SCORING pass is sent: the headlines, and the few facts needed to
+    /// read them (which ticker, what time it is, which session, live or replay).
+    ///
+    /// DELIBERATELY A DIFFERENT SHAPE, not the full payload with holes in it. That
+    /// pass grades the news and only the news; every extra field was an invitation to
+    /// grade something else, and that is precisely how a departure with no catalyst
+    /// used to outscore a real one.
+    pub fn for_news(&self) -> NewsPayload {
+        NewsPayload {
+            symbol: self.identity.symbol.clone(),
+            mode: self.context.mode.clone(),
+            as_of: self.context.as_of.clone(),
+            session: self.context.session.clone(),
+            minutes_to_open: self.context.minutes_to_open,
+            news: self.news.clone(),
         }
-        p.data_quality.missing.sort();
-        p
+    }
+}
+
+/// The whole input of the NEWS SCORING pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct NewsPayload {
+    pub symbol: String,
+    /// `live` or `replay`.
+    pub mode: String,
+    pub as_of: String,
+    pub session: String,
+    pub minutes_to_open: i64,
+    pub news: Vec<NewsItem>,
+}
+
+impl NewsPayload {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
 }
 
@@ -568,25 +572,35 @@ mod tests {
         }
     }
 
-    /// The triage pass drops content, never structure — otherwise the two passes
-    /// would be reading two different documents.
+    /// The news pass grades the news. Anything else in front of it is something else
+    /// to grade — this test is what keeps the payload from growing back.
     #[test]
-    fn triage_narrows_the_content_but_keeps_the_shape() {
+    fn the_news_pass_is_sent_the_news_and_nothing_else() {
         let deep = full();
-        let triage = deep.for_triage();
-        assert_eq!(shape(&deep), shape(&triage));
-        assert!(triage.sec_filings.is_empty());
-        assert!(triage.financials.cash_runway_quarters.is_none());
-        // …and says so, rather than letting the model read the absence as a fact.
-        assert_eq!(
-            triage.data_quality.sources.get("financials"),
-            Some(&Source::Missing)
-        );
-        assert!(triage
-            .data_quality
-            .missing
+        let json = deep.for_news().to_json();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut keys = Vec::new();
+        key_paths(&value, "", &mut keys);
+        let mut top: Vec<&str> = keys
             .iter()
-            .any(|m| m == "sec_filings"));
+            .filter(|k| !k.contains('.'))
+            .map(|k| k.as_str())
+            .collect();
+        top.sort_unstable();
+        assert_eq!(
+            top,
+            vec!["as_of", "minutes_to_open", "mode", "news", "session", "symbol"],
+        );
+        for absent in [
+            "float", "short", "vwap", "rvol", "sec_filings", "financials", "dilution", "sector",
+            "country", "tempo",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "the news payload must not carry {absent}:\n{json}"
+            );
+        }
+        assert_eq!(deep.for_news().news.len(), deep.news.len());
     }
 
     /// The prefix has to be stable to be cacheable, so map iteration order can't be

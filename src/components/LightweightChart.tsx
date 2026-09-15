@@ -331,18 +331,24 @@ export function LightweightChart({
 
   // Wheel / trackpad tuning (Settings → Apparence). Mirrored into refs so the
   // once-bound `onWheel` handler reads live values without re-binding.
-  const mouseSensitivity = useChartInput((s) => s.mouseSensitivity);
-  const zoomSensitivity  = useChartInput((s) => s.zoomSensitivity);
-  const zoomInvert       = useChartInput((s) => s.zoomInvert);
-  const scrollSwapAxes   = useChartInput((s) => s.scrollSwapAxes);
-  const mouseSensRef     = useRef(mouseSensitivity);
-  const zoomSensRef      = useRef(zoomSensitivity);
+  const mouseSensitivityX    = useChartInput((s) => s.mouseSensitivityX);
+  const mouseSensitivityY    = useChartInput((s) => s.mouseSensitivityY);
+  const trackpadSensitivityX = useChartInput((s) => s.trackpadSensitivityX);
+  const trackpadSensitivityY = useChartInput((s) => s.trackpadSensitivityY);
+  const zoomInvert           = useChartInput((s) => s.zoomInvert);
+  const scrollSwapAxes       = useChartInput((s) => s.scrollSwapAxes);
+  const mouseSensXRef    = useRef(mouseSensitivityX);
+  const mouseSensYRef    = useRef(mouseSensitivityY);
+  const trackpadSensXRef = useRef(trackpadSensitivityX);
+  const trackpadSensYRef = useRef(trackpadSensitivityY);
   const zoomInvertRef    = useRef(zoomInvert);
   const scrollSwapRef    = useRef(scrollSwapAxes);
-  useEffect(() => { mouseSensRef.current  = mouseSensitivity; }, [mouseSensitivity]);
-  useEffect(() => { zoomSensRef.current   = zoomSensitivity; },  [zoomSensitivity]);
-  useEffect(() => { zoomInvertRef.current = zoomInvert; },       [zoomInvert]);
-  useEffect(() => { scrollSwapRef.current = scrollSwapAxes; },   [scrollSwapAxes]);
+  useEffect(() => { mouseSensXRef.current    = mouseSensitivityX; },    [mouseSensitivityX]);
+  useEffect(() => { mouseSensYRef.current    = mouseSensitivityY; },    [mouseSensitivityY]);
+  useEffect(() => { trackpadSensXRef.current = trackpadSensitivityX; }, [trackpadSensitivityX]);
+  useEffect(() => { trackpadSensYRef.current = trackpadSensitivityY; }, [trackpadSensitivityY]);
+  useEffect(() => { zoomInvertRef.current    = zoomInvert; },           [zoomInvert]);
+  useEffect(() => { scrollSwapRef.current    = scrollSwapAxes; },       [scrollSwapAxes]);
 
   // ── Bar-loading pipeline (history refresh + RAM poll + lazy back-fill) — hook ─
   const { bars, loadOlderBars } = useChartBars(
@@ -432,17 +438,32 @@ export function LightweightChart({
     if (!logical) return;
     const n = barsRef.current?.length ?? 0;
     const lastIdx = n - 1;
+    const width = container.clientWidth;
     if (n === 0 || logical.to >= lastIdx) {
-      const opts = ts.options();
-      const pxOffset = opts.rightOffset * opts.barSpacing;
-      const next = Math.max(opts.minBarSpacing, Math.min(opts.barSpacing * factor, 80));
-      ts.applyOptions({ barSpacing: next, rightOffset: pxOffset / next });
+      // Keep the pixel gap past the last bar fixed while zooming, so the
+      // current bar's on-screen position doesn't drift. Derived entirely from
+      // the live visible logical range + measured container width, NOT from
+      // the timeScale's barSpacing/rightOffset options — those can lag behind
+      // a burst of wheel events (worse on HiDPI screens, where each redraw
+      // costs ~4x more to rasterize), and reading them back mid-burst made
+      // the "preserved" pixel gap balloon every tick instead of staying put.
+      const barsVisible = logical.to - logical.from;
+      if (barsVisible <= 0) return;
+      const spacing = width / barsVisible;
+      const gapBars = logical.to - lastIdx;
+      const pxOffset = gapBars * spacing;
+      const minSpacing = ts.options().minBarSpacing;
+      const nextSpacing = Math.max(minSpacing, Math.min(spacing * factor, 80));
+      const newBarsVisible = width / nextSpacing;
+      if (factor > 1 && newBarsVisible < width / 80) return;
+      const to = lastIdx + pxOffset / nextSpacing;
+      ts.setVisibleLogicalRange({ from: to - newBarsVisible, to });
       return;
     }
     const inv  = 1 / factor;
     const to   = logical.to;
     const from = to - (to - logical.from) * inv;
-    if (factor > 1 && to - from < container.clientWidth / 80) return;
+    if (factor > 1 && to - from < width / 80) return;
     ts.setVisibleLogicalRange({ from, to });
   }, []);
 
@@ -685,23 +706,26 @@ export function LightweightChart({
       // swapAxes: flip that mapping (vertical → price, horizontal → time).
       const hDominant = absX > absY;
       const zoomPrice = scrollSwapRef.current ? !hDominant : hDominant;
+      const delta = hDominant ? e.deltaX : e.deltaY;
+      if (delta === 0) return;
+      e.preventDefault();
+
+      // Mouse-wheel notches produce large deltas (~100 px); trackpad frames are
+      // tiny. Sensitivity is picked by (device × physical wheel axis) — not by
+      // what that wheel controls — so it stays correct under scrollSwapAxes.
+      const absD  = Math.abs(delta);
+      const isMouse = absD >= 50;
+      const sens  = hDominant
+        ? (isMouse ? mouseSensXRef.current : trackpadSensXRef.current)
+        : (isMouse ? mouseSensYRef.current : trackpadSensYRef.current);
 
       if (zoomPrice) {
-        e.preventDefault();
-        const delta = hDominant ? e.deltaX : e.deltaY;
-        zoomPriceAxis(delta < 0 ? -0.02 : 0.02);
+        const step = Math.min(absD * 0.0002 * sens, 0.05);
+        zoomPriceAxis(delta < 0 ? -step : step);
         return;
       }
 
       // Time-axis (X) zoom.
-      // Mouse-wheel notches produce large deltas (~100 px); trackpad frames are tiny.
-      // Use separate sensitivities so each can be tuned independently.
-      const delta = hDominant ? e.deltaX : e.deltaY;
-      if (delta === 0) return;
-      e.preventDefault();
-      const absD  = Math.abs(delta);
-      const isMouse = absD >= 50;
-      const sens  = isMouse ? mouseSensRef.current : zoomSensRef.current;
       const mag   = Math.min(absD * 0.001 * sens, 0.5);
       let zoomIn  = delta < 0;
       if (zoomInvertRef.current) zoomIn = !zoomIn;

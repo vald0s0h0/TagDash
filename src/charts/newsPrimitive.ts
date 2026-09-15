@@ -33,7 +33,9 @@ interface RenderTarget {
 }
 
 const DOT_R      = 2.6; // dot radius (CSS px)
-const PAD_BOTTOM = 4;   // dot centre offset above the pane's bottom edge (CSS px)
+const PAD_BOTTOM = 14;  // dot centre offset above the pane's bottom edge (CSS px)
+const SCORE_PAD  = 3;   // score baseline offset above the pane's bottom edge
+const SCORE_FONT = 9;   // score type size (CSS px)
 
 /** One news pastille: anchored on bar `t0`, optionally nudged `frac` of the way
  *  toward the next bar `t1` to land on the precise intraday publish moment. */
@@ -44,6 +46,10 @@ export interface NewsMark {
   t1:   number | null;
   /** Fraction from t0 toward t1 (0 = on the bar; daily is always 0). */
   frac: number;
+  /** The LLM news score (0..100) attached to this headline, drawn under the dot.
+   *  Null when no model has judged it — an unjudged headline shows a bare dot, and
+   *  that difference is the point: "no score" is not "score 0". */
+  score?: number | null;
 }
 
 class NewsRenderer implements ISeriesPrimitivePaneRenderer {
@@ -63,7 +69,10 @@ class NewsRenderer implements ISeriesPrimitivePaneRenderer {
 
       const y = (h - PAD_BOTTOM) * vr;
       const r = DOT_R * hr;
-      ctx.fillStyle = getChartTheme().markers.news;
+      const colour = getChartTheme().markers.news;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "alphabetic";
+      ctx.font = `600 ${SCORE_FONT * vr}px ui-sans-serif, system-ui, sans-serif`;
       for (const m of this.src.marks) {
         const x0 = ts.timeToCoordinate(m.t0 as Time);
         if (x0 == null) continue; // off the visible range
@@ -74,9 +83,13 @@ class NewsRenderer implements ISeriesPrimitivePaneRenderer {
           const x1 = ts.timeToCoordinate(m.t1 as Time);
           if (x1 != null) x = (x0 as number) + m.frac * ((x1 as number) - (x0 as number));
         }
+        ctx.fillStyle = colour;
         ctx.beginPath();
         ctx.arc(x * hr, y, r, 0, Math.PI * 2);
         ctx.fill();
+        if (m.score != null) {
+          ctx.fillText(String(Math.round(m.score)), x * hr, (h - SCORE_PAD) * vr);
+        }
       }
     });
   }

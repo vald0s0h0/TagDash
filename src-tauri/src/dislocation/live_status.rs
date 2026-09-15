@@ -14,7 +14,7 @@
 // than a confident number computed before the news existed.
 //
 // In memory on purpose. This is per-instant state with no forensic value: it never
-// survives a restart, and persisting a `Triage` phase would resurrect a spinner for a
+// survives a restart, and persisting a `News` phase would resurrect a spinner for a
 // call that died with the process. The verdicts themselves are in the DB.
 
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ pub enum Phase {
     /// Handed to the qualification task, waiting on one of the four slots.
     Queued,
     /// The fast pass is in flight.
-    Triage,
+    News,
     /// The deep pass is in flight.
     Deep,
     /// A headline landed after a verdict and a re-score is in flight.
@@ -39,7 +39,7 @@ impl Phase {
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::Queued => "queued",
-            Phase::Triage => "triage",
+            Phase::News => "news",
             Phase::Deep => "deep",
             Phase::Rescoring => "rescoring",
         }
@@ -66,7 +66,7 @@ type Registry = HashMap<String, Entry>;
 /// stay on that ticker's pane for the rest of the session, which is worse than
 /// showing nothing: it claims a score is coming that never will. Anything older than
 /// this is dropped on read. Comfortably above the worst honest case (queue wait plus
-/// the 15 s triage and 120 s deep budgets) and measured on the WALL clock, because
+/// the 15 s news and 120 s deep budgets) and measured on the WALL clock, because
 /// that is what the model calls run on even during an accelerated replay.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
@@ -162,8 +162,8 @@ mod tests {
     fn a_phase_is_visible_until_it_is_cleared() {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        set_phase("AAA", Phase::Triage);
-        assert_eq!(only("AAA").unwrap().phase, Some("triage"));
+        set_phase("AAA", Phase::News);
+        assert_eq!(only("AAA").unwrap().phase, Some("news"));
         set_phase("AAA", Phase::Deep);
         assert_eq!(only("AAA").unwrap().phase, Some("deep"));
         clear_phase("AAA");
@@ -176,7 +176,7 @@ mod tests {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let at = Utc::now();
-        set_phase("BBB", Phase::Triage);
+        set_phase("BBB", Phase::News);
         set_pending_headline("BBB", "FDA clearance", at);
         set_phase("BBB", Phase::Deep);
         let s = only("BBB").unwrap();

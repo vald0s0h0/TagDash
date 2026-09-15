@@ -1,10 +1,16 @@
 // Market Replay — rejoue une journée historique à travers toute la plateforme.
 //
-// SOURCE DE DONNÉES — même priorité qu'en live/paper (voir `data::Provider` et
-// `commands::spawn_live_feed`) : Alpaca SIP d'abord, puis Massive Starter+, puis
-// les flat files locaux. Le replay n'a donc pas de « mode » à lui : il rejoue la
-// journée avec le meilleur tape auquel le compte a droit, et chaque source
+// SOURCE DE DONNÉES — par défaut (`SourceChoice::Api`), même priorité qu'en
+// live/paper (voir `data::Provider` et `commands::spawn_live_feed`) : Alpaca SIP
+// d'abord, puis Massive Starter+, puis les flat files locaux ; chaque source
 // dégrade proprement vers la suivante si elle ne peut pas répondre.
+//
+// Le sélecteur de la modale « Choisir un jour » peut FORCER un dataset local à la
+// place — `flat_trades` (vrais prints + quotes sur les fenêtres d'ignition) ou
+// `flat_minutes` (tranches 10 s synthétisées). Un mode forcé ne dégrade jamais :
+// ni réseau, ni cache daily. C'est le point : comparer une même séance sur deux
+// tapes n'a de sens que si le tape demandé est bien celui qui a été rejoué. Le
+// choix vaut pour toute la session, « jour suivant » compris.
 //
 // Quand un replay est actif :
 //   • les flux live (WebSocket données + news) sont arrêtés ;
@@ -189,7 +195,19 @@ struct TickEvent {
 /// is missing simply removes its step from `data::attempt_order`, and the walk ends
 /// on the flat files / daily-bars fallback — which is exactly the offline replay the
 /// flat files exist for. `offline` short-circuits to the local files without a probe.
-fn resolve_sources(deps: &ReplayDeps) -> data::Sources {
+///
+/// `choice` is the day-picker toggle. A forced flat-file mode skips the resolution
+/// entirely and hands back credential-free sources: the load must stay on disk, and
+/// the surest way to guarantee that is to give it nothing to call with.
+fn resolve_sources(deps: &ReplayDeps, choice: data::SourceChoice) -> data::Sources {
+    if choice.is_local() {
+        return data::Sources {
+            provider: Some(data::Provider::FlatFiles),
+            alpaca: None,
+            massive_key: None,
+            choice,
+        };
+    }
     let offline = deps.config.read().unwrap().data_source.offline;
     let (alpaca, massive_key) = {
         let s = deps.secrets.read().unwrap();
@@ -221,18 +239,21 @@ fn resolve_sources(deps: &ReplayDeps) -> data::Sources {
         provider: Some(provider),
         alpaca: (!offline).then_some(alpaca).flatten(),
         massive_key: (!offline).then_some(massive_key).flatten(),
+        choice,
     }
 }
 
 // ─── Engine ─────────────────────────────────────────────────────────────────────
 
-/// Start a replay of `day` at `start_min` ET minutes (240/420/570). Returns an
-/// error when a replay is already active or the credentials are missing.
+/// Start a replay of `day` at `start_min` ET minutes (240/420/570), reading it via
+/// `choice` (ranked API walk, or a forced local flat-file dataset). Returns an error
+/// when a replay is already active or the date is malformed.
 pub fn start(
     shared: Arc<ReplayShared>,
     deps: ReplayDeps,
     day: String,
     start_min: u32,
+    choice: data::SourceChoice,
 ) -> Result<(), String> {
     {
         let st = shared.status.read().unwrap();
@@ -241,9 +262,10 @@ pub fn start(
         }
     }
     NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "date invalide".to_string())?;
-    let sources = resolve_sources(&deps);
+    let sources = resolve_sources(&deps, choice);
     eprintln!(
-        "[tagdash] replay {day}: source prioritaire = {}",
+        "[tagdash] replay {day}: mode = {}, source prioritaire = {}",
+        choice.as_str(),
         sources
             .provider
             .map_or("flat_files", data::Provider::as_str),

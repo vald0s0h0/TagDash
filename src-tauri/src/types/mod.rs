@@ -164,7 +164,10 @@ pub struct ScreenerMatch {
     pub gap_pct: Option<f64>,
     /// Relative volume (day volume / average daily volume).
     pub rvol: Option<f64>,
-    pub volume: u64,
+    /// Cumulative session volume since 04:00 ET today (same live counter as
+    /// `TickerLiveState::volume_day`), live-updating. None when the symbol has no
+    /// live ticker state yet (no data); Some(0) is a genuine zero-volume session.
+    pub volume: Option<u64>,
     pub float_shares: Option<u64>,
     /// SIC industry + country of origin (sec-api company_meta), for the screener
     /// card's industry/country display. None until sec-api metadata is cached.
@@ -261,6 +264,12 @@ pub struct MicroAttentionEntry {
     pub head_size: u8,
     pub dominant: bool,
     pub already_alerted: bool,
+    /// The RVOL third of the score, 0..100. Computed here rather than on the front
+    /// end so the number the pane shows every second and the number persisted with a
+    /// verdict come from the same function.
+    pub rvol_third: f64,
+    /// The attention third of the score, 0..100.
+    pub attention_third: f64,
     pub market_time: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
 }
@@ -348,6 +357,13 @@ pub struct Position {
     pub auto_be_applied: bool,
     #[serde(default)]
     pub auto_tp_applied: bool,
+    /// Entry legs filled so far / still resting for this trade — lets the
+    /// sidebar show "2/3" while a scaled-in entry is still partially working,
+    /// instead of a standalone order row that silently vanishes into the position.
+    #[serde(default)]
+    pub filled_entries: i64,
+    #[serde(default)]
+    pub pending_entries: i64,
 }
 
 /// Single executed fill (internal simulation only — no broker).
@@ -594,6 +610,12 @@ pub struct StrategyContext {
     pub rvol: Option<f64>,
     /// Float shares from FMP/cache. None when unavailable.
     pub float_shares: Option<u64>,
+    /// Market cap in dollars, from the universe table. None when unavailable.
+    pub market_cap: Option<i64>,
+    /// Institutional ownership, 0..100, from SEC 13D/13G (company_intel). None
+    /// when never collected — strategies gating on this should treat `None` as
+    /// "unknown", not "zero".
+    pub institutional_ownership_pct: Option<f64>,
 }
 
 /// A live news headline reduced to what news↔price correlation needs: when it
@@ -666,7 +688,7 @@ pub struct AlertEnrichment {
     pub llm_dilution: Option<String>,
     pub llm_news: Option<String>,
 
-    // ── Deepseek LLM — panic_mean_reversion (manual, button-triggered) ──
+    // ── Deepseek LLM — panic_mean_reversion & backside (manual, button-triggered) ──
     /// Very short context summary: why the stock is moving / which news pushed it.
     pub llm_context: Option<String>,
     /// Mean-reversion verdict: is the move solid or bluff, and the probability of

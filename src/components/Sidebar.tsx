@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, type ReactNode } from "react";
-import { AlarmClock, Bell, BriefcaseBusiness, ClipboardCheck, ListOrdered, Radar } from "lucide-react";
+import { AlarmClock, Bell, BriefcaseBusiness, ClipboardCheck, Radar } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useUiStore } from "@/stores/uiStore";
 import { useActiveAlerts, useScreenerMatches, useStartScanner } from "@/queries/useScanner";
@@ -7,8 +7,7 @@ import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertStatusStore } from "@/stores/alertStatusStore";
 import { ScannerAlerts } from "@/components/ScannerAlerts";
 import { PanicScoreButton, ScreenerPanel, matchToAlert, visibleMatches } from "@/components/ScreenerPanel";
-import { PositionsPanel } from "@/components/PositionsPanel";
-import { OrdersPanel } from "@/components/OrdersPanel";
+import { OrdersPositionsPanel, standalonePendingOrders } from "@/components/OrdersPositionsPanel";
 import { AlarmsPanel } from "@/components/AlarmsPanel";
 import { TodoPanel } from "@/components/TodoPanel";
 import { api } from "@/lib/tauri";
@@ -199,29 +198,34 @@ export function Sidebar() {
       )}
 
       {/* Alarmes — condensed watchlist of armed price levels. Click a ticker to
-          open its chart in the Open tab using the strategy's criteria. */}
-      <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "4rem", maxHeight: "10rem" }}>
-        <SectionHeader icon={AlarmClock} title="Alarmes" count={alarmCount} />
-        <div className="flex-1 overflow-y-auto">
-          <AlarmsPanel />
+          open its chart in the Open tab using the strategy's criteria. Hidden
+          entirely when there's nothing armed. */}
+      {alarmCount > 0 && (
+        <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "4rem", maxHeight: "10rem" }}>
+          <SectionHeader icon={AlarmClock} title="Alarmes" count={alarmCount} />
+          <div className="flex-1 overflow-y-auto">
+            <AlarmsPanel />
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* Positions */}
-      <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "5rem", maxHeight: "12rem" }}>
-        <SectionHeader icon={BriefcaseBusiness} title="Positions" count={positions.length} />
-        <div className="flex-1 overflow-y-auto">
-          <PositionsPanel onTickerClick={handleTickerClick} />
+      {/* Ordres & Positions — a resting entry order becomes a position row the
+          moment it fills (with a fill-progress badge while a scaled entry is
+          still partial); orders already reflected in a position (its bracket
+          legs, or a still-pending scale-in leg) don't get a separate row.
+          Hidden entirely when there's nothing open or pending. */}
+      {(positions.length > 0 || standalonePendingOrders(orders, positions).length > 0) && (
+        <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "5rem", maxHeight: "16rem" }}>
+          <SectionHeader
+            icon={BriefcaseBusiness}
+            title="Ordres & Positions"
+            count={positions.length + standalonePendingOrders(orders, positions).length}
+          />
+          <div className="flex-1 overflow-y-auto">
+            <OrdersPositionsPanel onTickerClick={handleTickerClick} />
+          </div>
         </div>
-      </div>
-
-      {/* Pending orders */}
-      <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "5rem", maxHeight: "12rem" }}>
-        <SectionHeader icon={ListOrdered} title="Ordres" count={orders.length} />
-        <div className="flex-1 overflow-y-auto">
-          <OrdersPanel onTickerClick={handleTickerClick} />
-        </div>
-      </div>
+      )}
 
       {/* À faire — trades missing screenshot / journal */}
       {todoTrades.length > 0 && (

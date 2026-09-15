@@ -40,12 +40,8 @@
 // registry still carries the metadata `MicroPullback` strategy (card, toggle,
 // name, priority) — see `strategies::micro_pullback`.
 
-pub mod intel_live;
-pub mod live_status;
 pub mod options;
-pub mod preselect;
 pub mod quality;
-mod v2;
 
 #[cfg(test)]
 mod tests;
@@ -62,6 +58,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::time::Duration;
 
 use crate::config::secrets::Secrets;
+use crate::strategies::issuer_profile::IssuerProfile;
 use crate::local_db::universe_repository;
 use crate::market_state::aggregators::{Bar, Timeframe};
 use crate::market_state::MarketState;
@@ -84,6 +81,14 @@ pub struct Config {
     ///   true  = ALSO watch tickers with no known float (tagged FLOAT_UNKNOWN).
     /// Tickers with unknown float are kept only when this is true. Default: true.
     pub allow_unknown_float: bool,
+    /// Only watch issuers in a structurally crowded industry. An unknown industry is
+    /// not hot, so it is excluded too.
+    pub hot_industry_only: bool,
+    /// Drop issuers domiciled in one of the four pump & dump base-rate
+    /// jurisdictions. An unknown domicile is never flagged, so it survives.
+    pub exclude_risk_domicile: bool,
+    /// How many of the acceleration ratios a tempo must clear to trip.
+    pub ratios_required: u8,
 
     // ── Baseline floors (gate 2) — stop a near-zero baseline yielding absurd
     //    ratios. The volume floor scales with the tempo (×T/10); the rate and the
@@ -165,6 +170,9 @@ impl Config {
         price_max: 25.0,
         float_max: 30_000_000,
         allow_unknown_float: true,
+        hot_industry_only: false,
+        exclude_risk_domicile: false,
+        ratios_required: 2,
 
         baseline_volume_floor_10s: 500.0,
         baseline_trade_rate_floor: 0.2,
@@ -250,14 +258,51 @@ impl Config {
             .filter_map(|(t, on)| on.then_some(t))
     }
 
-    /// Apply the user's Settings choices. Only the tempo mask is user-driven today;
-    /// the thresholds themselves stay compiled.
+    /// Apply the user's Settings choices to the compiled defaults.
+    ///
+    /// The grid is moved by MULTIPLIERS rather than replaced cell by cell. Its six
+    /// rows are a deliberate slope — the longer the window, the more absolute
+    /// movement is required and the less relative acceleration — and editing single
+    /// cells destroys that slope while looking like a small change. A multiplier
+    /// slides the whole grid and keeps its shape.
     fn with_options(mut self, opts: &MicroPullbackOptions) -> Self {
+        self.price_min = opts.price_min;
+        self.price_max = opts.price_max;
+        self.float_max = opts.float_max;
+        self.allow_unknown_float = opts.allow_unknown_float;
+        self.hot_industry_only = opts.hot_industry_only;
+        self.exclude_risk_domicile = opts.exclude_risk_domicile;
+        self.ratios_required = opts.ratios_required;
+
+        self.watch_max_secs = opts.watch_max_secs;
+        self.watch_fast_rate_per_sec = opts.watch_fast_rate_per_sec;
+        self.watch_slow_rate_per_sec = opts.watch_slow_rate_per_sec;
+        self.watch_min_dollar_per_sec = opts.watch_min_dollar_per_sec;
+
+        for t in self.tempos.iter_mut() {
+            t.return_min_pct *= opts.return_min_scale;
+            t.volume_min *= opts.volume_min_scale;
+            t.dollar_volume_min *= opts.volume_min_scale;
+            t.volume_ratio_min *= opts.ratio_min_scale;
+            t.trade_rate_ratio_min *= opts.ratio_min_scale;
+            t.range_ratio_min *= opts.ratio_min_scale;
+        }
+
         let enabled = opts.enabled_tempos();
         for (i, t) in self.tempos.iter().enumerate() {
             self.tempo_active[i] = enabled.contains(&t.secs);
         }
         self
+    }
+
+    /// The grid as the panel must display it: the effective numbers for one tempo
+    /// after the multipliers, so a slider's effect is never abstract.
+    pub fn effective_row(opts: &MicroPullbackOptions, tempo_secs: i64) -> Option<Tempo> {
+        Self::DEFAULT
+            .with_options(opts)
+            .tempos
+            .into_iter()
+            .find(|t| t.secs == tempo_secs)
     }
 }
 
@@ -422,6 +467,30 @@ pub struct TapeWindow {
     pub max_second_dollars: f64,
 }
 
+/// What the live tape IS, as far as the gates are concerned.
+///
+/// `kind` is the provenance — one message per trade, or one per symbol per second.
+/// `counts_trades` is the only thing the gates actually branch on, and it is a
+/// property of the DATA rather than of the provider: Massive's aggregate carries
+/// `z`, the second's average trade size, and `n ≈ v / z` restores the count. The
+/// two are therefore not the same question, and conflating them is what made this
+/// engine take the degraded path on a feed that had the number all along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapeShape {
+    pub kind: TapeKind,
+    pub counts_trades: bool,
+}
+
+impl TapeShape {
+    /// Read the live shape off the market state.
+    pub fn of(ms: &MarketState) -> Self {
+        Self {
+            kind: ms.tape_kind(),
+            counts_trades: ms.tape_counts_trades(),
+        }
+    }
+}
+
 /// What the final gate actually measured when it confirmed. Carried into the alert
 /// text and the A+ payload so the reason a ticker passed is always inspectable.
 #[derive(Debug, Clone, Copy)]
@@ -457,11 +526,17 @@ pub struct LiquidityProof {
 /// stays a pure function the tests can drive.
 fn confirm_liquidity(
     cfg: &Config,
-    source: TapeKind,
+    shape: TapeShape,
     tape_fn: &dyn Fn(i64) -> TapeWindow,
 ) -> Option<LiquidityProof> {
-    match source {
-        TapeKind::Prints => {
+    let source = shape.kind;
+    // The RATE path whenever a count exists — on prints natively, on aggregates
+    // reconstructed from `z`. The dollars-and-continuity path is the fallback for a
+    // tape that genuinely cannot say how many trades happened, not the default for
+    // one provider. Measured on 41 790 real confirmations: the rate path recovers
+    // 100 % of them, the fallback 79 % and very unevenly by ticker.
+    match shape.counts_trades {
+        true => {
             let fast = tape_fn(cfg.watch_fast_window_secs);
             let slow = tape_fn(cfg.watch_slow_window_secs);
             // The dollar floor reads the SLOW window even when the fast layer is what
@@ -488,7 +563,7 @@ fn confirm_liquidity(
                 window_secs: window,
             })
         }
-        TapeKind::SecondAggregates => {
+        false => {
             let w = cfg.watch_agg_window_secs;
             let win = tape_fn(w);
             let dollar_per_sec = win.dollars / w as f64;
@@ -551,8 +626,7 @@ struct Input {
 pub struct MicroPullbackEngine;
 
 impl MicroPullbackEngine {
-    /// Attention-first engine. The legacy detector remains compiled below while
-    /// replay fixtures are migrated, but production starts exclusively through v2.
+    /// Spawn the background loop. Returns immediately.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         running: Arc<AtomicBool>,
@@ -563,41 +637,12 @@ impl MicroPullbackEngine {
         alert_history: Arc<RwLock<Vec<AlertSignal>>>,
         strategy_enabled: Arc<RwLock<HashMap<String, bool>>>,
         options: Arc<RwLock<MicroPullbackOptions>>,
-        app_config: Arc<RwLock<crate::config::AppConfig>>,
-        attention: Arc<RwLock<Vec<crate::types::MicroAttentionEntry>>>,
-    ) {
-        v2::start(
-            running,
-            market,
-            db,
-            secrets,
-            active_alerts,
-            alert_history,
-            strategy_enabled,
-            options,
-            app_config,
-            attention,
-        );
-    }
-
-    /// Spawn the background loop. Returns immediately.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
-    fn start_legacy(
-        running: Arc<AtomicBool>,
-        market: Arc<RwLock<MarketState>>,
-        db: Arc<Mutex<rusqlite::Connection>>,
-        secrets: Arc<RwLock<Secrets>>,
-        active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
-        alert_history: Arc<RwLock<Vec<AlertSignal>>>,
-        strategy_enabled: Arc<RwLock<HashMap<String, bool>>>,
-        options: Arc<RwLock<MicroPullbackOptions>>,
-        app_config: Arc<RwLock<crate::config::AppConfig>>,
+        config: Arc<RwLock<crate::config::AppConfig>>,
     ) {
         // Tauri-managed runtime so it can be launched from the sync `setup` hook.
         tauri::async_runtime::spawn(async move {
             let mut machines: HashMap<String, Machine> = HashMap::new();
-            let (mut floats, mut avg_volumes) = load_universe_meta(&db);
+            let (mut floats, mut avg_volumes, mut profiles) = load_universe_meta(&db);
             let mut floats_loaded = std::time::Instant::now();
             // ET day + session segment the state belongs to. Crossing either boundary
             // resets everything (states, locks, seeds): the LOCK is per session, so a
@@ -650,12 +695,22 @@ impl MicroPullbackEngine {
                 }
 
                 if floats_loaded.elapsed() >= Duration::from_secs(FLOAT_REFRESH_SECS) {
-                    (floats, avg_volumes) = load_universe_meta(&db);
+                    (floats, avg_volumes, profiles) = load_universe_meta(&db);
                     floats_loaded = std::time::Instant::now();
                 }
 
-                // App clock: simulated instant during a Market Replay.
-                let now = crate::time::now();
+                // Feed-time clock: the simulated instant during a Market Replay, or
+                // live the latest event timestamp actually seen on the tape (near-now
+                // on Alpaca, ~T-15m on Massive Starter). Using the wall clock here
+                // instead would compare `tape_window_stats`' 1/5/10s windows against
+                // buckets stamped ~15 minutes in the past on Massive — every window
+                // would find zero buckets and `confirm_liquidity` could never
+                // confirm, so the engine would arm on every genuine departure and
+                // then silently time out without ever alerting.
+                let Some(now) = market.read().unwrap().strategy_market_now() else {
+                    crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
+                    continue;
+                };
                 if !in_active_session(now) {
                     if !machines.is_empty() || !seeds.is_empty() {
                         machines.clear();
@@ -683,7 +738,10 @@ impl MicroPullbackEngine {
 
                 // Which tape is feeding us right now — decides the liquidity variant
                 // and whether a trade-rate ratio exists at all.
-                let tape_source = market.read().unwrap().tape_kind();
+                // Re-read every tick, not once at start-up: a feed can switch
+                // provider mid-session, and Massive proves it supplies `z` only on
+                // its first aggregate.
+                let tape_shape = TapeShape::of(&market.read().unwrap());
 
                 // Snapshot candidate inputs under one brief read lock. Gate 1
                 // universe: price in band, float ≤ max (or unknown when allowed),
@@ -700,7 +758,8 @@ impl MicroPullbackEngine {
                         .filter_map(|t| {
                             let price = t.last_price?;
                             let float = floats.get(&t.symbol).copied();
-                            if !gate1_tradeable(price, float, &cfg) {
+                            let profile = profiles.get(&t.symbol).copied().unwrap_or_default();
+                            if !gate1_tradeable(price, float, profile, &cfg) {
                                 return None;
                             }
                             if let Some(m) = machines.get(&t.symbol) {
@@ -847,7 +906,7 @@ impl MicroPullbackEngine {
                         }
                     };
                     if let Some(outcome) =
-                        evaluate(m, inp, &cfg, now, seed, tape_source, &news_fn, &tape_fn)
+                        evaluate(m, inp, &cfg, now, seed, tape_shape, &news_fn, &tape_fn)
                     {
                         fires.push(outcome);
                     }
@@ -865,63 +924,55 @@ impl MicroPullbackEngine {
 
                 for outcome in fires {
                     match outcome {
-                        // A+ off: straight to the screen, exactly as before — plus
-                        // the phone, if asked for. With A+ ON this call belongs to the
-                        // qualification task instead, which only rings for a candidate
-                        // that actually cleared the bar.
-                        Outcome::Fired { alert, .. } if !opts.quality_aplus => {
+                        // NO MODEL IN THE PATH. That is the whole design: this engine
+                        // answers "does this ticker clear my bars, and is the tape
+                        // real?", and both halves are measurable from the tape alone.
+                        // The catalyst read is a button the trader presses afterwards
+                        // from the info bar, never a step the alert waits on. The
+                        // engine that scores a catalyst is Dislocation.
+                        Outcome::Fired(alert) => {
                             if opts.ntfy_alerts {
                                 crate::ntfy::notify_alert_once(&secrets, &alert);
                             }
+                            // Opt-in catalyst read, spawned on the FRESH fire only —
+                            // never on a depth republish, so widening the same
+                            // alert_id can never trigger a second call for it.
+                            if opts.llm_auto {
+                                if let Some(e) =
+                                    machines.get(&alert.symbol).and_then(|m| m.emitted.clone())
+                                {
+                                    let cand = quality::candidate_from_fire(
+                                        alert.clone(),
+                                        e.tempo.secs,
+                                        e.metrics.price_return,
+                                        e.metrics.volume_ratio,
+                                        e.metrics.trade_rate_ratio,
+                                        e.metrics.range_ratio,
+                                        e.proof.source,
+                                        e.proof.rate_per_sec,
+                                        e.proof.dollar_per_sec,
+                                        e.proof.active_seconds,
+                                        e.proof.window_secs,
+                                        e.timestamp,
+                                    );
+                                    let deps = crate::dislocation::quality::Deps {
+                                        db: db.clone(),
+                                        config: config.clone(),
+                                        secrets: secrets.clone(),
+                                        market: market.clone(),
+                                        active_alerts: active_alerts.clone(),
+                                        alert_history: alert_history.clone(),
+                                    };
+                                    tauri::async_runtime::spawn(quality::run_news_scoring(
+                                        deps, cand, opts, true,
+                                    ));
+                                }
+                            }
                             push_alert(&active_alerts, &alert_history, alert);
                         }
-                        // A+ on: the qualification decides whether this reaches the
-                        // screen, and owns the row from here on. It runs in its own
-                        // task — the loop ticks every second and must never wait on an
-                        // API call.
-                        Outcome::Fired {
-                            alert,
-                            tempo,
-                            metrics,
-                            proof,
-                            depth,
-                        } => {
-                            let cand = quality::Candidate {
-                                alert,
-                                tempo_secs: tempo.secs,
-                                tempo_depth: depth,
-                                price_return_pct: metrics.price_return,
-                                volume_ratio: metrics.volume_ratio,
-                                trade_rate_ratio: metrics.trade_rate_ratio,
-                                range_ratio: metrics.range_ratio,
-                                tape_source,
-                                tape_rate_per_sec: proof.rate_per_sec,
-                                tape_dollar_per_sec: proof.dollar_per_sec,
-                                tape_active_seconds: proof.active_seconds,
-                                tape_window_secs: proof.window_secs,
-                                detected_at: now,
-                                // The legacy engine has no pre-selection gate; it is
-                                // dead code kept for the historical replay fixtures.
-                                setup: Default::default(),
-                            };
-                            let deps = quality::Deps {
-                                db: db.clone(),
-                                config: app_config.clone(),
-                                secrets: secrets.clone(),
-                                market: market.clone(),
-                                active_alerts: active_alerts.clone(),
-                                alert_history: alert_history.clone(),
-                            };
-                            tauri::async_runtime::spawn(quality::run_qualification(
-                                deps, cand, opts,
-                            ));
-                        }
-                        // Under A+ the qualification task owns the row and re-publishes
-                        // it on every score; pushing the raw alert here would race it
-                        // and strip the A+ prefix back off. The depth known AT FIRE TIME
-                        // is still carried into the qualification — only later widening
-                        // is dropped, which is the cheaper of the two wrong answers.
-                        Outcome::DepthUpdated(_) if opts.quality_aplus => {}
+                        // The same event, republished because another tempo confirmed
+                        // it. Same `alert_id`, so the row widens in place instead of
+                        // stacking a second line.
                         Outcome::DepthUpdated(alert) => {
                             push_alert(&active_alerts, &alert_history, alert);
                         }
@@ -958,7 +1009,7 @@ fn evaluate(
     cfg: &Config,
     now: DateTime<Utc>,
     seed: Option<&Seed>,
-    source: TapeKind,
+    shape: TapeShape,
     news_fn: &dyn Fn(&str) -> (String, bool),
     tape_fn: &dyn Fn(i64) -> TapeWindow,
 ) -> Option<Outcome> {
@@ -972,10 +1023,10 @@ fn evaluate(
                 m.last_eval_bar = Some(latest);
                 let mut fastest: Option<(Tempo, TempoMetrics)> = None;
                 for tempo in cfg.active_tempos() {
-                    let Some(metrics) = eval_tempo(&inp.bars, tempo, cfg, seed, source) else {
+                    let Some(metrics) = eval_tempo(&inp.bars, tempo, cfg, seed, shape) else {
                         continue;
                     };
-                    if !gate3_trips(&metrics, tempo) {
+                    if !gate3_trips(&metrics, tempo, cfg.ratios_required) {
                         continue;
                     }
                     if !m.depth.contains(&tempo.secs) {
@@ -1017,7 +1068,7 @@ fn evaluate(
             m.watch = None;
             return None;
         }
-        if let Some(proof) = confirm_liquidity(cfg, source, tape_fn) {
+        if let Some(proof) = confirm_liquidity(cfg, shape, tape_fn) {
             let (news, news_today) = news_fn(&inp.symbol);
             let emitted = Emitted {
                 alert_id: format!("mp-{}-{}", now.timestamp_millis(), inp.symbol),
@@ -1033,13 +1084,7 @@ fn evaluate(
             m.locked = true;
             m.watch = None;
             m.emitted = Some(emitted);
-            return Some(Outcome::Fired {
-                alert,
-                tempo: w.tempo,
-                metrics: w.metrics,
-                proof,
-                depth: m.depth.clone(),
-            });
+            return Some(Outcome::Fired(alert));
         }
     }
     None
@@ -1047,18 +1092,17 @@ fn evaluate(
 
 /// What one evaluation produced.
 ///
-/// The distinction matters because only a FRESH fire is worth a qualification: a
-/// depth update is the same event described more completely, and re-running the LLM
-/// on it would spend a second call to reach the same verdict.
+/// The distinction matters for the phone: a FRESH fire rings, a depth update does
+/// not. It is the same event described more completely, and buzzing twice for one
+/// departure is how a trader learns to ignore the buzzer.
+///
+/// Both variants carry a finished alert. The tempo, the metrics and the liquidity
+/// proof that produced it are already rendered into `AlertSignal::reason` by
+/// `make_alert` and kept on `Machine::emitted` for the depth republish, so passing
+/// them out a second time bought nothing.
 enum Outcome {
     /// The liquidity gate just confirmed a new departure.
-    Fired {
-        alert: AlertSignal,
-        tempo: Tempo,
-        metrics: TempoMetrics,
-        proof: LiquidityProof,
-        depth: Vec<i64>,
-    },
+    Fired(AlertSignal),
     /// An already-published alert, re-rendered because another tempo tripped.
     DepthUpdated(AlertSignal),
 }
@@ -1079,10 +1123,28 @@ fn republish_with_depth(m: &mut Machine, inp: &Input, now: DateTime<Utc>) -> Opt
 
 // ─── Gate 1 ────────────────────────────────────────────────────────────────────
 
-/// Gate 1 — tradability: price in band and a float that qualifies (known ≤ max, or
-/// unknown when `allow_unknown_float`).
-fn gate1_tradeable(price: f64, float: Option<u64>, cfg: &Config) -> bool {
+/// Gate 1 — tradability: price in band, a float that qualifies (known ≤ max, or
+/// unknown when `allow_unknown_float`), and the two optional issuer switches.
+///
+/// THE TWO SWITCHES CUT IN OPPOSITE DIRECTIONS ON MISSING DATA, on purpose.
+/// `hot_industry_only` excludes an issuer whose industry we have never collected —
+/// an unknown industry is not a hot one, and a switch that says "only biotech and
+/// space" cannot honour that while admitting unknowns. `exclude_risk_domicile`
+/// keeps an issuer whose domicile we have never collected — we ban on what we know,
+/// never on a gap in our own data.
+fn gate1_tradeable(
+    price: f64,
+    float: Option<u64>,
+    profile: IssuerProfile,
+    cfg: &Config,
+) -> bool {
     if !(cfg.price_min..=cfg.price_max).contains(&price) {
+        return false;
+    }
+    if cfg.hot_industry_only && !profile.sector_hot {
+        return false;
+    }
+    if cfg.exclude_risk_domicile && profile.country_risk {
         return false;
     }
     match float {
@@ -1121,7 +1183,7 @@ fn eval_tempo(
     tempo: &Tempo,
     cfg: &Config,
     seed: Option<&Seed>,
-    source: TapeKind,
+    shape: TapeShape,
 ) -> Option<TempoMetrics> {
     let t = tempo.secs;
     let need = (t / BAR_SECS) as usize;
@@ -1160,10 +1222,10 @@ fn eval_tempo(
         current_trades: cur_trades,
         price_return: cur_return,
         volume_ratio: cur_vol / base_vol.max(vol_floor),
-        trade_rate_ratio: match source {
-            TapeKind::Prints => Some(cur_trade_rate / base_trade_rate.max(rate_floor)),
-            TapeKind::SecondAggregates => None,
-        },
+        // Available whenever the tape can count trades, whatever it is made of.
+        trade_rate_ratio: shape
+            .counts_trades
+            .then(|| cur_trade_rate / base_trade_rate.max(rate_floor)),
         range_ratio: cur_range_pct / base_range_pct.max(range_floor),
     })
 }
@@ -1182,7 +1244,7 @@ fn eval_tempo(
 /// watch (see `evaluate`). The two absolute minimums that remain are the share
 /// count and the dollar amount, and both are required: shares alone let a $1 name
 /// through on $10k, dollars alone let a $24 name through on 4 000 shares.
-fn gate3_trips(mtr: &TempoMetrics, tempo: &Tempo) -> bool {
+fn gate3_trips(mtr: &TempoMetrics, tempo: &Tempo, required: u8) -> bool {
     if mtr.price_return < tempo.return_min_pct
         || mtr.current_volume < tempo.volume_min
         || mtr.current_dollars < tempo.dollar_volume_min
@@ -1190,6 +1252,7 @@ fn gate3_trips(mtr: &TempoMetrics, tempo: &Tempo) -> bool {
         return false;
     }
     let mut cleared = 0;
+    let mut available = 2; // volume + range always exist
     if mtr.volume_ratio >= tempo.volume_ratio_min {
         cleared += 1;
     }
@@ -1197,11 +1260,15 @@ fn gate3_trips(mtr: &TempoMetrics, tempo: &Tempo) -> bool {
         cleared += 1;
     }
     if let Some(r) = mtr.trade_rate_ratio {
+        available += 1;
         if r >= tempo.trade_rate_ratio_min {
             cleared += 1;
         }
     }
-    cleared >= 2
+    // Asking for more ratios than the feed can produce would mute the strategy
+    // rather than tighten it. On a feed with no trade count, "3 of 3" means "both
+    // of the two there are".
+    cleared >= required.min(available) as u32
 }
 
 // ─── Baseline helpers ──────────────────────────────────────────────────────────
@@ -1472,9 +1539,17 @@ fn fmt_tempo(secs: i64) -> String {
 
 /// Per-symbol float (shares) from the universe table; symbols with no known float
 /// are omitted (treated as unknown — admitted only when `allow_unknown_float`).
+/// Float, average daily volume and issuer profile for the whole universe, in one
+/// pass. The profile (hot industry / risk domicile) comes from `company_meta`,
+/// written asynchronously by the startup enrichment — a symbol it has not reached
+/// yet simply has the default profile, which is "not hot, not flagged".
 fn load_universe_meta(
     db: &Arc<Mutex<rusqlite::Connection>>,
-) -> (HashMap<String, u64>, HashMap<String, f64>) {
+) -> (
+    HashMap<String, u64>,
+    HashMap<String, f64>,
+    HashMap<String, IssuerProfile>,
+) {
     let conn = db.lock().unwrap();
     let assets = universe_repository::get_all(&conn).unwrap_or_default();
     let mut floats = HashMap::new();
@@ -1487,7 +1562,21 @@ fn load_universe_meta(
             avg_volumes.insert(a.symbol, v as f64);
         }
     }
-    (floats, avg_volumes)
+    let profiles = crate::local_db::company_meta_repository::get_all(&conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            (
+                m.symbol,
+                IssuerProfile::from_meta(
+                    m.country.as_deref(),
+                    m.industry.as_deref(),
+                    m.sector.as_deref(),
+                ),
+            )
+        })
+        .collect();
+    (floats, avg_volumes, profiles)
 }
 
 /// Truncate a headline to `max` chars (char-boundary safe) for the alert reason.

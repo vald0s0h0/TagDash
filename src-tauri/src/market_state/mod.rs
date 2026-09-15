@@ -93,7 +93,19 @@ pub struct FeedDiagnostics {
     /// idle | connecting | authenticating | authenticated | subscribed |
     /// streaming | error | reconnecting | stopped
     pub state: String,
-    pub feed: String, // iex | sip | delayed_sip
+    pub feed: String, // iex | sip | delayed_sip | massive-a
+    /// What the tape physically is, so every consumer can adapt instead of
+    /// guessing from `feed`: `prints` (one message per real trade, SIP/IEX) or
+    /// `second_aggregates` (one message per symbol per second, Massive).
+    #[serde(default)]
+    pub tape_kind: String,
+    /// Whether a trade COUNT is available on this tape. Always true on prints.
+    /// On Massive aggregates it becomes true the moment a frame arrives carrying
+    /// the average trade size `z`, from which the count is reconstructed — see
+    /// `reconstruct_prints`. False until then, and false on a feed that stops
+    /// sending `z`, in which case the tape gates fall back to dollars + continuity.
+    #[serde(default)]
+    pub tape_counts_trades: bool,
     /// Market-data subscription detected at connect time: "sip" (paid) | "iex"
     /// (free). Decides whether the broad tier may use the `*` wildcard.
     #[serde(default)]
@@ -136,6 +148,8 @@ impl Default for FeedDiagnostics {
         Self {
             state: "idle".into(),
             feed: String::new(),
+            tape_kind: "prints".into(),
+            tape_counts_trades: true,
             plan: String::new(),
             symbol_limit: 0,
             broad_mode: String::new(),
@@ -476,6 +490,8 @@ pub struct MarketState {
     /// the live-feed task; `Prints` is the safe default (it is what the app has
     /// always assumed) until a task says otherwise.
     tape_kind: TapeKind,
+    /// Whether the current tape supplies a trade count — see `tape_counts_trades`.
+    tape_counts_trades: bool,
     /// Greatest market-event timestamp ingested. Strategy engines use this
     /// watermark as their clock, so a delayed whole-market feed remains internally
     /// causal instead of comparing T-15 minute prints with the wall clock.
@@ -503,6 +519,7 @@ impl MarketState {
             news_log: VecDeque::new(),
             news_feed: NewsDiagnostics::default(),
             tape_kind: TapeKind::Prints,
+            tape_counts_trades: true,
             market_watermark: None,
         }
     }
@@ -624,6 +641,14 @@ impl MarketState {
     /// real intrasecond OHLC/VWAP in the strategy tape. This matters on fast 04:00
     /// moves where using only the close materially understates the current spike.
     #[allow(clippy::too_many_arguments)]
+    /// Ingest one per-second aggregate.
+    ///
+    /// `prints` is how many real trades that second contained. It used to be
+    /// hard-coded to 1 — one message, one print — which capped every trade rate on
+    /// this feed at 1.0/s and made the tape gates (5/s, 3/s) arithmetically
+    /// unreachable rather than merely hard. The caller now reconstructs it from the
+    /// aggregate's average trade size; see `massive::stream::reconstruct_prints`.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_second_aggregate(
         &mut self,
         symbol: &str,
@@ -633,6 +658,7 @@ impl MarketState {
         close: f64,
         vwap: Option<f64>,
         size: u64,
+        prints: u64,
         event_time: DateTime<Utc>,
         now: DateTime<Utc>,
         warn_ms: u32,
@@ -642,7 +668,7 @@ impl MarketState {
             symbol,
             close,
             size,
-            1,
+            prints.max(1),
             event_time,
             now,
             warn_ms,
@@ -876,6 +902,17 @@ impl MarketState {
         }
     }
 
+    /// The true 04:00 ET open for `symbol` today, if a premarket print has
+    /// arrived. `Bar::open` is set once at bar creation (see
+    /// `seed_premarket_daily`) and never rewritten afterward, so this is safe to
+    /// read at any point during premarket — the value it returns is already the
+    /// final one for the day. Returns `None` before the first premarket trade,
+    /// or when the symbol's first trade of the day happens after 09:30 (no
+    /// premarket bar was ever built).
+    pub fn premarket_open_price(&self, symbol: &str) -> Option<f64> {
+        self.premarket_daily.get(symbol).map(|b| b.open)
+    }
+
     /// Wipe every piece of market DATA (tickers, candles, VWAP/trade counters,
     /// news) while keeping the feed/news diagnostics structs. Used by Market
     /// Replay on start, backward seek and stop, so the simulated day never mixes
@@ -1000,8 +1037,35 @@ impl MarketState {
             // left by a previous realtime Alpaca connection (or vice versa).
             self.trade_counts.clear();
             self.market_watermark = None;
+            // Whether the new tape counts trades is the new tape's business to
+            // prove. Prints always do; aggregates prove it on their first frame
+            // carrying `z`.
+            self.tape_counts_trades = matches!(kind, TapeKind::Prints);
         }
         self.tape_kind = kind;
+        self.feed.tape_kind = match kind {
+            TapeKind::Prints => "prints".to_string(),
+            TapeKind::SecondAggregates => "second_aggregates".to_string(),
+        };
+        self.feed.tape_counts_trades = self.tape_counts_trades;
+    }
+
+    /// Whether the live tape can say HOW MANY trades happened in a window.
+    ///
+    /// This is the switch every tape gate reads. It is a property of the DATA, not
+    /// of the provider: Massive's per-second aggregate carries `z`, the second's
+    /// average trade size, and `n ≈ v / z` recovers the count — measured exact on
+    /// 96.3 % of 34 998 real premarket seconds and never off by more than ±1 or
+    /// 10 %. A gate that assumed "aggregates therefore no count" was throwing away
+    /// a number the message had all along.
+    pub fn tape_counts_trades(&self) -> bool {
+        self.tape_counts_trades
+    }
+
+    /// Record that the aggregate feed is (or is no longer) supplying `z`.
+    pub fn set_tape_counts_trades(&mut self, counts: bool) {
+        self.tape_counts_trades = counts;
+        self.feed.tape_counts_trades = counts;
     }
 
     /// Total share volume for `symbol` over the last `secs` seconds, summed from
@@ -1517,6 +1581,7 @@ mod tests {
             5.5,
             Some(5.25),
             100,
+            4,
             event,
             event,
             1_000,
@@ -1541,7 +1606,7 @@ mod tests {
 
         let delayed = t(0);
         ms.on_second_aggregate(
-            "AAA", 5.0, 5.1, 4.9, 5.0, None, 100, delayed, realtime, 1_000, 2_000,
+            "AAA", 5.0, 5.1, 4.9, 5.0, None, 100, 1, delayed, realtime, 1_000, 2_000,
         );
         assert_eq!(ms.market_watermark, Some(delayed));
     }

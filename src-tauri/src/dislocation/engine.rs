@@ -1,4 +1,4 @@
-//! Micro Pullback v2: robust ticker-relative activity ignition -> market priority -> A+.
+//! Dislocation: robust ticker-relative activity, cross-sectional attention, catalyst.
 //!
 //! There are deliberately no absolute volume, VWAP, split or session-liquidity
 //! gates here. The ticker's own robust tempo RVOL answers "did it wake up?";
@@ -20,9 +20,9 @@ use chrono::{DateTime, Utc};
 use crate::config::secrets::Secrets;
 use crate::flat_files::minute::RvolBaseline;
 use crate::market_state::{MarketState, SecondTapeBar};
-use crate::micro_pullback::{quality, MicroPullbackOptions};
+use crate::dislocation::{quality, DislocationOptions};
 use crate::scanner::push_alert;
-use crate::strategies::micro_pullback::ID as STRATEGY_ID;
+use crate::strategies::dislocation::ID as STRATEGY_ID;
 use crate::types::{AlertSignal, MicroAttentionEntry, Side};
 
 const TOP_N: usize = 10;
@@ -34,20 +34,6 @@ const EVENT_RELEASE_SECS: i64 = 60;
 /// ceiling it then applies, so an OLD headline is reported as old (and logged as
 /// such) instead of being indistinguishable from no headline at all.
 const NEWS_LOOKBACK_SECS: i64 = 48 * 3600;
-/// Current tempo volume / median of prior, non-overlapping tempo windows.
-const TEMPO_RVOL_MIN: f64 = 5.0;
-/// A single-tempo event needs more surprise than a multi-tempo confirmation.
-const SINGLE_TEMPO_RVOL_MIN: f64 = 10.0;
-const SINGLE_TEMPO_ATTENTION_MIN: f64 = 85.0;
-/// A self-RVOL can be enormous when the robust baseline is near zero. Require each
-/// qualifying tempo to also sit in the top 20% of current market flow. Unlike an
-/// absolute share-volume floor this adapts to the quiet 04:00 tape.
-const MARKET_FLOW_RANK_MIN: f64 = 0.80;
-/// At the 04:00 cold start no self-history exists yet. A cross-sectional fallback
-/// may nominate a name, but only when flow AND displacement are both extreme and
-/// another tempo confirms it.
-const COLD_START_ATTENTION_MIN: f64 = 85.0;
-const COLD_START_RANK_MIN: f64 = 0.90;
 const LEADER_Z_MIN: f64 = 2.5;
 const HEAD_Z_MIN: f64 = 1.25;
 const HEAD_EXCESS_SHARE_MIN: f64 = 0.45;
@@ -64,18 +50,6 @@ struct Meta {
     /// and the deterministic score both need it BEFORE any provider call — that is
     /// the whole point of paying for it once per refresh.
     profile: crate::strategies::issuer_profile::IssuerProfile,
-    /// Date of the issuer's last split, `YYYY-MM-DD`, when known. Feeds the
-    /// deterministic reverse-split penalty that replaced the rubric's hard cap.
-    last_split_date: Option<chrono::NaiveDate>,
-}
-
-impl Meta {
-    /// Days between the last split and `now`. `None` when no split is on file — and
-    /// an unknown split is never treated as a recent one.
-    fn days_since_split(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.last_split_date
-            .map(|d| (now.date_naive() - d).num_days())
-    }
 }
 
 struct TapeSeries {
@@ -140,9 +114,6 @@ struct RawObservation {
     evidence_ok: bool,
     price_return_pct: f64,
     float_shares: Option<u64>,
-    /// Carried from the universe so the pre-selection gate can weigh the issuer
-    /// without a database round trip per candidate per tick.
-    profile: crate::strategies::issuer_profile::IssuerProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +202,7 @@ pub fn start(
     active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
     alert_history: Arc<RwLock<Vec<AlertSignal>>>,
     strategy_enabled: Arc<RwLock<HashMap<String, bool>>>,
-    options: Arc<RwLock<MicroPullbackOptions>>,
+    options: Arc<RwLock<DislocationOptions>>,
     app_config: Arc<RwLock<crate::config::AppConfig>>,
     attention: Arc<RwLock<Vec<MicroAttentionEntry>>>,
 ) {
@@ -283,6 +254,7 @@ pub fn start(
                 // and will clear their own entries, but a backward seek must not
                 // leave their spinners on the pane of the session being restarted.
                 super::live_status::reset();
+                quality::reset_news_thirds();
                 budget.reset();
             }
 
@@ -372,96 +344,132 @@ pub fn start(
                 }
             }
 
-            // ── Rank first, then spend the budget from the top ────────────────
+            // ── Two axes, one ranking, one budget ─────────────────────────────
             // `signals` is a HashMap, so iterating it directly processed a tick's
             // candidates in ARBITRARY order — with a bounded model budget that would
             // make "which ticker gets analysed" a hash-ordering accident. Two passes
-            // instead: score every fresh candidate, sort, then act best-first.
+            // instead: score every fresh candidate on the two axes that exist before
+            // any model speaks, sort, then act best-first.
             //
             // Anything that does not fit the budget is left completely untouched —
             // no `active_event`, no event row — so it is reconsidered on the next
             // tick. It is deferred behind something better, never lost.
-            let mut ranked: Vec<(String, Signal, super::preselect::Selection)> = Vec::new();
-            let mut refused: Vec<(String, Signal, super::preselect::Refusal)> = Vec::new();
-            let filters = super::preselect::Filters {
-                hot_industry_only: opts.hot_industry_only,
-                exclude_risk_domicile: opts.exclude_risk_domicile,
-            };
+            let mut ranked: Vec<(String, Signal, super::score::Scores, Option<i64>)> = Vec::new();
             for (symbol, signal) in signals {
-                {
+                let claimed = {
                     let machine = machines.entry(symbol.clone()).or_default();
                     machine.last_qualified_at = Some(market_now);
-                    if machine.active_event {
-                        continue;
+                    machine.active_event
+                };
+                let mut scores = scores_of(&signal.best);
+                // Publish this tick's tape thirds. A qualification task spawned
+                // moments ago is about to render a verdict, and it must score the
+                // move as it IS rather than as it was when the task started.
+                quality::record_tape(&symbol, scores.rvol, scores.attention);
+                if claimed {
+                    // FREE RE-SCORE. Two thirds out of three move every second, so a
+                    // candidate judged just under the bar can clear it a minute later
+                    // with nothing new to buy. Only the upgrade direction is taken
+                    // here: a row that flickered between priorities on every tick
+                    // would be unreadable, and a demotion is the verdict's own job.
+                    //
+                    // THIS ALSO COVERS THE NEVER-PUBLISHED CASE, which is the one
+                    // that matters: in blocking mode a verdict below the threshold
+                    // publishes nothing at all, so waiting for an existing row to
+                    // upgrade meant waiting for something that would never exist.
+                    scores.news = quality::news_third(&symbol);
+                    let previous = latest_alert(&active_alerts, &alert_history, &symbol);
+                    let worth_showing = scores.news.is_some()
+                        && scores.total() >= opts.alert_score_threshold
+                        && previous.as_ref().is_none_or(|p| p.priority < 5);
+                    if worth_showing {
+                        let news_count = market.read().unwrap().recent_news_count(
+                            &symbol,
+                            market_now,
+                            24 * 3600,
+                        );
+                        let machine = machines.entry(symbol.clone()).or_default();
+                        if previous.is_none() {
+                            machine.event_seq += 1;
+                        }
+                        let mut upgraded = make_alert(
+                            &market,
+                            &signal,
+                            market_now,
+                            machine.event_seq,
+                            previous.is_some(),
+                            news_count > 0,
+                        );
+                        // Same id when a row already exists: this is one event getting
+                        // better, and `push_alert` renders it in place rather than
+                        // adding a second row.
+                        if let Some(p) = &previous {
+                            upgraded.alert_id = p.alert_id.clone();
+                        }
+                        upgraded.priority = 5;
+                        upgraded.reason = format!(
+                            "[{:.0} · RVOL {:.0} · attention {:.0} · news {:.0} · seuil franchi sur la bande] {}",
+                            scores.total(),
+                            scores.rvol,
+                            scores.attention,
+                            scores.news.unwrap_or(0.0),
+                            upgraded.reason
+                        );
+                        if opts.ntfy_alerts {
+                            crate::ntfy::notify_alert_once(&secrets, &upgraded);
+                        }
+                        persist_event(
+                            &db,
+                            &upgraded.alert_id,
+                            &signal,
+                            market_now,
+                            previous.is_some(),
+                            "crossed_on_tape",
+                        );
+                        push_alert(&active_alerts, &alert_history, upgraded);
                     }
-                }
-                // With A+ off there is no model to budget for: the old behaviour is
-                // preserved exactly, every confirmed departure is published.
-                if !opts.quality_aplus {
-                    ranked.push((
-                        symbol,
-                        signal,
-                        super::preselect::Selection {
-                            setup: Default::default(),
-                            priority: 0.0,
-                        },
-                    ));
                     continue;
                 }
-                let best = &signal.best;
-                let pre = super::preselect::Candidate {
-                    attention: best.attention,
-                    rvol_rank: best.relative_rank,
-                    tempo_rvol: best.raw.relative_signal,
-                    attention_z: best.dominance_z,
-                    tempo_depth: signal.depth.len(),
-                    profile: best.raw.profile,
-                    newest_news_age_minutes: newest_news_age_minutes(
-                        &market,
-                        &symbol,
-                        market_now,
-                    ),
-                    days_since_split: meta
-                        .get(&symbol)
-                        .and_then(|m| m.days_since_split(market_now)),
-                    session: crate::time::session_at(market_now),
-                };
-                match super::preselect::preselect(&pre, &filters) {
-                    Ok(sel) => ranked.push((symbol, signal, sel)),
-                    Err(refusal) => refused.push((symbol, signal, refusal)),
-                }
+                let news_age = newest_news_age_minutes(&market, &symbol, market_now);
+                ranked.push((symbol, signal, scores, news_age));
             }
-            ranked.sort_by(|a, b| b.2.priority.total_cmp(&a.2.priority));
-            if opts.quality_aplus {
-                let room = budget.room(market_now, opts.llm_budget_per_5min as usize);
-                if ranked.len() > room {
-                    ranked.truncate(room);
-                }
-                budget.spend(ranked.len());
-            }
+            ranked.sort_by(|a, b| b.2.tape().total_cmp(&a.2.tape()));
 
-            // A refusal is a decision: it claims the event so it is not re-logged
-            // every ten seconds while the same move continues.
-            for (symbol, signal, refusal) in refused {
-                let machine = machines.entry(symbol.clone()).or_default();
-                machine.active_event = true;
-                machine.event_seq += 1;
-                let event_id = format!("mp-{}-{}", machine.event_seq, symbol);
-                if let Ok(conn) = db.lock() {
-                    let _ = crate::local_db::insert_log(
-                        &conn,
-                        "info",
-                        &format!(
-                            "micro_pullback A+ {symbol}: pas d'appel LLM — {}",
-                            refusal.reason()
-                        ),
-                    );
-                }
-                persist_event(&db, &event_id, &signal, market_now, false, refusal.outcome());
-            }
+            // No key, no model — and therefore no reason to hold a candidate back
+            // waiting for a third that can never arrive. Without this check a user
+            // with no Deepseek key would see every catalyst-carrying candidate
+            // silently refused inside the qualification task.
+            let has_model = secrets
+                .read()
+                .unwrap()
+                .deepseek_api_key
+                .as_deref()
+                .is_some_and(|k| !k.trim().is_empty());
+            let room = budget.room(market_now, opts.llm_budget_per_5min as usize);
+            let mut spent = 0usize;
 
-            for (symbol, signal, selection) in ranked {
-                let setup = selection.setup;
+            for (symbol, signal, mut scores, news_age) in ranked {
+                // The news third is the only one that costs money. It is worth
+                // spending only on a headline still inside the freshness window —
+                // outside it, the third is a measured zero, not an unknown.
+                let gradable_news = super::score::worth_a_model_call(news_age) && has_model;
+                let call_model = gradable_news && spent < room;
+                if gradable_news && !call_model {
+                    continue;
+                }
+                if !gradable_news {
+                    // Not an unknown: either there is nothing in the window to grade,
+                    // or there is no model to grade it with. Either way the third is
+                    // a measured zero and the candidate is judged on its tape alone.
+                    scores.news = Some(0.0);
+                }
+                // Without a model call the score is final right here, so the
+                // threshold is the whole decision. With one, the verdict is the
+                // qualification task's to make.
+                if !call_model && scores.total() < opts.alert_score_threshold {
+                    continue;
+                }
+
                 let machine = machines.entry(symbol.clone()).or_default();
                 machine.active_event = true;
                 machine.event_seq += 1;
@@ -481,7 +489,7 @@ pub fn start(
                 let materially_stronger = previous.is_none()
                     && machine.qualification_attempted
                     && is_materially_stronger_event(machine, &signal);
-                let score_claimed = !opts.quality_aplus
+                let score_claimed = !call_model
                     || quality::claim_score(&symbol, market_now, news_count)
                     || materially_stronger;
                 let no_new_information = machine.qualification_attempted && !score_claimed;
@@ -495,13 +503,13 @@ pub fn start(
                     news_count > 0,
                 );
 
-                if opts.quality_aplus && no_new_information {
+                if call_model && no_new_information {
                     if let Some(old) = previous {
-                        // Reuse the last visible A+ verdict. The new event's market
+                        // Reuse the last visible verdict. The new event's market
                         // metrics stay in the reason; no provider or LLM call occurs.
                         alert.priority = old.priority;
                         alert.reason = format!(
-                            "[Déjà alerté · A+ réutilisé · catalyseur inchangé] {} · nouvel événement: {}",
+                            "[Déjà alerté · score réutilisé · catalyseur inchangé] {} · nouvel événement: {}",
                             old.reason, alert.reason
                         );
                         if opts.ntfy_alerts && alert.priority >= 5 {
@@ -513,7 +521,7 @@ pub fn start(
                             &signal,
                             market_now,
                             true,
-                            "a_plus_reused",
+                            "score_reused",
                         );
                         push_alert(&active_alerts, &alert_history, alert);
                     } else if let Ok(conn) = db.lock() {
@@ -521,7 +529,7 @@ pub fn start(
                             &conn,
                             "info",
                             &format!(
-                                "micro_pullback v2 {symbol}: nouvel événement, A+ non rappelé (catalyseur inchangé)"
+                                "dislocation {symbol}: nouvel événement, LLM non rappelé (catalyseur inchangé)"
                             ),
                         );
                         drop(conn);
@@ -531,19 +539,24 @@ pub fn start(
                             &signal,
                             market_now,
                             false,
-                            "a_plus_unchanged_suppressed",
+                            "news_unchanged_suppressed",
                         );
                     }
                     continue;
                 }
 
-                machine.qualification_attempted = opts.quality_aplus;
-                if opts.quality_aplus {
+                machine.qualification_attempted = call_model;
+                if call_model {
                     machine.last_scored_depth = signal.depth.len();
                     machine.last_scored_attention = signal.best.attention;
                     machine.last_scored_rvol = signal.best.raw.relative_signal.unwrap_or_default();
+                    spent += 1;
+                    budget.spend(1);
                 }
-                if !opts.quality_aplus {
+
+                if !call_model {
+                    // Two thirds out of three, and they already clear the bar.
+                    quality::decorate_scores(&mut alert, &scores, news_age);
                     if opts.ntfy_alerts {
                         crate::ntfy::notify_alert_once(&secrets, &alert);
                     }
@@ -553,7 +566,7 @@ pub fn start(
                         &signal,
                         market_now,
                         already_alerted,
-                        "published_plain",
+                        "published_without_news",
                     );
                     push_alert(&active_alerts, &alert_history, alert);
                     continue;
@@ -582,7 +595,8 @@ pub fn start(
                     tape_active_seconds: Some(best.raw.active_seconds),
                     tape_window_secs: best.raw.tempo_secs,
                     detected_at: market_now,
-                    setup,
+                    scores,
+                    news_age_minutes: news_age,
                 };
                 persist_event(
                     &db,
@@ -590,7 +604,7 @@ pub fn start(
                     &signal,
                     market_now,
                     already_alerted,
-                    "sent_to_a_plus",
+                    "sent_to_news_llm",
                 );
                 tauri::async_runtime::spawn(quality::run_qualification(deps, candidate, opts));
             }
@@ -627,26 +641,6 @@ fn load_meta(
     // Issuer identity for the whole universe in one read. `company_meta` is written
     // by the startup pipeline and changes at most once a day, so joining it here
     // costs one query per five-minute refresh instead of one per candidate.
-    // Last split date for the whole universe in one read. `fundamentals_cache` holds
-    // the column but `all_fundamentals` does not project it, and one query beats one
-    // `get_dilution_and_splits` per candidate per tick.
-    let split_dates: HashMap<String, chrono::NaiveDate> = (|| -> rusqlite::Result<_> {
-        let mut stmt = conn.prepare(
-            "SELECT symbol, last_split_date FROM fundamentals_cache
-             WHERE last_split_date IS NOT NULL AND last_split_date <> ''",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        Ok(rows
-            .filter_map(Result::ok)
-            .filter_map(|(sym, d)| {
-                chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d")
-                    .ok()
-                    .map(|nd| (sym, nd))
-            })
-            .collect())
-    })()
-    .unwrap_or_default();
-
     let profiles = crate::local_db::company_meta_repository::get_all(&conn)
         .unwrap_or_default()
         .into_iter()
@@ -687,7 +681,6 @@ fn load_meta(
                 return None;
             }
             let profile = profiles.get(&a.symbol).copied().unwrap_or_default();
-            let last_split_date = split_dates.get(&a.symbol).copied();
             Some((
                 a.symbol,
                 Meta {
@@ -695,7 +688,6 @@ fn load_meta(
                     atr: f.and_then(|x| x.atr).filter(|v| *v > 0.0),
                     prev_close: f.and_then(|x| x.prev_close).filter(|v| *v > 0.0),
                     profile,
-                    last_split_date,
                 },
             ))
         })
@@ -766,7 +758,7 @@ fn snapshot(
     market: &Arc<RwLock<MarketState>>,
     meta: &HashMap<String, Meta>,
     historical_rvol: &HashMap<(String, u32), RvolBaseline>,
-    opts: &MicroPullbackOptions,
+    opts: &DislocationOptions,
     now: DateTime<Utc>,
 ) -> Vec<RawObservation> {
     let ms = market.read().unwrap();
@@ -891,7 +883,6 @@ fn observe(
         evidence_ok,
         price_return_pct: net / first.open * 100.0,
         float_shares: meta.float_shares,
-        profile: meta.profile,
     })
 }
 
@@ -930,11 +921,15 @@ fn relative_activity(series: &TapeSeries, now: i64, tempo: i64, current: u64) ->
         windows.push(volume as f64);
     }
     let baseline = median(&mut windows)?;
+    // The floor is what makes this number a RATIO. Without it a dormant premarket
+    // name whose prior windows are empty divides by ~1 and reports its raw share
+    // count as a multiplier — measured on 20 sessions, half of all premarket
+    // baselines are exactly zero. See `score::RVOL_BASELINE_FLOOR_PER_MIN`.
+    let expected = super::score::floor_expected(baseline, tempo);
     Some(TempoRvol {
-        // +1 is only a zero-safe continuity correction. Unlike the previous code,
-        // do not log-transform this: the A+ payload and the UI expect an actual
-        // multiplier, and "5x" must remain 5.0 rather than ln(5).
-        ratio: (current as f64 + 1.0) / (baseline + 1.0),
+        // Not a logarithm: the payload and the UI expect an actual multiplier, and
+        // "5x" must remain 5.0 rather than ln(5).
+        ratio: current as f64 / expected,
         windows: window_count as u8,
     })
 }
@@ -956,9 +951,9 @@ fn historical_activity(
     // Median + half a robust sigma avoids a single historically active day making
     // the expected value zero, while preserving genuine zero-volume dormancy.
     let typical_10m = baseline.median_volume_10m + 0.5 * 1.4826 * baseline.mad_volume_10m;
-    let expected = typical_10m.max(0.0) * tempo as f64 / 600.0;
+    let expected = super::score::expected_volume(typical_10m, tempo);
     Some(TempoRvol {
-        ratio: (current as f64 + 1.0) / (expected + 1.0),
+        ratio: current as f64 / expected,
         windows: baseline.sample_days,
     })
 }
@@ -1029,17 +1024,18 @@ fn rank_all(
                 }
                 let flow_rank = flow_num / flow_den;
                 let range_rank = percentile(&ranges, raw.range_signal);
+                // Kept for the forensic row only. It used to feed `attention` with
+                // a 0.15 weight, which made the attention third and the RVOL third
+                // of the score partly the same number.
                 let relative_rank = raw.relative_signal.map(|v| percentile(&relatives, v));
-                let mut attention_num = 0.35 * flow_rank
-                    + 0.25 * range_rank
-                    + 0.15 * raw.continuity
-                    + 0.10 * raw.distribution_quality;
-                let mut attention_den = 0.85;
-                if let Some(r) = relative_rank {
-                    attention_num += 0.15 * r;
-                    attention_den += 0.15;
-                }
-                let attention = 100.0 * attention_num / attention_den;
+                // "Beaucoup de volume, beaucoup de tape, beaucoup de volume par
+                // seconde." Flow carries the volume and the dollars, continuity and
+                // distribution carry the tape, range says the volume moved the price.
+                let attention = 100.0
+                    * (0.45 * flow_rank
+                        + 0.20 * range_rank
+                        + 0.20 * raw.continuity
+                        + 0.15 * raw.distribution_quality);
                 RankedObservation {
                     raw,
                     attention,
@@ -1060,6 +1056,7 @@ fn rank_all(
         ranked.sort_by(|a, b| b.attention.total_cmp(&a.attention));
 
         for (idx, r) in ranked.iter().take(TOP_N).enumerate() {
+            let thirds = scores_of(r);
             debug.push(MicroAttentionEntry {
                 symbol: r.raw.symbol.clone(),
                 tempo_secs: tempo as u32,
@@ -1078,6 +1075,8 @@ fn rank_all(
                 head_size: r.head_size as u8,
                 dominant: r.dominant,
                 already_alerted: alerted.contains(&r.raw.symbol),
+                rvol_third: thirds.rvol,
+                attention_third: thirds.attention,
                 market_time: market_now,
                 received_at,
             });
@@ -1150,18 +1149,27 @@ fn apply_dominance(rows: &mut [RankedObservation]) {
     }
 }
 
+/// One row per symbol: the tempo on which it looks strongest, plus the list of
+/// tempos it showed up on at all.
+///
+/// NO GATE HERE ANY MORE. This used to AND together `RVOL >= 5`, `flow >= p80`,
+/// a cold-start branch at `attention >= 85 / p90 / p90`, and a retention rule of
+/// "two tempos, or RVOL >= 10 with attention >= 85". Every one of those is a hard
+/// magnitude threshold on a quantity whose distribution moves between a cold 04:00
+/// tape and a hot 09:35 one — the exact thing that is not supposed to decide
+/// anything here. The capacity boundary is the per-tempo Top 10 in `rank_all`; the
+/// score decides the rest.
 fn collapse_signals(rows: &[RankedObservation]) -> HashMap<String, Signal> {
     let mut out: HashMap<String, Signal> = HashMap::new();
-    for row in rows.iter().filter(|r| candidate_row(r)) {
+    for row in rows {
         let entry = out.entry(row.raw.symbol.clone()).or_insert_with(|| Signal {
             best: row.clone(),
             depth: Vec::new(),
         });
         entry.depth.push(row.raw.tempo_secs);
-        let row_strength = row.raw.relative_signal.unwrap_or(0.0).ln_1p() * 10.0 + row.attention;
-        let best_strength =
-            entry.best.raw.relative_signal.unwrap_or(0.0).ln_1p() * 10.0 + entry.best.attention;
-        if row_strength > best_strength {
+        // The tempo that best represents the symbol is the one with the highest
+        // tape score — the same number that then ranks it against the others.
+        if tape_score(row) > tape_score(&entry.best) {
             entry.best = row.clone();
         }
     }
@@ -1169,25 +1177,20 @@ fn collapse_signals(rows: &[RankedObservation]) -> HashMap<String, Signal> {
         signal.depth.sort_unstable();
         signal.depth.dedup();
     }
-    out.retain(|_, signal| {
-        signal.depth.len() >= 2
-            || (signal.best.raw.relative_signal.unwrap_or(0.0) >= SINGLE_TEMPO_RVOL_MIN
-                && signal.best.attention >= SINGLE_TEMPO_ATTENTION_MIN)
-    });
     out
 }
 
-fn candidate_row(row: &RankedObservation) -> bool {
-    if !row.raw.evidence_ok {
-        return false;
-    }
-    match row.raw.relative_signal {
-        Some(rvol) => rvol >= TEMPO_RVOL_MIN && row.flow_rank >= MARKET_FLOW_RANK_MIN,
-        None => {
-            row.attention >= COLD_START_ATTENTION_MIN
-                && row.flow_rank >= COLD_START_RANK_MIN
-                && row.range_rank >= COLD_START_RANK_MIN
-        }
+/// The two thirds of the score that exist before any model is called.
+fn tape_score(row: &RankedObservation) -> f64 {
+    scores_of(row).tape()
+}
+
+/// The RVOL and attention thirds of one observation.
+fn scores_of(row: &RankedObservation) -> super::score::Scores {
+    super::score::Scores {
+        rvol: super::score::rvol_score(row.raw.relative_signal),
+        attention: super::score::attention_score(row.dominance_z, row.attention),
+        news: None,
     }
 }
 
@@ -1239,14 +1242,14 @@ fn make_alert(
     );
     AlertSignal {
         alert_id: format!(
-            "mp2-{}-{}-{event_seq}",
+            "dl-{}-{}-{event_seq}",
             now.timestamp_millis(),
             best.raw.symbol
         ),
         timestamp: now,
         symbol: best.raw.symbol.clone(),
         strategy_id: STRATEGY_ID.into(),
-        strategy_name: "Micro Pullback".into(),
+        strategy_name: "Dislocation".into(),
         priority: 5,
         session: crate::time::session_at(now),
         price: Some(best.raw.price),
@@ -1303,6 +1306,7 @@ fn persist_event(
     outcome: &str,
 ) {
     let r = &signal.best;
+    let thirds = scores_of(r);
     let row = MicroAttentionEntry {
         symbol: r.raw.symbol.clone(),
         tempo_secs: r.raw.tempo_secs as u32,
@@ -1320,6 +1324,8 @@ fn persist_event(
         dominance_z: r.dominance_z,
         head_size: r.head_size as u8,
         dominant: r.dominant,
+        rvol_third: thirds.rvol,
+        attention_third: thirds.attention,
         already_alerted,
         market_time: market_now,
         received_at: Utc::now(),
@@ -1420,7 +1426,6 @@ mod tests {
                 evidence_ok: true,
                 price_return_pct: 1.0,
                 float_shares: Some(1_000_000),
-                profile: Default::default(),
             },
             attention: attention_seed,
             direction: 100.0,
@@ -1493,11 +1498,13 @@ mod tests {
             },
         ];
         let tape = TapeSeries::new(series);
-        let rel = relative_activity(&tape, 100, 10, 200).unwrap();
-        assert!(
-            rel.ratio > 100.0,
-            "a first real impulse is surprising, not ineligible"
-        );
+        // 200 shares against an empty baseline used to report a ratio above 100.
+        // Floored, it is what it actually is: nothing much.
+        let small = relative_activity(&tape, 100, 10, 200).unwrap();
+        assert!(small.ratio < 3.0, "got {}", small.ratio);
+        // A genuine first impulse still reads as one.
+        let real = relative_activity(&tape, 100, 10, 50_000).unwrap();
+        assert!(real.ratio > 500.0, "got {}", real.ratio);
         let cold = TapeSeries::new(tape.bars[1..].to_vec());
         assert!(relative_activity(&cold, 100, 10, 200).is_none());
     }
@@ -1510,15 +1517,33 @@ mod tests {
         let profile = HashMap::from([(
             ("JUNS".to_string(), bucket),
             RvolBaseline {
-                // Expected 20-second volume = 300 * 20/600 = 10 shares.
-                median_volume_10m: 300.0,
+                // Expected 20-second volume = 300 000 * 20/600 = 10 000 shares,
+                // comfortably above the floor, so the time-of-day scaling is what is
+                // actually under test here.
+                median_volume_10m: 300_000.0,
                 mad_volume_10m: 0.0,
                 sample_days: 8,
             },
         )]);
-        let rvol = historical_activity(&profile, "JUNS", now, 20, 99).unwrap();
-        assert!((rvol.ratio - 100.0 / 11.0).abs() < 1e-9);
+        let rvol = historical_activity(&profile, "JUNS", now, 20, 99_000).unwrap();
+        assert!((rvol.ratio - 9.9).abs() < 1e-9, "got {}", rvol.ratio);
         assert_eq!(rvol.windows, 8);
+
+        // A baseline below the floor is compared to the floor instead of to itself.
+        let dormant = HashMap::from([(
+            ("SHELL".to_string(), bucket),
+            RvolBaseline {
+                median_volume_10m: 30.0,
+                mad_volume_10m: 0.0,
+                sample_days: 8,
+            },
+        )]);
+        let floored = historical_activity(&dormant, "SHELL", now, 20, 99_000).unwrap();
+        assert!(
+            (floored.ratio - 99_000.0 / (500.0 * 20.0 / 60.0)).abs() < 1e-6,
+            "got {}",
+            floored.ratio
+        );
     }
 
     #[test]
@@ -1531,22 +1556,24 @@ mod tests {
 
     #[test]
     fn five_minute_relative_activity_uses_only_retained_real_windows() {
+        // Volumes well above the floor, so what is under test is the window
+        // selection rather than the floor.
         let series = vec![
             SecondTapeBar {
                 sec: 10,
-                shares: 100,
+                shares: 100_000,
                 ..Default::default()
             },
             SecondTapeBar {
                 sec: 310,
-                shares: 100,
+                shares: 100_000,
                 ..Default::default()
             },
         ];
-        let rel = relative_activity(&TapeSeries::new(series), 900, 300, 200).unwrap();
+        let rel = relative_activity(&TapeSeries::new(series), 900, 300, 200_000).unwrap();
         assert!(
             rel.ratio > 1.9 && rel.ratio < 2.1,
-            "expected 201/101, got {}",
+            "expected 200 000/100 000, got {}",
             rel.ratio
         );
     }
@@ -1577,28 +1604,32 @@ mod tests {
     }
 
     #[test]
-    fn relative_flow_rejects_btcs_noise_but_keeps_the_juns_ignition() {
-        // Replay forensics, 2026-08-21: BTCS produced spectacular ratios against a
-        // near-zero baseline but remained below the top market-flow quintile. JUNS
-        // reached 0.85-0.95 as the real 07:09 impulse started.
-        let mut btcs_20 = raw("BTCS", 76.6);
-        btcs_20.raw.tempo_secs = 20;
-        btcs_20.raw.relative_signal = Some(10.3);
-        btcs_20.flow_rank = 0.795;
-        let mut btcs_40 = btcs_20.clone();
-        btcs_40.raw.tempo_secs = 40;
-        btcs_40.raw.relative_signal = Some(6_404.0);
-        assert!(collapse_signals(&[btcs_20, btcs_40]).is_empty());
+    fn noise_is_ranked_below_the_ignition_rather_than_gated_out() {
+        // Replay forensics, 2026-08-21. BTCS produced spectacular ratios against a
+        // near-zero baseline while staying in the pack; JUNS's 07:09 impulse was
+        // detached by four robust sigmas. The old code ANDed a flow-percentile gate
+        // to tell them apart and threw BTCS away entirely. Now BOTH are ranked, and
+        // the score is what separates them — which is the property that survives a
+        // market whose distributions move between 04:00 and 09:35.
+        let mut btcs = raw("BTCS", 76.6);
+        btcs.raw.tempo_secs = 20;
+        btcs.raw.relative_signal = Some(10.3);
+        btcs.dominance_z = 0.6;
 
-        let mut juns_20 = raw("JUNS", 94.0);
-        juns_20.raw.tempo_secs = 20;
-        juns_20.raw.relative_signal = Some(4_378.0);
-        juns_20.flow_rank = 0.891;
-        let mut juns_40 = juns_20.clone();
-        juns_40.raw.tempo_secs = 40;
-        juns_40.raw.relative_signal = Some(5_548.0);
-        juns_40.flow_rank = 0.853;
-        assert!(collapse_signals(&[juns_20, juns_40]).contains_key("JUNS"));
+        let mut juns = raw("JUNS", 94.0);
+        juns.raw.tempo_secs = 20;
+        juns.raw.relative_signal = Some(4_378.0);
+        juns.dominance_z = 4.58;
+
+        let out = collapse_signals(&[btcs.clone(), juns.clone()]);
+        assert!(out.contains_key("JUNS"));
+        assert!(out.contains_key("BTCS"), "noise is ranked, not erased");
+        assert!(
+            tape_score(&juns) > 2.0 * tape_score(&btcs),
+            "JUNS {:.0} vs BTCS {:.0}",
+            tape_score(&juns),
+            tape_score(&btcs)
+        );
     }
 
     #[test]
@@ -1619,11 +1650,49 @@ mod tests {
         assert!(is_materially_stronger_event(&machine, &signal));
     }
 
+    /// A single marginal print still has to be cheap. It is no longer thrown away by
+    /// a gate — it simply scores near nothing, so the budget never reaches it.
     #[test]
-    fn one_marginal_tempo_does_not_turn_a_single_print_into_an_llm_call() {
+    fn one_marginal_tempo_scores_near_zero() {
         let mut noise = raw("NOISE", 70.0);
         noise.raw.relative_signal = Some(5.1);
-        assert!(collapse_signals(&[noise]).is_empty());
+        noise.dominance_z = 0.3;
+        let s = scores_of(&noise);
+        assert!(s.rvol < 10.0, "RVOL third {:.1}", s.rvol);
+        // The attention third is majority-rank since the recalibration, so a row
+        // sitting mid-table still collects some of it. What has to stay negligible
+        // is the TOTAL: no RVOL and no catalyst is no candidate.
+        let total = crate::dislocation::score::Scores {
+            news: Some(0.0),
+            ..s
+        }
+        .total();
+        assert!(total < 20.0, "total {total:.1}");
+    }
+
+    /// The floor is what stops a dormant name's raw share count from masquerading as
+    /// a multiplier. Measured on 20 sessions: half of all premarket baselines are
+    /// exactly zero, and JUNS reported "RVOL 2 055" at 11:02 on 2 323 shares.
+    #[test]
+    fn a_collapsed_baseline_cannot_manufacture_an_rvol() {
+        let series = TapeSeries::new(vec![
+            SecondTapeBar {
+                sec: 100,
+                shares: 1,
+                ..Default::default()
+            },
+            SecondTapeBar {
+                sec: 160,
+                shares: 1,
+                ..Default::default()
+            },
+        ]);
+        let rel = relative_activity(&series, 200, 60, 2_323).unwrap();
+        assert!(
+            rel.ratio < 6.0,
+            "2 323 shares against an empty baseline is not a 2 000x wake, got {}",
+            rel.ratio
+        );
     }
 
     #[test]

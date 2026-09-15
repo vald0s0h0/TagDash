@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use crate::types::{AlertSignal, Session, StrategyCard, StrategyContext, StrategyRiskConfig};
 
-pub mod backside_parabolic;
+pub mod backside;
+pub mod dislocation;
 pub mod hod_drive;
 pub mod issuer_profile;
 pub mod micro_pullback;

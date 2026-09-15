@@ -119,6 +119,8 @@ mod tests {
             head_size: 1,
             dominant: true,
             already_alerted: false,
+            rvol_third: 22.0,
+            attention_third: 60.0,
             market_time: t,
             received_at: t + chrono::Duration::minutes(15),
         }

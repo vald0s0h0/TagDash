@@ -18,7 +18,7 @@
 // doesn't, with one code path for both and no second set of HTTP clients to keep in
 // sync. The refresh also warms the cache for everyone else.
 //
-// BUDGETS. The triage pass is the one the trader waits on, so it gets a short budget
+// BUDGETS. The news pass is the one the trader waits on, so it gets a short budget
 // and only the fast per-ticker endpoints. The deep pass runs after the alert is
 // already out (or while it is still blocked, in blocking mode) and can afford SEC.
 //
@@ -37,8 +37,8 @@ use crate::config::AppConfig;
 use crate::local_db::{cache_repository, company_intel_repository, company_meta_repository};
 use crate::quality_llm::payload::Source;
 
-/// Budget for the triage pass — short, because the alert is waiting on it.
-pub const TRIAGE_BUDGET: Duration = Duration::from_millis(2_500);
+/// Budget for the news pass — short, because the alert is waiting on it.
+pub const NEWS_BUDGET: Duration = Duration::from_millis(2_500);
 /// Budget for the deep pass.
 pub const DEEP_BUDGET: Duration = Duration::from_secs(8);
 /// How far back the REST news sweep reaches. Wider than the websocket's in-memory
@@ -58,15 +58,15 @@ pub struct GatherPlan {
 }
 
 impl GatherPlan {
-    pub const TRIAGE: Self = Self {
+    pub const NEWS: Self = Self {
         fetch_news: true,
         fetch_float: true,
         refresh_company_intel: false,
     };
     /// The only plan that spends provider calls on the DOSSIER — SEC filings,
     /// financials, dilution. It is requested exclusively by the deep pass, so with
-    /// `deep_llm` off no filing or statement is ever fetched for a candidate: the
-    /// triage rubric grades the catalyst and would not read them anyway.
+    /// `quality_aplus` off no filing or statement is ever fetched for a candidate: the
+    /// news rubric grades the catalyst and would not read them anyway.
     /// `no_dossier_work_without_the_deep_pass` pins that.
     pub const DEEP: Self = Self {
         fetch_news: false,
@@ -159,8 +159,8 @@ impl LiveIntel {
 /// Gather the dossier for `symbol`, fetching what fits inside `budget` and falling
 /// back to the cache for the rest.
 ///
-/// `plan` selects only the live work this phase needs. On the triage pass SEC/FMP is
-/// skipped; on the deep pass news and float are reused from triage; on a headline
+/// `plan` selects only the live work this phase needs. On the news pass SEC/FMP is
+/// skipped; on the deep pass news and float are reused from it; on a headline
 /// re-score only the REST news sweep is refreshed.
 pub async fn gather(
     db: &Arc<Mutex<rusqlite::Connection>>,
@@ -180,7 +180,8 @@ pub async fn gather(
     // and `massive::news::fetch_latest_news` adds `published_utc.lte = now`, both
     // reading the replay clock through `crate::time::now()` — so a headline published
     // later in the replayed day cannot come back. Blocking them bought no safety and
-    // cost the whole point of replaying Micro Pullback: A+ is a CATALYST decision, and
+    // cost the whole point of replaying Dislocation: the news third is a CATALYST
+    // decision, and
     // with the news half forced to `Missing` every candidate was scored on an absence
     // the live run would never have had. The websocket store fed by the replayed tape
     // stays merged in on top (see `quality::build_news`) — REST reaches back before

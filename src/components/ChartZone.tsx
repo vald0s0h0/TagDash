@@ -35,7 +35,9 @@ import {
 } from "@/stores/hotkeyStore";
 import { registerZoneGamepad, getChartControl } from "@/lib/gamepadBus";
 import {
-  useStrategyCards, useStrategies, usePanicLlmScores, useMicroQualityScores,
+  useStrategyCards, useStrategies, usePanicLlmScores, useDislocationScores,
+  useDislocationTape, useMicroPullbackScores, useMicroPullbackOptions,
+  useRunMicroPullbackNewsScore,
 } from "@/queries/useScanner";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
@@ -52,12 +54,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   PRIORITY_STYLES, TIMEFRAMES,
-  ChartInfoBar, StrategyInfoOverlay, MicroInfoOverlay, HodDriveInfoOverlay,
-  PanicReportOverlay, TBtn, Sep, EmptyZone,
+  ChartInfoBar, StrategyInfoOverlay, DislocationOverlay, MicroPullbackQualityOverlay,
+  HodDriveInfoOverlay, PanicReportOverlay, BacksideOverlay, TBtn, Sep, EmptyZone,
 } from "./chartZoneParts";
 
-// Micro Pullback gets the rich on-chart risk overlay (on its sub-minute pane);
-// every other strategy uses the generic field overlay (on its left pane).
+// Dislocation gets the rich on-chart score overlay (on its sub-minute pane): the
+// three thirds, the model's sentence and the news state.
+const DISLOCATION_ID = "dislocation";
+// Micro Pullback's own overlay is deliberately lighter — one score (its News-only
+// catalyst read, opt-in), no thirds, no threshold. Same pane as Dislocation's.
 const MICRO_PULLBACK_ID = "micro_pullback";
 // HOD Drive gets its own KPI overlay + HOD/LOD points + green-series crosses on its
 // timeframe (right/interactive) pane.
@@ -66,6 +71,9 @@ const HOD_DRIVE_ID = "hod_drive";
 // the multi-day move that put the ticker on the watchlist is visible — the report
 // explains that move, so the two belong side by side.
 const PANIC_MEAN_REVERSION_ID = "panic_mean_reversion";
+// Backside gets the minimal headline + "Analyser news" overlay (reuses Panic's
+// exact LLM call). No thirds, no score — just what Gate 1 doesn't already show.
+const BACKSIDE_ID = "backside";
 
 // Mood emojis offered by the toolbar (euphoric / angry / panicked / in the clouds).
 const EMOJIS: { glyph: string; title: string }[] = [
@@ -203,12 +211,15 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // Pane that carries the strategy info overlay: Micro Pullback draws its rich
   // risk overlay on the sub-minute (interactive) pane; other strategies keep the
   // generic field overlay on the left-most pane.
-  const isMicro = zone.strategy_id === MICRO_PULLBACK_ID;
+  const isDislocation = zone.strategy_id === DISLOCATION_ID;
+  const isMicroPullback = zone.strategy_id === MICRO_PULLBACK_ID;
   const isHod   = zone.strategy_id === HOD_DRIVE_ID;
   const isPanic = zone.strategy_id === PANIC_MEAN_REVERSION_ID;
-  // Micro Pullback + HOD Drive draw their overlay on the interactive (right) pane;
-  // every other strategy keeps the generic field overlay on the left-most pane.
-  const overlayPaneIdx = isMicro || isHod ? interactiveIdx : 0;
+  const isBackside = zone.strategy_id === BACKSIDE_ID;
+  // Dislocation + Micro Pullback + HOD Drive draw their overlay on the interactive
+  // (right) pane; every other strategy keeps the generic field overlay on the
+  // left-most pane.
+  const overlayPaneIdx = isDislocation || isMicroPullback || isHod ? interactiveIdx : 0;
 
   // ── Resizable panes (drag the gutters BETWEEN panes / columns) ─────────────
   // Sizes are flex-grow ratios persisted per layout shape (see paneSizeStore), so a
@@ -423,9 +434,18 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // Same contract as the panic board: day- and mode-scoped server-side, so a
   // replay's judgements never leak into live. The live half is what lets the
   // overlay draw a spinner instead of an empty pane while the models are running.
-  const { bySymbol: microQuality, liveBySymbol: microQualityLive } = useMicroQualityScores();
+  const { bySymbol: microQuality, liveBySymbol: microQualityLive } = useDislocationScores();
+  const { bySymbol: microAttention } = useDislocationTape();
   const microRow  = zone.symbol ? microQuality[zone.symbol] ?? null : null;
   const microLive = zone.symbol ? microQualityLive[zone.symbol] ?? null : null;
+  // The two tape thirds, live. They move every second; the persisted verdict does not.
+  const microTape = zone.symbol ? microAttention[zone.symbol] ?? null : null;
+
+  // ── Micro Pullback's own (lighter) catalyst read ─────────────────────────────
+  const { bySymbol: mpQuality } = useMicroPullbackScores();
+  const { data: mpOptions } = useMicroPullbackOptions();
+  const mpQualityRow = zone.symbol ? mpQuality[zone.symbol] ?? null : null;
+  const runMpNewsScore = useRunMicroPullbackNewsScore();
 
   // ── HOD Drive draft (suggested) trade levels ──────────────────────────────────
   // Initialized once when gates_pass flips true; local state not re-synced on each
@@ -484,7 +504,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const { data: tickerNews } = useQuery({
     queryKey: ["ticker_news", zone.symbol],
     queryFn:  () => api.getTickerNews(zone.symbol!),
-    enabled:  !!zone.symbol && zone.strategy_id === MICRO_PULLBACK_ID,
+    enabled:  !!zone.symbol && (zone.strategy_id === DISLOCATION_ID || isBackside),
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
@@ -1777,13 +1797,23 @@ export function ChartZone({ zone }: ChartZoneProps) {
                   )}
                   {/* Strategy-specific info overlay (rich for Micro Pullback). */}
                   {hasOverlay && (
-                    isMicro ? (
-                      <MicroInfoOverlay
+                    isDislocation ? (
+                      <DislocationOverlay
                         cardInfo={cardInfo ?? null}
                         enrichment={enrichment ?? null}
                         news={tickerNews ?? []}
                         quality={microRow}
                         live={microLive}
+                        attention={microTape}
+                      />
+                    ) : isMicroPullback ? (
+                      <MicroPullbackQualityOverlay
+                        quality={mpQualityRow}
+                        autoEnabled={mpOptions?.llm_auto ?? false}
+                        pending={runMpNewsScore.isPending}
+                        onScore={() => {
+                          if (zone.symbol) runMpNewsScore.mutate(zone.symbol);
+                        }}
                       />
                     ) : isHod ? (
                       <HodDriveInfoOverlay
@@ -1801,6 +1831,17 @@ export function ChartZone({ zone }: ChartZoneProps) {
                       // still what renders (the `panicScore` guard), so the pane is
                       // never emptier than it was.
                       <PanicReportOverlay score={panicScore} />
+                    ) : isBackside ? (
+                      <BacksideOverlay
+                        news={tickerNews ?? []}
+                        enrichment={enrichment ?? null}
+                        pending={enrichment?.llm_pending ?? false}
+                        onAnalyze={() => {
+                          if (zone.symbol && zone.strategy_id) {
+                            api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
+                          }
+                        }}
+                      />
                     ) : (
                       <StrategyInfoOverlay
                         card={card}
