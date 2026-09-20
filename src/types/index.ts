@@ -100,6 +100,162 @@ export interface MicroPullbackOptions {
   tempo_5m: boolean;
 }
 
+/** Apex — Micro Pullback's print-balance entries (mirrors `apex::options`).
+ *  Armed by hotkey; a packet of prints leaning one way fires a market order with a
+ *  symmetric ATR bracket. */
+export interface ApexOptions {
+  /** Master switch. Off, the backend measures nothing and the hotkey refuses. */
+  enabled: boolean;
+  long_enabled: boolean;
+  short_enabled: boolean;
+  /** TP distance = this × ATR(14) on 10-second bars. */
+  tp_atr_multiplier: number;
+  /** SL distance = this × ATR(14). Also what the position is sized on. */
+  sl_atr_multiplier: number;
+  /** Below this distance (cents) the trade is not taken. */
+  min_distance_cents: number;
+  /** % of Micro Pullback's max risk ($) an Apex trade risks. */
+  risk_pct: number;
+  /** No TP order: the position is closed at market (marketable limit in extended
+   *  hours) as soon as the tape turns against it. Needs TagDash running. */
+  tp_dynamic: boolean;
+  /** Opposite-side print imbalance (%) that closes the position. */
+  exit_imbalance_pct: number;
+  /** Prints the window must hold before that balance is trusted. */
+  exit_min_prints: number;
+  /** One opposite print this many times the ticker's average print size exits. */
+  exit_block_ratio: number;
+  /** …provided it is at least this many shares. */
+  exit_block_min_shares: number;
+  /** Stop follows the best price once the trade is in profit. */
+  sl_trailing: boolean;
+  /** Profit (in R) required before the stop starts following. */
+  sl_trail_start_r: number;
+  /** Distance kept behind the best price, in ATR. */
+  sl_trail_atr_multiplier: number;
+  /** Smallest stop move (cents) worth rewriting the order for. */
+  sl_trail_step_cents: number;
+  /** Sliding window the print balance is measured over. */
+  window_ms: number;
+  /** Prints the window must hold. */
+  min_prints: number;
+  /** |buy − sell| / (buy + sell), in percent. */
+  imbalance_pct: number;
+  /** Window print rate over the ticker's rolling baseline rate. */
+  burst_ratio: number;
+}
+
+export type ApexPhase = "disabled" | "idle" | "armed" | "firing" | "in_trade";
+
+export interface ApexNotice {
+  seq: number;
+  level: "info" | "warn" | "error";
+  message: string;
+}
+
+/** Pushed on the `apex-status` event on every change. */
+export interface ApexStatus {
+  phase: ApexPhase;
+  symbol: string | null;
+  zone_id: string | null;
+  atr: number | null;
+  /** Stop distance ($) the armed lines are drawn at. */
+  sl_distance: number | null;
+  /** Target distance ($) — null under the dynamic take profit. */
+  tp_distance: number | null;
+  min_distance: number;
+  /** False while a distance is under `min_distance`: armed, but nothing fires. */
+  tradeable: boolean;
+  long_enabled: boolean;
+  short_enabled: boolean;
+  tp_dynamic: boolean;
+  sl_trailing: boolean;
+  side: Side | null;
+  trade_id: string | null;
+  /** Live stop of the open trade — moves while the trail follows. */
+  stop_price: number | null;
+  trail_active: boolean;
+  notice: ApexNotice | null;
+}
+
+/** Dip's Settings panel (mirrors `dip::options`).
+ *
+ *  Micro Pullback's second hotkey engine: the trader lays a thick band on a price he
+ *  expects to be struck, and the band is traded when the strike lands there and
+ *  turns back. */
+export interface DipOptions {
+  /** Master switch. Off, the backend measures nothing and the hotkey refuses. */
+  enabled: boolean;
+  long_enabled: boolean;
+  short_enabled: boolean;
+  /** Total thickness (cents) a freshly placed band gets, half on each side. */
+  thickness_cents: number;
+  /** What one press of the thinner / thicker hotkey changes that total by. */
+  step_cents: number;
+  /** TP distance = this × ATR(14) on 10-second bars — Apex's very reading. */
+  tp_atr_multiplier: number;
+  /** SL distance = this × ATR(14). Also what the position is sized on. */
+  sl_atr_multiplier: number;
+  /** Below this distance (cents) the trade is not taken. */
+  min_distance_cents: number;
+  /** % of Micro Pullback's max risk ($) a Dip trade risks. */
+  risk_pct: number;
+  /** Sliding window the approach speed is measured over (micro-structure). */
+  speed_window_ms: number;
+  /** Floor: how much faster than the ticker's own ordinary travel the strike
+   *  must be. 1.0 = ordinary, read off ATR(14) on 10-second bars. */
+  min_speed_ratio: number;
+  /** Ceiling: past this the move is out of reach and is deliberately let go. */
+  max_speed_ratio: number;
+  /** How deep into the band (cents) the strike has to bite. */
+  min_penetration_cents: number;
+  /** How long an attack may last before it stops being one. */
+  attack_max_ms: number;
+  /** Move back off the extreme (cents) that counts as the turn. */
+  reversal_cents: number;
+  /** Past the far edge by this much, the level is gone and the band is dropped. */
+  break_cents: number;
+}
+
+export type DipPhase = "disabled" | "idle" | "armed" | "firing" | "in_trade";
+
+export interface DipNotice {
+  seq: number;
+  level: "info" | "warn" | "error";
+  message: string;
+}
+
+/** Pushed on the `dip-status` event on every change. */
+export interface DipStatus {
+  phase: DipPhase;
+  symbol: string | null;
+  zone_id: string | null;
+  /** The price the trader pointed at — the middle of the band. */
+  level: number | null;
+  low: number | null;
+  high: number | null;
+  /** Total thickness of the band in cents, as the hotkeys tuned it. */
+  thickness_cents: number | null;
+  /** Long = the band is a support (under the price), Short = a resistance. */
+  side: Side | null;
+  atr: number | null;
+  sl_distance: number | null;
+  tp_distance: number | null;
+  min_distance: number;
+  /** False while a distance is under `min_distance`: drawn and watched, inert. */
+  tradeable: boolean;
+  /** The price is inside the band right now — an attack is under way. */
+  attacking: boolean;
+  /** Fastest approach of that attack, in ticker-ordinary travels. */
+  speed_ratio: number;
+  long_enabled: boolean;
+  short_enabled: boolean;
+  trade_id: string | null;
+  stop_price: number | null;
+  take_profit: number | null;
+  notice: DipNotice | null;
+}
+
 /** Dislocation's own Settings panel (mirrors `dislocation::options`).
  *
  *  The scoring engine, formerly "Micro Pullback v2": one 0–100 number made of three
@@ -635,6 +791,29 @@ export interface DashboardTrade {
   broker:      string | null;
   tags:        string[];
   raw:         unknown;
+}
+
+/** What one dashboard sync did (mirrors TradeSyncReport in commands/mod.rs).
+ *  `reconciled` false means the page-through of TradeTally could not be proven
+ *  complete, so deletions were NOT applied — the cards may still show a trade that
+ *  was removed upstream until a clean sync lands. */
+export interface TradeSyncReport {
+  upserted:          number;
+  deleted:           number;
+  mappings_pruned:   number;
+  mappings_restored: number;
+  reconciled:        boolean;
+  upstream_total:    number | null;
+}
+
+/** TradeTally's journal entry for one calendar day (mirrors DiaryEntry in
+ *  dashboard/mod.rs). TradeTally keeps at most one per day and updates it in place. */
+export interface DiaryEntry {
+  id:         string | null;
+  entry_date: string;
+  title:      string;
+  content:    string;
+  updated_at: string | null;
 }
 
 /** The daily background photo + its folder (mirrors DailyBackground in
@@ -1195,10 +1374,17 @@ export interface ChartDrawing {
 
 /** One execution (fill) drawn on the chart as a triangle at (time, price). */
 export interface ExecFill {
-  time: string;       // RFC3339
+  /** RFC3339 — the MARKET time of the price this fill executed against, not the
+   *  instant the order was sent. The two differ by the data plan's delay (~15 min
+   *  on Massive Starter+), and anchoring the triangle here is what keeps it on the
+   *  candle that produced the fill price. */
+  time: string;
   price: number;
   increase: boolean;  // true = position grew (▶), false = position shrank (◀)
   buy: boolean;       // true = buy fill (green), false = sell fill (red)
+  /** Sizing button behind the entry: 25 / 50 / 100. Drawn as a small label left of
+   *  the triangle. null on exits and on fills no button sized. */
+  size_pct: number | null;
 }
 
 /** All executions of one trade, grouped for the connecting P&L line. */

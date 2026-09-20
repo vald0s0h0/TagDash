@@ -3,10 +3,10 @@ import type { ISeriesApi, IPriceLine } from "lightweight-charts";
 import { ENTRY_OPTIONS, BID_ASK_OPTIONS } from "@/charts/chartOptions";
 
 /** Informational horizontal price lines driven by live props: the average entry
- *  (faint dashed) and the live bid/ask (dashed, labelled). Each manages its own
- *  IPriceLine ref — owned by the component, nulled by the chart teardown — so the
- *  refs are passed in. Extracted verbatim from LightweightChart; same per-effect
- *  dependencies, same behaviour. */
+ *  (faint dashed) and the live bid/ask (dashed, unnamed — price on the ask, spread
+ *  on the bid). Each manages its own IPriceLine ref — owned by the component, nulled
+ *  by the chart teardown — so the refs are passed in. Extracted from
+ *  LightweightChart; same per-effect dependencies. */
 export function useReferenceLines(
   candleRef: MutableRefObject<ISeriesApi<"Candlestick"> | null>,
   entryLineRef: MutableRefObject<IPriceLine | null>,
@@ -34,7 +34,9 @@ export function useReferenceLines(
     }
   }, [entryPrice]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Bid / Ask price lines.
+  // Bid / Ask price lines. Nameless by design (the ask is the upper one, always):
+  // the ask keeps the native axis tag with its price, the bid has no tag at all —
+  // the component draws the spread pill at its price instead (see BID_ASK_OPTIONS).
   useEffect(() => {
     const series = candleRef.current;
     if (!series) return;
@@ -42,7 +44,9 @@ export function useReferenceLines(
       if (bidLineRef.current) {
         bidLineRef.current.applyOptions({ price: bid });
       } else {
-        bidLineRef.current = series.createPriceLine({ price: bid, ...BID_ASK_OPTIONS, title: "Bid" });
+        bidLineRef.current = series.createPriceLine({
+          price: bid, ...BID_ASK_OPTIONS, axisLabelVisible: false,
+        });
       }
     } else if (bidLineRef.current) {
       series.removePriceLine(bidLineRef.current);
@@ -52,7 +56,7 @@ export function useReferenceLines(
       if (askLineRef.current) {
         askLineRef.current.applyOptions({ price: ask });
       } else {
-        askLineRef.current = series.createPriceLine({ price: ask, ...BID_ASK_OPTIONS, title: "Ask" });
+        askLineRef.current = series.createPriceLine({ price: ask, ...BID_ASK_OPTIONS, title: "" });
       }
     } else if (askLineRef.current) {
       series.removePriceLine(askLineRef.current);

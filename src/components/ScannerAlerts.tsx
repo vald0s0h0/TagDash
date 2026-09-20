@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Bird } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import type { AlertSignal, Position } from "@/types";
+import type { AlertSignal, Position, TickerLiveState } from "@/types";
 import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertStatusStore } from "@/stores/alertStatusStore";
 import { useChartStore } from "@/stores/chartStore";
+import { useMarketSnapshot } from "@/queries/useMarket";
+import { fmtCompact } from "@/components/chartZoneParts";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
@@ -63,13 +65,6 @@ function fmt(v: number | null, decimals = 2): string {
   return v != null ? v.toFixed(decimals) : "—";
 }
 
-function fmtVol(v: number | null): string {
-  if (v == null) return "—";
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
-  if (v >= 1_000)     return `${(v / 1_000).toFixed(0)}K`;
-  return String(v);
-}
-
 function fmtFloat(v: number | null): string {
   if (v == null) return "";
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M fl`;
@@ -93,12 +88,24 @@ interface AlertRowProps {
   alert: AlertSignal;
   state: RowState;
   position: Position | null;
+  /** Live tape state for this ticker (same snapshot the chart band reads), or null
+   *  when the feed has nothing on it yet. */
+  live: TickerLiveState | null;
   onOpen: (alert: AlertSignal) => void;
   onRelease: (symbol: string) => void;
 }
 
-function AlertRow({ alert: a, state, position, onOpen, onRelease }: AlertRowProps) {
+function AlertRow({ alert: a, state, position, live, onOpen, onRelease }: AlertRowProps) {
   const blink = state === "waiting";
+
+  // An alert is an EVENT: its price/volume/change are the tape as it looked when the
+  // strategy fired, and they never move again. Shown as-is the card silently ages
+  // into a lie while the chart next to it runs — so the live snapshot wins whenever
+  // the feed has the ticker, and the alert's own figures only stand in until then
+  // (a replayed or just-delisted symbol absent from the tape).
+  const price     = live?.last_price     ?? a.price;
+  const volume    = live?.volume_day     ?? a.volume;
+  const changePct = live?.change_day_pct ?? a.change_day_pct;
 
   return (
     <li
@@ -220,27 +227,28 @@ function AlertRow({ alert: a, state, position, onOpen, onRelease }: AlertRowProp
           {a.strategy_name}
         </div>
 
-        {/* Price / volume row */}
+        {/* Price / volume row — live tape, formatted exactly like the band above the
+            chart (same source, same formatter, same decimals). */}
         <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
-          {a.price != null && (
+          {price != null && (
             <span className="tabular-nums text-foreground font-medium">
-              ${fmt(a.price)}
+              ${fmt(price)}
             </span>
           )}
-          {a.volume != null && (
+          {volume != null && (
             <span className="tabular-nums text-muted-foreground">
-              vol {fmtVol(a.volume)}
+              vol {fmtCompact(volume)}
             </span>
           )}
-          {a.change_day_pct != null && (
+          {changePct != null && (
             <span
               className={cn(
                 "tabular-nums",
-                a.change_day_pct >= 0 ? "text-emerald-400" : "text-red-400",
+                changePct >= 0 ? "text-emerald-400" : "text-red-400",
               )}
             >
-              {a.change_day_pct >= 0 ? "+" : ""}
-              {fmt(a.change_day_pct, 1)}%
+              {changePct >= 0 ? "+" : ""}
+              {fmt(changePct, 1)}%
             </span>
           )}
           {fmtFloat(a.float_shares) && (
@@ -287,6 +295,11 @@ export function ScannerAlerts({ alerts }: ScannerAlertsProps) {
     queryFn:  () => api.getInternalPositions(),
     refetchInterval: 1000,
   });
+
+  // Live tape for every ticker on screen. Fetched once here rather than per row:
+  // it is the SAME React-Query entry the chart zone reads, so every card and the
+  // band above the chart move together, on one 300 ms poll.
+  const { data: snapshot } = useMarketSnapshot();
 
   // 1s tick so a freshly-arrived alert's blinking "waiting" card settles after
   // WAITING_MS even when no new poll re-renders the list.
@@ -340,6 +353,7 @@ export function ScannerAlerts({ alerts }: ScannerAlertsProps) {
           alert={a}
           state={rowState(a)}
           position={positions.find((p) => p.symbol === a.symbol) ?? null}
+          live={snapshot?.tickers[a.symbol] ?? null}
           onOpen={open}
           onRelease={release}
         />

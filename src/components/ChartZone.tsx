@@ -1,4 +1,8 @@
 import { notifyError } from "@/stores/notificationStore";
+import { useApexStore } from "@/stores/apexStore";
+import { useDipStore } from "@/stores/dipStore";
+import type { ApexLinesSpec } from "@/charts/useApexLines";
+import type { DipZone } from "@/charts/dipZonePrimitive";
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from "react";
 import { toCanvas as domToCanvas } from "html-to-image";
 import {
@@ -33,12 +37,13 @@ import { usePaneSizeStore } from "@/stores/paneSizeStore";
 import {
   registerZoneHotkeys, setHoveredZone, TF_FOR_ACTION, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
-import { registerZoneGamepad, getChartControl } from "@/lib/gamepadBus";
+import { registerZoneGamepad, getChartControl, hoveredPaneOfZone } from "@/lib/gamepadBus";
 import {
   useStrategyCards, useStrategies, usePanicLlmScores, useDislocationScores,
   useDislocationTape, useMicroPullbackScores, useMicroPullbackOptions,
   useRunMicroPullbackNewsScore,
 } from "@/queries/useScanner";
+import { useMarketSnapshot } from "@/queries/useMarket";
 import { api } from "@/lib/tauri";
 import { createCrosshairSync } from "@/lib/crosshairSync";
 import { nyFilenameStamp } from "@/lib/nyTime";
@@ -327,13 +332,11 @@ export function ChartZone({ zone }: ChartZoneProps) {
     refetchInterval: 700,
   });
 
-  // ── Poll market snapshot for live bid/ask ─────────────────────────────────
-  const { data: snapshot } = useQuery({
-    queryKey: ["market-snapshot"],
-    queryFn:  () => api.getMarketSnapshot(),
-    refetchInterval: 500,
-    enabled: !!zone.symbol,
-  });
+  // ── Live tape (bid/ask, price, volume, change) ─────────────────────────────
+  // The shared snapshot query — the same cache entry the sidebar cards read, so the
+  // band above this chart and the card for the same ticker are always the same
+  // numbers, refreshed on the same 300 ms poll.
+  const { data: snapshot } = useMarketSnapshot();
   const liveState = zone.symbol ? (snapshot?.tickers[zone.symbol] ?? null) : null;
 
   const { data: brokerSelection } = useQuery({
@@ -352,6 +355,127 @@ export function ChartZone({ zone }: ChartZoneProps) {
   });
   const openPosition = positions?.find((p) => p.symbol === zone.symbol) ?? null;
   const hasPosition  = openPosition != null;
+
+  // ── Apex (Micro Pullback) — one global arming, drawn on the panes of its ticker ──
+  const apexStatus = useApexStore((s) => s.status);
+  const apexSpec: ApexLinesSpec | null = useMemo(() => {
+    if (apexStatus?.phase !== "armed" || apexStatus.sl_distance == null) return null;
+    return {
+      slDistance: apexStatus.sl_distance,
+      tpDistance: apexStatus.tp_distance,
+      long: apexStatus.long_enabled,
+      short: apexStatus.short_enabled,
+      tradeable: apexStatus.tradeable,
+    };
+  }, [apexStatus?.phase, apexStatus?.sl_distance, apexStatus?.tp_distance,
+      apexStatus?.long_enabled, apexStatus?.short_enabled, apexStatus?.tradeable]);
+
+  // When Apex fires (or an order it sent is refused) the backend rewrites this
+  // ticker's trade context — new tradeID, its SL/TP — so reload it on every phase
+  // change that concerns the ticker shown here. A refused order returns Apex to
+  // rest with no symbol, hence the previous symbol is checked too.
+  // The trailing stop moves the SL behind the scenes, so its price is part of the
+  // key: the line on the chart has to follow it.
+  const apexPhaseKey = apexStatus
+    ? `${apexStatus.phase}:${apexStatus.symbol ?? ""}:${apexStatus.trade_id ?? ""}:${apexStatus.stop_price ?? ""}`
+    : "";
+  const apexPrevSymbolRef = useRef<string | null>(null);
+  useEffect(() => {
+    const current = apexStatus?.symbol ?? null;
+    const previous = apexPrevSymbolRef.current;
+    apexPrevSymbolRef.current = current;
+    if (!zone.symbol || (current !== zone.symbol && previous !== zone.symbol)) return;
+    api.getZoneTradeContext(zone.zone_id, zone.symbol).then((ctx) => {
+      chartStore.setContext(zone.zone_id, ctx ?? null);
+    }).catch(() => {});
+  }, [apexPhaseKey, zone.zone_id, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Hotkey: arm on this zone's ticker, or disarm whatever is armed. The backend
+  // decides which, so a second press always disarms even over another zone.
+  const handleApexToggle = useCallback(async () => {
+    try {
+      const s = await api.apexToggle(zone.zone_id, zone.symbol ?? "");
+      useApexStore.getState().setStatus(s);
+    } catch (e) {
+      notifyError(e, "Apex");
+    }
+  }, [zone.zone_id, zone.symbol]);
+
+  // ── Dip (Micro Pullback) — one band at a time, drawn on the panes of its ticker ──
+  const dipStatus = useDipStore((s) => s.status);
+  const dipZone: DipZone | null = useMemo(() => {
+    if (!dipStatus || dipStatus.low == null || dipStatus.high == null) return null;
+    if (dipStatus.phase === "idle" || dipStatus.phase === "disabled") return null;
+    const side = dipStatus.side === "short" ? "short" : "long";
+    const thickness = dipStatus.thickness_cents;
+    const parts = [
+      `DIP ${side === "long" ? "support" : "résistance"}`,
+      thickness != null ? `${thickness} ¢` : null,
+      side === "long" ? "LONG" : "SHORT",
+      !dipStatus.tradeable ? "en veille" : null,
+      dipStatus.attacking ? `attaque ${dipStatus.speed_ratio.toFixed(1)}×` : null,
+    ].filter(Boolean);
+    return {
+      low: dipStatus.low,
+      high: dipStatus.high,
+      side,
+      tradeable: dipStatus.tradeable,
+      attacking: dipStatus.attacking,
+      label: parts.join(" · "),
+    };
+  }, [dipStatus?.phase, dipStatus?.low, dipStatus?.high, dipStatus?.side,
+      dipStatus?.thickness_cents, dipStatus?.tradeable, dipStatus?.attacking,
+      dipStatus?.speed_ratio]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Dip rewrites this ticker's trade context when it fires, exactly like Apex —
+  // same reload, same reason (see the comment above `apexPhaseKey`).
+  const dipPhaseKey = dipStatus
+    ? `${dipStatus.phase}:${dipStatus.symbol ?? ""}:${dipStatus.trade_id ?? ""}`
+    : "";
+  const dipPrevSymbolRef = useRef<string | null>(null);
+  useEffect(() => {
+    const current = dipStatus?.symbol ?? null;
+    const previous = dipPrevSymbolRef.current;
+    dipPrevSymbolRef.current = current;
+    if (!zone.symbol || (current !== zone.symbol && previous !== zone.symbol)) return;
+    api.getZoneTradeContext(zone.zone_id, zone.symbol).then((ctx) => {
+      chartStore.setContext(zone.zone_id, ctx ?? null);
+    }).catch(() => {});
+  }, [dipPhaseKey, zone.zone_id, zone.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The price the mouse is pointing at, in the pane it is actually over (a zone can
+  // show several, and they rarely share a price scale). Falls back to the focused
+  // pane's controller cursor, so a gamepad-only session still works.
+  const pointedPrice = useCallback((): number | null => {
+    const paneId = hoveredPaneOfZone(zone.zone_id) ?? `${zone.zone_id}-${focusPaneIdxRef.current}`;
+    const ctl = getChartControl(paneId);
+    return ctl?.getHoverPrice() ?? ctl?.getCursorPrice() ?? null;
+  }, [zone.zone_id]);
+
+  // Hotkey: lay the band where the trader is pointing — or, pointing back inside
+  // it, take it away. The backend decides which, and owns the support/résistance
+  // role from where the price is right now.
+  const handleDipPlace = useCallback(async () => {
+    const price = pointedPrice();
+    if (price == null) {
+      notifyError("place le curseur sur le prix visé", "Dip");
+      return;
+    }
+    try {
+      useDipStore.getState().setStatus(await api.dipPlace(zone.zone_id, zone.symbol ?? "", price));
+    } catch (e) {
+      notifyError(e, "Dip");
+    }
+  }, [zone.zone_id, zone.symbol, pointedPrice]);
+
+  // Hotkeys: one notch thinner / thicker, the level itself never moving.
+  const handleDipResize = useCallback(async (steps: number) => {
+    try {
+      useDipStore.getState().setStatus(await api.dipResize(steps));
+    } catch (e) {
+      notifyError(e, "Dip");
+    }
+  }, []);
 
   // Once the user has explicitly paid/reserved locates, refresh only the cheap
   // local cost projection. Alpaca's position mirror supplies actual average entry
@@ -1245,6 +1369,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
       case "close":      handleClose(); break;
       case "confirm_hod": handleConfirmHod(); break;
       case "invert_hod":  handleInvertHod(); break;
+      case "apex_arm":    handleApexToggle(); break;
+      case "dip_place":   handleDipPlace(); break;
+      case "dip_thinner": handleDipResize(-1); break;
+      case "dip_thicker": handleDipResize(1); break;
       case "run_llm":
         if (card?.llm && zone.symbol && zone.strategy_id) {
           api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
@@ -1257,7 +1385,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
     }
   }, [handleRelease, toggleMode, captureStatus, handleCapture, openJournal,
       chartStore, zone.zone_id, zone.symbol, zone.strategy_id, orderMode,
-      handleOrder, handleClose, handleConfirmHod, handleInvertHod, card]);
+      handleOrder, handleClose, handleConfirmHod, handleInvertHod, handleApexToggle,
+      handleDipPlace, handleDipResize, card]);
 
   useEffect(() => registerZoneHotkeys(zone.zone_id, runAction), [zone.zone_id, runAction]);
 
@@ -1872,6 +2001,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     onDraftEntryDrag={handleDraftEntryDrag}
                     onDraftSlDrag={handleDraftSlDrag}
                     onDraftTpDrag={handleDraftTpDrag}
+                    apex={apexStatus?.symbol === paneSymbol ? apexSpec : null}
+                    dip={dipStatus?.symbol === paneSymbol ? dipZone : null}
                     limitOrders={limitOrders}
                     lines={paneLines}
                     annotations={paneAnnotations}

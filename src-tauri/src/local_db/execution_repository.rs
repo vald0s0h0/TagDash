@@ -13,7 +13,15 @@ pub struct ExecutionRow {
     pub trade_id: String,
     pub quantity: i64,
     pub fill_price: f64,
-    pub filled_at: String, // RFC3339
+    pub filled_at: String, // RFC3339 — the true execution instant
+    /// Market time of the price this fill executed against (RFC3339). Differs from
+    /// `filled_at` by the data plan's delay; the chart places its marker here so the
+    /// triangle lands on the candle that produced the price. `None` on rows written
+    /// before the column existed, and whenever the feed had no print for the symbol.
+    pub data_at: Option<String>,
+    /// Sizing button behind an entry: 25 / 50 / 100. `None` for exits, for
+    /// strategy-driven fills, and for rows predating the column.
+    pub size_pct: Option<u8>,
 }
 
 /// Persist a fill. Idempotent on `fill_id`. The stored quantity is signed from
@@ -24,8 +32,9 @@ pub fn insert_fill(conn: &Connection, fill: &Fill) -> Result<()> {
         Side::Short => -fill.quantity.abs(),
     };
     conn.execute(
-        "INSERT OR IGNORE INTO executions (fill_id, trade_id, symbol, quantity, fill_price, filled_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO executions
+             (fill_id, trade_id, symbol, quantity, fill_price, filled_at, data_at, size_pct)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             fill.fill_id,
             fill.trade_id,
@@ -33,6 +42,8 @@ pub fn insert_fill(conn: &Connection, fill: &Fill) -> Result<()> {
             signed,
             fill.fill_price,
             fill.filled_at.to_rfc3339(),
+            fill.data_at.map(|d| d.to_rfc3339()),
+            fill.size_pct,
         ],
     )?;
     Ok(())
@@ -98,7 +109,7 @@ pub fn original_tps_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<(S
 /// All executions for a symbol, oldest → newest.
 pub fn get_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<ExecutionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT trade_id, quantity, fill_price, filled_at
+        "SELECT trade_id, quantity, fill_price, filled_at, data_at, size_pct
          FROM executions WHERE symbol = ?1 ORDER BY filled_at ASC, rowid ASC",
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
@@ -107,6 +118,8 @@ pub fn get_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<ExecutionRo
             quantity: row.get(1)?,
             fill_price: row.get(2)?,
             filled_at: row.get(3)?,
+            data_at: row.get(4)?,
+            size_pct: row.get(5)?,
         })
     })?;
     rows.collect()

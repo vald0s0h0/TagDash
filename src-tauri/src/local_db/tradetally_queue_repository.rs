@@ -144,6 +144,20 @@ pub fn purge_legacy(conn: &Connection) -> Result<usize> {
     )
 }
 
+/// Is a `trade_created` for this trade still waiting to be sent? Tells the worker
+/// whether an update event whose parent has no server id yet is legitimately
+/// early (the create is queued behind it) or permanently orphaned (the create is
+/// gone — sent without yielding an id, exhausted, or purged).
+pub fn has_pending_create(conn: &Connection, local_trade_id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tradetally_sync_queue
+         WHERE trade_id = ?1 AND event_type = 'trade_created' AND status = 'pending'",
+        params![local_trade_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 // ─── Retry helpers ───────────────────────────────────────────────────────────
 
 pub fn reset_to_pending(conn: &Connection, event_id: &str) -> Result<()> {

@@ -80,6 +80,12 @@ pub struct AppState {
     /// Dislocation's own options (active tempos, score threshold, model budget,
     /// Qualité A+). Same contract as above, its own blob.
     pub dislocation_options: Arc<RwLock<crate::dislocation::DislocationOptions>>,
+    /// Apex — Micro Pullback's print-balance entries: options + executor runtime.
+    /// The per-print measuring half lives in `MarketState::apex`.
+    pub apex: Arc<crate::apex::ApexShared>,
+    /// Dip — Micro Pullback's anticipated-level entries: options + executor runtime.
+    /// The per-print measuring half lives in `MarketState::dip`.
+    pub dip: Arc<crate::dip::DipShared>,
     /// Current active alerts (newest first, capped at 100).
     pub active_alerts: Arc<RwLock<Vec<AlertSignal>>>,
     /// Full alert history for the session (newest first, capped at 500).

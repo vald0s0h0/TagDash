@@ -33,7 +33,11 @@ export function useSttEvents() {
         const title = e.payload.title?.trim();
         if (title && !cur.title.trim()) cur.setTitle(title);
         const finalTitle = useJournalStore.getState().title.trim();
-        api.saveDiaryEntry(finalTitle, nextContent).catch(() => {});
+        api.saveDiaryEntry(finalTitle, nextContent)
+          // The buffer now matches what TradeTally was handed, so let a later
+          // fetch of the day's entry hydrate the card again.
+          .then(() => useJournalStore.getState().markSent())
+          .catch(() => {});
       }),
     );
 

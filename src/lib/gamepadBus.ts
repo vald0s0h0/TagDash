@@ -18,6 +18,9 @@ export interface ChartControl {
   nudgeCursor: (deltaFrac: number) => void;
   /** Current cursor price (null if never placed for this symbol). */
   getCursorPrice: () => number | null;
+  /** Price under the MOUSE in this pane, null once the pointer has left it. What
+   *  the hotkeys that place a level at the cursor read. */
+  getHoverPrice: () => number | null;
   /** Remove the cursor line (e.g. on focus change). */
   clearCursor: () => void;
 }
@@ -31,6 +34,30 @@ export function registerChartControl(paneId: string, ctl: ChartControl): () => v
 
 export function getChartControl(paneId: string | null): ChartControl | undefined {
   return paneId ? chartControls.get(paneId) : undefined;
+}
+
+// ─── Which pane the mouse is over ─────────────────────────────────────────────
+// A hotkey is routed to the hovered ZONE, but a zone can show several panes and
+// they rarely share a price scale. This says which one the pointer is actually in,
+// so "place it where I am pointing" means the pane the trader is looking at.
+
+let hoveredPaneId: string | null = null;
+
+export function setHoveredPane(paneId: string): void {
+  hoveredPaneId = paneId;
+}
+
+/** Called when the pointer leaves a pane — only that pane may drop the claim. */
+export function releaseHoveredPane(paneId: string): void {
+  if (hoveredPaneId === paneId) hoveredPaneId = null;
+}
+
+/** The hovered pane when it belongs to `zoneId`; pane ids are `${zoneId}-${index}`. */
+export function hoveredPaneOfZone(zoneId: string): string | null {
+  if (!hoveredPaneId) return null;
+  const prefix = `${zoneId}-`;
+  if (!hoveredPaneId.startsWith(prefix)) return null;
+  return /^\d+$/.test(hoveredPaneId.slice(prefix.length)) ? hoveredPaneId : null;
 }
 
 // ─── Per-zone gamepad handlers (digital buttons) ──────────────────────────────

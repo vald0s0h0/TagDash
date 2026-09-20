@@ -203,6 +203,11 @@ impl BrokerJournal {
             quantity: ev.qty.abs().round() as i64,
             fill_price: ev.price,
             filled_at: ev.at,
+            // Venue fills: the venue's own timestamp already IS market time, and no
+            // sizing button reaches this path (see `executions`, which the chart
+            // markers come from, is fed by the internal book alone).
+            size_pct: None,
+            data_at: None,
         });
         trade.position_qty = ev.position_qty;
         if let Some(avg) = venue_avg {
@@ -345,6 +350,8 @@ impl BrokerJournal {
                 quantity: a.qty.abs().round() as i64,
                 fill_price: a.price,
                 filled_at: a.at,
+                size_pct: None,
+                data_at: None,
             });
         }
         let Some(last) = exits.last() else {

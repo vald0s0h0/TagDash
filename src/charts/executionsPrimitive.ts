@@ -37,6 +37,44 @@ interface RenderTarget {
 const TRI_W = 7; // triangle horizontal size (CSS px)
 const TRI_H = 8; // triangle height (CSS px)
 
+// Sizing label ("25" / "50" / "100") sitting just left of an entry triangle, on
+// a tight black badge.
+// Deliberately about as tall as the triangle itself: it annotates the marker, it
+// must not compete with it.
+const PCT_FONT = 8; // CSS px
+const PCT_GAP  = 3; // CSS px between the label's badge and the triangle's body
+
+// Both the triangles and the sizing labels sit on candles, so each gets a black
+// edge to detach it from whatever is behind. A retina screen renders a single
+// DEVICE pixel — half a CSS pixel — so the outline reads as a crisp edge rather
+// than as a second shape; `hairline()` keeps it at that one device pixel.
+const OUTLINE = "#000000";
+const PCT_BG  = "#000000";
+const PCT_PAD_X = 1.5; // CSS px — ultra-tight badge padding, horizontal
+const PCT_PAD_Y = 1;   // CSS px — … and vertical
+const PCT_RADIUS = 1.5; // CSS px
+
+/** Thinnest line the display can draw: 1 device pixel (0.5 CSS px on retina). */
+function hairline(ratio: number): number {
+  return Math.max(1, Math.round(ratio * 0.5));
+}
+
+/** Rounded-rect path, hand-rolled: `ctx.roundRect` is too recent to rely on in
+ *  the app's WebView. Coordinates are bitmap (device) pixels. */
+function roundRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number,
+): void {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x,     y + h, rr);
+  ctx.arcTo(x,     y + h, x,     y,     rr);
+  ctx.arcTo(x,     y,     x + w, y,     rr);
+  ctx.closePath();
+}
+
 // The open-trade connecting line stays a fixed neutral grey (it carries no P&L
 // sign yet, so it isn't user-themed).
 const LINE_OPEN = "rgba(150,150,150,0.45)";
@@ -90,14 +128,19 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
       const barTimes = this.src.barTimes;
       for (const trade of this.src.trades) {
         // Project each fill to pixel space; skip those off the visible range.
-        const pts: { x: number; y: number; increase: boolean; buy: boolean }[] = [];
+        const pts: {
+          x: number; y: number; increase: boolean; buy: boolean; sizePct: number | null;
+        }[] = [];
         for (const f of trade.fills) {
           const snapped = snapToBar(barTimes, toSecNum(f.time));
           if (snapped == null) continue;
           const xc = ts.timeToCoordinate(snapped as Time);
           const yc = series.priceToCoordinate(f.price);
           if (xc == null || yc == null) continue;
-          pts.push({ x: xc * hr, y: yc * vr, increase: f.increase, buy: f.buy });
+          pts.push({
+            x: xc * hr, y: yc * vr, increase: f.increase, buy: f.buy,
+            sizePct: f.size_pct ?? null,
+          });
         }
 
         // Original-SL / original-TP segments: thin dashed lines at the launch-time
@@ -165,7 +208,44 @@ class ExecutionsRenderer implements ISeriesPrimitivePaneRenderer {
           }
           ctx.closePath();
           ctx.fill();
+          // Hairline black edge — keeps the marker readable over a candle of the
+          // same colour without thickening it.
+          ctx.strokeStyle = OUTLINE;
+          ctx.lineWidth = hairline(hr);
+          ctx.lineJoin = "miter";
+          ctx.stroke();
         }
+
+        // Entry size ("25" / "50" / "100") in small type, right-aligned just left
+        // of the ▶ triangle's body. Entries and scale-ins only — an exit closes
+        // whatever is open, so a percentage there would mean nothing (the backend
+        // already strips it, this is the drawing-side half of the same rule).
+        ctx.save();
+        ctx.font = `600 ${PCT_FONT * vr}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        for (const p of pts) {
+          if (!p.increase || p.sizePct == null) continue;
+          const label = String(p.sizePct);
+          const padX = PCT_PAD_X * hr;
+          const padY = PCT_PAD_Y * vr;
+          // PCT_GAP separates the BADGE from the triangle; the text then sits one
+          // padding inside the badge's right edge.
+          const badgeRight = p.x - w - PCT_GAP * hr;
+          const tw = ctx.measureText(label).width;
+          const bw = tw + padX * 2;
+          const bh = PCT_FONT * vr + padY * 2;
+          roundRectPath(
+            ctx,
+            badgeRight - bw, p.y - bh / 2, bw, bh,
+            PCT_RADIUS * hr,
+          );
+          ctx.fillStyle = PCT_BG;
+          ctx.fill();
+          ctx.fillStyle = p.buy ? colorBuy : colorSell;
+          ctx.fillText(label, badgeRight - padX, p.y);
+        }
+        ctx.restore();
       }
     });
   }

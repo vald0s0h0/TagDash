@@ -22,6 +22,25 @@ pub struct ZoneTradeContext {
     pub closed: bool,
 }
 
+/// The hotkey engines that take a trade of their own on a ticker: Apex and Dip.
+/// Both file it in TradeTally under their own setup name and size it off their own
+/// context, so a trade started by hand afterwards must not inherit either.
+fn is_engine_strategy(id: &str) -> bool {
+    id == crate::apex::STRATEGY_ID || id == crate::dip::STRATEGY_ID
+}
+
+/// A new trade started by hand on a ticker whose last trade was an Apex (or Dip) one
+/// belongs to the zone's strategy again — otherwise it would be filed in TradeTally
+/// as "Apex" / "Dip" and sized off that engine's context.
+fn release_engine(z: &mut ZoneTradeContext, caller_strategy_id: &str) {
+    if is_engine_strategy(&z.strategy_id)
+        && !caller_strategy_id.is_empty()
+        && !is_engine_strategy(caller_strategy_id)
+    {
+        z.strategy_id = caller_strategy_id.to_string();
+    }
+}
+
 #[derive(Clone)]
 pub struct ChartState {
     /// Trade context per ticker (symbol).
@@ -140,6 +159,9 @@ impl ChartState {
             z.trade_id = None;
             z.closed = false;
         }
+        if price.is_some() && z.trade_id.is_none() {
+            release_engine(z, strategy_id);
+        }
         z.stop_loss = price;
         if price.is_some() && z.trade_id.is_none() {
             z.trade_id = Some(Self::gen_trade_id(symbol, strategy_id));
@@ -162,11 +184,72 @@ impl ChartState {
             z.trade_id = None;
             z.closed = false;
         }
+        if price.is_some() && z.trade_id.is_none() {
+            release_engine(z, strategy_id);
+        }
         z.take_profit = price;
         if price.is_some() && z.trade_id.is_none() {
             z.trade_id = Some(Self::gen_trade_id(symbol, strategy_id));
         }
         z.clone()
+    }
+
+    /// Turn the ticker's context into a fresh trade owned by a hotkey engine: its own
+    /// tradeID, that engine's strategy id (TradeTally setup "Apex" / "Dip") and its
+    /// bracket. Whatever planned levels were drawn are replaced — the engine's
+    /// bracket is the trade's definition.
+    /// The caller guarantees no position is open on the ticker.
+    pub fn start_engine_trade(
+        &mut self,
+        zone_id: &str,
+        symbol: &str,
+        strategy_id: &str,
+        stop_loss: f64,
+        take_profit: Option<f64>,
+    ) -> ZoneTradeContext {
+        self.track_zone(zone_id, symbol);
+        let ctx = ZoneTradeContext {
+            zone_id: symbol.to_string(),
+            symbol: symbol.to_string(),
+            strategy_id: strategy_id.to_string(),
+            trade_id: Some(Self::gen_trade_id(symbol, strategy_id)),
+            stop_loss: Some(stop_loss),
+            // None under Apex's dynamic take profit: no target line, no bracket leg.
+            take_profit,
+            closed: false,
+        };
+        self.contexts.insert(symbol.to_string(), ctx.clone());
+        ctx
+    }
+
+    /// `start_engine_trade` for Apex, the engine that had it first.
+    pub fn start_apex_trade(
+        &mut self,
+        zone_id: &str,
+        symbol: &str,
+        stop_loss: f64,
+        take_profit: Option<f64>,
+    ) -> ZoneTradeContext {
+        self.start_engine_trade(
+            zone_id,
+            symbol,
+            crate::apex::STRATEGY_ID,
+            stop_loss,
+            take_profit,
+        )
+    }
+
+    /// Put a ticker's context back exactly as it was (an Apex order the venue
+    /// refused must not leave its tradeID and lines behind).
+    pub fn restore_context(&mut self, symbol: &str, previous: Option<ZoneTradeContext>) {
+        match previous {
+            Some(c) => {
+                self.contexts.insert(symbol.to_string(), c);
+            }
+            None => {
+                self.contexts.remove(symbol);
+            }
+        }
     }
 
     /// Called when a zone is released: forget which ticker it showed. The ticker's
@@ -205,5 +288,67 @@ impl ChartState {
             c.closed = true;
         }
         Some(symbol)
+    }
+}
+
+#[cfg(test)]
+mod apex_tests {
+    use super::*;
+
+    #[test]
+    fn an_apex_trade_gets_its_own_trade_id_and_strategy() {
+        let mut cs = ChartState::new();
+        cs.update_sl("z1", "ABCD", "micro_pullback", Some(4.0));
+        let ctx = cs.start_apex_trade("z1", "ABCD", 4.10, Some(4.30));
+        assert_eq!(ctx.strategy_id, "apex");
+        assert!(ctx.trade_id.as_deref().unwrap().ends_with("-ABCD-APEX"));
+        assert_eq!((ctx.stop_loss, ctx.take_profit), (Some(4.10), Some(4.30)));
+        assert_eq!(cs.get_context_for_zone("z1").unwrap().strategy_id, "apex");
+    }
+
+    #[test]
+    fn a_dynamic_take_profit_leaves_no_tp_line() {
+        let mut cs = ChartState::new();
+        let ctx = cs.start_apex_trade("z1", "ABCD", 4.10, None);
+        assert_eq!(ctx.take_profit, None);
+        assert_eq!(ctx.stop_loss, Some(4.10));
+    }
+
+    #[test]
+    fn moving_an_open_apex_stop_keeps_it_an_apex_trade() {
+        let mut cs = ChartState::new();
+        let id = cs.start_apex_trade("z1", "ABCD", 4.10, Some(4.30)).trade_id;
+        let ctx = cs.update_sl("z1", "ABCD", "micro_pullback", Some(4.15));
+        assert_eq!((ctx.strategy_id.as_str(), ctx.trade_id), ("apex", id));
+    }
+
+    #[test]
+    fn the_next_manual_trade_after_apex_belongs_to_the_zone_strategy() {
+        let mut cs = ChartState::new();
+        let id = cs
+            .start_apex_trade("z1", "ABCD", 4.10, Some(4.30))
+            .trade_id
+            .unwrap();
+        cs.reset_closed_trade(&id);
+        let ctx = cs.update_sl("z1", "ABCD", "micro_pullback", Some(4.0));
+        assert_eq!(ctx.strategy_id, "micro_pullback");
+        assert_ne!(ctx.trade_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn a_refused_apex_order_restores_the_previous_context() {
+        let mut cs = ChartState::new();
+        let before = cs.update_tp("z1", "ABCD", "micro_pullback", Some(5.0));
+        let prev = cs.get_context("ABCD");
+        cs.start_apex_trade("z1", "ABCD", 4.10, Some(4.30));
+        cs.restore_context("ABCD", prev);
+        let after = cs.get_context("ABCD").unwrap();
+        assert_eq!(after.trade_id, before.trade_id);
+        assert_eq!(after.strategy_id, "micro_pullback");
+
+        let mut fresh = ChartState::new();
+        fresh.start_apex_trade("z1", "WXYZ", 1.0, Some(1.2));
+        fresh.restore_context("WXYZ", None);
+        assert!(fresh.get_context("WXYZ").is_none());
     }
 }

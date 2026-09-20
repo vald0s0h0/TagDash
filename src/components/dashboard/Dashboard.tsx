@@ -68,6 +68,25 @@ export function Dashboard() {
       {/* Discreet controls (top-right). */}
       <div className="absolute right-3 top-3 z-20 flex items-center gap-2">
         {sync.isPending && <span className="text-[11px] text-white/70">Sync…</span>}
+        {/* A sync that could not prove it saw the whole journal refreshes but does not
+            prune, so a trade deleted in TradeTally may still be on the cards. Say so
+            rather than let the numbers quietly disagree with the source of truth. */}
+        {!sync.isPending && sync.data && !sync.data.reconciled && (
+          <span
+            title="La lecture de TradeTally était incomplète : les trades affichés ont été rafraîchis, mais les suppressions faites dans TradeTally ne sont pas encore répercutées. Relancez le sync."
+            className="text-[11px] text-amber-300/90"
+          >
+            Sync partiel
+          </span>
+        )}
+        {!sync.isPending && sync.isError && (
+          <span
+            title={String(sync.error)}
+            className="text-[11px] text-red-300/90"
+          >
+            TradeTally injoignable
+          </span>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

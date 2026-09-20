@@ -15,6 +15,8 @@ import { useDashboardStore } from "@/stores/dashboardStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertNotifications } from "@/queries/useAlertNotifications";
 import { useHotkeys } from "@/hooks/useHotkeys";
+import { useApexEvents } from "@/hooks/useApexEvents";
+import { useDipEvents } from "@/hooks/useDipEvents";
 import { useGamepad } from "@/hooks/useGamepad";
 import { useSttEvents } from "@/hooks/useSttEvents";
 import { api } from "@/lib/tauri";
@@ -37,6 +39,12 @@ export default function App() {
   // Global chart hotkeys (keyboard chords / extra mouse buttons → the zone under
   // the cursor). User-configured in Settings → Hotkeys.
   useHotkeys();
+
+  // Apex (Micro Pullback): live armed/fired status → chart lines + toasts.
+  useApexEvents();
+
+  // Dip (Micro Pullback): live band/attack status → chart band + toasts.
+  useDipEvents();
 
   // Xbox-controller layer (auto-active when a pad is connected). Drives the active
   // session's chart: stick zoom/cursor, D-pad ticker nav, face-button orders, R2

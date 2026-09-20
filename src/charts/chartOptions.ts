@@ -86,12 +86,105 @@ export const DRAFT_TP_OPTS = {
   axisLabelVisible: false, title: "TP ⟡",
 };
 
+// Armed Apex — violet dashed lines riding the price at the bracket distances. Loud
+// on purpose: while they are on screen a market order can leave at any print.
+// Dimmed while a distance is under the minimum (armed, but nothing fires).
+//
+// With both directions armed there can be four levels, because the stop and the
+// target no longer share a distance: above the price sit the long's target and the
+// short's stop, below them the long's stop and the short's target. Levels that land
+// on the same price are drawn once. Under the dynamic take profit there is no target
+// price at all, so only the stops are drawn.
+const APEX_COLOR = "#c084fc";
+
+function apexDistanceLabel(d: number): string {
+  return d >= 0.01 ? d.toFixed(2) : d.toFixed(4);
+}
+
+export interface ApexLineDef {
+  /** Stable key so the chart can move a line instead of recreating it. */
+  key: string;
+  /** Signed offset from the current price. */
+  offset: number;
+  title: string;
+}
+
+/** The lines an armed Apex draws, top to bottom. */
+export function apexLineDefs(spec: {
+  slDistance: number;
+  tpDistance: number | null;
+  long: boolean;
+  short: boolean;
+  tradeable: boolean;
+}): ApexLineDef[] {
+  const { slDistance: sl, tpDistance: tp } = spec;
+  const raw: { offset: number; kind: "tp" | "sl" }[] = [];
+  if (spec.long) {
+    if (tp != null) raw.push({ offset: tp, kind: "tp" });
+    raw.push({ offset: -sl, kind: "sl" });
+  }
+  if (spec.short) {
+    raw.push({ offset: sl, kind: "sl" });
+    if (tp != null) raw.push({ offset: -tp, kind: "tp" });
+  }
+  // One line per price level, whatever number of roles meet there.
+  const byOffset = new Map<string, { offset: number; kinds: Set<"tp" | "sl"> }>();
+  for (const r of raw) {
+    const key = r.offset.toFixed(6);
+    const entry = byOffset.get(key) ?? { offset: r.offset, kinds: new Set<"tp" | "sl">() };
+    entry.kinds.add(r.kind);
+    byOffset.set(key, entry);
+  }
+  const suffix = (spec.tradeable ? "" : " · < min") + (tp == null ? " · TP dyn" : "");
+  return [...byOffset.values()]
+    .sort((a, b) => b.offset - a.offset)
+    .map(({ offset, kinds }) => {
+      const sign = offset >= 0 ? "+" : "−";
+      const amount = apexDistanceLabel(Math.abs(offset));
+      const role = kinds.size === 2 ? (offset >= 0 ? "▲" : "▼") : kinds.has("tp") ? "TP" : "SL";
+      return {
+        key: `${offset >= 0 ? "up" : "down"}:${amount}`,
+        offset,
+        title: `Apex ${role} ${sign}${amount}${suffix}`,
+      };
+    });
+}
+
+/** Styling shared by every Apex line. */
+export function apexLineStyle(tradeable: boolean) {
+  return {
+    color: tradeable ? APEX_COLOR : hexToRgba(APEX_COLOR, 0.35),
+    lineWidth: 2 as const,
+    lineStyle: LineStyle.Dashed,
+    axisLabelVisible: true,
+  };
+}
+
+// Live bid / ask pair. Neither line is named any more: the ask is always the upper
+// of the two, so the words only ate pixels. The ask keeps the native axis tag (its
+// price); the bid has its tag switched off and gets a right-edge SPREAD pill in its
+// place (rendered by the component, like the SL/TP pills) — so one glance reads
+// "price on top, cost of crossing underneath" instead of two prices the eye has to
+// subtract. The pill is DOM because a native price line can only ever print its own
+// price, and its in-pane `title` is gated behind the same `axisLabelVisible` flag.
 export const BID_ASK_OPTIONS = {
   color:            "rgba(200,200,200,0.45)",
   lineWidth:        1 as const,
   lineStyle:        LineStyle.Dashed,
   axisLabelVisible: true,
 };
+
+/** Colour of the bid's spread pill — the bid/ask line grey, lifted enough to read
+ *  as text against the chart background. */
+export const SPREAD_TAG_COLOR = "rgba(210,210,210,0.85)";
+
+/** The bid line's label: the spread, not a price. Sub-cent spreads keep four
+ *  decimals — on a $0.40 name `0.00` would read as "no spread at all", which is
+ *  exactly the wrong call to make before crossing it. */
+export function spreadLabel(bid: number, ask: number): string {
+  const d = Math.max(ask - bid, 0);
+  return d >= 0.01 ? d.toFixed(2) : d.toFixed(4);
+}
 
 /** Price-alarm line style — amber by default, colour from the theme. A function
  *  (not a constant) so the colour is read live at create-time. */

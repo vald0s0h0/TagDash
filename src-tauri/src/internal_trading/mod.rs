@@ -131,6 +131,7 @@ impl InternalBook {
         limit_price: f64,
         stop_loss: Option<f64>,
         take_profit: Option<f64>,
+        size_pct: Option<u8>,
     ) -> InternalOrder {
         let order_id = gen_id();
         let now = crate::time::now();
@@ -179,6 +180,7 @@ impl InternalBook {
             oco_group,
             reduce_only: false,
             created_at: now,
+            size_pct,
         };
 
         self.orders.insert(order_id, order.clone());
@@ -198,6 +200,33 @@ impl InternalBook {
         fill_price: f64,
         stop_loss: Option<f64>,
         take_profit: Option<f64>,
+    ) -> Fill {
+        self.execute_market_fill_sized(
+            trade_id, zone_id, symbol, strategy_id, side, quantity, fill_price, stop_loss,
+            take_profit, None, None,
+        )
+    }
+
+    /// `execute_market_fill` plus the two pieces of provenance only the chart
+    /// cares about: `size_pct`, the sizing button that launched the entry (25 /
+    /// 50 / 100), and `data_at`, the market instant the fill price belongs to.
+    ///
+    /// Split from the plain version so the many callers that have neither — the
+    /// strategies, the Apex trigger, every test — stay unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_market_fill_sized(
+        &mut self,
+        trade_id: Option<String>,
+        zone_id: String,
+        symbol: String,
+        strategy_id: String,
+        side: Side,
+        quantity: i64,
+        fill_price: f64,
+        stop_loss: Option<f64>,
+        take_profit: Option<f64>,
+        size_pct: Option<u8>,
+        data_at: Option<DateTime<Utc>>,
     ) -> Fill {
         let order_id = gen_id();
         let fill_id = gen_id();
@@ -259,6 +288,7 @@ impl InternalBook {
                 oco_group: None,
                 reduce_only: false,
                 created_at: now,
+                size_pct,
             },
         );
 
@@ -271,6 +301,8 @@ impl InternalBook {
             quantity,
             fill_price,
             filled_at: now,
+            size_pct,
+            data_at,
         };
         self.fills.push(fill.clone());
 
@@ -541,6 +573,8 @@ impl InternalBook {
                 quantity: order.quantity,
                 fill_price,
                 filled_at: now,
+                size_pct: order.size_pct,
+                data_at: None,
             };
             self.fills.push(fill.clone());
 
@@ -628,6 +662,7 @@ impl InternalBook {
                     oco_group: Some(oco.clone()),
                     reduce_only: true,
                     created_at: now,
+                    size_pct: None,
                 },
             );
         }
@@ -653,6 +688,7 @@ impl InternalBook {
                     oco_group: Some(oco),
                     reduce_only: true,
                     created_at: now,
+                    size_pct: None,
                 },
             );
         }
@@ -1057,6 +1093,7 @@ mod tests {
             10.00,
             Some(9.50),
             None,
+            None,
         );
 
         // One merged window (as an accelerated replay poll can produce): opens
@@ -1111,6 +1148,7 @@ mod tests {
             100,
             10.00,
             Some(9.50),
+            None,
             None,
         );
 
@@ -1325,6 +1363,7 @@ mod tests {
             oco_group: None,
             reduce_only: false,
             created_at: t0,
+            size_pct: None,
         };
         let newer = InternalOrder {
             order_id: "newer".into(),
@@ -1342,6 +1381,7 @@ mod tests {
             oco_group: None,
             reduce_only: false,
             created_at: t0 + chrono::Duration::seconds(1),
+            size_pct: None,
         };
         // Inserted "newer" first: a naive implementation keyed off insertion/
         // iteration order would have a chance to get this backwards. The fix

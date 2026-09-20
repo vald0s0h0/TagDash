@@ -14,6 +14,24 @@ pub mod panic_mean_reversion;
 pub mod perfect_pullback;
 pub mod registry;
 
+/// The setup name a trade is filed under in TradeTally, from its strategy id.
+/// Apex and Dip are not in the registry (they are hotkey engines inside Micro
+/// Pullback, not scanners) but have their own setup names; an unknown id is passed
+/// through rather than invented.
+pub fn setup_name(strategy_id: &str) -> String {
+    if strategy_id == crate::apex::STRATEGY_ID {
+        return crate::apex::SETUP_NAME.to_string();
+    }
+    if strategy_id == crate::dip::STRATEGY_ID {
+        return crate::dip::SETUP_NAME.to_string();
+    }
+    registry::all_strategies()
+        .iter()
+        .find(|s| s.id() == strategy_id)
+        .map(|s| s.name().to_string())
+        .unwrap_or_else(|| strategy_id.to_string())
+}
+
 /// How the scanner treats a strategy's matches.
 /// - `Alert`    → cooldown'd, deduplicated, appended to the alert list (an event
 ///                that "just happened"). Used by premarket / open strategies.
@@ -59,5 +77,23 @@ pub trait ScanStrategy: Send + Sync {
     /// cooldown'd alert list. Defaults to `Alert`; pre-open strategies override.
     fn kind(&self) -> StrategyKind {
         StrategyKind::Alert
+    }
+}
+
+#[cfg(test)]
+mod setup_name_tests {
+    #[test]
+    fn apex_is_filed_as_apex_not_micro_pullback() {
+        assert_eq!(super::setup_name("apex"), "Apex");
+        assert_eq!(super::setup_name("dip"), "Dip");
+        assert_eq!(
+            super::setup_name(super::micro_pullback::ID),
+            super::registry::all_strategies()
+                .iter()
+                .find(|s| s.id() == super::micro_pullback::ID)
+                .unwrap()
+                .name()
+        );
+        assert_eq!(super::setup_name("inconnue"), "inconnue");
     }
 }

@@ -70,22 +70,74 @@ async fn drain_once(
             continue;
         }
 
-        // Resolve {TT_ID} placeholder if present
-        let needs_tt_id = event.endpoint.contains("{TT_ID}");
-        let tt_id_opt: Option<String> = if needs_tt_id {
+        // The trade's server id, when it already has one. Looked up for creates too:
+        // a mapping on file means the trade exists upstream, so the create must not
+        // be sent again whatever this event believes (see `dispatch`).
+        let (tt_id_opt, create_still_queued) = {
             let conn = db.lock().unwrap();
-            tradetally_queue_repository::get_tt_trade_id(&conn, &event.trade_id)
+            let mapped = tradetally_queue_repository::get_tt_trade_id(&conn, &event.trade_id)
                 .ok()
-                .flatten()
-        } else {
-            None
+                .flatten();
+            let queued = mapped.is_none()
+                && event.event_type != "trade_created"
+                && tradetally_queue_repository::has_pending_create(&conn, &event.trade_id)
+                    .unwrap_or(false);
+            (mapped, queued)
         };
 
+        let needs_tt_id = event.endpoint.contains("{TT_ID}");
+        let mut tt_id_opt = tt_id_opt;
         if needs_tt_id && tt_id_opt.is_none() {
-            // The parent trade has not been created in TradeTally yet.
-            // Leave this event as pending — it will be picked up once
-            // trade_id_created succeeds.
-            continue;
+            if create_still_queued {
+                // Legitimately early: the parent's create is queued behind this
+                // event and will run in this same drain or the next one. Leave it
+                // pending, untouched — no attempt spent on waiting.
+                continue;
+            }
+            // No mapping, and no create is coming to produce one. The trade may still
+            // exist upstream — the mapping can be lost to a DB reset or to a create
+            // whose response hid the id — so ask the source of truth, by the marker
+            // the trade carries in its notes, before giving up on this event.
+            match client
+                .find_trade_id_by_marker(&event.symbol, &super::marker_for(&event.trade_id))
+                .await
+            {
+                Ok(Some(found)) => {
+                    let conn = db.lock().unwrap();
+                    let _ = tradetally_queue_repository::save_tt_trade_id(
+                        &conn,
+                        &event.trade_id,
+                        &found,
+                    );
+                    tt_id_opt = Some(found);
+                }
+                Ok(None) => {
+                    // Not upstream either: this event can never be addressed. Fail it
+                    // rather than skip it, because `get_pending` reads the oldest 100
+                    // pending rows — a growing set of permanently unaddressable events
+                    // would fill that window and starve every new event behind it.
+                    let conn = db.lock().unwrap();
+                    let _ = tradetally_queue_repository::mark_failed(
+                        &conn,
+                        &event.event_id,
+                        "trade introuvable dans TradeTally (supprimé ou marqueur TagDash écrasé)",
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Couldn't ask (offline, auth). Record the failure rather than
+                    // skipping: a failed event is visible in Réglages → Sync and can be
+                    // replayed from there, whereas a skipped one spins silently forever
+                    // and eats a slot in the pending window.
+                    let conn = db.lock().unwrap();
+                    let _ = tradetally_queue_repository::mark_failed(
+                        &conn,
+                        &event.event_id,
+                        &format!("id TradeTally non résolu: {e}"),
+                    );
+                    continue;
+                }
+            }
         }
 
         let resolved_endpoint = match tt_id_opt {
@@ -98,6 +150,9 @@ async fn drain_once(
             &event.event_type,
             &resolved_endpoint,
             &event.payload_summary,
+            &event.trade_id,
+            &event.symbol,
+            tt_id_opt.as_deref(),
         )
         .await;
 
@@ -121,23 +176,81 @@ async fn drain_once(
 }
 
 // Returns Ok(Some(tt_id)) for trade creation events (so caller can persist the mapping).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     client: &TtClient,
     event_type: &str,
     endpoint: &str,
     payload_json: &str,
+    trade_id: &str,
+    symbol: &str,
+    known_tt_id: Option<&str>,
 ) -> Result<Option<String>, String> {
     let payload: serde_json::Value =
         serde_json::from_str(payload_json).map_err(|e| format!("invalid payload JSON: {e}"))?;
 
     match event_type {
         // Creates the trade and returns the server id (persisted as the mapping).
+        //
+        // POST /api/v1/trades is not idempotent and TradeTally offers no
+        // idempotency key, so every path that could send it twice is closed here
+        // instead — a duplicated create is a duplicated trade in the journal, and
+        // nothing downstream can tell the copy from the original:
+        //
+        // 1. A mapping already on file → the trade exists; don't send anything.
+        // 2. A POST that errors may still have been committed upstream (a 15 s
+        //    timeout, an unparsable body, a 502 from the reverse proxy). Before
+        //    reporting failure — which is what "Rejouer les échecs" would later
+        //    POST again — look the trade up by its TagDash marker. Found means the
+        //    create landed: record the id and call it a success.
         "trade_created" => {
-            let resp = client.post_json(endpoint, &payload).await?;
-            Ok(extract_tt_id(&resp))
+            if let Some(existing) = known_tt_id {
+                return Ok(Some(existing.to_string()));
+            }
+            match client.post_json(endpoint, &payload).await {
+                Ok(resp) => match extract_tt_id(&resp) {
+                    Some(id) => Ok(Some(id)),
+                    // Created, but the response shape hid the id. Recover it from
+                    // the marker, or the trade stays unmappable and every later
+                    // event for it dies waiting for an id that never comes.
+                    None => recover_created_id(client, symbol, trade_id)
+                        .await
+                        .map(Some)
+                        .map_err(|e| format!("trade créé mais id introuvable: {e}")),
+                },
+                Err(post_err) => match client
+                    .find_trade_id_by_marker(symbol, &super::marker_for(trade_id))
+                    .await
+                {
+                    Ok(Some(id)) => Ok(Some(id)),
+                    // Not upstream → the POST really did fail; report it so it can
+                    // be retried safely.
+                    Ok(None) => Err(post_err),
+                    // Couldn't check → report the original failure. A retry may
+                    // duplicate, but guard 1 plus the marker lookup catch it on the
+                    // next attempt; silently swallowing the error would lose the trade.
+                    Err(_) => Err(post_err),
+                },
+            }
         }
-        // All updates PUT the (partial) trade body to /api/v1/trades/{TT_ID}.
-        "fill_added" | "trade_closed" | "levels_updated" | "note_updated" => {
+        // The journal note replaces `notes` upstream, which is also where the local
+        // trade id is recorded. Re-attach the marker here, at the last point before
+        // the wire, so it survives every note edit — and so events queued before this
+        // existed are covered too. Losing it means losing the only link to this trade
+        // that outlives the local DB.
+        "note_updated" => {
+            let mut payload = payload;
+            let notes = payload
+                .get("notes")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            payload["notes"] = serde_json::Value::String(super::notes_with_marker(&notes, trade_id));
+            client.put_json(endpoint, &payload).await?;
+            Ok(None)
+        }
+        // All other updates PUT the (partial) trade body to /api/v1/trades/{TT_ID}.
+        "fill_added" | "trade_closed" | "levels_updated" => {
             client.put_json(endpoint, &payload).await?;
             Ok(None)
         }
@@ -173,6 +286,18 @@ async fn dispatch(
         }
         other => Err(format!("unknown event_type: {other}")),
     }
+}
+
+/// Look up the id of the trade we just created, by the marker its notes carry.
+async fn recover_created_id(
+    client: &TtClient,
+    symbol: &str,
+    trade_id: &str,
+) -> Result<String, String> {
+    client
+        .find_trade_id_by_marker(symbol, &super::marker_for(trade_id))
+        .await?
+        .ok_or_else(|| "marqueur TagDash absent des trades du symbole".to_string())
 }
 
 fn extract_tt_id(resp: &serde_json::Value) -> Option<String> {

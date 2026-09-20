@@ -1,4 +1,5 @@
 pub mod alpaca;
+pub mod apex;
 pub mod broker;
 pub mod chart_payloads;
 pub mod chart_state;
@@ -6,6 +7,7 @@ pub mod commands;
 pub mod company_intel;
 pub mod config;
 pub mod dashboard;
+pub mod dip;
 pub mod dislocation;
 pub mod enrichment;
 pub mod flat_files;
@@ -125,6 +127,10 @@ pub fn run() {
     // `micro_pullback::options` for why it isn't a generic channel.
     let micro_pullback_options = micro_pullback::MicroPullbackOptions::load(&db);
     let dislocation_options = dislocation::DislocationOptions::load(&db);
+    // Apex (Micro Pullback's print-balance entries) — its own blob, see `apex::options`.
+    let apex_options = apex::ApexOptions::load(&db);
+    // Dip (Micro Pullback's anticipated-level entries) — its own blob, see `dip::options`.
+    let dip_options = dip::DipOptions::load(&db);
     // Backside has no engine loop, so its options don't live in AppState — just
     // seed the module-static once here; `should_alert()` reads it directly.
     strategies::backside::init_options(&db);
@@ -183,6 +189,8 @@ pub fn run() {
         strategy_risk: Arc::new(RwLock::new(strategy_risk)),
         micro_pullback_options: Arc::new(RwLock::new(micro_pullback_options)),
         dislocation_options: Arc::new(RwLock::new(dislocation_options)),
+        apex: Arc::new(apex::ApexShared::new(apex_options)),
+        dip: Arc::new(dip::DipShared::new(dip_options)),
         active_alerts: Arc::new(RwLock::new(Vec::new())),
         alert_history: Arc::new(RwLock::new(Vec::new())),
         screener: Arc::new(RwLock::new(Vec::new())),
@@ -542,6 +550,14 @@ pub fn run() {
                 );
             }
 
+            // 4b. Apex: hands the flow book its trigger channel, then runs the
+            //     executor (fires on receipt) and its 250 ms housekeeping.
+            commands::apex::start(app.handle().clone());
+
+            // 4c. Dip: same shape — the watch book gets its channel, the executor
+            //     fires on receipt and housekeeping keeps the band's ATR fresh.
+            commands::dip::start(app.handle().clone());
+
             // 5. On-demand "capacité à diluer" collector: a background worker that
             //    refreshes a ticker's SEC dilution section the moment it surfaces on
             //    the premarket scanners (scanner calls company_intel::ondemand::request).
@@ -645,6 +661,15 @@ pub fn run() {
             commands::set_strategy_risk,
             commands::test_ntfy,
             commands::get_micro_pullback_options,
+            commands::apex::get_apex_options,
+            commands::apex::set_apex_options,
+            commands::apex::get_apex_status,
+            commands::apex::apex_toggle,
+            commands::dip::get_dip_options,
+            commands::dip::set_dip_options,
+            commands::dip::get_dip_status,
+            commands::dip::dip_place,
+            commands::dip::dip_resize,
             commands::set_micro_pullback_options,
             commands::get_dislocation_options,
             commands::set_dislocation_options,
@@ -693,6 +718,7 @@ pub fn run() {
             commands::sync_tradetally_trades,
             commands::get_dashboard_trades,
             commands::save_diary_entry,
+            commands::get_diary_entry,
             commands::get_daily_background,
             commands::open_backgrounds_folder,
             commands::get_mood,

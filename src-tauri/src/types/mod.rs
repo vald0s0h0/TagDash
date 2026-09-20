@@ -327,6 +327,13 @@ pub struct InternalOrder {
     pub oco_group: Option<String>, // set when both SL & TP present
     pub reduce_only: bool,         // true for protective SL/TP bracket exits
     pub created_at: DateTime<Utc>,
+    /// Which sizing button launched this order: 25 / 50 / 100 (% of the full
+    /// risk-based size). Carried onto the resulting `Fill` so the chart can label
+    /// the entry triangle. `None` for anything not sized by a button — protective
+    /// SL/TP exits, closes, and orders restored from a database written before the
+    /// column existed.
+    #[serde(default)]
+    pub size_pct: Option<u8>,
 }
 
 /// Open internal position.
@@ -377,6 +384,21 @@ pub struct Fill {
     pub quantity: i64,
     pub fill_price: f64,
     pub filled_at: DateTime<Utc>,
+    /// Sizing button behind this fill (25 / 50 / 100), inherited from its order.
+    /// `None` for exits and for fills that no button sized.
+    #[serde(default)]
+    pub size_pct: Option<u8>,
+    /// Market time of the price this fill was executed against — the timestamp of
+    /// the freshest aggregate the feed had delivered for the symbol.
+    ///
+    /// On a 15-minute delayed plan (Massive Starter+) that is ~15 minutes behind
+    /// `filled_at`: the click happens now, but the price it fills at belongs to a
+    /// bar 15 minutes back. The chart places its triangle here so the marker sits
+    /// on the candle that actually produced the fill price, while `filled_at`
+    /// stays the true execution instant for the journal and TradeTally.
+    /// `None` when the feed had no print for the symbol (fall back to `filled_at`).
+    #[serde(default)]
+    pub data_at: Option<DateTime<Utc>>,
 }
 
 /// The price path a symbol traced between two fill polls — a micro-bar the

@@ -22,6 +22,7 @@ import { ExecutionsPrimitive } from "@/charts/executionsPrimitive";
 import { BollingerPrimitive } from "@/charts/bollingerPrimitive";
 import { GridPrimitive } from "@/charts/gridPrimitive";
 import { ShortCostPrimitive, type ShortCostBand } from "@/charts/shortCostPrimitive";
+import { DipZonePrimitive, type DipZone } from "@/charts/dipZonePrimitive";
 import { NewsPrimitive } from "@/charts/newsPrimitive";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
 import { useChartTheme, getChartTheme } from "@/stores/chartThemeStore";
@@ -29,8 +30,9 @@ import { useChartInput } from "@/stores/chartInputStore";
 import {
   BACKFILL_THRESHOLD,
   slOpts, tpOpts, alarmOpts, CURSOR_OPTIONS,
+  spreadLabel, SPREAD_TAG_COLOR,
 } from "@/charts/chartOptions";
-import { registerChartControl } from "@/lib/gamepadBus";
+import { registerChartControl, setHoveredPane, releaseHoveredPane } from "@/lib/gamepadBus";
 import { useVolumeSeries } from "@/charts/useVolumeSeries";
 import { useReferenceLines } from "@/charts/useReferenceLines";
 import { usePrevDayLines } from "@/charts/usePrevDayLines";
@@ -39,6 +41,7 @@ import { useSessionShading } from "@/charts/useSessionShading";
 import { useCandleMarkers } from "@/charts/useCandleMarkers";
 import { useSlTpLines } from "@/charts/useSlTpLines";
 import { useDraftLines } from "@/charts/useDraftLines";
+import { useApexLines, type ApexLinesSpec } from "@/charts/useApexLines";
 import { useExecutionMarkers } from "@/charts/useExecutionMarkers";
 import { useNewsMarkers } from "@/charts/useNewsMarkers";
 import { useCrosshairRegister } from "@/charts/useCrosshairRegister";
@@ -152,6 +155,10 @@ interface Props {
   onDraftEntryDrag?: (price: number) => void;
   onDraftSlDrag?:    (price: number) => void;
   onDraftTpDrag?:    (price: number) => void;
+  /** Armed Apex on this pane's ticker: lines at price ± distance. */
+  apex?:          ApexLinesSpec | null;
+  /** Dip's band on this pane's ticker: the green zone laid by the trader. */
+  dip?:           DipZone | null;
   onPriceClick:   (price: number, time: number, pixelX: number, pixelY: number, scope: DrawScope) => void;
   onSlDragEnd:    (price: number) => void;
   onTpDragEnd:    (price: number) => void;
@@ -209,6 +216,8 @@ export function LightweightChart({
   onDraftEntryDrag,
   onDraftSlDrag,
   onDraftTpDrag,
+  apex = null,
+  dip = null,
   onPriceClick,
   onSlDragEnd,
   onTpDragEnd,
@@ -254,6 +263,9 @@ export function LightweightChart({
   const bollingerPrimRef = useRef<BollingerPrimitive | null>(null);
   const gridPrimRef      = useRef<GridPrimitive | null>(null);
   const shortCostPrimRef = useRef<ShortCostPrimitive | null>(null);
+  const dipZonePrimRef   = useRef<DipZonePrimitive | null>(null);
+  /** Price under the mouse in this pane — read by the cursor-placement hotkeys. */
+  const hoverPriceRef    = useRef<number | null>(null);
   const newsPrimRef      = useRef<NewsPrimitive | null>(null);
   // User trend lines + selection handles (custom primitive).
   const drawingsPrimRef = useRef<DrawingsPrimitive | null>(null);
@@ -503,9 +515,10 @@ export function LightweightChart({
       zoomPrice: zoomPriceAxis,
       nudgeCursor,
       getCursorPrice: () => cursorPriceRef.current,
+      getHoverPrice: () => hoverPriceRef.current,
       clearCursor: clearCursorLine,
     });
-    return () => { un(); clearCursorLine(); };
+    return () => { un(); clearCursorLine(); releaseHoveredPane(paneId); };
   }, [paneId, zoomTimeAxis, zoomPriceAxis, nudgeCursor, clearCursorLine]);
 
   // Drop the cursor when the symbol changes so it re-seeds at the new price.
@@ -614,6 +627,12 @@ export function LightweightChart({
     candle.attachPrimitive(shortCostPrim);
     shortCostPrimRef.current = shortCostPrim;
 
+    // Dip's band sits at the very bottom too: the price action that walks into it
+    // has to stay readable.
+    const dipZonePrim = new DipZonePrimitive();
+    candle.attachPrimitive(dipZonePrim);
+    dipZonePrimRef.current = dipZonePrim;
+
     const drawingsPrim = new DrawingsPrimitive();
     candle.attachPrimitive(drawingsPrim);
     drawingsPrimRef.current = drawingsPrim;
@@ -679,9 +698,40 @@ export function LightweightChart({
     });
 
     // ── Global crosshair sync (same instrument, sibling panes) ────────────────
+    //
+    // Only POINTER-driven moves are broadcast. lightweight-charts also re-fires
+    // `crosshairMove` on every data update (recalculateAllPanes → updateCrosshair,
+    // with no sourceEvent): mirroring those turned each pane's ticks into a
+    // broadcast, the sibling answered on its own next tick, and the crosshair
+    // ping-ponged between the two panes' snapped bar centres — the vertical line
+    // jumping at trade frequency with the mouse dead still, worst in Market Replay
+    // where the tape pours in. The price (y) survived because it is re-derived from
+    // the same pixel, which is why only the vertical line looked possessed.
+    //
+    // A leave (no `point`) has no sourceEvent either and must still propagate, or
+    // siblings keep a crosshair the user has already walked away from.
+    // ── Where the mouse is, for the hotkeys that place a level at the cursor ──
+    // Only POINTER-driven moves count: lightweight-charts re-fires this event on
+    // every data update (no `sourceEvent`), and a tick must not be read as the
+    // trader pointing somewhere. Leaving the pane drops both the price and the
+    // hover claim, so a key pressed over the toolbar can never place a band at a
+    // price the mouse walked away from.
+    chart.subscribeCrosshairMove((param) => {
+      if (param.point == null) {
+        hoverPriceRef.current = null;
+        if (paneId) releaseHoveredPane(paneId);
+        return;
+      }
+      if (param.sourceEvent == null) return;
+      hoverPriceRef.current = candle.coordinateToPrice(param.point.y) ?? null;
+      if (paneId) setHoveredPane(paneId);
+    });
+
     if (crosshairSync && paneId) {
       chart.subscribeCrosshairMove((param) => {
         if (crosshairSync.syncing) return;
+        const leaving = param.point == null;
+        if (!leaving && param.sourceEvent == null) return; // data-driven echo
         const price = param.point ? candle.coordinateToPrice(param.point.y) : null;
         crosshairSync.broadcast(
           paneId,
@@ -762,6 +812,8 @@ export function LightweightChart({
       execPrimRef.current = null;
       bollingerPrimRef.current = null;
       shortCostPrimRef.current = null;
+      dipZonePrimRef.current = null;
+      hoverPriceRef.current = null;
       gridPrimRef.current = null;
       newsPrimRef.current = null;
       drawingsPrimRef.current = null;
@@ -801,6 +853,9 @@ export function LightweightChart({
   useDraftLines(candleRef, draftEntryLineRef, draftSlLineRef, draftTpLineRef,
     draftEntry ?? null, draftSl ?? null, draftTp ?? null);
 
+  // ── Armed Apex lines (price ± ATR distance, follow the ticks) ──────────────
+  useApexLines(candleRef, lastBarRef, symbol, timeframe === "daily" ? null : apex);
+
   // ── Pending limit order lines (dotted, light) ─────────────────────────────
   useLimitLines(candleRef, limitOrders);
 
@@ -821,6 +876,11 @@ export function LightweightChart({
   useEffect(() => {
     shortCostPrimRef.current?.setData(shortCostBand);
   }, [shortCostBand]);
+
+  // ── Dip's band (green zone, behind the candles) ──────────────────────────
+  useEffect(() => {
+    dipZonePrimRef.current?.setData(dip);
+  }, [dip]);
 
   // ── User trend lines (custom primitive) — fed with live drag preview ───────
   const linesKey = lines.map((l) => `${l.id}:${l.point1.time},${l.point1.price},${l.point2.time},${l.point2.price}:${l.color}:${l.opacity}:${l.width}:${l.lineStyle}`).join("|");
@@ -852,8 +912,15 @@ export function LightweightChart({
     }
   }, [alarmsKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── On-chart ✕ delete buttons for user price lines (SL/TP/alarms) — hook ─
-  useDeleteButtons(candleRef, tagBtnRefs, tagPriceRef, slPrice, tpPrice, alarms, onDeleteSl, onDeleteTp, onDeleteAlarm);
+  // ── Right-edge label pills: ✕ on user lines (SL/TP/alarms), spread on the bid ─
+  // The spread only exists with both quotes, and it rides the bid line — the ask
+  // keeps its own native price tag.
+  const spread = bid != null && ask != null ? spreadLabel(bid, ask) : null;
+  useDeleteButtons(
+    candleRef, tagBtnRefs, tagPriceRef, slPrice, tpPrice, alarms,
+    spread != null ? bid : null,
+    onDeleteSl, onDeleteTp, onDeleteAlarm,
+  );
 
   // ── Previous-day reference lines (PDC/PDH/PDL) — extracted hook ────────────
   usePrevDayLines(candleRef, prevDayLineMap, indicators, prevDay);
@@ -1077,6 +1144,27 @@ export function LightweightChart({
       {linePoint1 && (
         <div className="pointer-events-none absolute left-2 top-2 rounded bg-amber-900/70 px-1.5 py-0.5 text-[10px] text-amber-300">
           Point 1 sélectionné — cliquez pour le point 2
+        </div>
+      )}
+
+      {/* Spread pill on the bid line — where the bid's own price tag would be, since
+          the pair is read as "ask price / spread", not as two prices. Keyed "spread"
+          so the pill-tracking rAF loop parks it on the bid. */}
+      {spread != null && (
+        <div
+          ref={(el) => {
+            if (el) tagBtnRefs.current.set("spread", el);
+            else tagBtnRefs.current.delete("spread");
+          }}
+          title="Spread (ask − bid)"
+          style={{
+            right: 2, top: -100, transform: "translateY(-50%)",
+            borderColor: "rgba(200,200,200,0.35)", color: SPREAD_TAG_COLOR,
+            display: "none",
+          }}
+          className="pointer-events-none absolute z-20 flex items-center rounded-sm border bg-black/80 px-1 py-px text-[9px] leading-none tabular-nums"
+        >
+          {spread}
         </div>
       )}
 

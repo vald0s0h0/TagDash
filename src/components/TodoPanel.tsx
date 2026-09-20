@@ -1,10 +1,40 @@
 import { useState } from "react";
-import { Camera, NotebookPen } from "lucide-react";
+import { Camera, Eraser, NotebookPen } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
+import { useTodoClearStore } from "@/stores/todoClearStore";
 import { JournalModal } from "./JournalModal";
 import type { TodoTrade } from "@/types";
+
+/** The rows actually rendered: everything the user hasn't cleared. The header's
+ *  count and the section's visibility read this too, so badge and list can never
+ *  disagree (same contract as the screener's `visibleMatches`). */
+export function visibleTodos(todos: TodoTrade[], cleared: string[]): TodoTrade[] {
+  return cleared.length === 0
+    ? todos
+    : todos.filter((t) => !cleared.includes(t.trade_id));
+}
+
+/** "Vider" — empties the À faire list without touching a single trade: it just
+ *  records the pending trade ids as cleared. Sits to the LEFT of the count badge. */
+export function TodoClearButton({ todos }: { todos: TodoTrade[] }) {
+  const clearAll = useTodoClearStore((s) => s.clearAll);
+  return (
+    <button
+      type="button"
+      onClick={() => clearAll(todos.map((t) => t.trade_id))}
+      title="Vider la liste À faire (les trades ne sont pas supprimés)"
+      className={cn(
+        "flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide transition-colors",
+        "bg-accent text-muted-foreground hover:bg-accent/70 hover:text-foreground",
+      )}
+    >
+      <Eraser className="h-3 w-3" />
+      <span>Vider</span>
+    </button>
+  );
+}
 
 function badgeColor(t: TodoTrade): string {
   if (t.pnl === 0) return "bg-zinc-700 text-zinc-300";
@@ -15,11 +45,13 @@ function badgeColor(t: TodoTrade): string {
 }
 
 export function TodoPanel({ onTickerClick }: { onTickerClick?: (symbol: string) => void }) {
-  const { data: todos = [] } = useQuery({
+  const { data: allTodos = [] } = useQuery({
     queryKey: ["todo_trades"],
     queryFn:  () => api.getTodoTrades(),
     refetchInterval: 3000,
   });
+  const cleared = useTodoClearStore((s) => s.cleared);
+  const todos = visibleTodos(allTodos, cleared);
 
   const [journalTarget, setJournalTarget] =
     useState<{ tradeId: string; symbol: string } | null>(null);

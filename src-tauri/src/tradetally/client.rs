@@ -177,6 +177,91 @@ impl TtClient {
         Ok(())
     }
 
+    /// Read TradeTally's diary entry for one calendar day, or `None` when the day
+    /// has none. `GET /api/diary` sits behind the same session middleware as the
+    /// POST, so this repeats the token-first / JWT-fallback dance.
+    ///
+    /// Filtering is done with `startDate`/`endDate` (both the day): a bare `date=`
+    /// parameter is silently ignored by the server and would hand back the most
+    /// recent entry of *any* day — which is how a stale journal ends up on screen.
+    pub async fn fetch_diary_entry(&self, entry_date: &str) -> Result<Option<Value>, String> {
+        let endpoint =
+            format!("/api/diary?startDate={entry_date}&endDate={entry_date}&limit=1");
+
+        // 1) Try the API token, 2) fall back to a session JWT on 401/403.
+        let value = match self.get_json_with(&endpoint, &self.auth_header()).await {
+            Ok(v) => v,
+            Err(e) if is_auth_error(&e) => {
+                let jwt = self.login_jwt().await?;
+                self.get_json_with(&endpoint, &format!("Bearer {jwt}")).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let entries = value
+            .get("entries")
+            .or_else(|| value.get("data"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .or_else(|| value.as_array().cloned())
+            .unwrap_or_default();
+
+        // Defensive: only accept an entry that really is for the day asked for, so a
+        // server that ignores the filter can't put yesterday's journal on the card.
+        Ok(entries.into_iter().find(|e| {
+            e.get("entry_date")
+                .and_then(|v| v.as_str())
+                .map(|d| d.starts_with(entry_date))
+                .unwrap_or(false)
+        }))
+    }
+
+    /// Find the TradeTally id of the trade carrying `marker` in its notes, among the
+    /// trades for `symbol`. Used to recover from an ambiguous `trade_created` POST —
+    /// one that may well have been committed upstream before the error reached us.
+    /// Blindly retrying such a POST is what puts the same trade in the journal twice.
+    pub async fn find_trade_id_by_marker(
+        &self,
+        symbol: &str,
+        marker: &str,
+    ) -> Result<Option<String>, String> {
+        let value = self
+            .get_json(&format!("/api/v1/trades?symbol={symbol}&limit=100"))
+            .await?;
+        let trades = value
+            .get("data")
+            .or_else(|| value.get("trades"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .or_else(|| value.as_array().cloned())
+            .unwrap_or_default();
+        Ok(trades
+            .iter()
+            .find(|t| {
+                t.get("notes")
+                    .and_then(|v| v.as_str())
+                    .map(|n| n.contains(marker))
+                    .unwrap_or(false)
+            })
+            .and_then(|t| t.get("id").or_else(|| t.get("uuid")))
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
+    /// GET a JSON resource under an explicit `Authorization` value.
+    async fn get_json_with(&self, endpoint: &str, auth: &str) -> Result<Value, String> {
+        let resp = self
+            .inner
+            .get(self.url(endpoint))
+            .header("Authorization", auth)
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        self.handle_resp(resp).await
+    }
+
     /// Log in with the stored email/password and return a JWT. Shared by the
     /// diary POST and the screenshot upload (both behind session auth).
     async fn login_jwt(&self) -> Result<String, String> {
@@ -266,4 +351,11 @@ impl TtClient {
         }
         Ok(())
     }
+}
+
+/// Does this error string come from an auth rejection? `handle_resp` flattens the
+/// status into the message, so the status is read back out of it. Only used to
+/// decide whether to retry a request with a session JWT.
+fn is_auth_error(e: &str) -> bool {
+    e.starts_with("HTTP 401") || e.starts_with("HTTP 403")
 }

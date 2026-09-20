@@ -145,7 +145,26 @@ fn trigger_rank(plan: &ProtectionPlan, w: &FillWindow) -> Option<u8> {
 
 /// Submit at a limit beyond the latest print. The cap still prevents an unbounded
 /// market-order fill; the 5% collar is intentionally explicit and deterministic.
-fn marketable_exit_limit(side: Side, last: f64) -> f64 {
+/// Hand a TagDash-side exit (Apex's dynamic take profit, its trailing stop) the
+/// plan's own exit client id and mark the plan as exiting, so `process_windows`
+/// chases that very order instead of sending a second one at the same position.
+/// None when the symbol has no local plan — the caller then mints its own id.
+pub fn mark_exit_pending(
+    book: &mut ProtectionBook,
+    conn: &Connection,
+    symbol: &str,
+) -> Option<String> {
+    let id = {
+        let plan = book.plans.get_mut(symbol)?;
+        plan.status = ProtectionStatus::ExitPending;
+        plan.updated_at = Utc::now();
+        plan.exit_client_order_id.clone()
+    };
+    let _ = persist(book, conn);
+    Some(id)
+}
+
+pub(crate) fn marketable_exit_limit(side: Side, last: f64) -> f64 {
     match side {
         Side::Long => (last * 0.95).max(0.0001), // long exit is a sell limit
         Side::Short => last * 1.05,              // short exit is a buy limit

@@ -157,6 +157,8 @@ fn order_of(o: &BrokerOrder) -> InternalOrder {
         // Alpaca's bracket legs only ever reduce; a parentless order is an entry.
         reduce_only: o.parent_id.is_some(),
         created_at: o.submitted_at.unwrap_or_else(Utc::now),
+        // A venue order carries no TagDash sizing button.
+        size_pct: None,
     }
 }
 

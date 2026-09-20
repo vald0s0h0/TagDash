@@ -403,8 +403,8 @@ async fn session(
                                     if let (Some(sym), Some(bid), Some(ask)) =
                                         (m.symbol.as_deref(), m.bid_price, m.ask_price)
                                     {
-                                        ms.on_quote(sym, bid, ask, now);
                                         let event_time = parse_ts(m.timestamp.as_deref());
+                                        ms.on_quote(sym, bid, ask, now, event_time);
                                         crate::replay::tape::record_quote(sym, bid, ask, event_time);
                                     }
                                 }
@@ -874,6 +874,7 @@ mod tests {
             100,
             10.00,
             Some(9.50),
+            None,
             None,
         );
         book

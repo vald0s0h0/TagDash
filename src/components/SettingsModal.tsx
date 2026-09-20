@@ -41,6 +41,8 @@ import { Separator } from "@/components/ui/separator";
 import { BacksidePanel } from "@/components/settings/BacksidePanel";
 import { DislocationPanel } from "@/components/settings/DislocationPanel";
 import { MicroPullbackPanel } from "@/components/settings/MicroPullbackPanel";
+import { ApexPanel } from "@/components/settings/ApexPanel";
+import { DipPanel } from "@/components/settings/DipPanel";
 import { useLocalConfig, useUpdateLocalConfig } from "@/queries/useLocalConfig";
 import { useSecretsStatus, useUpdateSecrets } from "@/queries/useSecretsStatus";
 import { useStrategies, useSetStrategyEnabled, useSetStrategyRisk } from "@/queries/useScanner";
@@ -1012,6 +1014,8 @@ export function SettingsModal({ open, onClose }: Props) {
                           completely different sets — deliberately not a generic
                           channel, see `micro_pullback::options`. */}
                       {s.id === "micro_pullback" && <MicroPullbackPanel />}
+                      {s.id === "micro_pullback" && <ApexPanel />}
+                      {s.id === "micro_pullback" && <DipPanel />}
                       {s.id === "dislocation" && <DislocationPanel />}
                       {s.id === "backside" && <BacksidePanel />}
                     </div>

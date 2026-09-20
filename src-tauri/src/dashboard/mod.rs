@@ -3,6 +3,7 @@
 // KPI / series math is done on the frontend from `DashboardTrade`s, so this module
 // stays a thin fetch + parse + file layer.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -36,6 +37,35 @@ pub struct DashboardTrade {
     pub broker: Option<String>,
     pub tags: Vec<String>,
     pub raw: Value,
+}
+
+/// The result of one page-through of `GET /api/v1/trades`.
+///
+/// `complete` is the whole point of this type. The local cache reconciles by
+/// deleting every row the fetch did not return, so it may only do that against a
+/// snapshot we can *prove* is the entire upstream journal: the page-through ended
+/// on TradeTally's own end-of-list signal, and — when it reported a total — we
+/// received exactly that many distinct trades. Anything less (a page that 500s
+/// halfway, a proxy that truncates, a server that ignores `page`) yields
+/// `complete = false`, and the cache then only refreshes what it saw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeSnapshot {
+    pub trades: Vec<DashboardTrade>,
+    /// `pagination.total` as reported upstream, when it reports one.
+    pub upstream_total: Option<usize>,
+    pub complete: bool,
+}
+
+/// One TradeTally diary (journal) entry, as returned by `GET /api/diary`.
+/// TradeTally keeps at most one entry per calendar day and updates it in place,
+/// so the day is the identity — `id` is carried only for reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiaryEntry {
+    pub id: Option<String>,
+    pub entry_date: String,
+    pub title: String,
+    pub content: String,
+    pub updated_at: Option<String>,
 }
 
 /// The folder where the user drops background photos + the image chosen for today
@@ -74,19 +104,30 @@ pub struct Mood {
 
 // ─── TradeTally sync ─────────────────────────────────────────────────────────
 
-/// Page through `GET /api/v1/trades` and return every trade. The caller upserts
-/// the result into the `tt_trades` cache. Defensive parsing throughout — missing
-/// fields are `None`, and a trade with no id is skipped (it can't be keyed).
-pub async fn sync_trades(client: &TtClient) -> Result<Vec<DashboardTrade>, String> {
+/// Page through `GET /api/v1/trades` and return the whole upstream journal, plus
+/// whether the page-through can be trusted as complete (see `TradeSnapshot`).
+/// Defensive parsing throughout — missing fields are `None`, and a trade with no
+/// id is skipped (it can't be keyed).
+pub async fn sync_trades(client: &TtClient) -> Result<TradeSnapshot, String> {
     const LIMIT: usize = 100;
     const MAX_PAGES: usize = 500; // safety cap (~50k trades)
 
     let mut all: Vec<DashboardTrade> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut upstream_total: Option<usize> = None;
+    let mut reached_end = false;
     let mut page = 1usize;
 
     loop {
         let endpoint = format!("/api/v1/trades?page={page}&limit={LIMIT}");
         let resp = client.get_json(&endpoint).await?;
+
+        if upstream_total.is_none() {
+            upstream_total = resp
+                .pointer("/pagination/total")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+        }
 
         // The v1 list endpoint wraps trades in `{ data: [...], pagination: {...} }`.
         // Accept `trades` and a bare array too, just in case the shape varies.
@@ -99,24 +140,42 @@ pub async fn sync_trades(client: &TtClient) -> Result<Vec<DashboardTrade>, Strin
             .unwrap_or_default();
 
         if trades.is_empty() {
+            reached_end = true;
             break;
         }
         let batch = trades.len();
+
+        // Keep only ids we have not already collected. A server that silently
+        // ignores `page` hands back the same rows forever; that shows up here as a
+        // page that adds nothing new, and we stop rather than loop to MAX_PAGES
+        // and inflate the snapshot with 500 copies of page 1.
+        let mut fresh = 0usize;
         for t in &trades {
             if let Some(parsed) = parse_trade(t) {
-                all.push(parsed);
+                if seen.insert(parsed.tt_id.clone()) {
+                    all.push(parsed);
+                    fresh += 1;
+                }
             }
+        }
+        if fresh == 0 {
+            break; // not `reached_end`: pagination is not behaving, don't prune on it
         }
 
         // Stop on the API's `pagination.hasMore` flag; fall back to a short batch.
         match resp
-            .get("pagination")
-            .and_then(|p| p.get("hasMore"))
+            .pointer("/pagination/hasMore")
             .and_then(|v| v.as_bool())
         {
-            Some(false) => break,
+            Some(false) => {
+                reached_end = true;
+                break;
+            }
             Some(true) => {}
-            None if batch < LIMIT => break,
+            None if batch < LIMIT => {
+                reached_end = true;
+                break;
+            }
             None => {}
         }
 
@@ -126,7 +185,16 @@ pub async fn sync_trades(client: &TtClient) -> Result<Vec<DashboardTrade>, Strin
         }
     }
 
-    Ok(all)
+    // A reported total we did not match means rows went missing somewhere between
+    // TradeTally and here — exactly the case where pruning the cache would delete
+    // trades that still exist upstream.
+    let complete = reached_end && upstream_total.is_none_or(|total| seen.len() == total);
+
+    Ok(TradeSnapshot {
+        trades: all,
+        upstream_total,
+        complete,
+    })
 }
 
 fn parse_trade(v: &Value) -> Option<DashboardTrade> {

@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
 import type {
-  BacksideOptions, DislocationOptions, MicroAttentionEntry, MicroPullbackOptions,
+  ApexOptions, BacksideOptions, DipOptions, DislocationOptions, MicroAttentionEntry, MicroPullbackOptions,
   MicroPullbackQualityRow, MicroQualityLive, MicroQualityRow, PanicLlmScore, StrategyRiskConfig,
 } from "@/types";
 
@@ -319,6 +319,46 @@ export function useSetMicroPullbackOptions() {
     mutationFn: (options: MicroPullbackOptions) => api.setMicroPullbackOptions(options),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["micro-pullback-options"] });
+    },
+  });
+}
+
+/** Apex's options (Micro Pullback's print-balance entries) — its own blob. */
+export function useApexOptions() {
+  return useQuery({
+    queryKey: ["apex-options"],
+    queryFn: api.getApexOptions,
+    staleTime: Infinity,
+  });
+}
+
+/** Replace Apex's options. The backend pushes them into the flow book at once. */
+export function useSetApexOptions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (options: ApexOptions) => api.setApexOptions(options),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["apex-options"] });
+    },
+  });
+}
+
+/** Dip's options (Micro Pullback's anticipated-level entries) — its own blob. */
+export function useDipOptions() {
+  return useQuery({
+    queryKey: ["dip-options"],
+    queryFn: api.getDipOptions,
+    staleTime: Infinity,
+  });
+}
+
+/** Replace Dip's options. The backend pushes them into the watch book at once. */
+export function useSetDipOptions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (options: DipOptions) => api.setDipOptions(options),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dip-options"] });
     },
   });
 }

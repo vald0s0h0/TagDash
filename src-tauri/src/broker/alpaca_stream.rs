@@ -210,11 +210,7 @@ fn strategy_name_for(chart: &Arc<RwLock<ChartState>>, symbol: &str) -> String {
         .map(|c| c.strategy_id)
         .filter(|s| !s.is_empty());
     match id {
-        Some(id) => crate::strategies::registry::all_strategies()
-            .iter()
-            .find(|s| s.id() == id)
-            .map(|s| s.name().to_string())
-            .unwrap_or(id),
+        Some(id) => crate::strategies::setup_name(&id),
         None => "Alpaca".to_string(),
     }
 }

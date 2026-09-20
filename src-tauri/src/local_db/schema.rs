@@ -522,7 +522,13 @@ CREATE TABLE IF NOT EXISTS executions (
     symbol     TEXT NOT NULL,
     quantity   INTEGER NOT NULL,
     fill_price REAL NOT NULL,
-    filled_at  TEXT NOT NULL
+    filled_at  TEXT NOT NULL,
+    -- Market time of the price the fill executed against. On a delayed data plan
+    -- it trails `filled_at` by the plan's delay; the chart anchors its triangle
+    -- here so the marker sits on the candle that produced the price.
+    data_at    TEXT,
+    -- Sizing button behind an entry (25 / 50 / 100). NULL for exits.
+    size_pct   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_executions_symbol ON executions(symbol);
 
@@ -811,6 +817,11 @@ const ALTERS: &[&str] = &[
     "ALTER TABLE micro_quality_scores ADD COLUMN attention_score REAL",
     "ALTER TABLE micro_quality_scores ADD COLUMN news_score REAL",
     "CREATE INDEX IF NOT EXISTS idx_executions_trade ON executions(trade_id)",
+    // Chart provenance for an execution marker: the market instant the fill price
+    // belongs to (≠ `filled_at` on a 15-minute delayed plan), and the sizing button
+    // that launched an entry (25 / 50 / 100). Both NULL on rows written earlier.
+    "ALTER TABLE executions ADD COLUMN data_at TEXT",
+    "ALTER TABLE executions ADD COLUMN size_pct INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_screenshot_files_trade ON screenshot_files(trade_id)",
 ];
 

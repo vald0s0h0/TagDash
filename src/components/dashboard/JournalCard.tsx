@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { ArrowRight } from "lucide-react";
 import { FrostLabel } from "./frosted";
-import { useSaveDiary } from "./useDashboard";
+import { useDiaryEntry, useSaveDiary } from "./useDashboard";
 import { MicDictate } from "@/components/MicDictate";
 import { useJournalStore, journalDayKey } from "@/stores/journalStore";
 
@@ -13,14 +13,22 @@ const fieldClass =
  *  day long. The SEND button only pushes the current text to TradeTally (create-or-
  *  update for the day) — it never clears the fields, so you can keep editing and
  *  re-send across tab switches and restarts. The draft auto-resets the next day at
- *  midnight ET. The send is queued + retried, so it can't be lost. */
+ *  midnight ET. The send is queued + retried, so it can't be lost.
+ *
+ *  TradeTally is the source of truth for the entry, so the card reads it back on
+ *  every open and adopts it — an entry written on another machine, or edited in
+ *  TradeTally itself, shows up here. Unsent local edits always win over the fetch
+ *  (see `dirty` in the journal store), so this can't overwrite what you are typing. */
 export function JournalCard() {
   const title = useJournalStore((s) => s.title);
   const content = useJournalStore((s) => s.content);
+  const dirty = useJournalStore((s) => s.dirty);
   const setTitle = useJournalStore((s) => s.setTitle);
   const setContent = useJournalStore((s) => s.setContent);
   const rollover = useJournalStore((s) => s.rollover);
+  const hydrate = useJournalStore((s) => s.hydrate);
   const save = useSaveDiary();
+  const remote = useDiaryEntry();
 
   // Roll the draft over at ET midnight — on open, and (if left open) on the minute.
   useEffect(() => {
@@ -28,6 +36,13 @@ export function JournalCard() {
     const id = setInterval(() => rollover(journalDayKey()), 60_000);
     return () => clearInterval(id);
   }, [rollover]);
+
+  // Adopt TradeTally's entry for the day once it arrives.
+  const entry = remote.data;
+  useEffect(() => {
+    if (!entry) return;
+    hydrate(entry.entry_date, entry.title, entry.content);
+  }, [entry, hydrate]);
 
   const empty = !title.trim() && !content.trim();
 
@@ -37,13 +52,24 @@ export function JournalCard() {
     save.mutate({ title: title.trim(), content: content.trim() });
   }
 
+  // One line about where the text on screen stands relative to TradeTally. The
+  // send states win (they're the most recent action), then unsent edits, then what
+  // the last read of TradeTally said.
   const status = save.isPending
     ? "Envoi…"
-    : save.isSuccess
-      ? "À jour ✓"
-      : save.isError
-        ? "En file — réessai"
-        : null;
+    : save.isError
+      ? "En file — réessai"
+      : dirty
+        ? "Non envoyé"
+        : save.isSuccess
+          ? "Envoyé ✓"
+          : remote.isFetching
+            ? "Lecture…"
+            : remote.isError
+              ? "TradeTally injoignable"
+              : entry
+                ? "TradeTally ✓"
+                : null;
 
   return (
     <div className="flex h-full w-full flex-col gap-[11px] p-[22px]">

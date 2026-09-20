@@ -9,7 +9,8 @@ import { ScannerAlerts } from "@/components/ScannerAlerts";
 import { PanicScoreButton, ScreenerPanel, matchToAlert, visibleMatches } from "@/components/ScreenerPanel";
 import { OrdersPositionsPanel, standalonePendingOrders } from "@/components/OrdersPositionsPanel";
 import { AlarmsPanel } from "@/components/AlarmsPanel";
-import { TodoPanel } from "@/components/TodoPanel";
+import { TodoClearButton, TodoPanel, visibleTodos } from "@/components/TodoPanel";
+import { useTodoClearStore } from "@/stores/todoClearStore";
 import { api } from "@/lib/tauri";
 import type { AlertSignal, Session } from "@/types";
 
@@ -89,6 +90,13 @@ export function Sidebar() {
     queryFn:  () => api.getTodoTrades(),
     refetchInterval: 3000,
   });
+  // What "À faire" actually shows — the raw query still contains the trades the
+  // user cleared. Same helper as the panel, so the badge and the list agree.
+  const clearedTodos  = useTodoClearStore((s) => s.cleared);
+  const visibleTodoTrades = useMemo(
+    () => visibleTodos(todoTrades, clearedTodos),
+    [todoTrades, clearedTodos],
+  );
   // One badge per ticker, armed alarms only (matches AlarmsPanel's condensing).
   const alarmCount = new Set(
     alarms.filter((a) => a.triggered_at == null).map((a) => a.symbol)
@@ -227,10 +235,16 @@ export function Sidebar() {
         </div>
       )}
 
-      {/* À faire — trades missing screenshot / journal */}
-      {todoTrades.length > 0 && (
+      {/* À faire — trades missing screenshot / journal. "Vider" only hides them:
+          the trades themselves stay in the DB. */}
+      {visibleTodoTrades.length > 0 && (
         <div className="flex flex-col overflow-hidden border-t border-border" style={{ minHeight: "3rem", maxHeight: "10rem" }}>
-          <SectionHeader icon={ClipboardCheck} title="À faire" count={todoTrades.length} />
+          <SectionHeader
+            icon={ClipboardCheck}
+            title="À faire"
+            count={visibleTodoTrades.length}
+            action={<TodoClearButton todos={todoTrades} />}
+          />
           <div className="flex-1 overflow-y-auto">
             <TodoPanel onTickerClick={handleTickerClick} />
           </div>

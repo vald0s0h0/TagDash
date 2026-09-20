@@ -57,23 +57,29 @@ export interface RpfPoint {
   pf: number;
 }
 
-/** Rolling profit factor over a trailing window (default 20 trades). A window with
- *  no losses is clamped to `cap` so the line stays visible (rather than spiking to
- *  infinity). */
+/** Rolling profit factor over a trailing window of exactly `window` trades
+ *  (default 20). Only emits a point once the window has actually started
+ *  rolling — i.e. once there are more than `window` closed trades — so a
+ *  partial or single static first-window value never gets plotted. With 121
+ *  trades and window=100, this yields 21 points (indices 100..120). A window
+ *  with no losses is clamped to `cap` so the line stays visible (rather than
+ *  spiking to infinity). */
 export function rollingProfitFactor(
   trades: DashboardTrade[],
   window = 20,
   cap = 5
 ): RpfPoint[] {
-  return trades.map((t, i) => {
-    const slice = trades.slice(Math.max(0, i - window + 1), i + 1);
+  const result: RpfPoint[] = [];
+  for (let i = window; i < trades.length; i++) {
+    const slice = trades.slice(i - window + 1, i + 1);
     const pf = profitFactor(slice);
     let v: number;
     if (pf == null) v = 0;
     else if (!isFinite(pf)) v = cap;
     else v = round2(Math.min(pf, cap * 4)); // soft outlier guard
-    return { i, date: dateKey(t), pf: v };
-  });
+    result.push({ i, date: dateKey(trades[i]), pf: v });
+  }
+  return result;
 }
 
 export interface KpiSummary {
@@ -124,4 +130,54 @@ export function formatPf(v: number | null): string {
 
 export function formatPct(v: number): string {
   return `${(v * 100).toFixed(0)}%`;
+}
+
+// ─── Risk sizing (last N days) ─────────────────────────────────────────────────
+
+function toDayIndex(dateStr: string): number {
+  return Math.floor(new Date(dateStr).getTime() / 86400000);
+}
+
+export interface RiskSummary {
+  /** Average P&L per trade, over trades closed in the trailing window. */
+  expectancy: number;
+  /** Average P&L per calendar day over the trailing window — days with no
+   *  trade count as 0, so the denominator is always `days`. */
+  avgDailyPnl: number;
+  /** Daily loss cutoff = avgDailyPnl × 3. */
+  dailyCutoff: number;
+  /** Risk sized per trade = avgDailyPnl. */
+  riskPerTrade: number;
+  /** Trades that fell inside the window (0 means nothing to show). */
+  tradeCount: number;
+}
+
+/** Expectancy + risk-sizing figures over a trailing window of calendar days,
+ *  anchored to the most recent closed trade's date (not wall-clock "today") so
+ *  it stays meaningful on data that isn't updated in real time. */
+export function riskSummary(closed: DashboardTrade[], days = 20): RiskSummary {
+  if (closed.length === 0) {
+    return { expectancy: 0, avgDailyPnl: 0, dailyCutoff: 0, riskPerTrade: 0, tradeCount: 0 };
+  }
+
+  const latestDay = toDayIndex(dateKey(closed[closed.length - 1]));
+  const windowStart = latestDay - (days - 1);
+
+  const windowTrades = closed.filter((t) => {
+    const d = dateKey(t);
+    if (!d) return false;
+    const day = toDayIndex(d);
+    return day >= windowStart && day <= latestDay;
+  });
+
+  const totalPnl = windowTrades.reduce((a, t) => a + (t.pnl ?? 0), 0);
+  const avgDailyPnl = round2(totalPnl / days);
+
+  return {
+    expectancy: windowTrades.length ? round2(totalPnl / windowTrades.length) : 0,
+    avgDailyPnl,
+    dailyCutoff: round2(avgDailyPnl * 3),
+    riskPerTrade: avgDailyPnl,
+    tradeCount: windowTrades.length,
+  };
 }

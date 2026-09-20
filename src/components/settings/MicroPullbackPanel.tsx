@@ -75,7 +75,7 @@ const CALIBRATION = {
   ratiosRequired: 2,
 };
 
-function Row({
+export function Row({
   checked,
   disabled,
   label,
@@ -110,7 +110,7 @@ function Row({
 
 /** A labelled numeric field that only commits on blur or Enter, so a half-typed
  *  value never reaches the engine. */
-function Num({
+export function Num({
   label,
   value,
   suffix,

@@ -18,6 +18,9 @@ export type CardId =
   | "kpis"
   | "pnl-curve"
   | "rolling-pf"
+  | "rolling-pf-50"
+  | "rolling-pf-100"
+  | "risk"
   | "journal"
   | "inspiration"
   | "quote"
@@ -40,8 +43,11 @@ export const DEFAULT_LAYOUT: Record<CardId, CardLayout> = {
   "pnl-curve":   { x: 8,  y: 0, w: 12, h: 6, visible: true, surface: "glass" },
   "rolling-pf":  { x: 8,  y: 6, w: 6,  h: 6, visible: true, surface: "glass" },
   "journal":     { x: 14, y: 6, w: 6,  h: 6, visible: true, surface: "glass" },
-  // Extra card — off by default (the default board is already full). Enable it in
-  // the Cartes menu and drag it into place.
+  // Extra cards — off by default (the default board is already full). Enable them
+  // in the Cartes menu and drag them into place.
+  "rolling-pf-50":  { x: 8,  y: 6, w: 6, h: 6, visible: false, surface: "glass" },
+  "rolling-pf-100": { x: 8,  y: 6, w: 6, h: 6, visible: false, surface: "glass" },
+  "risk":        { x: 0,  y: 0, w: 8,  h: 4, visible: false, surface: "glass" },
   "heading":     { x: 0,  y: 0, w: 8,  h: 2, visible: false, surface: "glass" },
 };
 

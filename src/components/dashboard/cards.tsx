@@ -4,6 +4,7 @@ import type { CardId } from "@/stores/dashboardStore";
 import { KpiCard } from "./KpiCard";
 import { PnlCurveCard } from "./PnlCurveCard";
 import { RollingProfitFactorCard } from "./RollingProfitFactorCard";
+import { RiskCard } from "./RiskCard";
 import { JournalCard } from "./JournalCard";
 import { InspirationCard, QuoteCard, HeadingCard } from "./MoodCards";
 
@@ -22,8 +23,19 @@ export const CARD_DEFS: CardDef[] = [
   {
     id: "rolling-pf",
     title: "Facteur de profit · 20 trades",
-    render: ({ trades }) => <RollingProfitFactorCard trades={trades} />,
+    render: ({ trades }) => <RollingProfitFactorCard trades={trades} window={20} />,
   },
+  {
+    id: "rolling-pf-50",
+    title: "Facteur de profit · 50 trades",
+    render: ({ trades }) => <RollingProfitFactorCard trades={trades} window={50} />,
+  },
+  {
+    id: "rolling-pf-100",
+    title: "Facteur de profit · 100 trades",
+    render: ({ trades }) => <RollingProfitFactorCard trades={trades} window={100} />,
+  },
+  { id: "risk", title: "Risque · 20 jours", render: ({ trades }) => <RiskCard trades={trades} /> },
   { id: "journal", title: "Journal", render: () => <JournalCard /> },
   { id: "inspiration", title: "Inspiration", render: () => <InspirationCard /> },
   { id: "quote", title: "Citation", render: () => <QuoteCard /> },

@@ -14,6 +14,7 @@ import type {
   ChartDrawing,
   DailyBackground,
   DashboardTrade,
+  DiaryEntry,
   FeedDiagnostics,
   FlatFileDay,
   FlatFilesKind,
@@ -44,6 +45,10 @@ import type {
   StrategyCard,
   StrategyRiskConfig,
   MicroPullbackOptions,
+  ApexOptions,
+  ApexStatus,
+  DipOptions,
+  DipStatus,
   DislocationOptions,
   BacksideOptions,
   MicroAttentionEntry,
@@ -66,6 +71,7 @@ import type {
   PanicLlmScore,
   MicroQualityBoard,
   MicroPullbackQualityRow,
+  TradeSyncReport,
 } from "@/types";
 
 export const api = {
@@ -73,10 +79,14 @@ export const api = {
   getAppStatus: () => invoke<AppStatus>("get_app_status"),
 
   // Dashboard (moodboard)
-  syncTradetallyTrades:  () => invoke<number>("sync_tradetally_trades"),
+  syncTradetallyTrades:  () => invoke<TradeSyncReport>("sync_tradetally_trades"),
   getDashboardTrades:    () => invoke<DashboardTrade[]>("get_dashboard_trades"),
   saveDiaryEntry:        (title: string, content: string) =>
     invoke<void>("save_diary_entry", { title, content }),
+  // TradeTally's own entry for the day (defaults to today, ET) — what the source
+  // of truth holds, as opposed to the local draft.
+  getDiaryEntry:         (entry_date?: string) =>
+    invoke<DiaryEntry | null>("get_diary_entry", { entry_date: entry_date ?? null }),
   getDailyBackground:    () => invoke<DailyBackground>("get_daily_background"),
   openBackgroundsFolder: () => invoke<void>("open_backgrounds_folder"),
   getMood:               () => invoke<Mood>("get_mood"),
@@ -218,6 +228,24 @@ export const api = {
     invoke<MicroPullbackOptions>("get_micro_pullback_options"),
   setMicroPullbackOptions: (options: MicroPullbackOptions) =>
     invoke<void>("set_micro_pullback_options", { options }),
+  // Apex (Micro Pullback): options, live status, and the arm/disarm hotkey.
+  getApexOptions: () => invoke<ApexOptions>("get_apex_options"),
+  setApexOptions: (options: ApexOptions) =>
+    invoke<void>("set_apex_options", { options }),
+  getApexStatus: () => invoke<ApexStatus>("get_apex_status"),
+  apexToggle: (zone_id: string, symbol: string) =>
+    invoke<ApexStatus>("apex_toggle", { zone_id, symbol }),
+
+  // Dip (Micro Pullback): options, live status, and the band hotkeys. `dip_place`
+  // carries the price under the cursor — the backend decides whether that lays the
+  // band, moves it, or (pointing back inside it) takes it away.
+  getDipOptions: () => invoke<DipOptions>("get_dip_options"),
+  setDipOptions: (options: DipOptions) =>
+    invoke<void>("set_dip_options", { options }),
+  getDipStatus: () => invoke<DipStatus>("get_dip_status"),
+  dipPlace: (zone_id: string, symbol: string, price: number) =>
+    invoke<DipStatus>("dip_place", { zone_id, symbol, price }),
+  dipResize: (steps: number) => invoke<DipStatus>("dip_resize", { steps }),
   getDislocationAttention: () =>
     invoke<MicroAttentionEntry[]>("get_dislocation_attention"),
   getDislocationOptions: () =>

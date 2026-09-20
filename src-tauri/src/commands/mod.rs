@@ -1,6 +1,8 @@
 // Tauri command surface. Thin orchestration only — logic lives in modules.
 // All state access via tauri::State<AppState>.
 
+pub mod apex;
+pub mod dip;
 pub mod broker;
 
 use std::sync::atomic::Ordering;
@@ -2947,6 +2949,15 @@ fn all_market_prices(market: &RwLock<MarketState>) -> HashMap<String, (f64, f64)
 }
 
 fn strategy_max_risk(state: &tauri::State<'_, AppState>, strategy_id: &str) -> f64 {
+    // An Apex or Dip trade has no risk setting of its own: both live on Micro
+    // Pullback's, the strategy they are part of.
+    let strategy_id = if strategy_id == crate::apex::STRATEGY_ID {
+        crate::apex::OWNER_STRATEGY_ID
+    } else if strategy_id == crate::dip::STRATEGY_ID {
+        crate::dip::OWNER_STRATEGY_ID
+    } else {
+        strategy_id
+    };
     // Runtime Settings override wins; else the strategy's compiled default.
     if let Some(r) = state.strategy_risk.read().unwrap().get(strategy_id) {
         return r.max_risk_dollars;
@@ -3128,6 +3139,7 @@ pub async fn create_internal_order_percent(
         limit_price,
         ctx.stop_loss,
         ctx.take_profit,
+        Some(percent),
     );
     // A resting entry order is part of the day's state — persist so it survives a
     // restart and the trading loop can still fill it on a price cross.
@@ -3195,6 +3207,7 @@ pub async fn create_internal_limit_order_percent(
         limit_price,
         ctx.stop_loss,
         ctx.take_profit,
+        Some(percent),
     );
     persist_book(&state.internal_book, &state.db);
     Ok(())
@@ -3297,11 +3310,7 @@ fn sync_fill(
                 let _ =
                     execution_repository::set_original_tp(&db, &fill.trade_id, &fill.symbol, tp0);
             }
-            let strategy_name = registry::all_strategies()
-                .iter()
-                .find(|s| s.id() == strategy_id)
-                .map(|s| s.name().to_string())
-                .unwrap_or_else(|| strategy_id.clone());
+            let strategy_name = crate::strategies::setup_name(&strategy_id);
             tradetally::enqueue_trade_created(
                 &db,
                 &fill.trade_id,
@@ -3438,7 +3447,7 @@ pub fn spawn_trading_loop(
             // so there's no lock nesting.
             let windows = market.write().unwrap().drain_fill_windows();
             let prices = all_market_prices(&market);
-            let (new_fills, risk_updates) = {
+            let (mut new_fills, risk_updates) = {
                 let mut book = internal_book.write().unwrap();
 
                 // Re-check the SAME window across rounds until one produces no
@@ -3494,6 +3503,19 @@ pub fn spawn_trading_loop(
                     .collect();
                 (new_fills, updates)
             };
+            // Resting fills (limit entries, SL/TP exits) were matched against the
+            // window of prices the feed had just delivered. On a delayed plan that
+            // window describes market time ~15 minutes back, so stamp each fill with
+            // the symbol's as-of instant: the chart then draws the marker on the
+            // candle it filled against rather than at the moment we noticed
+            // (`Fill::data_at`). `filled_at` is untouched — the journal and
+            // TradeTally keep the real execution time.
+            {
+                let m = market.read().unwrap();
+                for f in &mut new_fills {
+                    f.data_at = m.last_event_at(&f.symbol);
+                }
+            }
             for f in &new_fills {
                 sync_fill(&internal_book, &db, &config, &chart, f);
             }
@@ -3540,17 +3562,28 @@ pub async fn create_internal_market_order_percent(
         .await;
     }
 
-    let fill = state.internal_book.write().unwrap().execute_market_fill(
-        ctx.trade_id.clone(),
-        zone_id,
-        ctx.symbol.clone(),
-        ctx.strategy_id.clone(),
-        side,
-        qty,
-        fill_price,
-        ctx.stop_loss,
-        ctx.take_profit,
-    );
+    // The price above came from the feed's freshest aggregate, which on a delayed
+    // plan is ~15 minutes old. Stamping the fill with that bar's market time is what
+    // lets the chart draw the triangle on the candle that produced the price,
+    // instead of 15 minutes to its right (`Fill::data_at`).
+    let data_at = state.market.read().unwrap().last_event_at(&ctx.symbol);
+    let fill = state
+        .internal_book
+        .write()
+        .unwrap()
+        .execute_market_fill_sized(
+            ctx.trade_id.clone(),
+            zone_id,
+            ctx.symbol.clone(),
+            ctx.strategy_id.clone(),
+            side,
+            qty,
+            fill_price,
+            ctx.stop_loss,
+            ctx.take_profit,
+            Some(percent),
+            data_at,
+        );
 
     // (Re)materialise protective SL/TP bracket orders for the open position.
     state
@@ -3714,10 +3747,19 @@ pub fn get_trade_lifecycle(
 /// position increase (triangle points right) or decrease (points left).
 #[derive(Serialize)]
 pub struct ExecFill {
-    pub time: String, // RFC3339; the chart converts to NY for display
+    /// RFC3339; the chart converts to NY for display. This is the MARKET time of
+    /// the price the fill executed against (`executions.data_at`), falling back to
+    /// the execution instant when no as-of was recorded. On a 15-minute delayed
+    /// plan the two differ by the delay, and using the execution instant here is
+    /// what used to push every triangle ~15 minutes right of its candle.
+    pub time: String,
     pub price: f64,
     pub increase: bool, // position grew (triangle points right) vs shrank (left)
     pub buy: bool,      // buy fill (green) vs sell fill (red)
+    /// Sizing button behind the entry (25 / 50 / 100), drawn as a small label to
+    /// the left of the triangle. `None` on exits and on fills no button sized, so
+    /// the chart leaves them unlabelled.
+    pub size_pct: Option<u8>,
 }
 
 /// All executions of one trade, grouped so the chart can connect them with a
@@ -3787,11 +3829,14 @@ pub fn get_executions_for_symbol(
             if long_dir.is_none() && r.quantity != 0 {
                 long_dir = Some(r.quantity > 0);
             }
+            let increase = net.abs() > before.abs();
             fills.push(ExecFill {
-                time: r.filled_at.clone(),
+                time: r.data_at.clone().unwrap_or_else(|| r.filled_at.clone()),
                 price: r.fill_price,
-                increase: net.abs() > before.abs(),
+                increase,
                 buy: r.quantity > 0, // signed delta: + = buy/long, − = sell/short
+                // Entries and scale-ins carry the label; exits never do.
+                size_pct: increase.then_some(r.size_pct).flatten(),
             });
         }
         let original_sl = original_sls.get(&tid).copied();
@@ -4106,12 +4151,81 @@ pub fn get_tickers_table(
 
 /// Re-sync the user's trades from TradeTally (source of truth) into the local
 /// `tt_trades` cache. Called every time the dashboard tab opens, and on demand via
-/// the Refresh button. Reconciles both ways: trades removed upstream are pruned
-/// from the cache, not just the present ones refreshed. Returns the number of
-/// trades upserted.
+/// the Refresh button.
+///
+/// Reconciles in both directions, but only ever deletes against a fetch it can
+/// prove complete (see `dashboard::TradeSnapshot`): trades removed upstream are
+/// pruned from the cache and their id mappings dropped, while a truncated fetch
+/// degrades to a plain refresh instead of deleting the trades it failed to see.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn sync_tradetally_trades(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    // Build the TradeTally client the same way the background worker does.
+pub async fn sync_tradetally_trades(
+    state: tauri::State<'_, AppState>,
+) -> Result<TradeSyncReport, String> {
+    let client = tradetally_client(&state)?;
+
+    // Stamped before the fetch: any mapping created after this instant belongs to a
+    // trade pushed while the fetch was in flight, which the fetch cannot have seen.
+    let fetch_started_at = Utc::now()
+        .naive_utc()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    // Network fetch happens with no DB lock held.
+    let snapshot = crate::dashboard::sync_trades(&client).await?;
+
+    let outcome = {
+        let mut guard = state.db.lock().unwrap();
+        let outcome =
+            dashboard_repository::sync_trades_bulk(&mut guard, &snapshot, &fetch_started_at)
+                .map_err(|e| e.to_string())?;
+        let _ =
+            cache_repository::set_app_meta(&guard, "tt_trades_synced_at", &Utc::now().to_rfc3339());
+        outcome
+    };
+
+    // Deletions are the quiet half of a sync — surfaced in the log so a cache that
+    // suddenly shrinks is traceable to the fetch that shrank it. A fetch that could
+    // not be trusted is louder still: the cache may now hold trades that no longer
+    // exist upstream, and nothing on screen would otherwise say so.
+    if !outcome.pruned {
+        eprintln!(
+            "[tagdash] sync TradeTally incomplet : {} trades rafraîchis, total annoncé {:?} — \
+             aucune purge (les suppressions faites dans TradeTally restent affichées)",
+            outcome.upserted, snapshot.upstream_total
+        );
+    } else if outcome.deleted > 0 || outcome.mappings_pruned > 0 {
+        eprintln!(
+            "[tagdash] sync TradeTally : {} trades à jour, {} lignes obsolètes purgées, \
+             {} mappings morts supprimés",
+            outcome.upserted, outcome.deleted, outcome.mappings_pruned
+        );
+    }
+
+    Ok(TradeSyncReport {
+        upserted: outcome.upserted,
+        deleted: outcome.deleted,
+        mappings_pruned: outcome.mappings_pruned,
+        mappings_restored: outcome.mappings_restored,
+        reconciled: outcome.pruned,
+        upstream_total: snapshot.upstream_total,
+    })
+}
+
+/// What one dashboard sync did, for the UI. `reconciled` false means the fetch
+/// could not be proven complete, so deletions were *not* applied — the cards may
+/// still show a trade that was removed in TradeTally until a clean sync lands.
+#[derive(Debug, Clone, Serialize)]
+pub struct TradeSyncReport {
+    pub upserted: usize,
+    pub deleted: usize,
+    pub mappings_pruned: usize,
+    pub mappings_restored: usize,
+    pub reconciled: bool,
+    pub upstream_total: Option<usize>,
+}
+
+/// Build the TradeTally client the same way the background worker does.
+fn tradetally_client(state: &tauri::State<'_, AppState>) -> Result<tradetally::TtClient, String> {
     let (base_url, token, tt_email, tt_password) = {
         let cfg = state.config.read().unwrap();
         let sec = state.secrets.read().unwrap();
@@ -4125,29 +4239,7 @@ pub async fn sync_tradetally_trades(state: tauri::State<'_, AppState>) -> Result
     if token.is_empty() {
         return Err("TradeTally token not set".into());
     }
-
-    let client =
-        tradetally::TtClient::new(base_url, token).with_session_creds(tt_email, tt_password);
-
-    // Network fetch happens with no DB lock held.
-    let trades = crate::dashboard::sync_trades(&client).await?;
-
-    let (count, deleted) = {
-        let mut guard = state.db.lock().unwrap();
-        let counts = dashboard_repository::sync_trades_bulk(&mut guard, &trades)
-            .map_err(|e| e.to_string())?;
-        let _ =
-            cache_repository::set_app_meta(&guard, "tt_trades_synced_at", &Utc::now().to_rfc3339());
-        counts
-    };
-    // Deletions are the quiet half of a sync — surfaced in the log so a cache that
-    // suddenly shrinks is traceable to the fetch that shrank it.
-    if deleted > 0 {
-        eprintln!(
-            "[tagdash] sync TradeTally : {count} trades à jour, {deleted} lignes obsolètes purgées"
-        );
-    }
-    Ok(count)
+    Ok(tradetally::TtClient::new(base_url, token).with_session_creds(tt_email, tt_password))
 }
 
 /// Cached trades for the dashboard KPI cards (oldest first). The frontend derives
@@ -4158,6 +4250,67 @@ pub fn get_dashboard_trades(
 ) -> Vec<crate::dashboard::DashboardTrade> {
     let conn = state.db.lock().unwrap();
     dashboard_repository::get_all_trades(&conn).unwrap_or_default()
+}
+
+/// TradeTally's own journal entry for a day (default: today, ET) — the Journal card
+/// reads it so the card shows what the source of truth holds, not just whatever
+/// draft this machine happens to have in local storage.
+///
+/// Mirrored into `diary_entries_local` on the way through, and served from there
+/// when the server is unreachable, so the card still shows the day's entry offline.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_diary_entry(
+    entry_date: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<crate::dashboard::DiaryEntry>, String> {
+    let date = entry_date.unwrap_or_else(|| crate::time::et_date(crate::time::now()));
+
+    let fetched = match tradetally_client(&state) {
+        Ok(client) => client.fetch_diary_entry(&date).await,
+        Err(e) => Err(e),
+    };
+
+    match fetched {
+        Ok(Some(v)) => {
+            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or_default();
+            let content = v.get("content").and_then(|x| x.as_str()).unwrap_or_default();
+            let entry = crate::dashboard::DiaryEntry {
+                id: v.get("id").and_then(|x| x.as_str()).map(str::to_string),
+                entry_date: date.clone(),
+                title: title.to_string(),
+                content: content.to_string(),
+                updated_at: v
+                    .get("updated_at")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
+            };
+            let conn = state.db.lock().unwrap();
+            let _ = dashboard_repository::upsert_diary_upstream(&conn, &date, title, content);
+            Ok(Some(entry))
+        }
+        // The day has no entry upstream — that is an answer, not a failure, and it
+        // must not resurrect a stale local mirror.
+        Ok(None) => Ok(None),
+        Err(e) => {
+            // Unreachable / unauthorised: fall back to the local mirror so the card
+            // is not blank, and say nothing about it — the draft is still editable
+            // and the send queue will carry it when the server comes back.
+            let local = {
+                let conn = state.db.lock().unwrap();
+                dashboard_repository::get_diary_local(&conn, &date).unwrap_or(None)
+            };
+            match local {
+                Some((title, content)) => Ok(Some(crate::dashboard::DiaryEntry {
+                    id: None,
+                    entry_date: date,
+                    title,
+                    content,
+                    updated_at: None,
+                })),
+                None => Err(e),
+            }
+        }
+    }
 }
 
 /// Journal/diary card → create-or-update today's TradeTally diary entry. Enqueued

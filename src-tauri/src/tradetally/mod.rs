@@ -110,6 +110,52 @@ pub fn enqueue_event(
     let _ = tradetally_queue_repository::enqueue(conn, &row);
 }
 
+// ─── Local ↔ server correlation marker ───────────────────────────────────────
+//
+// The `tradetally_trade_ids` table is the fast path from a TagDash trade to its
+// TradeTally id, but it is local state: it does not survive a reinstall, a fresh
+// machine, or a DB reset, and it says nothing to a second TagDash install. So
+// every trade TagDash creates also carries its local id *inside the TradeTally
+// record*, as a marker line in `notes`. That marker is the only correlation key
+// that lives in the source of truth, which makes it the thing that lets us
+// recover a lost mapping and — crucially — recognise a trade we already created
+// instead of creating it a second time.
+//
+// Which is why `note_updated` must never drop it: the journal text the user types
+// replaces `notes` wholesale, and a trade whose marker was overwritten becomes
+// permanently unrecognisable as a TagDash trade.
+
+/// The marker text carried in a TradeTally trade's notes for a local trade id.
+pub fn marker_for(trade_id: &str) -> String {
+    format!("TagDash {trade_id}")
+}
+
+/// The local trade id carried by a TradeTally trade's notes, if any. The inverse
+/// of `marker_for`: it is how a lost local→server mapping is rebuilt from the
+/// source of truth during a sync.
+pub fn local_id_from_marker(notes: &str) -> Option<String> {
+    let rest = notes.split("TagDash ").nth(1)?;
+    let id = rest
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// User notes with the correlation marker guaranteed present, as its own trailing
+/// line. Idempotent: notes that already carry the marker are returned untouched.
+pub(crate) fn notes_with_marker(notes: &str, trade_id: &str) -> String {
+    let marker = marker_for(trade_id);
+    if notes.contains(&marker) {
+        return notes.to_string();
+    }
+    if notes.trim().is_empty() {
+        return marker;
+    }
+    format!("{}\n\n{marker}", notes.trim_end())
+}
+
 // ─── Typed event helpers (TradeTally REST API v1) ───────────────────────────
 //
 // A TradeTally trade is a single record (POST /api/v1/trades) with an
@@ -182,7 +228,7 @@ pub fn enqueue_trade_created(
         "fees":           cfg.trading.default_fees,
         "stopLoss":       round_level(stop_loss),
         "takeProfit":     round_level(take_profit),
-        "notes":          format!("TagDash {trade_id}"),
+        "notes":          marker_for(trade_id),
         "setup":          strategy_name,
         "broker":         cfg.trading.default_broker,
         "instrumentType": "stock",
@@ -263,6 +309,9 @@ pub fn enqueue_note_updated(
     confidence: Option<i32>,
     tags: &[String],
 ) {
+    // The marker is re-attached by the worker at send time (`notes_with_marker`),
+    // not here, so events queued before that existed are covered too. What is stored
+    // in the queue stays the text the user actually typed.
     let payload = json!({
         "notes":      notes,
         "confidence": confidence,
@@ -296,4 +345,36 @@ pub fn enqueue_chart_updated(conn: &Connection, trade_id: &str, symbol: &str, lo
         "/api/trades/{TT_ID}/images",
         payload,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_marker_survives_a_journal_note_and_round_trips() {
+        let id = "260901143012-AAPL-HOD_DRIVE";
+        let notes = notes_with_marker("Belle gestion du risque.", id);
+        assert!(notes.starts_with("Belle gestion du risque."));
+        assert_eq!(local_id_from_marker(&notes).as_deref(), Some(id));
+    }
+
+    #[test]
+    fn adding_the_marker_twice_does_not_duplicate_it() {
+        let id = "260901143012-AAPL-HOD_DRIVE";
+        let once = notes_with_marker("note", id);
+        assert_eq!(notes_with_marker(&once, id), once);
+    }
+
+    #[test]
+    fn empty_notes_carry_the_marker_alone() {
+        let id = "260901143012-AAPL-HOD_DRIVE";
+        assert_eq!(notes_with_marker("   ", id), marker_for(id));
+    }
+
+    #[test]
+    fn notes_without_a_marker_yield_no_local_id() {
+        assert_eq!(local_id_from_marker("juste une note"), None);
+        assert_eq!(local_id_from_marker("TagDash "), None);
+    }
 }

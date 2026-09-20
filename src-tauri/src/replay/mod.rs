@@ -806,7 +806,7 @@ fn emit_until(
                     }
                 }
                 data::Event::Quote { symbol, bid, ask } => {
-                    ms.on_quote(symbol, *bid, *ask, event_time);
+                    ms.on_quote(symbol, *bid, *ask, event_time, event_time);
                 }
                 data::Event::News(h) => {
                     ms.on_news(h.clone());

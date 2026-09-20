@@ -16,6 +16,8 @@ export type HotkeyActionId =
   | "capture" | "journal"
   | "order_mode" | "order_25" | "order_50" | "order_100" | "close"
   | "confirm_hod" | "invert_hod"
+  | "apex_arm"
+  | "dip_place" | "dip_thinner" | "dip_thicker"
   | "run_llm"
   | "tf_5s" | "tf_10s" | "tf_1m" | "tf_2m" | "tf_5m" | "tf_15m" | "tf_daily"
   // Replay (global — not tied to a chart zone, special-cased in useHotkeys)
@@ -46,6 +48,10 @@ export const HOTKEY_ACTIONS: HotkeyActionDef[] = [
   { id: "close",       label: "Clôturer la position",    group: "Ordres" },
   { id: "confirm_hod", label: "Confirmer HOD Drive",     group: "Ordres" },
   { id: "invert_hod",  label: "Inverser HOD Drive (short)", group: "Ordres" },
+  { id: "apex_arm",    label: "Armer / désarmer Apex",   group: "Ordres" },
+  { id: "dip_place",   label: "Poser / retirer la zone Dip", group: "Ordres" },
+  { id: "dip_thinner", label: "Zone Dip plus fine",       group: "Ordres" },
+  { id: "dip_thicker", label: "Zone Dip plus épaisse",    group: "Ordres" },
 
   { id: "run_llm",    label: "Lancer l'analyse IA",     group: "Analyse" },
 
@@ -138,6 +144,20 @@ export function bindingLabel(b: Binding): string {
 
 // ─── Persisted bindings store ─────────────────────────────────────────────────
 
+/** Bindings a fresh install starts with. Apex is armed with V and Dip's band is
+ *  laid with G: one key, no chord, because the move each one anticipates is seconds
+ *  away. B and T then tune that band one notch thinner / thicker, and they sit next
+ *  to G on the same hand. */
+const bare = (code: string): Binding =>
+  ({ kind: "key", code, ctrl: false, alt: false, shift: false, meta: false });
+
+const DEFAULT_BINDINGS: Partial<Record<HotkeyActionId, Binding>> = {
+  apex_arm:    bare("KeyV"),
+  dip_place:   bare("KeyG"),
+  dip_thinner: bare("KeyB"),
+  dip_thicker: bare("KeyT"),
+};
+
 interface HotkeyState {
   bindings: Partial<Record<HotkeyActionId, Binding>>;
   setBinding:   (id: HotkeyActionId, b: Binding) => void;
@@ -147,7 +167,7 @@ interface HotkeyState {
 export const useHotkeyStore = create<HotkeyState>()(
   persist(
     (set) => ({
-      bindings: {},
+      bindings: { ...DEFAULT_BINDINGS },
       setBinding: (id, b) =>
         set((s) => {
           // A chord is unique: strip it off any other action it was bound to.
@@ -166,7 +186,28 @@ export const useHotkeyStore = create<HotkeyState>()(
           return { bindings: next };
         }),
     }),
-    { name: "tagdash-hotkeys" },
+    {
+      name: "tagdash-hotkeys",
+      version: 2,
+      // Each version hands existing installs the defaults it introduced — but only
+      // where the user has not spoken. A key they bound themselves always wins, and
+      // the new action simply stays unassigned (Réglages → Clavier shows it as such).
+      //   v0 → v1: Apex (V).
+      //   v1 → v2: Dip (G, and B / T for its thickness).
+      migrate: (persisted, version) => {
+        const state = (persisted ?? { bindings: {} }) as { bindings: Partial<Record<HotkeyActionId, Binding>> };
+        const bindings = { ...(state.bindings ?? {}) };
+        const seed = (id: HotkeyActionId) => {
+          const v = DEFAULT_BINDINGS[id];
+          if (!v || bindings[id]) return;
+          if (Object.values(bindings).some((b) => b && bindingsEqual(b, v))) return;
+          bindings[id] = v;
+        };
+        if (version < 1) seed("apex_arm");
+        if (version < 2) { seed("dip_place"); seed("dip_thinner"); seed("dip_thicker"); }
+        return { ...state, bindings } as HotkeyState;
+      },
+    },
   ),
 );
 

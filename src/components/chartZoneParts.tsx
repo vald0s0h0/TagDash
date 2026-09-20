@@ -219,7 +219,11 @@ export function ChartInfoBar({
   const gapCls = gapPct == null ? "" : gapPct >= 0 ? "text-emerald-400" : "text-red-400";
 
   const rvol = cardInfo?.rvol ?? null;
-  const volSince4am = cardInfo?.volume_since_4am ?? null;
+  // Volume comes from the live counter itself, not from the 3 s card-info echo of it
+  // (server-side `volume_since_4am` IS `TickerLiveState::volume_day`). Reading the
+  // snapshot directly keeps this chip tick-current and identical to the sidebar card
+  // for the same ticker; the polled figure only stands in before the first tick.
+  const volSince4am = live?.volume_day ?? cardInfo?.volume_since_4am ?? null;
 
   return (
     <div ref={bandRef} className="flex shrink-0 items-center gap-x-3">

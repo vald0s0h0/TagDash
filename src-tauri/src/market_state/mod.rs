@@ -52,6 +52,14 @@ pub struct TickerLiveState {
     pub change_day_pct: Option<f64>,
     pub latency_ui_ms: Option<u32>,
     pub updated_at: DateTime<Utc>,
+    /// Market time of the freshest print/aggregate ingested for this symbol, as
+    /// stamped by the feed — NOT the instant we received it (`updated_at`).
+    ///
+    /// The two differ by the plan's delay: on Massive Starter+ every aggregate
+    /// arrives ~15 minutes after the market minute it describes. Anything that
+    /// must line up with the chart's candles (execution markers) reads this;
+    /// anything measuring feed health reads `updated_at`.
+    pub last_event_at: Option<DateTime<Utc>>,
 }
 
 impl TickerLiveState {
@@ -72,7 +80,18 @@ impl TickerLiveState {
             change_day_pct: None,
             latency_ui_ms: None,
             updated_at: now,
+            last_event_at: None,
         }
+    }
+
+    /// Record the market instant of an incoming event, keeping the newest one.
+    /// Monotonic: an out-of-order or replayed-late message can never rewind the
+    /// symbol's as-of time and drag execution markers backwards with it.
+    fn note_event_time(&mut self, event_time: DateTime<Utc>) {
+        self.last_event_at = Some(match self.last_event_at {
+            Some(prev) if prev > event_time => prev,
+            _ => event_time,
+        });
     }
 }
 
@@ -496,6 +515,12 @@ pub struct MarketState {
     /// watermark as their clock, so a delayed whole-market feed remains internally
     /// causal instead of comparing T-15 minute prints with the wall clock.
     market_watermark: Option<DateTime<Utc>>,
+    /// Apex's print-balance trackers, fed from the ingest calls below under the
+    /// lock they already hold — see `crate::apex::flow`.
+    pub apex: crate::apex::flow::FlowBook,
+    /// Dip's price-path trackers and the placed zone, fed from the same calls —
+    /// see `crate::dip::watch`.
+    pub dip: crate::dip::watch::DipBook,
 }
 
 impl MarketState {
@@ -521,6 +546,8 @@ impl MarketState {
             tape_kind: TapeKind::Prints,
             tape_counts_trades: true,
             market_watermark: None,
+            apex: crate::apex::flow::FlowBook::default(),
+            dip: crate::dip::watch::DipBook::default(),
         }
     }
 
@@ -634,6 +661,9 @@ impl MarketState {
             warn_ms,
             critical_ms,
         );
+        self.apex
+            .on_print(symbol, price, size, 1, event_time.timestamp_millis(), None);
+        self.dip.on_print(symbol, price, event_time.timestamp_millis());
     }
 
     /// Process one provider-native one-second aggregate. It follows the normal
@@ -681,6 +711,19 @@ impl MarketState {
             ticker.high_day = Some(ticker.high_day.map_or(high, |h| h.max(high)));
             ticker.low_day = Some(ticker.low_day.map_or(low, |l| l.min(low)));
         }
+        // One aggregate = one signed packet of `prints` trades; the open breaks a tie
+        // with the previous close.
+        self.apex.on_print(
+            symbol,
+            close,
+            size,
+            prints.max(1),
+            event_time.timestamp_millis(),
+            Some(open),
+        );
+        // The second's close is where it left the price: that is the point of the
+        // path Dip measures the attack on.
+        self.dip.on_print(symbol, close, event_time.timestamp_millis());
     }
 
     /// Market Replay ingestion: identical to `on_trade` but the print may stand
@@ -705,6 +748,15 @@ impl MarketState {
             1_000,
             2_000,
         );
+        self.apex.on_print(
+            symbol,
+            price,
+            size,
+            prints.max(1),
+            event_time.timestamp_millis(),
+            None,
+        );
+        self.dip.on_print(symbol, price, event_time.timestamp_millis());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -775,6 +827,7 @@ impl MarketState {
             state.change_day_pct = Some(cp);
         }
         state.updated_at = now;
+        state.note_event_time(event_time);
         // `state` borrow ends here — safe to access other fields below
 
         // Update global latency
@@ -928,6 +981,8 @@ impl MarketState {
         self.news_by_symbol.clear();
         self.news_log.clear();
         self.market_watermark = None;
+        self.apex.reset_data();
+        self.dip.reset_data();
     }
 
     /// Number of trade prints for `symbol` over the last `secs` seconds. None
@@ -1037,6 +1092,8 @@ impl MarketState {
             // left by a previous realtime Alpaca connection (or vice versa).
             self.trade_counts.clear();
             self.market_watermark = None;
+            self.apex.reset_data();
+            self.dip.reset_data();
             // Whether the new tape counts trades is the new tape's business to
             // prove. Prints always do; aggregates prove it on their first frame
             // carrying `z`.
@@ -1165,6 +1222,14 @@ impl MarketState {
         self.tickers.get(symbol).and_then(|t| t.last_price)
     }
 
+    /// Market time of the freshest data held for `symbol` — the instant the price
+    /// an order would fill at actually belongs to. Equal to wall-clock now on a
+    /// real-time feed; ~15 minutes behind it on a delayed plan. `None` before the
+    /// symbol's first print. See `TickerLiveState::last_event_at`.
+    pub fn last_event_at(&self, symbol: &str) -> Option<DateTime<Utc>> {
+        self.tickers.get(symbol).and_then(|t| t.last_event_at)
+    }
+
     /// The single most recent live news headline on file for `symbol` (Alpaca
     /// news WebSocket), or None. Used by the enrichment pipeline to surface the
     /// real headline on the chart instead of calling Massive (which carries no
@@ -1214,8 +1279,16 @@ impl MarketState {
         self.news_feed.updated_at = Utc::now();
     }
 
-    /// Process one quote update (bid/ask).
-    pub fn on_quote(&mut self, symbol: &str, bid: f64, ask: f64, now: DateTime<Utc>) {
+    /// Process one quote update (bid/ask). `event_time` is the quote's own market
+    /// instant — it is what Apex compares a print's timestamp against.
+    pub fn on_quote(
+        &mut self,
+        symbol: &str,
+        bid: f64,
+        ask: f64,
+        now: DateTime<Utc>,
+        event_time: DateTime<Utc>,
+    ) {
         let state = self
             .tickers
             .entry(symbol.to_string())
@@ -1224,6 +1297,9 @@ impl MarketState {
         state.ask = Some(ask);
         state.spread = Some((ask - bid).max(0.0));
         state.updated_at = now;
+        state.note_event_time(event_time);
+        self.apex
+            .on_quote(symbol, bid, ask, event_time.timestamp_millis());
     }
 
     /// Clone all live states into a serialisable snapshot for the frontend.
@@ -1382,6 +1458,7 @@ impl MarketState {
             state.change_day_pct = Some(cp);
         }
         state.updated_at = now;
+        state.note_event_time(bar_time);
 
         // Push the closed minute bar to the M1 ring buffer (chart history).
         if let Some(rb) = self

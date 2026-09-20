@@ -2,11 +2,15 @@ import { useEffect, type MutableRefObject } from "react";
 import type { ISeriesApi } from "lightweight-charts";
 import type { ChartAlarm } from "@/stores/chartStore";
 
-/** Right-edge "price + ✕" label pills for user price lines (SL/TP/alarms).
- *  lightweight-charts has no native delete affordance and no interactive axis tag,
- *  so the component renders a small pill per line — the line's price plus a ✕ to
- *  remove it — standing in for the (disabled) native axis label, with the delete
- *  button integrated INTO the label rather than floating over the chart text.
+/** Right-edge label pills tracked to a price line.
+ *
+ *  Two kinds ride the same loop. The user lines (SL/TP/alarms) get a "price + ✕"
+ *  pill: lightweight-charts has no native delete affordance and no interactive axis
+ *  tag, so the pill stands in for the (disabled) native axis label with the delete
+ *  button integrated INTO it rather than floating over the chart text. The bid line
+ *  gets a spread pill — same right-edge slot, no ✕, because what belongs there is
+ *  the spread and a native tag can only print the line's own price.
+ *
  *  This hook keeps the target price→pixel map fresh (1st effect) and repositions
  *  the pill DOM nodes every frame via requestAnimationFrame so they track their
  *  line through scroll / zoom / autoscale (2nd effect). The pill nodes live in
@@ -19,6 +23,8 @@ export function useDeleteButtons(
   slPrice: number | null,
   tpPrice: number | null,
   alarms: ChartAlarm[],
+  /** Bid price the spread pill rides, or null when there is no live spread. */
+  spreadPrice: number | null,
   onDeleteSl?: () => void,
   onDeleteTp?: () => void,
   onDeleteAlarm?: (id: string) => void,
@@ -29,8 +35,9 @@ export function useDeleteButtons(
     if (slPrice != null && onDeleteSl) m.set("sl", slPrice);
     if (tpPrice != null && onDeleteTp) m.set("tp", tpPrice);
     if (onDeleteAlarm) for (const a of alarms) m.set(`alarm-${a.id}`, a.price);
+    if (spreadPrice != null) m.set("spread", spreadPrice);
     tagPriceRef.current = m;
-  }, [slPrice, tpPrice, alarmsKey, onDeleteSl, onDeleteTp, onDeleteAlarm]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [slPrice, tpPrice, alarmsKey, spreadPrice, onDeleteSl, onDeleteTp, onDeleteAlarm]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     let raf = 0;

@@ -8,10 +8,17 @@ export function ChartCard({
   label,
   value,
   data,
+  refLines,
+  yMin,
 }: {
   label: string;
   value: string;
   data: number[];
+  /** Extra horizontal threshold lines (e.g. [1]), drawn very thin with no
+   *  legend. The value scale expands to always keep them in view. */
+  refLines?: number[];
+  /** Force the Y scale's floor (e.g. 0) instead of deriving it from the data. */
+  yMin?: number;
 }) {
   const gid = useId();
   const W = 1000;
@@ -19,20 +26,22 @@ export function ChartCard({
 
   let line = "";
   let area = "";
+  let refYs: number[] = [];
   if (data.length >= 2) {
-    const min = Math.min(...data);
-    const max = Math.max(...data);
+    const min = yMin ?? Math.min(...data, ...(refLines ?? []));
+    const max = Math.max(...data, ...(refLines ?? []), yMin ?? -Infinity);
     const span = max - min || 1;
     // Leave a little vertical breathing room top and bottom.
     const top = H * 0.16;
     const bot = H * 0.96;
+    const toY = (v: number) => bot - ((v - min) / span) * (bot - top);
     const pts = data.map((v, i) => {
       const x = (i / (data.length - 1)) * W;
-      const y = bot - ((v - min) / span) * (bot - top);
-      return [x, y] as const;
+      return [x, toY(v)] as const;
     });
     line = pts.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
     area = `${line} L${W},${H} L0,${H} Z`;
+    refYs = (refLines ?? []).map(toY);
   }
 
   return (
@@ -50,11 +59,23 @@ export function ChartCard({
             </linearGradient>
           </defs>
           <path d={area} fill={`url(#${gid})`} />
+          {refYs.map((y, i) => (
+            <line
+              key={i}
+              x1={0}
+              y1={y}
+              x2={W}
+              y2={y}
+              stroke="rgba(255,255,255,0.35)"
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
           <path
             d={line}
             fill="none"
             stroke="rgba(255,255,255,0.60)"
-            strokeWidth={2}
+            strokeWidth={1}
             strokeLinejoin="round"
             strokeLinecap="round"
             vectorEffect="non-scaling-stroke"
