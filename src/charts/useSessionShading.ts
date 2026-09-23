@@ -1,35 +1,34 @@
 import { useEffect, type MutableRefObject } from "react";
-import type { ISeriesApi } from "lightweight-charts";
 import type { Bar, Timeframe } from "@/types";
 import { toUTC } from "@/charts/chartOptions";
-import { hexToRgba } from "@/charts/drawingsPrimitive";
-import { isExtendedHours } from "@/lib/nyTime";
-import type { ChartTheme } from "@/stores/chartThemeStore";
+import { nyDayStamp, nySessionOfMinutes } from "@/lib/nyTime";
+import type { SessionBandsPrimitive, SessionMark } from "@/charts/sessionBandsPrimitive";
 
-/** Full-height tint behind the candles on extended-hours bars (outside the
- *  09:30–16:00 NY cash session). Colour + opacity come from the theme. Intraday
- *  only — a daily bar spans a whole day. Paints on the dedicated `sessionBgRef`
- *  histogram (created in the chart-setup effect). */
+/** Per-bar session marks for the backdrop primitive: which NY session each bar
+ *  belongs to (pre / regular / post) and where a new NY calendar day starts.
+ *  The primitive turns those into solid extended-hours zones + the day-change
+ *  separator; colours and the separator toggle come from the theme, read at draw
+ *  time. Intraday only — a daily bar spans a whole day, so there is nothing to
+ *  shade or separate. */
 export function useSessionShading(
-  sessionBgRef: MutableRefObject<ISeriesApi<"Histogram"> | null>,
+  primRef: MutableRefObject<SessionBandsPrimitive | null>,
   bars: Bar[] | undefined,
   timeframe: Timeframe,
-  theme: ChartTheme,
 ) {
   useEffect(() => {
-    const series = sessionBgRef.current;
-    if (!series) return;
+    const prim = primRef.current;
+    if (!prim) return;
     if (timeframe === "daily" || !bars?.length) {
-      try { series.setData([]); } catch { /* */ }
+      prim.setData([]);
       return;
     }
-    const TINT  = hexToRgba(theme.session.color, theme.session.opacity); // extended hours
-    const CLEAR = "rgba(0,0,0,0)";                                       // cash session
-    const data = bars.map((b) => ({
-      time:  toUTC(b.time),
-      value: 1, // constant → fills full pane height on its own hidden scale
-      color: isExtendedHours(b.time) ? TINT : CLEAR,
-    }));
-    try { series.setData(data); } catch { /* duplicate-time guard */ }
-  }, [bars, timeframe, theme]);
+    let prevDay = "";
+    const marks: SessionMark[] = bars.map((b, i) => {
+      const { day, minutes } = nyDayStamp(b.time);
+      const dayStart = i > 0 && day !== prevDay;
+      prevDay = day;
+      return { time: toUTC(b.time) as number, session: nySessionOfMinutes(minutes), dayStart };
+    });
+    prim.setData(marks);
+  }, [bars, timeframe]);
 }

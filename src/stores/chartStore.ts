@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Timeframe, ZoneTradeContext } from "@/types";
+import type { PremarketMode, Timeframe, ZoneTradeContext } from "@/types";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -60,6 +60,9 @@ export interface ZoneChartState {
   pendingEmoji: string | null;
   /** When set, next chart click places a limit order at that price for this % size. */
   pendingLimitPercent: 25 | 50 | 100 | null;
+  /** Daily-pane premarket overlay. Per zone, so one ticker can be studied with the
+   *  ghost on while another stays clean. */
+  premarketMode: PremarketMode;
   context:      ZoneTradeContext | null;
 }
 
@@ -73,6 +76,7 @@ const DEFAULT_ZONE: ZoneChartState = {
   linePoint1:  null,
   pendingEmoji: null,
   pendingLimitPercent: null,
+  premarketMode: "off",
   context:     null,
 };
 
@@ -83,6 +87,9 @@ interface ChartStoreState {
 
   getZone:         (zoneId: string) => ZoneChartState;
   setTimeframe:    (zoneId: string, tf: Timeframe) => void;
+  /** Cycle off → overlay → only → off, or jump straight to a mode. */
+  setPremarketMode: (zoneId: string, mode: PremarketMode) => void;
+  cyclePremarketMode: (zoneId: string) => void;
   setDrawMode:     (zoneId: string, mode: DrawMode) => void;
   setOrderMode:    (zoneId: string, mode: OrderMode) => void;
   setPendingLimitPercent: (zoneId: string, pct: 25 | 50 | 100 | null) => void;
@@ -123,6 +130,16 @@ export const useChartStore = create<ChartStoreState>((set, get) => ({
 
   setTimeframe: (zoneId, tf) =>
     set((s) => ({ zones: patch(s.zones, zoneId, { timeframe: tf }) })),
+
+  setPremarketMode: (zoneId, mode) =>
+    set((s) => ({ zones: patch(s.zones, zoneId, { premarketMode: mode }) })),
+
+  cyclePremarketMode: (zoneId) =>
+    set((s) => {
+      const cur = (s.zones[zoneId] ?? DEFAULT_ZONE).premarketMode;
+      const next: PremarketMode = cur === "off" ? "overlay" : cur === "overlay" ? "only" : "off";
+      return { zones: patch(s.zones, zoneId, { premarketMode: next }) };
+    }),
 
   setDrawMode: (zoneId, mode) =>
     set((s) => ({ zones: patch(s.zones, zoneId, { drawMode: mode, linePoint1: null }) })),

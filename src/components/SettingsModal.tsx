@@ -589,6 +589,29 @@ function SensRow({
   );
 }
 
+/** One labelled on/off row (appearance toggles). */
+function ToggleRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: ReactNode;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-1">
+      <span className="text-xs">{label}</span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-4 w-4 shrink-0 cursor-pointer accent-blue-500"
+      />
+    </div>
+  );
+}
+
 /** A titled group of appearance rows. */
 function ThemeGroup({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -635,6 +658,12 @@ function AppearanceTab() {
     return {
       value: theme[section][key] as unknown as number,
       onChange: (v: number) => setField(section, key, v as ChartTheme[S][keyof ChartTheme[S]]),
+    };
+  }
+  function toggle<S extends ChartThemeSection>(section: S, key: keyof ChartTheme[S]) {
+    return {
+      checked: theme[section][key] as unknown as boolean,
+      onChange: (v: boolean) => setField(section, key, v as ChartTheme[S][keyof ChartTheme[S]]),
     };
   }
 
@@ -694,9 +723,48 @@ function AppearanceTab() {
           <OpacityRow label="Opacité baisse" {...opacity("volume", "downOpacity")} />
         </ThemeGroup>
 
+        <ThemeGroup title="Crosshair">
+          <ColorRow label="Couleur (lignes)" {...color("crosshair", "color")} />
+          <ToggleRow
+            label={
+              <>
+                Ligne verticale
+                <span className="ml-1 text-muted-foreground/60">
+                  (décoché : ligne horizontale seule)
+                </span>
+              </>
+            }
+            {...toggle("crosshair", "vertVisible")}
+          />
+        </ThemeGroup>
+
         <ThemeGroup title="Fond pré / post-market">
-          <ColorRow label="Teinte" {...color("session", "color")} />
-          <OpacityRow label="Opacité" {...opacity("session", "opacity")} />
+          <ColorRow label="Pré-market — teinte" {...color("session", "preColor")} />
+          <OpacityRow label="Pré-market — opacité" {...opacity("session", "preOpacity")} />
+          <ColorRow label="After-hours — teinte" {...color("session", "postColor")} />
+          <OpacityRow label="After-hours — opacité" {...opacity("session", "postOpacity")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Barres pré-market (daily)">
+          <ColorRow label="Teinte" {...color("premarket", "color")} />
+          <OpacityRow label="Barre" {...opacity("premarket", "fillOpacity")} />
+          <OpacityRow label="Traits open / close (noirs)" {...opacity("premarket", "tickOpacity")} />
+        </ThemeGroup>
+
+        <ThemeGroup title="Changement de jour (intraday)">
+          <ToggleRow
+            label={
+              <>
+                Ligne verticale
+                <span className="ml-1 text-muted-foreground/60">
+                  (entre after-hours et pré-market)
+                </span>
+              </>
+            }
+            {...toggle("daySeparator", "enabled")}
+          />
+          <ColorRow label="Couleur" {...color("daySeparator", "color")} />
+          <OpacityRow label="Opacité" {...opacity("daySeparator", "opacity")} />
         </ThemeGroup>
 
         <ThemeGroup title="Grille">

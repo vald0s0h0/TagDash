@@ -966,6 +966,15 @@ impl MarketState {
         self.premarket_daily.get(symbol).map(|b| b.open)
     }
 
+    /// The provisional premarket daily candle being built for `symbol` today, if
+    /// any. Live ticks feed it (see `seed_premarket_daily`), so during premarket it
+    /// is fresher than any REST fold — which is why `load_premarket_daily` prefers
+    /// it for the forming day. None outside premarket: the bar is dropped at the
+    /// 09:30 open, and from then on the session is final and served from cache.
+    pub fn premarket_daily_bar(&self, symbol: &str) -> Option<Bar> {
+        self.premarket_daily.get(symbol).cloned()
+    }
+
     /// Wipe every piece of market DATA (tickers, candles, VWAP/trade counters,
     /// news) while keeping the feed/news diagnostics structs. Used by Market
     /// Replay on start, backward seek and stop, so the simulated day never mixes

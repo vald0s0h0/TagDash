@@ -14,9 +14,13 @@ interface Props {
   onClose:  () => void;
   tradeId:  string;
   symbol:   string;
+  /** The trade has not executed yet, so TradeTally does not have it. The note is
+   *  kept locally and posted the moment the trade is created upstream — saying so
+   *  is the difference between "waiting" and the silent loss this used to be. */
+  pending?: boolean;
 }
 
-export function JournalModal({ open, onClose, tradeId, symbol }: Props) {
+export function JournalModal({ open, onClose, tradeId, symbol, pending }: Props) {
   const [notes,      setNotes]      = useState("");
   const [confidence, setConfidence] = useState<number>(5);
   const [tags,       setTags]       = useState<string[]>([]);
@@ -81,6 +85,12 @@ export function JournalModal({ open, onClose, tradeId, symbol }: Props) {
         </DialogHeader>
 
         <p className="font-mono text-[10px] text-muted-foreground truncate">{tradeId}</p>
+        {pending && (
+          <p className="text-[10px] text-amber-400/90">
+            Trade pas encore exécuté — la note est gardée ici et envoyée à TradeTally
+            dès l'entrée.
+          </p>
+        )}
 
         {/* Notes */}
         <div className="space-y-1">

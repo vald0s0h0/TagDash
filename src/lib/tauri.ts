@@ -60,6 +60,7 @@ import type {
   Timeframe,
   TradeExecutions,
   TradeLifecycle,
+  TradeLink,
   ZoneTradeContext,
   BrokerAccount,
   BrokerMirror,
@@ -126,6 +127,11 @@ export const api = {
     invoke<void>("retry_tradetally_event", { event_id }),
   retryAllTradeTallyEvents: () => invoke<void>("retry_all_tradetally_events"),
 
+  // Which trade the journal / screenshot actually belong to for a ticker — see
+  // `TradeLink`. Resolved backend-side so every caller agrees.
+  getTradeLink: (zone_id: string, symbol: string) =>
+    invoke<TradeLink>("get_trade_link", { zone_id, symbol }),
+
   // Journal
   saveJournalEntry: (trade_id: string, symbol: string, notes: string, confidence: number | null, tags: string[]) =>
     invoke<void>("save_journal_entry", { trade_id, symbol, notes, confidence, tags }),
@@ -186,6 +192,12 @@ export const api = {
   // Lazily back-fill older history (batch) as the user scrolls into the past.
   loadOlderBars: (symbol: string, timeframe: Timeframe, before: string, limit: number) =>
     invoke<Bar[]>("load_older_bars", { symbol, timeframe, before, limit }),
+  // Premarket (04:00-09:30 ET) daily candles from `from_date` to today — the ghost
+  // series the daily pane draws behind its regular-session candles. Neither
+  // provider's daily bar contains this; it is folded from 15-min bars and cached,
+  // so widening the window only fetches what is genuinely missing.
+  loadPremarketDaily: (symbol: string, from_date: string) =>
+    invoke<Bar[]>("load_premarket_daily", { symbol, from_date }),
   // Historical split-day markers (Alpaca corporate-actions, last 2y) for any
   // daily chart — red dots on the split ex-dates.
   getSplitMarkers: (symbol: string) =>

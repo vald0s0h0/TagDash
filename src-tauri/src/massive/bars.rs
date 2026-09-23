@@ -273,6 +273,35 @@ pub async fn fetch_bars_before(
     .await
 }
 
+/// Fetch every bar of `tf` for ONE symbol over [`from_ms`, `to_ms`], oldest →
+/// newest. The range counterpart of `fetch_recent_bars`: both ends are pinned and
+/// the count is not capped by a caller-chosen bar budget — `limit` goes straight to
+/// the endpoint's documented 50 000 ceiling, which measures BASE units scanned (see
+/// `scan_limit`). The premarket folder sizes its own windows so that ceiling is
+/// never reached (60 calendar days = ~35 600 base minutes on AAPL, the worst case
+/// TagDash charts); it must, because `sort=desc` truncation drops the OLDEST bars —
+/// exactly the days a scroll-back into history is asking for.
+pub async fn fetch_range(
+    api_key: &str,
+    symbol: &str,
+    tf: Timeframe,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<Bar>, String> {
+    if to_ms <= from_ms {
+        return Ok(vec![]);
+    }
+    fetch(&aggs_url(
+        symbol,
+        tf,
+        aligned_from_ms(from_ms, tf),
+        to_ms,
+        50_000,
+        api_key,
+    ))
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

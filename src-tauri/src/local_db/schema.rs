@@ -90,6 +90,35 @@ CREATE TABLE IF NOT EXISTS daily_cache (
     PRIMARY KEY (symbol, date)
 );
 
+-- Premarket (04:00-09:30 ET) daily candles, folded from 15-minute intraday bars
+-- by `crate::premarket`. Both providers' daily bars are regular-session only, so
+-- this is the ONLY place the premarket range of a past day exists. A closed day's
+-- premarket is immutable, so rows are written once and never refreshed.
+CREATE TABLE IF NOT EXISTS premarket_daily (
+    symbol      TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    open        REAL NOT NULL,
+    high        REAL NOT NULL,
+    low         REAL NOT NULL,
+    close       REAL NOT NULL,
+    volume      INTEGER NOT NULL DEFAULT 0,
+    vwap        REAL,
+    trade_count INTEGER,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, date)
+);
+
+-- Which date span of `premarket_daily` has actually been fetched for a symbol.
+-- Load-bearing: a day on which the symbol never printed in premarket produces NO
+-- row, so "no row" cannot be read as "not fetched yet" — without this table an
+-- illiquid name would be re-fetched on every single chart open.
+CREATE TABLE IF NOT EXISTS premarket_coverage (
+    symbol     TEXT PRIMARY KEY NOT NULL,
+    first_date TEXT NOT NULL,
+    last_date  TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Tags retrieved from TradeTally API at startup.
 CREATE TABLE IF NOT EXISTS tradetally_tags (
     tag        TEXT PRIMARY KEY NOT NULL,

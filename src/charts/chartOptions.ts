@@ -1,9 +1,9 @@
 // Static chart styling/options + small time helpers shared by the chart panes.
 // No React and no chart instance — pure data, so they live outside the component.
 
-import { LineStyle, type UTCTimestamp } from "lightweight-charts";
+import { CrosshairMode, LineStyle, type UTCTimestamp } from "lightweight-charts";
 import type { Timeframe } from "@/types";
-import { getChartTheme } from "@/stores/chartThemeStore";
+import { getChartTheme, type ChartTheme } from "@/stores/chartThemeStore";
 import { hexToRgba } from "@/charts/drawingsPrimitive";
 
 export function toUTC(isoString: string): UTCTimestamp {
@@ -209,6 +209,24 @@ export const CURSOR_OPTIONS = {
   axisLabelVisible: true,
   title:            "⊹",
 };
+
+// Crosshair styling, user-tunable (Settings → Apparence): one colour for both
+// lines, and an option to drop the vertical line — some setups only ever read the
+// price under the cursor, and the vertical bar just clutters the candles. The time
+// label goes with it: without its line it has nothing to point at.
+export function crosshairOptions(theme: ChartTheme) {
+  const { color, vertVisible } = theme.crosshair;
+  return {
+    mode:     CrosshairMode.Normal,
+    vertLine: {
+      color,
+      visible:              vertVisible,
+      labelVisible:         vertVisible,
+      labelBackgroundColor: "#1a1a1a",
+    },
+    horzLine: { color, labelBackgroundColor: "#1a1a1a" },
+  };
+}
 
 // Previous-day reference levels (close = key, high/low = secondary). Drawn as
 // horizontal price lines from the previous trading day's daily bar.

@@ -6,6 +6,25 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic within the process — the tie-breaker in every generated tradeID.
+static TRADE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Short, sortable-enough base-36 rendering of the counter (0, 1, … 9, a, b, …).
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".into();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneTradeContext {
@@ -72,10 +91,23 @@ impl ChartState {
             })
     }
 
+    /// `<ts>-<SYMBOL>-<STRATEGY>-<seq>`.
+    ///
+    /// The trailing counter is not decoration. The timestamp has second resolution
+    /// and, in a Market Replay, comes from a clock that moves in jumps — so closing
+    /// a trade and planning the next one on the same ticker inside one second used
+    /// to mint the very SAME id twice. TradeTally already had a mapping on file for
+    /// it, skipped the create, and filed the new trade's fills onto the old trade.
+    /// The counter makes a collision impossible for as long as the process lives,
+    /// which is the whole window in which two ids can share a second.
+    ///
+    /// Nothing anywhere parses the shape of an id — it is an opaque string to the
+    /// queue, the marker in TradeTally's notes and the screenshot filenames alike.
     fn gen_trade_id(symbol: &str, strategy_id: &str) -> String {
         let ts = crate::time::now().format("%y%m%d%H%M%S").to_string();
         let strat = strategy_id.to_uppercase().replace('-', "_");
-        format!("{}-{}-{}", ts, symbol.to_uppercase(), strat)
+        let seq = base36(TRADE_SEQ.fetch_add(1, Ordering::Relaxed));
+        format!("{}-{}-{}-{}", ts, symbol.to_uppercase(), strat, seq)
     }
 
     /// Record which ticker a zone currently shows (so zone_id lookups resolve it).
@@ -111,6 +143,13 @@ impl ChartState {
     pub fn replace_contexts(&mut self, ctxs: Vec<ZoneTradeContext>) {
         self.contexts.clear();
         self.import_contexts(ctxs);
+    }
+
+    /// The ticker a zone currently shows, whether or not it has a trade context.
+    /// `get_context_for_zone` answers None for a ticker that was never traded, which
+    /// is exactly the case the release path still needs an answer for.
+    pub fn symbol_for_zone(&self, zone_id: &str) -> Option<String> {
+        self.zone_symbol.get(zone_id).cloned()
     }
 
     /// Context of the ticker a zone currently shows (zone_id → symbol → context).
@@ -192,6 +231,38 @@ impl ChartState {
             z.trade_id = Some(Self::gen_trade_id(symbol, strategy_id));
         }
         z.clone()
+    }
+
+    /// Rub out a tradeID that never became a trade.
+    ///
+    /// Placing an SL or a TP mints a tradeID on the spot — that is what lets a trade
+    /// be journalled and screenshotted before it is entered. Taking the same level
+    /// straight back off used to leave the id standing, and the ticker's context then
+    /// pointed at a trade that had never existed: nothing to attach a note or a chart
+    /// to upstream, so the note was filed against a trade TradeTally could not find
+    /// and the previous, REAL trade on the ticker was no longer reachable from the
+    /// chart. Hence: no level left, and no execution against the id → the id goes
+    /// with the level.
+    ///
+    /// `had_activity` is the caller's answer to "did this trade ever fill?"; this
+    /// type has no way to know. Returns the context as it now stands.
+    pub fn discard_planned_trade(
+        &mut self,
+        symbol: &str,
+        had_activity: bool,
+    ) -> Option<ZoneTradeContext> {
+        let z = self.contexts.get_mut(symbol)?;
+        if had_activity
+            || z.trade_id.is_none()
+            || z.stop_loss.is_some()
+            || z.take_profit.is_some()
+        {
+            return Some(z.clone());
+        }
+        z.trade_id = None;
+        // Never traded, so there is nothing to have closed.
+        z.closed = false;
+        Some(z.clone())
     }
 
     /// Turn the ticker's context into a fresh trade owned by a hotkey engine: its own
@@ -292,6 +363,115 @@ impl ChartState {
 }
 
 #[cfg(test)]
+mod trade_link_tests {
+    //! The tradeID a ticker carries between trades. What matters here is that a
+    //! LINE drawn on the chart never leaves a trade behind it once it is rubbed out:
+    //! the journal and the screenshot bind to whatever id the context holds, and an
+    //! id that stands for nothing sends them to a trade TradeTally cannot find.
+
+    use super::*;
+
+    /// The exact sequence that used to lose the link: close a trade, drop an SL,
+    /// take it straight back off.
+    #[test]
+    fn a_level_placed_and_removed_leaves_no_trade_behind() {
+        let mut cs = ChartState::new();
+        // A real trade, closed.
+        let real = cs
+            .update_sl("z1", "ABCD", "micro_pullback", Some(4.0))
+            .trade_id
+            .unwrap();
+        cs.reset_closed_trade(&real);
+
+        // A fresh SL mints a new id — that is what lets a trade be journalled before
+        // it is entered, so it is expected.
+        let planned = cs
+            .update_sl("z1", "ABCD", "micro_pullback", Some(3.9))
+            .trade_id
+            .unwrap();
+        assert_ne!(planned, real);
+
+        // Taking it straight back off: it never traded, so it leaves nothing behind.
+        cs.update_sl("z1", "ABCD", "micro_pullback", None);
+        let ctx = cs
+            .discard_planned_trade("ABCD", false)
+            .expect("the ticker still has a context");
+        assert_eq!(ctx.trade_id, None, "the phantom id is gone");
+        assert!(!ctx.closed);
+    }
+
+    #[test]
+    fn a_trade_that_executed_keeps_its_id_when_its_levels_are_cleared() {
+        let mut cs = ChartState::new();
+        let id = cs
+            .update_sl("z1", "ABCD", "micro_pullback", Some(4.0))
+            .trade_id
+            .unwrap();
+        cs.update_sl("z1", "ABCD", "micro_pullback", None);
+        let ctx = cs.discard_planned_trade("ABCD", true).unwrap();
+        assert_eq!(
+            ctx.trade_id.as_deref(),
+            Some(id.as_str()),
+            "a filled trade survives its lines being cleared"
+        );
+    }
+
+    #[test]
+    fn a_level_still_on_the_chart_holds_its_planned_trade() {
+        let mut cs = ChartState::new();
+        let id = cs
+            .update_sl("z1", "ABCD", "micro_pullback", Some(4.0))
+            .trade_id
+            .unwrap();
+        // Only the TP is cleared; the SL is still drawn, so the plan stands.
+        cs.update_tp("z1", "ABCD", "micro_pullback", None);
+        let ctx = cs.discard_planned_trade("ABCD", false).unwrap();
+        assert_eq!(ctx.trade_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// Two trades minted on the same ticker inside one second are two trades.
+    #[test]
+    fn two_trades_in_the_same_second_never_share_an_id() {
+        let mut cs = ChartState::new();
+        let first = cs
+            .update_sl("z1", "ABCD", "micro_pullback", Some(4.0))
+            .trade_id
+            .unwrap();
+        cs.reset_closed_trade(&first);
+        let second = cs
+            .update_sl("z1", "ABCD", "micro_pullback", Some(3.9))
+            .trade_id
+            .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_ticker_that_was_never_touched_has_nothing_to_discard() {
+        let mut cs = ChartState::new();
+        assert!(cs.discard_planned_trade("ABCD", false).is_none());
+    }
+
+    #[test]
+    fn a_released_zone_no_longer_resolves_to_its_ticker() {
+        let mut cs = ChartState::new();
+        cs.load_zone_context("z1", "ABCD");
+        assert_eq!(cs.symbol_for_zone("z1").as_deref(), Some("ABCD"));
+        cs.clear_zone("z1");
+        assert_eq!(cs.symbol_for_zone("z1"), None);
+    }
+
+    /// The release path needs the ticker even when it has no trade context at all —
+    /// that is the common case, a chart opened and released without a trade.
+    #[test]
+    fn the_zone_ticker_is_known_before_any_trade_exists() {
+        let mut cs = ChartState::new();
+        cs.load_zone_context("z1", "ABCD");
+        assert!(cs.get_context_for_zone("z1").is_none());
+        assert_eq!(cs.symbol_for_zone("z1").as_deref(), Some("ABCD"));
+    }
+}
+
+#[cfg(test)]
 mod apex_tests {
     use super::*;
 
@@ -301,7 +481,7 @@ mod apex_tests {
         cs.update_sl("z1", "ABCD", "micro_pullback", Some(4.0));
         let ctx = cs.start_apex_trade("z1", "ABCD", 4.10, Some(4.30));
         assert_eq!(ctx.strategy_id, "apex");
-        assert!(ctx.trade_id.as_deref().unwrap().ends_with("-ABCD-APEX"));
+        assert!(ctx.trade_id.as_deref().unwrap().contains("-ABCD-APEX-"));
         assert_eq!((ctx.stop_loss, ctx.take_profit), (Some(4.10), Some(4.30)));
         assert_eq!(cs.get_context_for_zone("z1").unwrap().strategy_id, "apex");
     }

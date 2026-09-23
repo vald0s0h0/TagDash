@@ -22,8 +22,23 @@ export interface ChartTheme {
   candle: { up: string; down: string };
   /** Volume histogram opacity (colour taken from the candle up/down colours). */
   volume: { upOpacity: number; downOpacity: number };
-  /** Extended-hours (pre/post-market) background tint behind intraday candles. */
-  session: { color: string; opacity: number };
+  /** Crosshair lines. The vertical line (and its time label) can be switched off
+   *  to keep the horizontal price line only. */
+  crosshair: { color: string; vertVisible: boolean };
+  /** Extended-hours background bands behind intraday candles — one solid zone per
+   *  contiguous stretch, with its own colour for pre-market and after-hours. */
+  session: {
+    preColor: string;  preOpacity: number;
+    postColor: string; postOpacity: number;
+  };
+  /** Thin vertical line at each NY day change (after-hours → next pre-market).
+   *  Intraday panes only — a daily bar already spans a whole day. */
+  daySeparator: { enabled: boolean; color: string; opacity: number };
+  /** Premarket bars on a DAILY pane: the 04:00–09:30 range as a column behind each
+   *  regular candle, at 70 % of its width. `fillOpacity` is that column;
+   *  `tickOpacity` the hairline BLACK open/close ticks read against it. Same hue
+   *  family as `session.preColor` on purpose — premarket reads the same everywhere. */
+  premarket: { color: string; fillOpacity: number; tickOpacity: number };
   /** Horizontal price grid lines. */
   grid: { color: string; opacity: number };
   /** Strategy-card indicators. Bollinger is a translucent fill (own opacity). */
@@ -51,7 +66,13 @@ export type ChartThemeSection = keyof ChartTheme;
 export const DEFAULT_CHART_THEME: ChartTheme = {
   candle: { up: "#26a69a", down: "#ef5350" },
   volume: { upOpacity: 0.4, downOpacity: 0.4 },
-  session: { color: "#8296be", opacity: 0.02 },
+  crosshair: { color: "#333333", vertVisible: true },
+  session: {
+    preColor: "#8296be",  preOpacity: 0.02,
+    postColor: "#be9682", postOpacity: 0.02,
+  },
+  daySeparator: { enabled: true, color: "#ef4444", opacity: 0.55 },
+  premarket: { color: "#8296be", fillOpacity: 0.5, tickOpacity: 0.85 },
   grid: { color: "#111111", opacity: 0.5 },
   indicators: {
     vwap: "#3b82f6",
@@ -88,9 +109,38 @@ function mergeTheme(persisted: Partial<ChartTheme> | undefined): ChartTheme {
     for (const section of Object.keys(out)) {
       const ps = p[section];
       if (ps && typeof ps === "object") {
-        out[section] = { ...out[section], ...(ps as Record<string, unknown>) };
+        // Only keys the current shape defines — a stale key from an older version
+        // (e.g. the pre-split `session.color`) must not survive into the theme.
+        for (const key of Object.keys(out[section])) {
+          const v = (ps as Record<string, unknown>)[key];
+          if (v !== undefined) out[section][key] = v;
+        }
       }
     }
+  }
+  // The premarket section changed MEANING when its bars stopped being a full-slot
+  // backdrop with a drawn outline and became a 70 %-width column with black
+  // open/close ticks: `fillOpacity` was tuned for a sliver peeking past a candle,
+  // and `edgeOpacity` no longer exists at all. Carrying that over ships a
+  // half-migrated look, so a persisted value from that version resets to defaults.
+  // `edgeOpacity` is the tell — only the old shape had it.
+  const stalePm = (persisted as { premarket?: Record<string, unknown> } | undefined)?.premarket;
+  if (stalePm && stalePm.edgeOpacity !== undefined) {
+    out.premarket = { ...DEFAULT_CHART_THEME.premarket } as unknown as Record<string, unknown>;
+  }
+
+  // Legacy (single-tint) session shading: `{ color, opacity }` predates the split
+  // into pre-market / after-hours. Carry the old tint over to both so an existing
+  // install keeps the look it had until the user picks two colours.
+  const legacy = (persisted as { session?: { color?: string; opacity?: number } } | undefined)?.session;
+  const sess = out.session as { preColor: string; preOpacity: number; postColor: string; postOpacity: number };
+  if (legacy?.color && !(persisted?.session as Record<string, unknown> | undefined)?.preColor) {
+    sess.preColor = legacy.color;
+    sess.postColor = legacy.color;
+  }
+  if (typeof legacy?.opacity === "number" && (persisted?.session as Record<string, unknown> | undefined)?.preOpacity == null) {
+    sess.preOpacity = legacy.opacity;
+    sess.postOpacity = legacy.opacity;
   }
   return out as unknown as ChartTheme;
 }

@@ -487,3 +487,78 @@ pub async fn fetch_bars_before(
     out.sort_by_key(|b| b.time);
     Ok(out)
 }
+
+/// Fetch every bar of `tf` for ONE symbol over [`start`, `end`], oldest → newest.
+/// Unlike `fetch_recent_bars` (a "last N bars" query) this is a RANGE query with
+/// both ends pinned and no `limit` cap on the count — it follows `next_page_token`
+/// until the window is exhausted. The premarket folder needs it: it asks for a
+/// precise span of sessions and cannot tolerate the provider choosing which end to
+/// truncate. Sub-minute frames Alpaca's REST bars don't serve → empty.
+pub async fn fetch_bars_range(
+    key: &str,
+    secret: &str,
+    symbol: &str,
+    tf: crate::market_state::aggregators::Timeframe,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<crate::market_state::aggregators::Bar>, String> {
+    use crate::market_state::aggregators::Bar;
+    use chrono::{DateTime, Utc};
+
+    let Some(timeframe) = alpaca_timeframe(tf) else {
+        return Ok(vec![]);
+    };
+    let start_s = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let end_s = end.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    // Replay guard: the caller's `end` stands unless the simulated clock is earlier.
+    let end_s = effective_end(tf.seconds(), Some(&end_s)).unwrap_or(end_s);
+
+    let client = crate::http::client();
+    let mut out: Vec<Bar> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut url = format!(
+            "https://data.alpaca.markets/v2/stocks/bars?symbols={symbol}\
+             &timeframe={timeframe}&start={start_s}&end={end_s}&limit=10000&adjustment=split"
+        );
+        if let Some(tok) = &page_token {
+            url.push_str(&format!("&page_token={tok}"));
+        }
+        let resp = client
+            .get(&url)
+            .header("APCA-API-KEY-ID", key)
+            .header("APCA-API-SECRET-KEY", secret)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Alpaca range bars HTTP {status}: {body}"));
+        }
+        let raw: BarsResponse = resp.json().await.map_err(|e| e.to_string())?;
+        if let Some(bars) = raw.bars.get(symbol) {
+            for b in bars {
+                let Ok(time) = b.t.parse::<DateTime<Utc>>() else {
+                    continue;
+                };
+                out.push(Bar {
+                    time,
+                    open: b.o,
+                    high: b.h,
+                    low: b.l,
+                    close: b.c,
+                    volume: b.v.max(0) as u64,
+                    vwap: b.vw,
+                    trade_count: b.n.map(|n| n.max(0) as u64),
+                });
+            }
+        }
+        match raw.next_page_token {
+            Some(tok) if !tok.is_empty() => page_token = Some(tok),
+            _ => break,
+        }
+    }
+    out.sort_by_key(|b| b.time);
+    Ok(out)
+}

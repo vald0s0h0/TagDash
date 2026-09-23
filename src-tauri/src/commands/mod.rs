@@ -1,5 +1,18 @@
 // Tauri command surface. Thin orchestration only — logic lives in modules.
 // All state access via tauri::State<AppState>.
+//
+// ── EVERY command is `async`, and that is not decoration ─────────────────────
+// Tauri runs a command WITHOUT `async` on the main thread — the same thread that
+// pumps the macOS run loop and the WKWebView. So a command that takes the SQLite
+// mutex freezes the whole application for exactly as long as whoever holds that
+// mutex keeps it, and the background engines hold it for whole multi-thousand-row
+// transactions. That is the spinning beach ball: opening a modal, or a ticker alert
+// swapping the chart (a burst of per-ticker commands), landing on a running write.
+//
+// So: a command is declared `pub async fn`, or carries `async` in its attribute
+// (`#[tauri::command(rename_all = "snake_case", async)]`) — which runs a plain sync
+// body on the async runtime instead of on the main thread. There is no third option,
+// and a new command without one reintroduces the freeze.
 
 pub mod apex;
 pub mod dip;
@@ -21,7 +34,8 @@ use crate::local_db::drawing_repository::Drawing;
 use crate::local_db::{
     alarm_repository, book_repository, bug_repository, cache_repository, company_meta_repository,
     dashboard_repository, drawing_repository, execution_repository, get_recent_logs,
-    journal_repository, screener_repository, tradetally_queue_repository, universe_repository,
+    journal_repository, premarket_repository, screener_repository, tradetally_queue_repository,
+    universe_repository,
     BugReport, JournalEntry, LocalLogEntry, PriceAlarm, SyncQueueStatus,
 };
 use crate::market_state::{
@@ -126,21 +140,21 @@ pub async fn update_secrets(
 
 // ─── Journal tags (user-defined, stored in tagdash.toml) ──────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_journal_tags(state: tauri::State<'_, AppState>) -> Vec<String> {
     state.config.read().unwrap().journal.tags.clone()
 }
 
 // ─── Sync queue ──────────────────────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_sync_queue_status(state: tauri::State<'_, AppState>) -> SyncQueueStatus {
     let db = state.db.lock().unwrap();
     tradetally_queue_repository::get_status(&db, 50).unwrap_or_default()
 }
 
 /// Reset a single failed event to pending so it is retried immediately.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn retry_tradetally_event(
     event_id: String,
     state: tauri::State<'_, AppState>,
@@ -150,7 +164,7 @@ pub fn retry_tradetally_event(
 }
 
 /// Reset ALL failed events to pending.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn retry_all_tradetally_events(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db = state.db.lock().unwrap();
     tradetally_queue_repository::reset_all_failed_to_pending(&db).map_err(|e| e.to_string())
@@ -158,7 +172,7 @@ pub fn retry_all_tradetally_events(state: tauri::State<'_, AppState>) -> Result<
 
 // ─── Journal ─────────────────────────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn save_journal_entry(
     trade_id: String,
     symbol: String,
@@ -175,16 +189,184 @@ pub fn save_journal_entry(
         tags: tags.clone(),
         updated_at: String::new(),
     };
+    // The note is ALWAYS kept locally. It only goes up to TradeTally once the trade
+    // exists there — i.e. once it has executed. Sent earlier it would be addressed to
+    // a trade nobody can find, the worker would fail it permanently, and the text
+    // would quietly never arrive. A note written on a trade still being planned waits
+    // here instead, and the worker posts it the moment the trade is created upstream
+    // (see `tradetally::worker::flush_deferred_for_trade`).
+    let has_activity = trade_has_activity(&state, &trade_id);
     {
         let db = state.db.lock().unwrap();
         journal_repository::save(&db, &entry).map_err(|e| e.to_string())?;
-        // Enqueue a note_updated event to TradeTally
-        tradetally::enqueue_note_updated(&db, &trade_id, &symbol, &notes, confidence, &tags);
+        if has_activity {
+            tradetally::enqueue_note_updated(&db, &trade_id, &symbol, &notes, confidence, &tags);
+        }
     }
     Ok(())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+/// Has this trade actually happened?
+///
+/// A fill in the live book, or an execution row from any earlier session. Either one
+/// means the trade exists at the broker and therefore in TradeTally (or is on its way
+/// there), which is what makes it legitimate to file a note or a chart against it.
+/// The table is consulted as well as the book because the book prunes closed trades
+/// from its persisted snapshot: after a restart this morning's real trade is unknown
+/// to it while its executions are still on file.
+fn trade_has_activity(state: &tauri::State<'_, AppState>, trade_id: &str) -> bool {
+    if trade_id.is_empty() {
+        return false;
+    }
+    let in_book = state
+        .internal_book
+        .read()
+        .unwrap()
+        .get_trade_lifecycle(trade_id)
+        .map(|lc| !lc.fills.is_empty())
+        .unwrap_or(false);
+    if in_book {
+        return true;
+    }
+    let db = state.db.lock().unwrap();
+    execution_repository::trade_has_executions(&db, trade_id).unwrap_or(false)
+}
+
+/// The tradeID of the position open on `symbol` right now, if there is one.
+fn open_position_trade_id(state: &tauri::State<'_, AppState>, symbol: &str) -> Option<String> {
+    if alpaca_active(state) {
+        // The venue knows nothing of our tradeIDs: the ticker's chart context is what
+        // names the trade its position belongs to.
+        let held = state
+            .broker
+            .mirror
+            .read()
+            .unwrap()
+            .positions
+            .get(symbol)
+            .is_some_and(|p| p.quantity != 0.0);
+        if !held {
+            return None;
+        }
+        return state
+            .chart
+            .read()
+            .unwrap()
+            .get_context(symbol)
+            .and_then(|c| c.trade_id);
+    }
+    state
+        .internal_book
+        .read()
+        .unwrap()
+        .positions
+        .get(symbol)
+        .map(|p| p.trade_id.clone())
+}
+
+/// Which trade the journal note and the screenshot belong to, for the ticker on
+/// screen. The chart's own context is no longer trusted on its own: it mints a
+/// tradeID the instant an SL or a TP is drawn, so it can perfectly well be naming a
+/// trade that was never taken.
+#[derive(Debug, Clone, Serialize)]
+pub struct TradeLink {
+    pub symbol: String,
+    pub trade_id: Option<String>,
+    /// The trade executed — it exists in TradeTally, so a note or a chart filed
+    /// against it will land there. False for a trade still being planned.
+    pub has_activity: bool,
+    /// A position is open on it right now.
+    pub open: bool,
+    /// Where the id came from, so the UI can say which trade it is about:
+    /// "position" (open), "context" (the ticker's last trade), "planned" (levels
+    /// drawn, nothing entered), "history" (last executed trade on the ticker),
+    /// "none".
+    pub source: &'static str,
+}
+
+/// Resolve the trade the chart's note / screenshot buttons act on, in the order the
+/// trader means it:
+///   1. the position OPEN on the ticker — that is the trade he is looking at;
+///   2. the ticker's context, when it still stands for something: levels drawn (a
+///      trade being planned) or a trade that really executed (the one just closed);
+///   3. the last trade that actually executed on the ticker — the fallback that keeps
+///      "je viens de fermer un trade" working after the context has moved on;
+///   4. nothing, and the buttons stay disabled.
+#[tauri::command(rename_all = "snake_case", async)]
+pub fn get_trade_link(
+    zone_id: String,
+    symbol: String,
+    state: tauri::State<'_, AppState>,
+) -> TradeLink {
+    let mut symbol = symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        symbol = state
+            .chart
+            .read()
+            .unwrap()
+            .symbol_for_zone(&zone_id)
+            .unwrap_or_default();
+    }
+    let empty = TradeLink {
+        symbol: symbol.clone(),
+        trade_id: None,
+        has_activity: false,
+        open: false,
+        source: "none",
+    };
+    if symbol.is_empty() {
+        return empty;
+    }
+
+    // 1 ── the open position IS the trade on the chart.
+    if let Some(trade_id) = open_position_trade_id(&state, &symbol) {
+        let has_activity = trade_has_activity(&state, &trade_id);
+        return TradeLink {
+            symbol,
+            trade_id: Some(trade_id),
+            has_activity,
+            open: true,
+            source: "position",
+        };
+    }
+
+    // 2 ── the ticker's context, if it names something real or something planned.
+    //      Copied out before anything else is locked: no nested locks on this path.
+    let ctx = state.chart.read().unwrap().get_context(&symbol);
+    if let Some(trade_id) = ctx.as_ref().and_then(|c| c.trade_id.clone()) {
+        let planned = ctx
+            .as_ref()
+            .is_some_and(|c| c.stop_loss.is_some() || c.take_profit.is_some());
+        let has_activity = trade_has_activity(&state, &trade_id);
+        if has_activity || planned {
+            return TradeLink {
+                symbol,
+                trade_id: Some(trade_id),
+                has_activity,
+                open: false,
+                source: if has_activity { "context" } else { "planned" },
+            };
+        }
+    }
+
+    // 3 ── whatever last traded on this ticker.
+    let last = {
+        let db = state.db.lock().unwrap();
+        execution_repository::last_executed_trade_for_symbol(&db, &symbol).unwrap_or(None)
+    };
+    match last {
+        Some(trade_id) => TradeLink {
+            symbol,
+            trade_id: Some(trade_id),
+            has_activity: true,
+            open: false,
+            source: "history",
+        },
+        None => empty,
+    }
+}
+
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_journal_entry(
     trade_id: String,
     state: tauri::State<'_, AppState>,
@@ -198,7 +380,7 @@ pub fn get_journal_entry(
 /// Save a base64-encoded PNG captured by the frontend.
 /// If a tradeID is provided, the screenshot is linked and queued for TradeTally.
 /// Returns the local file path.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn save_screenshot_local(
     zone_id: String,
     trade_id: Option<String>,
@@ -227,13 +409,10 @@ pub fn save_screenshot_local(
                         .map(|p| !p.is_empty())
                         .unwrap_or(false)
             };
-            let has_activity = state
-                .internal_book
-                .read()
-                .unwrap()
-                .get_trade_lifecycle(tid)
-                .map(|lc| !lc.fills.is_empty())
-                .unwrap_or(false);
+            // Same test as the journal's: a trade closed in an earlier session is no
+            // longer in the book but its executions are still on file, and a chart
+            // for it must still reach TradeTally.
+            let has_activity = trade_has_activity(&state, tid);
             if has_creds && has_activity {
                 let symbol = state
                     .chart
@@ -253,10 +432,18 @@ pub fn save_screenshot_local(
     // Record in screenshot_files table + (when eligible) queue the upload.
     {
         let db = state.db.lock().unwrap();
+        // `uploaded` records whether this file was HANDED TO the sync queue, not
+        // whether the POST has landed — the queue owns delivery from there. A 0 is
+        // what the deferred flush looks for when the trade finally appears upstream.
         db.execute(
             "INSERT OR IGNORE INTO screenshot_files (id, trade_id, path, uploaded, created_at)
-             VALUES (?1, ?2, ?3, 0, datetime('now'))",
-            rusqlite::params![&filename, &trade_id, &local_path],
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            rusqlite::params![
+                &filename,
+                &trade_id,
+                &local_path,
+                if tt.is_some() { 1 } else { 0 }
+            ],
         )
         .map_err(|e| e.to_string())?;
         if let Some((tid, symbol)) = &tt {
@@ -279,7 +466,7 @@ pub struct TodoTrade {
     pub has_journal: bool,
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_todo_trades(state: tauri::State<'_, AppState>) -> Vec<TodoTrade> {
     let db = state.db.lock().unwrap();
     let mut stmt = match db.prepare(
@@ -356,7 +543,7 @@ pub struct TradeDbRow {
     pub synced_on_tradetally: bool,
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_all_trades_db(state: tauri::State<'_, AppState>) -> Vec<TradeDbRow> {
     let db = state.db.lock().unwrap();
     let mut stmt = match db.prepare(
@@ -453,7 +640,7 @@ pub fn get_all_trades_db(state: tauri::State<'_, AppState>) -> Vec<TradeDbRow> {
     out
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_trade_days(state: tauri::State<'_, AppState>) -> Vec<String> {
     let db = state.db.lock().unwrap();
     let mut stmt =
@@ -466,7 +653,7 @@ pub fn get_trade_days(state: tauri::State<'_, AppState>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn delete_trade_db(trade_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db = state.db.lock().unwrap();
     db.execute(
@@ -499,7 +686,7 @@ pub fn delete_trade_db(trade_id: String, state: tauri::State<'_, AppState>) -> R
 
 // ─── Local logs ──────────────────────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_local_logs(limit: Option<u32>, state: tauri::State<'_, AppState>) -> Vec<LocalLogEntry> {
     let db = state.db.lock().unwrap();
     get_recent_logs(&db, limit.unwrap_or(100)).unwrap_or_default()
@@ -507,13 +694,13 @@ pub fn get_local_logs(limit: Option<u32>, state: tauri::State<'_, AppState>) -> 
 
 // ─── Bug reports (persisted) ──────────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_bug_reports(state: tauri::State<'_, AppState>) -> Vec<BugReport> {
     let db = state.db.lock().unwrap();
     bug_repository::get_all(&db).unwrap_or_default()
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn add_bug_report(
     id: String,
     text: String,
@@ -525,7 +712,7 @@ pub fn add_bug_report(
     bug_repository::get_all(&db).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn delete_bug_report(
     id: String,
     state: tauri::State<'_, AppState>,
@@ -535,7 +722,7 @@ pub fn delete_bug_report(
     bug_repository::get_all(&db).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn clear_bug_reports(state: tauri::State<'_, AppState>) -> Result<Vec<BugReport>, String> {
     let db = state.db.lock().unwrap();
     bug_repository::clear_all(&db).map_err(|e| e.to_string())?;
@@ -544,7 +731,7 @@ pub fn clear_bug_reports(state: tauri::State<'_, AppState>) -> Result<Vec<BugRep
 
 // ─── Price alarms (persisted; level-crossing watcher lives in the scanner) ────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn create_alarm(
     id: String,
     symbol: String,
@@ -557,7 +744,7 @@ pub fn create_alarm(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_alarms_for_symbol(symbol: String, state: tauri::State<'_, AppState>) -> Vec<PriceAlarm> {
     let db = state.db.lock().unwrap();
     alarm_repository::get_for_symbol(&db, &symbol).unwrap_or_default()
@@ -578,7 +765,7 @@ pub struct AlarmView {
     pub triggered_at: Option<String>,
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_all_alarms(state: tauri::State<'_, AppState>) -> Vec<AlarmView> {
     let db = state.db.lock().unwrap();
     let alarms = alarm_repository::get_all(&db).unwrap_or_default();
@@ -610,7 +797,7 @@ pub fn get_all_alarms(state: tauri::State<'_, AppState>) -> Vec<AlarmView> {
 }
 
 /// Move an alarm to a new price (chart-drag from the chart area).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn update_alarm_price(
     id: String,
     price: f64,
@@ -620,7 +807,7 @@ pub fn update_alarm_price(
     alarm_repository::update_price(&db, &id, price).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn delete_alarm(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db = state.db.lock().unwrap();
     alarm_repository::delete(&db, &id).map_err(|e| e.to_string())
@@ -907,7 +1094,7 @@ pub async fn start_live_feed(
     Ok(())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stop_live_feed(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.live_feed_running.store(false, Ordering::Relaxed);
     Ok(())
@@ -944,7 +1131,7 @@ pub fn spawn_news_feed(
     Ok(())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn start_news_feed(state: tauri::State<'_, AppState>) -> Result<(), String> {
     spawn_news_feed(
         state.market.clone(),
@@ -953,7 +1140,7 @@ pub fn start_news_feed(state: tauri::State<'_, AppState>) -> Result<(), String> 
     )
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stop_news_feed(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.news_feed_running.store(false, Ordering::Relaxed);
     Ok(())
@@ -962,7 +1149,7 @@ pub fn stop_news_feed(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// Set the symbols currently displayed in chart zones. The live feed tick-streams
 /// these (trades+quotes) on top of the broad surveillance tier, and pushes their
 /// ticks to the frontend. Persists even if the feed isn't connected yet.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_focus_symbols(
     symbols: Vec<String>,
     state: tauri::State<'_, AppState>,
@@ -1603,6 +1790,103 @@ pub async fn load_older_bars(
     Ok(vec![])
 }
 
+/// Which provider serves the intraday bars a premarket candle is folded from.
+/// Mirrors the rule the rest of the chart already follows
+/// (`preferred_massive_bars_key`): Massive whenever Alpaca is on the free IEX plan
+/// and a paid Massive key is present, Alpaca otherwise.
+///
+/// The IEX case matters more here than anywhere else: premarket volume is thin, so
+/// a range built from IEX's own prints alone can be wildly narrower than the real
+/// session. That is precisely why Massive comes first when it is available.
+fn premarket_source(state: &tauri::State<'_, AppState>) -> Option<crate::premarket::Source> {
+    if let Some(key) = preferred_massive_bars_key(state, crate::premarket::FOLD_TF) {
+        return Some(crate::premarket::Source::Massive(key));
+    }
+    let s = state.secrets.read().unwrap();
+    let key = s.alpaca_key.clone().filter(|k| !k.is_empty())?;
+    let secret = s.alpaca_secret.clone().filter(|k| !k.is_empty())?;
+    Some(crate::premarket::Source::Alpaca { key, secret })
+}
+
+/// Premarket (04:00–09:30 ET) daily candles for `symbol` from `from_date`
+/// (`YYYY-MM-DD`, inclusive) to today — the ghost series the daily pane draws
+/// behind (or instead of) the regular-session candles.
+///
+/// Neither provider's daily bar contains this: both are regular-session only
+/// (measured — see `crate::premarket`'s module doc), so every candle here is folded
+/// from 15-minute intraday bars and cached. The cache is authoritative for closed
+/// days, so widening the window as the user scrolls back only ever fetches the part
+/// that is genuinely missing; re-opening the same ticker fetches nothing at all.
+///
+/// Sources of the CURRENT day, in order of freshness:
+///   • during premarket — the live RAM bar (`MarketState::premarket_daily_bar`),
+///     fed tick by tick, so the forming ghost tracks the session in real time
+///     rather than lagging a REST fold;
+///   • from the 09:30 open onward — the session is final, so it is folded and
+///     cached exactly once like any closed day.
+///
+/// Replay / offline never reaches the network: the cache answers, clamped to the
+/// simulated day, and the replayed RAM bar supplies a simulated premarket.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn load_premarket_daily(
+    symbol: String,
+    from_date: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Bar>, String> {
+    let now = crate::time::now();
+    let today = crate::time::et_date(now);
+    // A window starting in the future is empty, not an error.
+    if from_date.is_empty() || from_date.as_str() > today.as_str() {
+        return Ok(vec![]);
+    }
+    let historical = intraday_is_historical(&state);
+
+    // Today's premarket is FINAL from the 09:30 open onward (09:30 ET = 570
+    // minutes), so from then on it caches like any closed day. Before the open it
+    // is still forming, so the cacheable range stops at yesterday and the live RAM
+    // bar supplies today.
+    let pm_final_today = crate::time::et_minutes(now) >= 570;
+    let closed_to = if pm_final_today {
+        today.clone()
+    } else {
+        crate::premarket::shift_date(&today, -1)
+    };
+
+    // ── Fill whatever part of the window the cache does not already cover ──
+    if !historical {
+        if let Some(src) = premarket_source(&state) {
+            let db = state.db.clone();
+            crate::premarket::ensure_cached(&src, &db, &symbol, &from_date, &closed_to).await;
+        }
+    }
+
+    // ── Read the whole window back out of the cache ──
+    let mut out: Vec<Bar> = {
+        let conn = state.db.lock().unwrap();
+        premarket_repository::get_range(&conn, &symbol, &from_date, &today)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(premarket_repository::to_bar)
+            .collect()
+    };
+
+    // ── The forming day: live RAM wins over anything cached ──
+    // Also the only premarket source during a replay, where the simulated feed is
+    // what builds it — and it is bounded by the simulated clock, so no leak.
+    if crate::time::is_premarket(now) {
+        if let Some(live) = state.market.read().unwrap().premarket_daily_bar(&symbol) {
+            let day = crate::time::et_date(live.time);
+            if day == today {
+                out.retain(|b| crate::time::et_date(b.time) != today);
+                out.push(live);
+            }
+        }
+    }
+
+    out.sort_by_key(|b| b.time);
+    Ok(out)
+}
+
 /// Historical stock-split day markers for ONE symbol over the last 2 years
 /// (Alpaca corporate-actions) — red dots on the daily pane. Surfaced for EVERY
 /// daily chart (not only enriched alerts, which got them via the enrichment
@@ -1775,7 +2059,7 @@ pub async fn get_strategies(state: tauri::State<'_, AppState>) -> Result<Vec<Str
 
 /// Toggle a strategy on/off at runtime (no code change needed). Persisted in the
 /// `app_config` table so it survives a relaunch; the scanner picks it up live.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_strategy_enabled(
     strategy_id: String,
     enabled: bool,
@@ -1793,7 +2077,7 @@ pub fn set_strategy_enabled(
 /// Set the full risk config for a strategy at runtime. Persisted in the
 /// `app_config` table so it survives a relaunch; position sizing reads it on the
 /// next order (effet immédiat). Replaces the old single-f64 `set_strategy_risk`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_strategy_risk(
     strategy_id: String,
     risk: crate::types::StrategyRiskConfig,
@@ -1845,7 +2129,7 @@ pub async fn test_ntfy(state: tauri::State<'_, AppState>) -> Result<(), String> 
 /// Two engines, two blobs: `get_dislocation_options` below is the other one. They
 /// were one struct while Dislocation was called "Micro Pullback v2", which is
 /// exactly the confusion this split removes.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_micro_pullback_options(
     state: tauri::State<'_, AppState>,
 ) -> crate::micro_pullback::MicroPullbackOptions {
@@ -1854,7 +2138,7 @@ pub fn get_micro_pullback_options(
 
 /// Replace Micro Pullback's options. Persisted in `app_meta`; the engine re-reads
 /// the struct every tick, so a change lands on the next second without a restart.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_micro_pullback_options(
     options: crate::micro_pullback::MicroPullbackOptions,
     state: tauri::State<'_, AppState>,
@@ -1874,7 +2158,7 @@ pub fn set_micro_pullback_options(
 }
 
 /// Dislocation's own options, same contract as Micro Pullback's above.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_dislocation_options(
     state: tauri::State<'_, AppState>,
 ) -> crate::dislocation::DislocationOptions {
@@ -1883,7 +2167,7 @@ pub fn get_dislocation_options(
 
 /// Replace Dislocation's options. Persisted in `app_meta`; the engine re-reads the
 /// struct every tick, so a change lands on the next second without a restart.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_dislocation_options(
     options: crate::dislocation::DislocationOptions,
     state: tauri::State<'_, AppState>,
@@ -1902,12 +2186,12 @@ pub fn set_dislocation_options(
 /// not `AppState`, because `should_alert()` has no state parameter to read one
 /// from. `set_` persists then writes through to that static, so the very next
 /// scan tick sees the change.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_backside_options() -> crate::strategies::backside::BacksideOptions {
     crate::strategies::backside::current_options()
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_backside_options(
     options: crate::strategies::backside::BacksideOptions,
     state: tauri::State<'_, AppState>,
@@ -1935,7 +2219,7 @@ pub async fn get_dislocation_attention(
 
 /// Identity card per strategy (keyed by strategy id). Static metadata used by
 /// the UI to lay out panes/indicators and the info band when an alert lands.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_strategy_cards() -> HashMap<String, StrategyCard> {
     registry::all_strategies()
         .iter()
@@ -1946,12 +2230,34 @@ pub fn get_strategy_cards() -> HashMap<String, StrategyCard> {
 /// Kick off async enrichment for a symbol shown in a zone. Idempotent and only
 /// runs for strategies whose card declares enrichment/LLM needs. Returns at once;
 /// results are polled via `get_alert_enrichment`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn start_alert_enrichment(
     symbol: String,
     strategy_id: String,
     state: tauri::State<'_, AppState>,
 ) {
+    // ── Premarket ghost series: warm the cache the moment a ticker is alerted ──
+    // Independent of the enrichment card below (every strategy's daily pane can show
+    // the ghost), and deliberately BEFORE the `needs` early-return. Folding 60 days
+    // of premarket takes one provider call and a couple of seconds, so doing it now
+    // means the series is already there when the pane asks — instead of the user
+    // watching it appear. Idempotent by construction: `ensure_cached` fetches only
+    // what the coverage table says is missing, so a re-alert costs one SELECT.
+    if !intraday_is_historical(&state) {
+        if let Some(src) = premarket_source(&state) {
+            let db = state.db.clone();
+            let sym = symbol.clone();
+            let today = crate::time::et_date(crate::time::now());
+            let from = crate::premarket::shift_date(&today, -crate::premarket::DEFAULT_WINDOW_DAYS);
+            // Yesterday: today's premarket is still forming (or already served from
+            // the live RAM bar), so it is not cacheable here.
+            let to = crate::premarket::shift_date(&today, -1);
+            tauri::async_runtime::spawn(async move {
+                crate::premarket::ensure_cached(&src, &db, &sym, &from, &to).await;
+            });
+        }
+    }
+
     let needs = registry::all_strategies()
         .iter()
         .find(|s| s.id() == strategy_id)
@@ -1987,7 +2293,7 @@ pub fn start_alert_enrichment(
 /// Dislocation's automatic quality pipeline). One Deepseek call producing a short
 /// context/verdict pair (see `enrichment::run_panic_llm`). Ignored while a call is
 /// already in flight.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn run_alert_llm(symbol: String, strategy_id: String, state: tauri::State<'_, AppState>) {
     // Don't stack calls if one is already running for this symbol.
     if let Some(e) = state.enrichments.read().unwrap().get(&symbol) {
@@ -2017,7 +2323,7 @@ pub fn run_alert_llm(symbol: String, strategy_id: String, state: tauri::State<'_
 /// the frontend polls `get_micro_pullback_scores` for the result. Double-clicking,
 /// or clicking while the auto path is already scoring this symbol, is a no-op —
 /// `quality::run_news_scoring`'s in-flight guard covers both.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn run_micro_pullback_news_score(symbol: String, state: tauri::State<'_, AppState>) {
     let alert = state
         .active_alerts
@@ -2073,7 +2379,7 @@ pub fn run_micro_pullback_news_score(symbol: String, state: tauri::State<'_, App
 
 /// Micro Pullback's news judgements for the current app-clock day and mode. Day- and
 /// mode-scoped exactly like `get_dislocation_scores`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_micro_pullback_scores(
     state: tauri::State<'_, AppState>,
 ) -> Vec<crate::local_db::micro_pullback_quality_repository::MicroPullbackQualityRow> {
@@ -2085,7 +2391,7 @@ pub fn get_micro_pullback_scores(
 }
 
 /// Current progressive enrichment for a symbol (polled by the info band).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_alert_enrichment(
     symbol: String,
     state: tauri::State<'_, AppState>,
@@ -2105,7 +2411,7 @@ pub fn get_alert_enrichment(
 ///
 /// Returns immediately; progress is polled through `get_panic_llm_run`. Never
 /// automatic — this command is the only thing that starts a run.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn run_panic_llm_analysis(
     symbols: Vec<String>,
     dismissed: Vec<String>,
@@ -2126,7 +2432,7 @@ pub fn run_panic_llm_analysis(
 
 /// Progress of the current (or last) Panic Score run — drives the button's spinner,
 /// its `done/total` counter and any error message.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_panic_llm_run(
     state: tauri::State<'_, AppState>,
 ) -> crate::panic_llm::state::PanicRunState {
@@ -2135,7 +2441,7 @@ pub fn get_panic_llm_run(
 
 /// The stored analysis for the CURRENT app-clock day and mode. Day- and mode-scoped
 /// like every other watchlist read, so a replay's scores never surface in live mode.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_panic_llm_scores(
     state: tauri::State<'_, AppState>,
 ) -> Vec<crate::local_db::panic_llm_repository::PanicLlmScore> {
@@ -2153,7 +2459,7 @@ pub fn get_panic_llm_scores(
 /// second command: the overlay needs "score, and is it still moving?" as ONE answer —
 /// polled separately the two would disagree for a poll interval and the pane would
 /// flicker between a stale score and a spinner.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_dislocation_scores(
     state: tauri::State<'_, AppState>,
 ) -> crate::dislocation::quality::QualityBoard {
@@ -2172,7 +2478,7 @@ pub fn get_dislocation_scores(
 
 /// Whether a web-search provider is configured — the button uses this to explain that
 /// the context cascade will stop at the structured sources.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn has_web_search_provider(state: tauri::State<'_, AppState>) -> bool {
     let s = state.secrets.read().unwrap();
     crate::websearch::provider_from(&s).is_some()
@@ -2232,7 +2538,7 @@ fn et_today() -> String {
 
 /// Persist a pre-open screener dismissal for TODAY so the ticker stays hidden
 /// across restarts until the next trading day.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn dismiss_screener(symbol: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     screener_repository::dismiss(&conn, &symbol, &et_today()).map_err(|e| e.to_string())
@@ -2240,7 +2546,7 @@ pub fn dismiss_screener(symbol: String, state: tauri::State<'_, AppState>) -> Re
 
 /// Symbols dismissed from the screener TODAY. Old days are pruned on read so the
 /// dismissals naturally reset each trading day.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_screener_dismissals(state: tauri::State<'_, AppState>) -> Vec<String> {
     let conn = state.db.lock().unwrap();
     screener_repository::dismissals(&conn, &et_today())
@@ -2254,20 +2560,20 @@ fn pins_simulated() -> bool {
 
 /// Pin a ticker in the pre-open screener. Unlike a dismissal a pin is NOT day-scoped:
 /// it keeps the ticker on the list on the following days until the user removes it.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn pin_screener(symbol: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     screener_repository::pin(&conn, &symbol, pins_simulated()).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn unpin_screener(symbol: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     screener_repository::unpin(&conn, &symbol, pins_simulated()).map_err(|e| e.to_string())
 }
 
 /// Pinned symbols for the current mode (live vs replay).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_screener_pins(state: tauri::State<'_, AppState>) -> Vec<String> {
     let conn = state.db.lock().unwrap();
     screener_repository::pins(&conn, pins_simulated())
@@ -2277,7 +2583,7 @@ pub fn get_screener_pins(state: tauri::State<'_, AppState>) -> Vec<String> {
 ///
 /// A private memo, nothing more: no strategy, scanner, sizing or ordering reads it.
 /// Same lifetime as a pin — it survives day changes until the user clears it.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_screener_rating(
     symbol: String,
     rating: i64,
@@ -2289,7 +2595,7 @@ pub fn set_screener_rating(
 }
 
 /// Ratings for the current mode, as `{ SYMBOL: 1..3 }`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_screener_ratings(state: tauri::State<'_, AppState>) -> HashMap<String, i64> {
     let conn = state.db.lock().unwrap();
     screener_repository::ratings(&conn, pins_simulated())
@@ -2315,7 +2621,7 @@ pub async fn start_scanner(state: tauri::State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stop_scanner(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.scanner_running.store(false, Ordering::Relaxed);
     Ok(())
@@ -2325,7 +2631,7 @@ pub fn stop_scanner(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 /// Top-N panic scores for the CURRENT app-clock day (strongest first), for debugging
 /// the Panic Mean Reversion screener. Defaults to 30.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_mean_reversion_scores(
     limit: Option<u32>,
     state: tauri::State<'_, AppState>,
@@ -2740,7 +3046,7 @@ pub async fn get_news_markers(
 /// the async runtime (premarket minute bars + daily history) so the command returns
 /// at once. Note: before ~09:25 ET there's little/no premarket data, so the premarket
 /// re-rank won't contribute yet.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn force_recompute_scores(state: tauri::State<'_, AppState>) {
     let db = state.db.clone();
     let secrets = state.secrets.clone();
@@ -2771,7 +3077,7 @@ pub async fn refresh_sec_shares(state: tauri::State<'_, AppState>) -> Result<usi
 
 /// How many symbols currently resolve to a market cap for the app-clock day. Surfaced
 /// so thin coverage is visible instead of silently skewing the size buckets.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn sec_shares_coverage(state: tauri::State<'_, AppState>) -> usize {
     let db = state.db.lock().unwrap();
     crate::sec_shares::coverage(&db, &et_today())
@@ -2779,7 +3085,7 @@ pub fn sec_shares_coverage(state: tauri::State<'_, AppState>) -> usize {
 
 // ─── Chart / zone trade context ───────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_zone_trade_context(
     zone_id: String,
     symbol: String,
@@ -2795,7 +3101,7 @@ pub fn get_zone_trade_context(
         .load_zone_context(&zone_id, &symbol)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn create_or_get_trade_id_for_zone(
     zone_id: String,
     symbol: String,
@@ -2813,7 +3119,35 @@ pub fn create_or_get_trade_id_for_zone(
 
 /// Set (or clear) the SL for a zone. Auto-creates tradeID if price is Some.
 /// Enqueues trade_id_created (first time) + sl_updated to TradeTally.
-#[tauri::command(rename_all = "snake_case")]
+/// Nothing left on the chart for this ticker and nothing ever executed → the
+/// tradeID the last SL/TP minted goes away with the line.
+///
+/// This is what keeps "je ferme un trade, je pose un SL, je le retire aussitôt" from
+/// silently re-pointing the ticker at a trade that never existed: without it the
+/// context kept the phantom id, the journal and the screenshot bound to it, and
+/// TradeTally had nothing to attach them to. With it, the ticker falls back to its
+/// last REAL trade (see `get_trade_link`).
+fn discard_if_never_traded(
+    state: &tauri::State<'_, AppState>,
+    symbol: &str,
+    ctx: ZoneTradeContext,
+) -> ZoneTradeContext {
+    if ctx.stop_loss.is_some() || ctx.take_profit.is_some() {
+        return ctx;
+    }
+    let Some(trade_id) = ctx.trade_id.clone() else {
+        return ctx;
+    };
+    let had_activity = trade_has_activity(state, &trade_id);
+    state
+        .chart
+        .write()
+        .unwrap()
+        .discard_planned_trade(symbol, had_activity)
+        .unwrap_or(ctx)
+}
+
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn update_zone_sl(
     zone_id: String,
     symbol: String,
@@ -2826,6 +3160,7 @@ pub fn update_zone_sl(
         .write()
         .unwrap()
         .update_sl(&zone_id, &symbol, &strategy_id, price);
+    let ctx = discard_if_never_traded(&state, &symbol, ctx);
 
     // Keep the live bracket SL order (if any) in sync with the moved line.
     state
@@ -2863,7 +3198,7 @@ pub fn update_zone_sl(
 
 /// Set (or clear) the TP for a zone. Auto-creates tradeID if price is Some.
 /// Enqueues trade_id_created (first time) + tp_updated to TradeTally.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn update_zone_tp(
     zone_id: String,
     symbol: String,
@@ -2876,6 +3211,7 @@ pub fn update_zone_tp(
         .write()
         .unwrap()
         .update_tp(&zone_id, &symbol, &strategy_id, price);
+    let ctx = discard_if_never_traded(&state, &symbol, ctx);
 
     // Keep the live bracket TP order (if any) in sync with the moved line.
     state
@@ -2905,12 +3241,24 @@ pub fn update_zone_tp(
     ctx
 }
 
-#[tauri::command(rename_all = "snake_case")]
+/// A zone was released (Libérer). Forgets which ticker it showed — the ticker's own
+/// trade context is kept, it belongs to the ticker — and stands down the hotkey
+/// engines that were watching it.
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn clear_zone_context(
     zone_id: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // Read BEFORE `clear_zone`: it drops the zone→ticker entry the disarms match on.
+    let symbol = state.chart.read().unwrap().symbol_for_zone(&zone_id);
     state.chart.write().unwrap().clear_zone(&zone_id);
+    // Releasing a chart releases its armings with it. An arming the trader can no
+    // longer see is an arming that fires by surprise — on a ticker he has explicitly
+    // said he is done with. An OPEN Apex/Dip trade is untouched: it is managed by its
+    // bracket, not by what is on screen.
+    apex::disarm_on_release(&app, &state, &zone_id, symbol.as_deref());
+    dip::disarm_on_release(&app, &state, &zone_id, symbol.as_deref());
     Ok(())
 }
 
@@ -3677,7 +4025,7 @@ fn alpaca_active(state: &tauri::State<'_, AppState>) -> bool {
     crate::broker::routes_to_venue(&state.config.read().unwrap(), replaying)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_internal_positions(state: tauri::State<'_, AppState>) -> Vec<Position> {
     // With Alpaca active, every row on screen is a position Alpaca actually holds.
     // Projected here rather than in each of the six frontend consumers, so no panel
@@ -3722,7 +4070,7 @@ pub fn get_internal_positions(state: tauri::State<'_, AppState>) -> Vec<Position
     positions
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_internal_orders(state: tauri::State<'_, AppState>) -> Vec<InternalOrder> {
     if alpaca_active(&state) {
         return crate::broker::projection::orders(&state.broker.snapshot());
@@ -3731,7 +4079,7 @@ pub fn get_internal_orders(state: tauri::State<'_, AppState>) -> Vec<InternalOrd
     state.internal_book.read().unwrap().get_pending_orders()
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_trade_lifecycle(
     trade_id: String,
     state: tauri::State<'_, AppState>,
@@ -3784,7 +4132,7 @@ pub struct TradeExecutions {
 /// the entry/scale/exit triangles + connecting P&L line on every chart of that
 /// symbol. Increase/decrease and realized P&L are reconstructed from the signed
 /// fill quantities (running net position + cash flow).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_executions_for_symbol(
     symbol: String,
     state: tauri::State<'_, AppState>,
@@ -3858,14 +4206,14 @@ pub fn get_executions_for_symbol(
 
 /// Persist a user drawing (trend line or text annotation) for a ticker so it
 /// reappears on every chart/zone of that symbol and survives restarts.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn create_drawing(drawing: Drawing, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     drawing_repository::insert(&conn, &drawing).map_err(|e| e.to_string())
 }
 
 /// All persisted drawings for a ticker (lines + text annotations).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_drawings_for_symbol(symbol: String, state: tauri::State<'_, AppState>) -> Vec<Drawing> {
     let conn = state.db.lock().unwrap();
     drawing_repository::get_for_symbol(&conn, &symbol).unwrap_or_default()
@@ -3873,13 +4221,13 @@ pub fn get_drawings_for_symbol(symbol: String, state: tauri::State<'_, AppState>
 
 /// Update an existing drawing (position after a drag, or style after an edit).
 /// Same INSERT OR REPLACE path as create — the full row is sent each time.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn update_drawing(drawing: Drawing, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     drawing_repository::insert(&conn, &drawing).map_err(|e| e.to_string())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn delete_drawing(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     drawing_repository::delete(&conn, &id).map_err(|e| e.to_string())
@@ -3945,12 +4293,12 @@ fn parse_hm(hm: &str) -> Result<u32, String> {
     Ok(h * 60 + m)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.replay.send(crate::replay::ReplayCmd::Stop)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_set_playing(playing: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.replay.send(if playing {
         crate::replay::ReplayCmd::Play
@@ -3959,7 +4307,7 @@ pub fn replay_set_playing(playing: bool, state: tauri::State<'_, AppState>) -> R
     })
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_set_speed(speed: f64, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if !speed.is_finite() || speed <= 0.0 {
         return Err("vitesse invalide".into());
@@ -3969,7 +4317,7 @@ pub fn replay_set_speed(speed: f64, state: tauri::State<'_, AppState>) -> Result
 
 /// Avance/recule le temps simulé de `delta_secs` secondes (négatif = retour en
 /// arrière → l'état du marché est rejoué depuis le début de journée).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_seek_relative(
     delta_secs: i64,
     state: tauri::State<'_, AppState>,
@@ -3980,7 +4328,7 @@ pub fn replay_seek_relative(
 }
 
 /// Saute à une heure ET du jour rejoué ("04:00", "07:00", "09:30"…).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_seek_clock(hm: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let minutes = parse_hm(&hm)?;
     state
@@ -3989,19 +4337,19 @@ pub fn replay_seek_clock(hm: String, state: tauri::State<'_, AppState>) -> Resul
 }
 
 /// Avance en accéléré jusqu'à la prochaine alerte scanner, puis met en pause.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_next_alert(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.replay.send(crate::replay::ReplayCmd::NextAlert)
 }
 
 /// Avance jusqu'au prochain close de barre 1 min, puis pause.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_next_bar(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.replay.send(crate::replay::ReplayCmd::NextBar)
 }
 
 /// Charge la séance suivante (jour ouvré suivant) à la même heure de départ.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_next_day(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.replay.send(crate::replay::ReplayCmd::NextDay)
 }
@@ -4023,7 +4371,7 @@ pub async fn get_replay_status(
 /// background — poll `get_flat_files_status`. Errors if a download is already running
 /// or the Alpaca keys are missing. (Daily ignores the day granularity and writes the
 /// cumulative `daily.db`; for it, start/end is just the bar range.)
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn flat_files_download(
     kind: String,
     start_day: String,
@@ -4054,12 +4402,12 @@ pub fn flat_files_download(
 }
 
 /// Request cancellation of the running download (takes effect between days).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn flat_files_cancel(state: tauri::State<'_, AppState>) {
     state.flat_files.request_cancel();
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_flat_files_status(
     state: tauri::State<'_, AppState>,
 ) -> crate::flat_files::FlatFilesStatus {
@@ -4068,7 +4416,7 @@ pub fn get_flat_files_status(
 
 /// Every day present on disk for `kind` (downloaded or imported from another user),
 /// for the calendar. Picks up dropped-in files on the next call.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_flat_files_calendar(
     kind: String,
     state: tauri::State<'_, AppState>,
@@ -4081,7 +4429,7 @@ pub fn get_flat_files_calendar(
 
 /// Open a flat-files folder in the OS file manager (to copy/share the files). `kind`
 /// opens that subfolder; an unknown kind opens the root `flat_files/`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn open_flat_files_folder(
     kind: String,
     state: tauri::State<'_, AppState>,
@@ -4103,13 +4451,13 @@ pub fn open_flat_files_folder(
 /// The self-describing `company_intel` catalog: every captured datum, its label,
 /// section, source and type. Lets the UI render the data without hard-coding
 /// field names.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_company_intel_catalog() -> Vec<crate::company_intel::IntelField> {
     crate::company_intel::catalog().to_vec()
 }
 
 /// The cached company-intel record for one ticker (None until collected).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_company_intel(
     symbol: String,
     state: tauri::State<'_, AppState>,
@@ -4120,7 +4468,7 @@ pub fn get_company_intel(
 /// Request a background refresh of one ticker's company intel. Spawns the
 /// collection job on the async runtime and returns immediately — the network work
 /// runs in the backend, never on the UI path.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn refresh_company_intel(symbol: String, state: tauri::State<'_, AppState>) {
     let db = state.db.clone();
     let config = state.config.clone();
@@ -4136,7 +4484,7 @@ pub fn refresh_company_intel(symbol: String, state: tauri::State<'_, AppState>) 
 /// tickers matching the query (symbol prefix or name contains). Read-only — a
 /// snapshot of the local DB for the data-table view, no network. Bounded so the UI
 /// never loads the whole universe at once.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_tickers_table(
     query: Option<String>,
     limit: Option<u32>,
@@ -4244,7 +4592,7 @@ fn tradetally_client(state: &tauri::State<'_, AppState>) -> Result<tradetally::T
 
 /// Cached trades for the dashboard KPI cards (oldest first). The frontend derives
 /// profit factor, PnL curve, etc. from these.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_dashboard_trades(
     state: tauri::State<'_, AppState>,
 ) -> Vec<crate::dashboard::DashboardTrade> {
@@ -4316,7 +4664,7 @@ pub async fn get_diary_entry(
 /// Journal/diary card → create-or-update today's TradeTally diary entry. Enqueued
 /// on the resilient sync queue (drained by the background worker) and mirrored
 /// locally. `entry_date` is today's ET calendar day.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn save_diary_entry(
     title: String,
     content: String,
@@ -4333,7 +4681,7 @@ pub fn save_diary_entry(
 
 /// Today's background image (deterministic per ET day) from the user's photo
 /// folder, plus the folder path so the UI can show / open it.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_daily_background(
     state: tauri::State<'_, AppState>,
 ) -> crate::dashboard::DailyBackground {
@@ -4341,28 +4689,28 @@ pub fn get_daily_background(
 }
 
 /// Open the backgrounds folder in the OS file manager.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn open_backgrounds_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
     crate::dashboard::open_folder(&state.app_dir.join("backgrounds"))
 }
 
 /// A fresh random mood pick (image + short + long phrase) from the user's `mood/`
 /// folder. Re-randomises on every call (each dashboard open / refresh).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_mood(state: tauri::State<'_, AppState>) -> crate::dashboard::Mood {
     crate::dashboard::pick_mood(&state.app_dir)
 }
 
 /// Open a mood drop target: `"images"` folder, or the `"short"` / `"long"` phrases
 /// `.txt` file (in the OS default editor).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn open_mood_target(state: tauri::State<'_, AppState>, target: String) -> Result<(), String> {
     crate::dashboard::open_mood_target(&state.app_dir, &target)
 }
 
 /// The bundled default dashboard layout JSON (shipped with the app). The frontend
 /// uses it to seed a brand-new user's board; users with a saved layout ignore it.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_default_dashboard(app: tauri::AppHandle) -> Option<String> {
     use tauri::Manager;
     let dir = app
@@ -4375,7 +4723,7 @@ pub fn get_default_dashboard(app: tauri::AppHandle) -> Option<String> {
 /// Save the current dashboard layout to `<app_dir>/dashboard-default.json`, so the
 /// maintainer can capture their arrangement and bundle it as the new shipped
 /// default. Returns the written file path. (Maintainer affordance.)
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn export_dashboard_default(
     layout_json: String,
     state: tauri::State<'_, AppState>,
@@ -4630,7 +4978,7 @@ pub async fn set_flash_overlay(enabled: bool, app: tauri::AppHandle) -> Result<(
 
 /// Pipeline snapshot polled by the mic buttons + the STT modal (model presence,
 /// download progress, recording flag, worker state/pause reason, the job queue).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_status(state: tauri::State<'_, AppState>) -> crate::stt::SttStatus {
     let cfg = state.config.read().unwrap().stt.clone();
     state.stt.status(&cfg)
@@ -4649,7 +4997,7 @@ pub async fn stt_download_model(state: tauri::State<'_, AppState>) -> Result<(),
 }
 
 /// Start capturing a dictée. `kind` is "trade" (with `trade_id`/`symbol`) or "diary".
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_start_recording(
     kind: String,
     trade_id: Option<String>,
@@ -4676,7 +5024,7 @@ pub fn stt_start_recording(
 }
 
 /// Stop capturing, enqueue the dictée job, and return its id.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_stop_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -4685,7 +5033,7 @@ pub fn stt_stop_recording(
 }
 
 /// Discard the in-progress recording.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_cancel_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -4695,7 +5043,7 @@ pub fn stt_cancel_recording(
 }
 
 /// Cancel a queued/running job.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_cancel_job(
     id: String,
     app: tauri::AppHandle,
@@ -4706,7 +5054,7 @@ pub fn stt_cancel_job(
 }
 
 /// Re-queue a failed job for another attempt.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_retry_job(
     id: String,
     app: tauri::AppHandle,
@@ -4717,7 +5065,7 @@ pub fn stt_retry_job(
 }
 
 /// Available input device names (for the mic-check UI).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn stt_list_input_devices() -> Vec<String> {
     crate::stt::recorder::list_input_devices()
 }

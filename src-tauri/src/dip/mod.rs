@@ -136,6 +136,12 @@ pub struct Runtime {
     pub sl_distance: Option<f64>,
     pub tp_distance: Option<f64>,
     pub tradeable: bool,
+    /// A position or a working entry order stands on the ticker — whoever opened
+    /// it. The arming SURVIVES it (Apex and Dip are armed independently and either
+    /// may fire first) but its trigger is held: the book nets one position per
+    /// ticker, so a second entry would stack onto the first instead of standing on
+    /// its own. Mirrored into `tradeable`, and cleared as soon as the ticker is flat.
+    pub held: bool,
     pub trade_id: Option<String>,
     // ── Open trade ──
     pub entry_price: Option<f64>,

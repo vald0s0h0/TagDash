@@ -57,7 +57,7 @@ fn refuse_venue_during_replay(state: &tauri::State<'_, AppState>) -> Result<(), 
     }
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_broker_selection(state: tauri::State<'_, AppState>) -> Result<BrokerSelection, String> {
     Ok(selection_of(&state))
 }
@@ -76,7 +76,7 @@ fn effective_massive_tier(state: &tauri::State<'_, AppState>) -> crate::massive:
     crate::massive::plan::effective_from_app_state(&state.db, &state.config)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_massive_tier_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<MassiveTierStatus, String> {
@@ -103,7 +103,7 @@ pub fn get_massive_tier_status(
 /// wrong). `tier` must be `"unlimited"`, `"basic"`, or `None` to go back to
 /// automatic. Re-applies the broker safety gate immediately, since forcing
 /// "unlimited" must disable Alpaca just as detecting it would.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_massive_tier_override(
     tier: Option<String>,
     state: tauri::State<'_, AppState>,
@@ -127,7 +127,7 @@ pub fn set_massive_tier_override(
 /// Switch broker / environment. Persisted immediately: the background truth-keeper
 /// picks the change up on its next pass, reconnecting the trade-updates stream to
 /// the newly selected account and clearing the mirror of the old one.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_broker_selection(
     broker_id: String,
     environment: String,
@@ -202,7 +202,7 @@ pub fn set_broker_selection(
 
 /// The venue's current view. Empty for the internal broker, whose book is served by
 /// the existing `get_internal_*` commands.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_broker_mirror(state: tauri::State<'_, AppState>) -> Result<BrokerMirror, String> {
     Ok(state.broker.snapshot())
 }
@@ -424,7 +424,7 @@ pub async fn get_shortability(
 
 /// Bulk shortability straight from the cache, for list views that would otherwise
 /// issue one request per row.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_non_shortable_symbols(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let conn = state.db.lock().unwrap();
     universe_repository::non_shortable_symbols(&conn).map_err(|e| e.to_string())
@@ -752,7 +752,7 @@ pub async fn prepare_short_locate(
 
 /// Pure refresh path: combines the paid locate basis with Alpaca's latest position
 /// quantity and average fill, so partial fills immediately tighten the band.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_short_cost_zone(
     zone_id: String,
     state: tauri::State<'_, AppState>,

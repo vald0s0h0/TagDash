@@ -66,14 +66,14 @@ fn reason_label(reason: ExitReason) -> &'static str {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_apex_options(state: State<'_>) -> ApexOptions {
     *state.apex.options.read().unwrap()
 }
 
 /// Replace Apex's options. Persisted first, then pushed into the flow book, so the
 /// next print is measured with them.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_apex_options(
     options: ApexOptions,
     app: AppHandle,
@@ -123,7 +123,7 @@ pub fn set_apex_options(
     Ok(())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_apex_status(state: State<'_>) -> ApexStatus {
     state.apex.status()
 }
@@ -181,12 +181,11 @@ pub async fn apex_toggle(
     if symbol.is_empty() {
         return Err("aucun ticker dans cette zone".into());
     }
-    if position_open(&state, &symbol) {
-        return Err(format!("position déjà ouverte sur {symbol}"));
-    }
-    if entry_order_pending(&state, &symbol) {
-        return Err(format!("ordre en attente sur {symbol}"));
-    }
+    // A position or a working order on the ticker no longer REFUSES the arming.
+    // Apex and Dip are armed independently and either may fire first, so the one
+    // that arrives second has to be allowed to stand and wait rather than be turned
+    // away. It arms HELD instead — see `ticker_held`.
+    let held = ticker_held(&state, &symbol);
     let (bid, ask) = market_prices(&state, &symbol);
     if bid <= 0.0 || ask <= 0.0 {
         return Err(format!("pas de cotation pour {symbol}"));
@@ -197,7 +196,9 @@ pub async fn apex_toggle(
             levels::ATR_PERIOD
         )
     })?;
-    let (sl_distance, tp_distance, tradeable) = bracket_distances(&opts, atr, (bid + ask) / 2.0);
+    let (sl_distance, tp_distance, distances_ok) =
+        bracket_distances(&opts, atr, (bid + ask) / 2.0);
+    let tradeable = distances_ok && !held;
 
     let arm_id = state.apex.next_id();
     // Runtime first, flow book second: a burst already under way may fire the very
@@ -213,10 +214,18 @@ pub async fn apex_toggle(
             sl_distance: Some(sl_distance),
             tp_distance,
             tradeable,
+            held,
             replay_generation: crate::replay::clock::generation(),
             replay_active: crate::replay::clock::is_active(),
             last_atr_at: Some(Utc::now()),
-            notice: Some(if tradeable {
+            notice: Some(if held {
+                state.apex.notice(
+                    "warn",
+                    format!(
+                        "Apex armé sur {symbol}, en veille : une position ou un ordre est déjà ouvert — le déclenchement reprend dès que le ticker est à plat"
+                    ),
+                )
+            } else if tradeable {
                 state.apex.notice(
                     "info",
                     format!(
@@ -319,6 +328,52 @@ pub fn start(app: AppHandle) {
     });
 }
 
+/// A chart was released (Libérer, or the gamepad's release): the ticker is gone from
+/// the screen, so an Apex armed on it has nothing left to watch — and an arming the
+/// trader can no longer see is an arming that fires by surprise.
+///
+/// Only an ARMED Apex is stood down. Firing / InTrade is deliberately left alone: an
+/// open Apex trade is managed by its bracket (and, under TP dynamique / SL suiveur,
+/// by the flow book), none of which needs the chart to be on screen.
+pub fn disarm_on_release(
+    app: &AppHandle,
+    state: &State<'_>,
+    zone_id: &str,
+    symbol: Option<&str>,
+) -> bool {
+    let (phase, arm_id, armed_symbol, armed_zone) = {
+        let rt = state.apex.runtime.read().unwrap();
+        (
+            rt.phase,
+            rt.arm_id,
+            rt.symbol.clone(),
+            rt.zone_id.clone(),
+        )
+    };
+    if phase != ApexPhase::Armed {
+        return false;
+    }
+    // Either handle identifies it: the arming remembers the zone it was fired from,
+    // and the ticker is what it actually watches (the same ticker can have moved to
+    // another zone since).
+    let mine = armed_zone.as_deref() == Some(zone_id)
+        || matches!((armed_symbol.as_deref(), symbol), (Some(a), Some(b)) if a == b);
+    if !mine {
+        return false;
+    }
+    let sym = armed_symbol.unwrap_or_default();
+    let done = disarm_if(
+        state,
+        arm_id,
+        "info",
+        format!("Apex désarmé ({sym}) : ticker libéré"),
+    );
+    if done {
+        emit(app, state);
+    }
+    done
+}
+
 /// Disarm only if `arm_id` is still the armed one. Returns whether it was.
 fn disarm_if(state: &State<'_>, arm_id: u64, level: &'static str, message: String) -> bool {
     {
@@ -345,10 +400,6 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         ))
     } else if !opts.long_enabled && !opts.short_enabled {
         Some("Apex désarmé : aucune direction active".to_string())
-    } else if position_open(state, &sym) || entry_order_pending(state, &sym) {
-        Some(format!(
-            "Apex désarmé ({sym}) : une position ou un ordre est apparu"
-        ))
     } else {
         None
     };
@@ -356,10 +407,19 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         return disarm_if(state, rt.arm_id, "warn", message);
     }
 
+    // A position or a working order on the ticker used to disarm here. It no longer
+    // does: Apex and Dip are armed independently, either may fire first, and the one
+    // that did not fire must still be standing when the ticker goes flat again.
+    // The trigger is HELD instead of dropped.
+    let held = ticker_held(state, &sym);
+
     let now = Utc::now();
-    if rt
-        .last_atr_at
-        .is_some_and(|t| (now - t).num_milliseconds() < ATR_REFRESH_MS)
+    // The ATR is worth recomputing once a second; a change in `held` has to land on
+    // the very next tick, because it is what suspends and resumes the trigger.
+    if rt.held == held
+        && rt
+            .last_atr_at
+            .is_some_and(|t| (now - t).num_milliseconds() < ATR_REFRESH_MS)
     {
         return false;
     }
@@ -370,13 +430,14 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         0.0
     };
     let atr = atr_for(state, &sym);
-    let (sl_distance, tp_distance, tradeable) = match atr {
+    let (sl_distance, tp_distance, distances_ok) = match atr {
         Some(a) => {
             let (sl, tp, ok) = bracket_distances(&opts, a, ref_px);
             (Some(sl), tp, ok)
         }
         None => (None, None, false),
     };
+    let tradeable = distances_ok && !held;
 
     let changed = {
         let mut w = state.apex.runtime.write().unwrap();
@@ -387,13 +448,21 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         let changed = w.atr != atr
             || w.sl_distance != sl_distance
             || w.tp_distance != tp_distance
-            || w.tradeable != tradeable;
+            || w.tradeable != tradeable
+            || w.held != held;
         if w.tradeable != tradeable {
             let d = sl_distance.map(fmt_px).unwrap_or_else(|| "—".into());
             w.notice = Some(if tradeable {
                 state.apex.notice(
                     "info",
                     format!("Apex {sym} : SL ±{d} $ — déclenchement actif"),
+                )
+            } else if held {
+                state.apex.notice(
+                    "warn",
+                    format!(
+                        "Apex {sym} : une position ou un ordre est ouvert — armement gardé, déclenchement en veille"
+                    ),
                 )
             } else {
                 state.apex.notice(
@@ -409,6 +478,7 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         w.sl_distance = sl_distance;
         w.tp_distance = tp_distance;
         w.tradeable = tradeable;
+        w.held = held;
         changed
     };
     state
@@ -708,10 +778,14 @@ async fn fire(state: &State<'_>, trigger: &FlowTrigger, zone_id: &str) -> Outcom
             tradeable: true,
         };
     }
-    if position_open(state, sym) || entry_order_pending(state, sym) {
-        return Outcome::Abort(format!(
-            "Apex {sym} : position ou ordre déjà ouvert — trade non pris"
-        ));
+    if ticker_held(state, sym) {
+        // Not a reason to stand Apex down: the trade that holds the ticker is very
+        // likely the other engine's, and this arming is still the trader's plan for
+        // the next time the ticker is flat.
+        return Outcome::Rearm {
+            message: format!("Apex {sym} : position ou ordre déjà ouvert — trade non pris"),
+            tradeable: false,
+        };
     }
 
     let (bid, ask) = market_prices(state, sym);
@@ -1036,6 +1110,18 @@ fn position_entry(state: &State<'_>, symbol: &str) -> Option<f64> {
             .map(|p| p.avg_entry_price)
             .filter(|p| *p > 0.0)
     }
+}
+
+/// Something already stands on the ticker: a position, or an entry order on its
+/// way to becoming one — whichever engine or button opened it.
+///
+/// Apex stays ARMED through it (Apex and Dip are armed independently and either may
+/// fire first), but its trigger is held: the book nets one position per ticker, so a
+/// second entry would stack onto the first — same tradeID, one averaged entry, one
+/// bracket — instead of standing as its own trade. The trigger comes back on its own
+/// the moment the ticker is flat again.
+fn ticker_held(state: &State<'_>, symbol: &str) -> bool {
+    position_open(state, symbol) || entry_order_pending(state, symbol)
 }
 
 /// A working entry order on `symbol` — Apex would stack on top of it.

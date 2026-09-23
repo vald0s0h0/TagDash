@@ -26,6 +26,7 @@ pub mod ntfy;
 pub mod panic_llm;
 pub mod panic_watchlist;
 pub mod perfect_pullback;
+pub mod premarket;
 pub mod quality_llm;
 pub mod replay;
 pub mod scanner;
@@ -650,6 +651,7 @@ pub fn run() {
             commands::get_ticker_bars,
             commands::load_chart_bars,
             commands::load_older_bars,
+            commands::load_premarket_daily,
             commands::get_split_markers,
             commands::get_previous_day_levels,
             commands::get_latency_status,
@@ -738,6 +740,7 @@ pub fn run() {
             commands::update_zone_sl,
             commands::update_zone_tp,
             commands::clear_zone_context,
+            commands::get_trade_link,
             // Internal trading engine
             commands::create_internal_order_percent,
             commands::create_internal_limit_order_percent,

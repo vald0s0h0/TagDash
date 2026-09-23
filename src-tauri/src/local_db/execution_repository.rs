@@ -106,6 +106,44 @@ pub fn original_tps_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<(S
     rows.collect()
 }
 
+/// Did this trade ever execute?
+///
+/// One row in `executions` is the only proof a tradeID stands for something real:
+/// a fill is what makes the trade exist at the broker, and therefore what makes it
+/// exist in TradeTally. An id with no row is a PLAN — a line drawn on the chart —
+/// and nothing may be filed against it upstream.
+///
+/// Read from the table rather than from the in-RAM book on purpose: the book prunes
+/// closed trades from its persisted snapshot, so after a restart a perfectly real
+/// trade from this morning is unknown to it while its executions are still here.
+pub fn trade_has_executions(conn: &Connection, trade_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM executions WHERE trade_id = ?1 LIMIT 1",
+            params![trade_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The most recently executed trade on `symbol`, open or long closed.
+///
+/// What "the last trade on this chart" means once the ticker's context no longer
+/// names a real one — the note and the screenshot land here rather than on a trade
+/// that never happened.
+pub fn last_executed_trade_for_symbol(conn: &Connection, symbol: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT trade_id FROM executions WHERE symbol = ?1
+         GROUP BY trade_id
+         ORDER BY MAX(filled_at) DESC, MAX(rowid) DESC
+         LIMIT 1",
+        params![symbol],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// All executions for a symbol, oldest → newest.
 pub fn get_for_symbol(conn: &Connection, symbol: &str) -> Result<Vec<ExecutionRow>> {
     let mut stmt = conn.prepare(

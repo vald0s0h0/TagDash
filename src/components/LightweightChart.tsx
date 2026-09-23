@@ -1,7 +1,6 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from "react";
 import {
   createChart,
-  CrosshairMode,
   TickMarkType,
   type IChartApi,
   type ISeriesApi,
@@ -12,7 +11,7 @@ import {
 } from "lightweight-charts";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
-import type { PaneIndicator, Timeframe } from "@/types";
+import type { PaneIndicator, PremarketMode, Timeframe } from "@/types";
 import type {
   DrawMode, ChartLine, ChartAnnotation, ChartAlarm, CtxTarget, DrawScope,
 } from "@/stores/chartStore";
@@ -24,12 +23,15 @@ import { GridPrimitive } from "@/charts/gridPrimitive";
 import { ShortCostPrimitive, type ShortCostBand } from "@/charts/shortCostPrimitive";
 import { DipZonePrimitive, type DipZone } from "@/charts/dipZonePrimitive";
 import { NewsPrimitive } from "@/charts/newsPrimitive";
+import { SessionBandsPrimitive } from "@/charts/sessionBandsPrimitive";
+import { PremarketPrimitive } from "@/charts/premarketPrimitive";
+import { PremarketChip } from "@/components/PremarketChip";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
 import { useChartTheme, getChartTheme } from "@/stores/chartThemeStore";
 import { useChartInput } from "@/stores/chartInputStore";
 import {
-  BACKFILL_THRESHOLD,
-  slOpts, tpOpts, alarmOpts, CURSOR_OPTIONS,
+  BACKFILL_THRESHOLD, toUTC,
+  slOpts, tpOpts, alarmOpts, CURSOR_OPTIONS, crosshairOptions,
   spreadLabel, SPREAD_TAG_COLOR,
 } from "@/charts/chartOptions";
 import { registerChartControl, setHoveredPane, releaseHoveredPane } from "@/lib/gamepadBus";
@@ -49,6 +51,7 @@ import { useDeleteButtons } from "@/charts/useDeleteButtons";
 import { useBarSeries } from "@/charts/useBarSeries";
 import { useLiveTicks } from "@/charts/useLiveTicks";
 import { useChartBars } from "@/charts/useChartBars";
+import { usePremarketBars } from "@/charts/usePremarketBars";
 import { useBarTooltip } from "@/charts/useBarTooltip";
 import { useLimitLines, type LimitLineEntry } from "@/charts/useLimitLines";
 
@@ -63,6 +66,10 @@ function pointSegDist(px: number, py: number, ax: number, ay: number, bx: number
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
+
+// Quantisation of the premarket window's left edge: the visible-range handler is
+// per-frame, so only a move of at least this much republishes it.
+const PM_RANGE_QUANTUM_SEC = 5 * 86_400;
 
 const HANDLE_HIT = 8;   // px radius to grab an endpoint handle
 const SEG_HIT    = 6;   // px distance to grab a segment body
@@ -137,6 +144,14 @@ interface Props {
   linePoint1:  { time: number; price: number } | null;
   /** Strategy-card indicators overlaid on this pane (VWAP / EMA / SMA). */
   indicators?: PaneIndicator[];
+  /** DAILY panes only: how the 04:00–09:30 premarket session is shown. Ignored on
+   *  every intraday pane (their own bars already carry extended hours, and the
+   *  session bands already mark them). */
+  premarketMode?: PremarketMode;
+  /** Cycle that mode. When given (daily panes), the chart renders the PM toggle
+   *  itself — it is the only thing that knows how wide the price scale is, and the
+   *  chip must sit clear of it. */
+  onCyclePremarket?: () => void;
   /** Candle markers (e.g. red dots on split days, HOD/LOD points, series crosses),
    *  unix-seconds keyed. `position`/`shape` default to belowBar/circle. */
   markers?: {
@@ -207,6 +222,8 @@ export function LightweightChart({
   alarms,
   linePoint1,
   indicators = [],
+  premarketMode = "off",
+  onCyclePremarket,
   markers = [],
   crosshairSync,
   paneId,
@@ -258,7 +275,8 @@ export function LightweightChart({
   // Strategy-card indicator series (VWAP / EMA / SMA = Line), keyed by id.
   const indicatorSeriesMap = useRef<Map<string, ISeriesApi<"Line"> | ISeriesApi<"Histogram">>>(new Map());
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const sessionBgRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const sessionPrimRef  = useRef<SessionBandsPrimitive | null>(null);
+  const premarketPrimRef = useRef<PremarketPrimitive | null>(null);
   const execPrimRef     = useRef<ExecutionsPrimitive | null>(null);
   const bollingerPrimRef = useRef<BollingerPrimitive | null>(null);
   const gridPrimRef      = useRef<GridPrimitive | null>(null);
@@ -548,11 +566,9 @@ export function LightweightChart({
         vertLines: { visible: false },
         horzLines: { visible: false },
       },
-      crosshair: {
-        mode:     CrosshairMode.Normal,
-        vertLine: { color: "#333", labelBackgroundColor: "#1a1a1a" },
-        horzLine: { color: "#333", labelBackgroundColor: "#1a1a1a" },
-      },
+      // Colour + "horizontal line only" come from the theme (Settings → Apparence);
+      // a dedicated effect re-applies them on every edit (this setup runs once).
+      crosshair: crosshairOptions(getChartTheme()),
       timeScale: {
         borderColor:      "#1e1e1e",
         timeVisible:      true,
@@ -579,15 +595,6 @@ export function LightweightChart({
       handleScale: { ...DEFAULT_SCALE },
     });
 
-    const sessionBg = chart.addHistogramSeries({
-      priceScaleId:     "session-bg",
-      base:             0,
-      priceLineVisible: false,
-      lastValueVisible: false,
-    });
-    sessionBg.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 } });
-    sessionBgRef.current = sessionBg;
-
     // Seed candle colours from the live theme; a dedicated effect re-applies them
     // when the user edits the palette (this setup effect runs once).
     const { up, down } = getChartTheme().candle;
@@ -604,7 +611,20 @@ export function LightweightChart({
     chartRef.current  = chart;
     candleRef.current = candle;
 
-    // Horizontal grid (round/half-dollar levels). Attached first so it sits
+    // Pre/post-market zones + day separator. Attached first: it is the backdrop
+    // everything else — grid included — is drawn over.
+    const sessionPrim = new SessionBandsPrimitive();
+    candle.attachPrimitive(sessionPrim);
+    sessionPrimRef.current = sessionPrim;
+
+    // Premarket ghost (daily panes). Its fill is a backdrop like the session
+    // bands; its high/low caps are a top-z view, so they stay readable over the
+    // candle body — see the primitive's own header.
+    const premarketPrim = new PremarketPrimitive();
+    candle.attachPrimitive(premarketPrim);
+    premarketPrimRef.current = premarketPrim;
+
+    // Horizontal grid (round/half-dollar levels). Attached next so it sits
     // behind the other bottom-z primitives (Bollinger fill) and the candles.
     const gridPrim = new GridPrimitive();
     candle.attachPrimitive(gridPrim);
@@ -808,13 +828,14 @@ export function LightweightChart({
       cursorPriceRef.current = null;
       indicatorSeriesMap.current.clear();
       volumeSeriesRef.current = null;
-      sessionBgRef.current = null;
+      sessionPrimRef.current = null;
       execPrimRef.current = null;
       bollingerPrimRef.current = null;
       shortCostPrimRef.current = null;
       dipZonePrimRef.current = null;
       hoverPriceRef.current = null;
       gridPrimRef.current = null;
+      premarketPrimRef.current = null;
       newsPrimRef.current = null;
       drawingsPrimRef.current = null;
       alarmLineMap.current.clear();
@@ -825,8 +846,118 @@ export function LightweightChart({
   // ── Register this pane in the crosshair sync group (extracted hook) ─────────
   useCrosshairRegister(chartRef, candleRef, crosshairSync, paneId, symbol);
 
+  // ── Premarket ghost series (daily panes only) ──────────────────────────────
+  // The window follows the loaded daily history, so scrolling back extends both
+  // together. `enabled` false on every intraday pane and whenever the mode is off,
+  // so a pane that isn't showing the ghost costs nothing.
+  const pmEnabled = timeframe === "daily" && premarketMode !== "off";
+
+  // Leftmost visible bar time — what sizes the premarket window. NOT `bars[0]`:
+  // a daily pane loads 600 bars (~2.5 years) while showing ~100, so asking for the
+  // loaded span fired a dozen provider chunks before the first ghost could appear.
+  const [visibleFromSec, setVisibleFromSec] = useState<number | null>(null);
+  const pmPublishedFromRef = useRef<number | null>(null);
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !pmEnabled) return;
+    const ts = chart.timeScale();
+    pmPublishedFromRef.current = null;
+    const publish = (from: number) => {
+      const prev = pmPublishedFromRef.current;
+      // This handler fires on EVERY frame of a pan, and a React re-render of this
+      // component per frame is not affordable. Publish only a meaningfully earlier
+      // left edge: panning right or zooming in never re-renders, and a long
+      // scroll-back costs a handful of updates instead of hundreds.
+      if (prev != null && from > prev - PM_RANGE_QUANTUM_SEC) return;
+      pmPublishedFromRef.current = from;
+      setVisibleFromSec(from);
+    };
+    const onRange = (r: { from: Time; to: Time } | null) => {
+      if (r?.from != null) publish(Number(r.from));
+    };
+    // The subscription only fires on CHANGE, so seed from the range as it stands —
+    // otherwise switching the ghost on without touching the chart never sizes it.
+    // Null while the series is still empty; the first `setData` then fires onRange.
+    const cur = ts.getVisibleRange();
+    if (cur?.from != null) publish(Number(cur.from));
+    ts.subscribeVisibleTimeRangeChange(onRange);
+    return () => ts.unsubscribeVisibleTimeRangeChange(onRange);
+  }, [pmEnabled, symbol]);
+
+  const premarketBars = usePremarketBars(symbol, pmEnabled, visibleFromSec);
+
+  // Width of the right price scale, so the PM chip can sit just LEFT of it instead
+  // of on top of it. It is not a constant: lightweight-charts sizes the scale from
+  // the widest price label, so a $0.0819 ticker and a $340 one get different axes.
+  const [rightScaleW, setRightScaleW] = useState(0);
+  const readScaleWidth = useCallback(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    try { setRightScaleW(Math.round(chart.priceScale("right").width())); } catch { /* not laid out yet */ }
+  }, []);
+  // Daily panes only: premarket is a session INSIDE a daily bar, so the toggle is
+  // meaningless on an intraday pane (whose bars already carry extended hours, and
+  // whose session bands already mark them).
+  // Depend on a stable boolean, never on the callback itself: ChartZone passes an
+  // inline arrow and re-renders on its 300 ms polls, which would tear down and
+  // rebuild this observer several times a second.
+  const showPmChip = !!onCyclePremarket && timeframe === "daily";
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !showPmChip) return;
+    readScaleWidth();
+    const ro = new ResizeObserver(readScaleWidth);
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, [showPmChip, readScaleWidth]);
+  // Label widths also change when the PRICE does (9.99 → 10.00), which no resize
+  // event reports. Re-reading on each data render covers it for free: when the bars
+  // stop moving, so does the axis. `setState` with an unchanged number is a no-op.
+  useEffect(readScaleWidth, [bars, readScaleWidth]);
+
+  // "only" mode: the premarket series feeds the candle series — not to be drawn as
+  // candles (they are made transparent below) but so the price scale autoscales to
+  // the premarket range and the crosshair reads premarket values. The premarket
+  // bars themselves are drawn by the primitive, identically in both modes.
+  // Everything else (indicators, SL/TP R-ratios, the click-to-price bar reference)
+  // keeps reading `bars`: a Bollinger band or an R multiple computed off premarket
+  // candles would be a different statistic wearing the same name.
+  const showingPremarket = premarketMode === "only" && !!premarketBars?.length;
+  const displayBars = showingPremarket ? premarketBars : bars;
+
+  // A mode flip swaps the series under the SAME timestamps, which `useBarSeries`
+  // would read as a pure tail change and render with a single `update()` — leaving
+  // every earlier candle showing the old session. Clearing the render bookkeeping
+  // here (during render, before that hook's effect) forces a full `setData`.
+  const prevShowingPmRef = useRef(showingPremarket);
+  if (prevShowingPmRef.current !== showingPremarket) {
+    prevShowingPmRef.current = showingPremarket;
+    renderedFirstRef.current = null;
+    renderedLastRef.current  = null;
+  }
+
   // ── Feed bar data (official lightweight-charts protocol) — extracted hook ──
-  useBarSeries(candleRef, bars, renderedFirstRef, renderedLastRef, lastBarRef);
+  useBarSeries(candleRef, displayBars, renderedFirstRef, renderedLastRef, lastBarRef);
+
+  // ── Paint the premarket bars (behind the candles, both modes) ──────────────
+  // Depend on the premarket ARRAY, not on `bars`: it only changes when its (5 s,
+  // premarket-only) query returns, whereas `bars` gets a new identity on every RAM
+  // poll — which would re-map and re-draw every bar once a second for nothing.
+  const ghost = premarketMode === "off" ? undefined : premarketBars;
+  useEffect(() => {
+    const prim = premarketPrimRef.current;
+    if (!prim) return;
+    prim.setData(
+      (ghost ?? []).map((b) => ({
+        time:  toUTC(b.time) as number,
+        open:  b.open,
+        high:  b.high,
+        low:   b.low,
+        close: b.close,
+      })),
+    );
+  }, [ghost]);
+
 
   // ── Live ticks (focus symbols) — update the forming candle (extracted hook) ─
   useLiveTicks(candleRef, lastBarRef, symbol, timeframe);
@@ -835,16 +966,16 @@ export function LightweightChart({
   useIndicators(chartRef, indicatorSeriesMap, bollingerPrimRef, bars, indicators, theme);
 
   // ── Volume histogram — always on, every pane (extracted hook) ──────────────
-  useVolumeSeries(chartRef, volumeSeriesRef, bars, theme);
+  useVolumeSeries(chartRef, volumeSeriesRef, displayBars, theme);
 
   // ── Press-and-hold tooltip (bar volume + body % above the bar) — extracted hook ─
   useBarTooltip(chartRef, candleRef, volumeSeriesRef, containerRef);
 
   // ── Pre/post-market background shading (extracted hook) ────────────────────
-  useSessionShading(sessionBgRef, bars, timeframe, theme);
+  useSessionShading(sessionPrimRef, bars, timeframe);
 
   // ── Candle markers (e.g. red dots on split days) — extracted hook ──────────
-  useCandleMarkers(candleRef, allMarkers, bars);
+  useCandleMarkers(candleRef, allMarkers, displayBars);
 
   // ── User SL / TP lines (+ R-ratio title, planned↔order styling) — extracted hook ─
   useSlTpLines(candleRef, slLineRef, tpLineRef, tpPriceRef, slPrice, tpPrice, ordersActive, bars);
@@ -927,11 +1058,18 @@ export function LightweightChart({
 
   // ── Live theme apply ───────────────────────────────────────────────────────
   // Re-style the once-created candle series + reconciled price lines, and poke the
-  // theme-reading primitives (grid / executions) to redraw, whenever the palette
-  // is edited. The data hooks above (volume / session / indicators / Bollinger /
-  // split markers) re-run on `theme` themselves, so they're not handled here.
+  // theme-reading primitives (grid / executions / session bands) to redraw, and
+  // re-apply the crosshair options, whenever the palette is edited. The data hooks
+  // above (volume / indicators / Bollinger / split markers) re-run on `theme`
+  // themselves, so they're not handled here.
   useEffect(() => {
-    const { up, down } = theme.candle;
+    // Premarket-only mode: the series still carries the premarket bars (for the
+    // autoscale and the crosshair) but draws nothing — the primitive owns that
+    // look, so the two must not be painted on top of each other.
+    const CLEAR = "rgba(0,0,0,0)";
+    const { up, down } = showingPremarket
+      ? { up: CLEAR, down: CLEAR }
+      : theme.candle;
     candleRef.current?.applyOptions({
       upColor: up, downColor: down,
       borderUpColor: up, borderDownColor: down,
@@ -940,10 +1078,13 @@ export function LightweightChart({
     slLineRef.current?.applyOptions({ color: slOpts(ordersActiveRef.current).color });
     tpLineRef.current?.applyOptions({ color: tpOpts(ordersActiveRef.current).color });
     for (const line of alarmLineMap.current.values()) line.applyOptions({ color: theme.levels.alarm });
+    chartRef.current?.applyOptions({ crosshair: crosshairOptions(theme) });
     gridPrimRef.current?.redraw();
     execPrimRef.current?.redraw();
     newsPrimRef.current?.redraw();
-  }, [theme]);
+    sessionPrimRef.current?.redraw();
+    premarketPrimRef.current?.redraw();
+  }, [theme, showingPremarket]);
 
   // ── Freeze / restore the chart's pan+zoom around an in-chart drag ──────────
   const freezePan = useCallback((freeze: boolean) => {
@@ -1140,6 +1281,12 @@ export function LightweightChart({
         onMouseDown={onMouseDown}
         onContextMenu={onContextMenuHandler}
       />
+
+      {showPmChip && onCyclePremarket && (
+        <div className="absolute z-20" style={{ top: 4, right: rightScaleW + 4 }}>
+          <PremarketChip mode={premarketMode} onCycle={onCyclePremarket} />
+        </div>
+      )}
 
       {linePoint1 && (
         <div className="pointer-events-none absolute left-2 top-2 rounded bg-amber-900/70 px-1.5 py-0.5 text-[10px] text-amber-300">

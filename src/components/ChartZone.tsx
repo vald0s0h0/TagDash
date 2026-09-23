@@ -136,7 +136,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // keeps the modal (and any in-progress notes) on the original trade instead
   // of reloading the newly-arrived ticker's entry.
   const [journalTarget, setJournalTarget] =
-    useState<{ tradeId: string; symbol: string } | null>(null);
+    useState<{ tradeId: string; symbol: string; pending?: boolean } | null>(null);
 
   // Inline voice-dictation toggle, registered by the toolbar MicDictate button so
   // the Xbox `journal_audio` button can start/stop the same recording.
@@ -152,20 +152,46 @@ export function ChartZone({ zone }: ChartZoneProps) {
 
   const chartStore   = useChartStore();
   const zoneState    = useChartStore((s) => s.getZone(zone.zone_id));
-  const { timeframe, drawMode, orderMode, lines, annotations, alarms, linePoint1, pendingEmoji, pendingLimitPercent, context } = zoneState;
+  const { timeframe, drawMode, orderMode, lines, annotations, alarms, linePoint1, pendingEmoji, pendingLimitPercent, premarketMode, context } = zoneState;
 
   // Right-click context menu (one per zone).
   const [ctxMenu, setCtxMenu] = useState<{ target: CtxTarget; x: number; y: number } | null>(null);
 
   const hasSl      = context?.stop_loss  != null;
   const hasTp      = context?.take_profit != null;
-  const hasTradeId = !!context?.trade_id;
+
+  // ── Which trade a note / screenshot belongs to ─────────────────────────────
+  // NOT `context.trade_id`. The context mints an id the moment an SL or a TP is
+  // drawn, so it can perfectly well be naming a trade that was never taken — and a
+  // note filed against one of those reaches no TradeTally trade at all (that is the
+  // "connexion perdue" case: close a trade, drop an SL, take it straight back off).
+  // The backend resolves it instead, preferring the open position, then the ticker's
+  // context when it still stands for something, then the last trade that actually
+  // executed on the ticker. Re-queried whenever the context's id changes, and polled
+  // so a fill or a close is picked up within the second.
+  const { data: tradeLink } = useQuery({
+    queryKey: ["trade_link", zone.zone_id, zone.symbol, context?.trade_id ?? null],
+    queryFn:  () => api.getTradeLink(zone.zone_id, zone.symbol!),
+    enabled:  !!zone.symbol,
+    refetchInterval: 1000,
+  });
+  const linkedTradeId = tradeLink?.trade_id ?? null;
+  const hasTradeId    = !!linkedTradeId;
+  // Read by the gamepad handlers, which are registered once and must not close over
+  // a stale id.
+  const linkedTradeIdRef = useRef<string | null>(null);
+  linkedTradeIdRef.current = linkedTradeId;
 
   // Snapshot the current trade and open the journal pinned to it.
   const openJournal = useCallback(() => {
-    const tradeId = context?.trade_id;
-    if (tradeId && zone.symbol) setJournalTarget({ tradeId, symbol: zone.symbol });
-  }, [context?.trade_id, zone.symbol]);
+    if (linkedTradeId && zone.symbol) {
+      setJournalTarget({
+        tradeId: linkedTradeId,
+        symbol: zone.symbol,
+        pending: !tradeLink?.has_activity,
+      });
+    }
+  }, [linkedTradeId, tradeLink?.has_activity, zone.symbol]);
 
   // Toggle the inline voice dictation for the current trade (gamepad path mirrors
   // the toolbar mic button).
@@ -1257,14 +1283,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
       const dataUrl = canvas.toDataURL("image/png");
 
       const ts  = nyFilenameStamp(); // New York time
-      const filename = hasTradeId
-        ? `${context!.trade_id}_${ts}.png`
-        : `capture_${ts}.png`;
+      const tradeId = linkedTradeIdRef.current;
+      const filename = tradeId ? `${tradeId}_${ts}.png` : `capture_${ts}.png`;
 
-      if (hasTradeId) {
+      if (tradeId) {
         await api.saveScreenshotLocal(
           zone.zone_id,
-          context!.trade_id ?? null,
+          tradeId,
           dataUrl,
           filename,
         );
@@ -1284,7 +1309,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       setCaptureStatus("error");
       setTimeout(() => setCaptureStatus("idle"), 3000);
     }
-  }, [zone.zone_id, hasTradeId, context]);
+  }, [zone.zone_id]);
 
   // ── Controller (gamepad) zone handlers ─────────────────────────────────────
   // R1 cycles the focused pane; the cursor-layer buttons (A/B/Y, R2 up) drop
@@ -1373,6 +1398,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
       case "dip_place":   handleDipPlace(); break;
       case "dip_thinner": handleDipResize(-1); break;
       case "dip_thicker": handleDipResize(1); break;
+      case "premarket_cycle": chartStore.cyclePremarketMode(zone.zone_id); break;
       case "run_llm":
         if (card?.llm && zone.symbol && zone.strategy_id) {
           api.runAlertLlm(zone.symbol, zone.strategy_id).catch(() => {});
@@ -1411,8 +1437,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
       capture: () => { if (captureStatus === "idle") handleCapture(); },
       journalAudio: toggleAudioNote,
       release: handleRelease,
-      hasTradeId: () => !!useChartStore.getState().getZone(zone.zone_id).context?.trade_id,
-      tradeId:    () => useChartStore.getState().getZone(zone.zone_id).context?.trade_id ?? null,
+      hasTradeId: () => !!linkedTradeIdRef.current,
+      tradeId:    () => linkedTradeIdRef.current,
       symbol:     () => zone.symbol,
     });
   }, [zone.zone_id, zone.symbol, cycleFocus, cursorPlace, removeOrders,
@@ -1623,7 +1649,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
         captureStatus === "pending" ? "Capture en cours…"
         : captureStatus === "success" ? "Capturé !"
         : captureStatus === "error" ? "Erreur capture"
-        : hasTradeId ? "Capturer (lié au trade)"
+        : hasTradeId ? `Capturer (lié au trade ${linkedTradeId})`
         : "Capturer (enregistrer sous)"
       }
       onClick={captureStatus === "idle" ? handleCapture : undefined}
@@ -1646,7 +1672,12 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const tbJournal = (
     <TBtn
       key="journal"
-      title={hasTradeId ? "Journal" : "TradeID requis (placer SL ou TP d'abord)"}
+      title={
+        !hasTradeId ? "Aucun trade sur ce ticker (placer un SL ou un TP, ou entrer une position)"
+        : tradeLink?.open ? `Journal — trade en cours (${linkedTradeId})`
+        : tradeLink?.source === "planned" ? `Journal — trade préparé (${linkedTradeId})`
+        : `Journal — dernier trade (${linkedTradeId})`
+      }
       disabled={!hasTradeId}
       onClick={openJournal}
     >
@@ -1659,10 +1690,14 @@ export function ChartZone({ zone }: ChartZoneProps) {
       key="audio-note"
       variant="toolbar"
       mode="trade"
-      tradeId={context?.trade_id}
+      tradeId={linkedTradeId ?? undefined}
       symbol={zone.symbol}
       disabled={!hasTradeId}
-      title={hasTradeId ? "Dicter une note (micro)" : "TradeID requis (placer SL ou TP d'abord)"}
+      title={
+        hasTradeId
+          ? `Dicter une note (micro) — ${linkedTradeId}`
+          : "Aucun trade sur ce ticker (placer un SL ou un TP, ou entrer une position)"
+      }
       onRegisterToggle={(t) => { audioToggleRef.current = t; }}
     />
   );
@@ -1914,7 +1949,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
                   )}
                   style={{ flexGrow: rowGrow(ci, ri), flexBasis: 0 }}
                 >
-                  {!isInteractive && (
+                  {/* Not on a daily pane: the PM toggle owns that corner there, and
+                      "TICKER · daily" is the one label the chart itself already
+                      makes obvious. */}
+                  {!isInteractive && !isDaily && (
                     <span className={cn(
                       "pointer-events-none absolute top-1 z-10 rounded bg-black/40 px-1 text-[8px] tabular-nums text-muted-foreground/70",
                       // Avoid the strategy overlay (top-left): label goes right when
@@ -2009,6 +2047,8 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     alarms={alarms}
                     linePoint1={linePoint1}
                     indicators={pane.indicators}
+                    premarketMode={isDaily ? premarketMode : "off"}
+                    onCyclePremarket={isDaily ? () => chartStore.cyclePremarketMode(zone.zone_id) : undefined}
                     markers={hodMarkers ?? splitMarkers}
                     crosshairSync={crosshairSyncRef.current}
                     paneId={`${zone.zone_id}-${i}`}
@@ -2044,6 +2084,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
           onClose={() => setJournalTarget(null)}
           tradeId={journalTarget.tradeId}
           symbol={journalTarget.symbol}
+          pending={journalTarget.pending}
         />
       )}
 

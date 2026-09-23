@@ -68,14 +68,14 @@ fn role_label(side: Side) -> &'static str {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_dip_options(state: State<'_>) -> DipOptions {
     *state.dip.options.read().unwrap()
 }
 
 /// Replace Dip's options. Persisted first, then pushed into the watch book, so the
 /// next print is measured with them.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn set_dip_options(
     options: DipOptions,
     app: AppHandle,
@@ -117,7 +117,7 @@ pub fn set_dip_options(
     Ok(())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(rename_all = "snake_case", async)]
 pub fn get_dip_status(state: State<'_>) -> DipStatus {
     state.dip.status()
 }
@@ -193,12 +193,11 @@ pub async fn dip_place(
     if !price.is_finite() || price <= 0.0 {
         return Err("aucun prix sous le curseur".into());
     }
-    if position_open(&state, &symbol) {
-        return Err(format!("position déjà ouverte sur {symbol}"));
-    }
-    if entry_order_pending(&state, &symbol) {
-        return Err(format!("ordre en attente sur {symbol}"));
-    }
+    // A position or a working order on the ticker no longer REFUSES the band. Dip
+    // and Apex are armed independently and either may fire first, so the one that
+    // arrives second has to be allowed to stand and wait rather than be turned away.
+    // The band goes down HELD instead — see `ticker_held`.
+    let held = ticker_held(&state, &symbol);
     let (bid, ask) = market_prices(&state, &symbol);
     if bid <= 0.0 || ask <= 0.0 {
         return Err(format!("pas de cotation pour {symbol}"));
@@ -230,7 +229,8 @@ pub async fn dip_place(
             levels::ATR_PERIOD
         )
     })?;
-    let (sl_distance, tp_distance, tradeable) = bracket_distances(&opts, atr, mid);
+    let (sl_distance, tp_distance, distances_ok) = bracket_distances(&opts, atr, mid);
+    let tradeable = distances_ok && !held;
 
     let arm_id = state.dip.next_id();
     // Runtime first, watch book second: an attack already under way may turn on the
@@ -251,10 +251,18 @@ pub async fn dip_place(
             sl_distance: Some(sl_distance),
             tp_distance: Some(tp_distance),
             tradeable,
+            held,
             replay_generation: crate::replay::clock::generation(),
             replay_active: crate::replay::clock::is_active(),
             last_atr_at: Some(Utc::now()),
-            notice: Some(if tradeable {
+            notice: Some(if held {
+                state.dip.notice(
+                    "warn",
+                    format!(
+                        "Dip {symbol} : zone posée en veille — une position ou un ordre est déjà ouvert ; le déclenchement reprend dès que le ticker est à plat"
+                    ),
+                )
+            } else if tradeable {
                 state.dip.notice(
                     "info",
                     format!(
@@ -420,6 +428,52 @@ pub fn start(app: AppHandle) {
     });
 }
 
+/// A chart was released (Libérer, or the gamepad's release): the ticker is gone from
+/// the screen, so the band drawn on it has nothing left to watch — and a band the
+/// trader can no longer see is a trade that fires by surprise.
+///
+/// Only an ARMED band is taken away. Firing / InTrade is deliberately left alone: an
+/// open Dip trade rests on its own bracket at the broker and does not need the chart
+/// to be on screen.
+pub fn disarm_on_release(
+    app: &AppHandle,
+    state: &State<'_>,
+    zone_id: &str,
+    symbol: Option<&str>,
+) -> bool {
+    let (phase, arm_id, armed_symbol, armed_zone) = {
+        let rt = state.dip.runtime.read().unwrap();
+        (
+            rt.phase,
+            rt.arm_id,
+            rt.symbol.clone(),
+            rt.zone_id.clone(),
+        )
+    };
+    if phase != DipPhase::Armed {
+        return false;
+    }
+    // Either handle identifies it: the band remembers the zone it was laid from, and
+    // the ticker is what it actually watches (the same ticker can have moved to
+    // another zone since).
+    let mine = armed_zone.as_deref() == Some(zone_id)
+        || matches!((armed_symbol.as_deref(), symbol), (Some(a), Some(b)) if a == b);
+    if !mine {
+        return false;
+    }
+    let sym = armed_symbol.unwrap_or_default();
+    let done = disarm_if(
+        state,
+        arm_id,
+        "info",
+        format!("Zone Dip retirée ({sym}) : ticker libéré"),
+    );
+    if done {
+        emit(app, state);
+    }
+    done
+}
+
 /// Disarm only if `arm_id` is still the armed one. Returns whether it was.
 fn disarm_if(state: &State<'_>, arm_id: u64, level: &'static str, message: String) -> bool {
     {
@@ -452,16 +506,18 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         Some(format!(
             "Zone Dip retirée ({sym}) : sa direction a été désactivée"
         ))
-    } else if position_open(state, &sym) || entry_order_pending(state, &sym) {
-        Some(format!(
-            "Zone Dip retirée ({sym}) : une position ou un ordre est apparu"
-        ))
     } else {
         None
     };
     if let Some(message) = reason {
         return disarm_if(state, rt.arm_id, "warn", message);
     }
+
+    // A position or a working order on the ticker used to pull the band off the
+    // chart here. It no longer does: Dip and Apex are armed independently, either
+    // may fire first, and the one that did not fire must still be there when the
+    // ticker goes flat again. The trigger is HELD instead of dropped.
+    let held = ticker_held(state, &sym);
 
     // The attack readout changes on the hot path, far too often to emit from there.
     let live = state
@@ -483,9 +539,12 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
     };
 
     let now = Utc::now();
-    if rt
-        .last_atr_at
-        .is_some_and(|t| (now - t).num_milliseconds() < ATR_REFRESH_MS)
+    // The ATR is worth recomputing once a second; a change in `held` has to land on
+    // the very next tick, because it is what suspends and resumes the trigger.
+    if rt.held == held
+        && rt
+            .last_atr_at
+            .is_some_and(|t| (now - t).num_milliseconds() < ATR_REFRESH_MS)
     {
         return attack_changed;
     }
@@ -496,13 +555,14 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         0.0
     };
     let atr = atr_for(state, &sym);
-    let (sl_distance, tp_distance, tradeable) = match atr {
+    let (sl_distance, tp_distance, distances_ok) = match atr {
         Some(a) => {
             let (sl, tp, ok) = bracket_distances(&opts, a, ref_px);
             (Some(sl), Some(tp), ok)
         }
         None => (None, None, false),
     };
+    let tradeable = distances_ok && !held;
 
     let changed = {
         let mut w = state.dip.runtime.write().unwrap();
@@ -513,13 +573,21 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         let changed = w.atr != atr
             || w.sl_distance != sl_distance
             || w.tp_distance != tp_distance
-            || w.tradeable != tradeable;
+            || w.tradeable != tradeable
+            || w.held != held;
         if w.tradeable != tradeable {
             let d = sl_distance.map(fmt_px).unwrap_or_else(|| "—".into());
             w.notice = Some(if tradeable {
                 state
                     .dip
                     .notice("info", format!("Dip {sym} : SL {d} $ — zone active"))
+            } else if held {
+                state.dip.notice(
+                    "warn",
+                    format!(
+                        "Dip {sym} : une position ou un ordre est ouvert — zone gardée, déclenchement en veille"
+                    ),
+                )
             } else {
                 state.dip.notice(
                     "warn",
@@ -534,6 +602,7 @@ fn armed_tick(state: &State<'_>, rt: &Runtime) -> bool {
         w.sl_distance = sl_distance;
         w.tp_distance = tp_distance;
         w.tradeable = tradeable;
+        w.held = held;
         changed
     };
     {
@@ -757,10 +826,14 @@ async fn fire(state: &State<'_>, trigger: &DipTrigger, zone_id: &str) -> Outcome
             side_label(side)
         ));
     }
-    if position_open(state, sym) || entry_order_pending(state, sym) {
-        return Outcome::Abort(format!(
-            "Dip {sym} : position ou ordre déjà ouvert — trade non pris"
-        ));
+    if ticker_held(state, sym) {
+        // Not a reason to take the band off the chart: the trade that holds the
+        // ticker is very likely the other engine's, and this band is still the level
+        // the trader chose for the next time the ticker is flat.
+        return Outcome::Rearm {
+            message: format!("Dip {sym} : position ou ordre déjà ouvert — trade non pris"),
+            tradeable: false,
+        };
     }
 
     let (bid, ask) = market_prices(state, sym);
@@ -929,6 +1002,18 @@ fn position_entry(state: &State<'_>, symbol: &str) -> Option<f64> {
             .map(|p| p.avg_entry_price)
             .filter(|p| *p > 0.0)
     }
+}
+
+/// Something already stands on the ticker: a position, or an entry order on its
+/// way to becoming one — whichever engine or button opened it.
+///
+/// The band stays ON the chart through it (Dip and Apex are armed independently and
+/// either may fire first), but its trigger is held: the book nets one position per
+/// ticker, so a second entry would stack onto the first — same tradeID, one averaged
+/// entry, one bracket — instead of standing as its own trade. The trigger comes back
+/// on its own the moment the ticker is flat again.
+fn ticker_held(state: &State<'_>, symbol: &str) -> bool {
+    position_open(state, symbol) || entry_order_pending(state, symbol)
 }
 
 /// A working entry order on `symbol` — Dip would stack on top of it.

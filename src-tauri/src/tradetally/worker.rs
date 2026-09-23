@@ -50,6 +50,11 @@ async fn drain_once(
         return;
     }
 
+    // The /images route rejects the API token, so screenshots need the session
+    // login. Known here, before the credentials move into the client.
+    let has_session_creds = tt_email.as_deref().is_some_and(|e| !e.is_empty())
+        && tt_password.as_deref().is_some_and(|p| !p.is_empty());
+
     let client = TtClient::new(base_url, token).with_session_creds(tt_email, tt_password);
 
     // Snapshot pending events (holds lock only briefly)
@@ -167,11 +172,74 @@ async fn drain_once(
                     );
                 }
                 let _ = tradetally_queue_repository::mark_success(&conn, &event.event_id);
+                // The trade now EXISTS upstream, so anything written about it while it
+                // was still a plan can finally be addressed to it.
+                if event.event_type == "trade_created" {
+                    flush_deferred_for_trade(
+                        &conn,
+                        &event.trade_id,
+                        &event.symbol,
+                        has_session_creds,
+                    );
+                }
             }
             Err(ref e) => {
                 let _ = tradetally_queue_repository::mark_failed(&conn, &event.event_id, e);
             }
         }
+    }
+}
+
+/// Send what was written about a trade BEFORE the trade existed in TradeTally.
+///
+/// A note or a screenshot can legitimately be produced on a trade that is still only
+/// a plan — levels drawn, nothing entered. Queued then, it would be addressed to a
+/// trade the server has never heard of, fail permanently ("trade introuvable") and
+/// the text would be lost even though it sits safely in the local tables. So those
+/// two are deliberately NOT queued at write time (see `commands::save_journal_entry`
+/// and `save_screenshot_local`); they wait here, and this runs the instant the
+/// trade's create lands.
+///
+/// Idempotent: a note is re-sent as an update (same endpoint the journal already
+/// uses), and a screenshot is only picked up while its row is still marked
+/// un-queued.
+fn flush_deferred_for_trade(
+    conn: &rusqlite::Connection,
+    trade_id: &str,
+    symbol: &str,
+    with_images: bool,
+) {
+    if let Ok(Some(entry)) = crate::local_db::journal_repository::get(conn, trade_id) {
+        if !entry.notes.trim().is_empty() {
+            super::enqueue_note_updated(
+                conn,
+                trade_id,
+                symbol,
+                &entry.notes,
+                entry.confidence,
+                &entry.tags,
+            );
+        }
+    }
+
+    if !with_images {
+        return; // no session login: the /images route would reject every one of them
+    }
+    let paths: Vec<String> = conn
+        .prepare("SELECT path FROM screenshot_files WHERE trade_id = ?1 AND uploaded = 0")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map(rusqlite::params![trade_id], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })
+        .unwrap_or_default();
+    for path in &paths {
+        super::enqueue_chart_updated(conn, trade_id, symbol, path);
+    }
+    if !paths.is_empty() {
+        let _ = conn.execute(
+            "UPDATE screenshot_files SET uploaded = 1 WHERE trade_id = ?1 AND uploaded = 0",
+            rusqlite::params![trade_id],
+        );
     }
 }
 

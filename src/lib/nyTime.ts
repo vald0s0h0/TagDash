@@ -15,16 +15,19 @@ function toDate(input: TimeInput): Date {
   return new Date(input);
 }
 
+// Built once: constructing an Intl formatter is the costly part, and the chart
+// scans every bar of a multi-thousand-bar series through `nyParts`.
+const NY_PARTS_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone:   NY_TZ,
+  hourCycle:  "h23", // 00–23, avoids the "24:00" en-US midnight quirk
+  year:   "numeric", month: "2-digit", day:    "2-digit",
+  hour:   "2-digit", minute: "2-digit", second: "2-digit",
+});
+
 /** NY wall-clock parts (zero-padded, 24h) for an instant. */
 function nyParts(d: Date): Record<string, string> {
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone:   NY_TZ,
-    hourCycle:  "h23", // 00–23, avoids the "24:00" en-US midnight quirk
-    year:   "numeric", month: "2-digit", day:    "2-digit",
-    hour:   "2-digit", minute: "2-digit", second: "2-digit",
-  });
   const out: Record<string, string> = {};
-  for (const p of fmt.formatToParts(d)) out[p.type] = p.value;
+  for (const p of NY_PARTS_FMT.formatToParts(d)) out[p.type] = p.value;
   return out;
 }
 
@@ -86,4 +89,29 @@ export const NY_REGULAR_CLOSE_MIN = 16 * 60;
 export function isExtendedHours(input: TimeInput): boolean {
   const m = nyMinutesOfDay(input);
   return m < NY_REGULAR_OPEN_MIN || m >= NY_REGULAR_CLOSE_MIN;
+}
+
+/** Which NY session an instant belongs to — the two extended-hours halves are
+ *  distinguished (they get their own background tint on the chart). */
+export type NySession = "pre" | "regular" | "post";
+
+/** Session for an already-resolved minutes-since-NY-midnight value. */
+export function nySessionOfMinutes(m: number): NySession {
+  if (m < NY_REGULAR_OPEN_MIN) return "pre";
+  if (m >= NY_REGULAR_CLOSE_MIN) return "post";
+  return "regular";
+}
+
+export function nySession(input: TimeInput): NySession {
+  return nySessionOfMinutes(nyMinutesOfDay(input));
+}
+
+/** NY calendar day + minutes-of-day in a single conversion — for per-bar scans
+ *  that need both (chart session shading + day separator). */
+export function nyDayStamp(input: TimeInput): { day: string; minutes: number } {
+  const p = nyParts(toDate(input));
+  return {
+    day:     `${p.year}-${p.month}-${p.day}`,
+    minutes: Number(p.hour) * 60 + Number(p.minute),
+  };
 }

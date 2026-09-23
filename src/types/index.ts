@@ -1283,7 +1283,36 @@ export interface LayoutTab {
 
 export type Timeframe = "5s" | "10s" | "1m" | "2m" | "5m" | "15m" | "daily";
 
+/** What a DAILY pane shows of each day:
+ *  • "off"     — the regular session only (09:30–16:00), i.e. the provider's own
+ *                daily bar, which is what every chart showed before this existed;
+ *  • "overlay" — the same candles, with the 04:00–09:30 premarket range drawn as a
+ *                ghost behind them (and its high/low as hairlines over them);
+ *  • "only"    — the premarket candles themselves, the regular session dimmed
+ *                behind them for context.
+ *  Indicators never follow this: they stay on the regular session in every mode. */
+export type PremarketMode = "off" | "overlay" | "only";
+
 // ─── Chart / zone trade context ───────────────────────────────────────────────
+
+/** Which trade the journal note / screenshot buttons act on for the ticker on
+ *  screen — resolved by the backend, not by the chart context alone.
+ *
+ *  The context mints a tradeID the instant an SL or a TP is drawn, so on its own it
+ *  can name a trade that was never taken; a note filed against one of those reaches
+ *  no TradeTally trade at all. `get_trade_link` picks, in order: the position open on
+ *  the ticker, the ticker's context when it still stands for something (levels drawn,
+ *  or a trade that really executed), then the last trade that actually executed on
+ *  the ticker. */
+export interface TradeLink {
+  symbol: string;
+  trade_id: string | null;
+  /** The trade executed, so TradeTally has it and a note/chart will land there. */
+  has_activity: boolean;
+  /** A position is open on it right now. */
+  open: boolean;
+  source: "position" | "context" | "planned" | "history" | "none";
+}
 
 export interface ZoneTradeContext {
   zone_id:     string;
