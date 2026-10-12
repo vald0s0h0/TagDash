@@ -260,10 +260,10 @@ fn parse_tags(v: Option<&Value>) -> Vec<String> {
 
 // ─── Daily background ────────────────────────────────────────────────────────
 
-/// Ensure `<app_dir>/backgrounds/` exists, then pick one image for today
+/// Ensure `<root>/user/backgrounds/` exists, then pick one image for today
 /// (deterministic per ET calendar day) and return it as a data-URL.
 pub fn pick_daily_background(app_dir: &Path) -> DailyBackground {
-    let dir = app_dir.join("backgrounds");
+    let dir = crate::paths::backgrounds_dir(app_dir);
     let _ = std::fs::create_dir_all(&dir);
     let dir_str = dir.to_string_lossy().to_string();
 
@@ -365,8 +365,8 @@ fn os_open(path: &Path) -> Result<(), String> {
 /// The mood drop targets, created on first access so the "open" actions always
 /// have something to open and the expected format is self-documenting. Returns
 /// `(images_dir, short_file, long_file)`.
-fn mood_paths(app_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let root = app_dir.join("mood");
+pub(crate) fn mood_paths(app_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = crate::paths::mood_dir(app_dir);
     let images = root.join("images");
     let short = root.join("short.txt");
     let long = root.join("long.txt");
@@ -464,6 +464,50 @@ pub fn open_mood_target(app_dir: &Path, target: &str) -> Result<(), String> {
     }
 }
 
+// ─── Dashboard assets, as Réglages ▸ Tableau de bord shows and edits them ───────
+
+/// What feeds the dashboard: how many backgrounds and mood images there are, and
+/// the two phrase files as text.
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardAssets {
+    pub backgrounds: usize,
+    pub mood_images: usize,
+    /// Content of `short.txt` / `long.txt` (one phrase per line, `#` = comment).
+    pub short_phrases: String,
+    pub long_phrases: String,
+}
+
+fn image_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && is_image(p)).count())
+        .unwrap_or(0)
+}
+
+pub fn assets(app_dir: &Path) -> DashboardAssets {
+    let (images_dir, short_path, long_path) = mood_paths(app_dir);
+    DashboardAssets {
+        backgrounds: image_count(&crate::paths::backgrounds_dir(app_dir)),
+        mood_images: image_count(&images_dir),
+        short_phrases: std::fs::read_to_string(short_path).unwrap_or_default(),
+        long_phrases: std::fs::read_to_string(long_path).unwrap_or_default(),
+    }
+}
+
+/// Replace a phrase file (`"short"` | `"long"`) with `content`.
+pub fn save_phrases(app_dir: &Path, kind: &str, content: &str) -> Result<(), String> {
+    let (_, short_path, long_path) = mood_paths(app_dir);
+    let path = match kind {
+        "short" => short_path,
+        "long" => long_path,
+        _ => return Err(format!("unknown phrase file: {kind}")),
+    };
+    let mut text = content.replace("\r\n", "\n");
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
 // ─── Bundled default assets (shipped with the app, seeded once on first run) ───
 
 /// Copy the bundled default mood images / phrase files / backgrounds into the
@@ -472,16 +516,14 @@ pub fn open_mood_target(app_dir: &Path, target: &str) -> Result<(), String> {
 /// files (and any later edit/deletion sticks — this is gated by a one-time marker
 /// in the caller). `resources` is the resolved `resources/defaults` directory.
 pub fn seed_default_assets(resources: &Path, app_dir: &Path) {
+    let mood = crate::paths::mood_dir(app_dir);
+    copy_dir_if_absent(&resources.join("mood").join("images"), &mood.join("images"));
     copy_dir_if_absent(
-        &resources.join("mood").join("images"),
-        &app_dir.join("mood").join("images"),
+        &resources.join("backgrounds"),
+        &crate::paths::backgrounds_dir(app_dir),
     );
-    copy_dir_if_absent(&resources.join("backgrounds"), &app_dir.join("backgrounds"));
     for name in ["short.txt", "long.txt"] {
-        copy_file_if_absent(
-            &resources.join("mood").join(name),
-            &app_dir.join("mood").join(name),
-        );
+        copy_file_if_absent(&resources.join("mood").join(name), &mood.join(name));
     }
 }
 
@@ -517,10 +559,16 @@ pub fn read_default_dashboard(resources: &Path) -> Option<String> {
     std::fs::read_to_string(resources.join("dashboard.json")).ok()
 }
 
-/// Persist the current dashboard layout to `<app_dir>/dashboard-default.json` so the
-/// maintainer can capture it and bundle it as the new shipped default.
-pub fn write_dashboard_export(app_dir: &Path, json: &str) -> Result<(), String> {
-    std::fs::write(app_dir.join("dashboard-default.json"), json).map_err(|e| e.to_string())
+/// Persist the current dashboard layout to `<root>/user/dashboard-default.json` so
+/// the maintainer can capture it and bundle it as the new shipped default. Returns
+/// the file written.
+pub fn write_dashboard_export(app_dir: &Path, json: &str) -> Result<std::path::PathBuf, String> {
+    let path = crate::paths::user(app_dir).join("dashboard-default.json");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 // ─── Minimal base64 encoder (no crate dependency, matching `screenshot`'s

@@ -98,6 +98,21 @@ export interface MicroPullbackOptions {
   tempo_1m: boolean;
   tempo_2m: boolean;
   tempo_5m: boolean;
+
+  // ── Créneau ──
+  /** Active window, ET minutes since midnight, [start, end). Drives the live
+   *  engine AND what a replay downloads. 240–1200 = 04:00–20:00. */
+  session_start_min: number;
+  session_end_min: number;
+
+  // ── Données replay ──
+  /** Real ticks kept around each pre-scan hit (minutes before / after). */
+  replay_before_min: number;
+  replay_after_min: number;
+  /** Cap on symbols whose ticks are downloaded for one day, strongest first (150). */
+  replay_max_symbols: number;
+  /** Backend migration marker for the pad defaults — round-tripped, never edited. */
+  replay_pads_version: number;
 }
 
 /** Apex — Micro Pullback's print-balance entries (mirrors `apex::options`).
@@ -996,6 +1011,198 @@ export interface AppConfig {
   broker: { broker: "tagdash" | "alpaca"; environment: "paper" | "live" };
   /** Offline Speech-to-Text dictée pipeline (whisper.cpp). */
   stt: SttConfig;
+  /** Trade review (onglet Revue): reviewed tags + session recorder. */
+  review: ReviewConfig;
+}
+
+// ─── Trade review (onglet Revue) ──────────────────────────────────────────────────
+
+export interface ReviewConfig {
+  /** Matched (case-insensitive) against TradeTally tags AND setup. Also decides
+   *  which scanner alerts open a recording session. */
+  tags: string[];
+  /** Start the voice recorder by itself when a reviewed ticker appears. */
+  auto_voice: boolean;
+  pre_window_min: number;
+  post_window_min: number;
+  /** Version of the window defaults (backend-managed, round-tripped as is). */
+  window_defaults?: number;
+}
+
+export type ReviewKind = "tt" | "missed";
+
+export interface ReviewRef {
+  kind: ReviewKind;
+  id: string;
+}
+
+/** One TradeTally trade with review edits not yet accepted upstream. */
+export interface ReviewOutboxTarget {
+  tt_id: string;
+  symbol: string | null;
+  day: string | null;
+  ops: number;
+  attempts: number;
+  last_error: string | null;
+}
+
+/** The review's offline outbox: edits applied locally, waiting for TradeTally. */
+export interface ReviewOutboxStatus {
+  pending: number;
+  targets: ReviewOutboxTarget[];
+  /** TradeTally unreachable right now (network failure, or offline mode). */
+  offline: boolean;
+  flushing: boolean;
+  last_sync_ms: number | null;
+}
+
+export interface ReviewItem extends ReviewRef {
+  symbol: string;
+  day: string;
+  setup: string | null;
+  /** The review tag that brought the item in (Settings ▸ Revue spelling). */
+  tag: string | null;
+  pnl: number | null;
+  review_count: number;
+  has_data: boolean;
+  /** Entry (alert for a missed trade), epoch ms — orders a ticker's day. */
+  entry_ms: number | null;
+}
+
+export interface NextReview {
+  item: ReviewItem | null;
+  remaining_unreviewed: number;
+  total: number;
+  sip_available: boolean;
+  /** 1-based position among the ticker's trades of that day. */
+  group_pos: number;
+  group_len: number;
+  /** Every item of that ticker's day, chronologically — one replay timeline. */
+  group: ReviewItem[];
+}
+
+export interface ReviewSession {
+  session_id: string;
+  day: string;
+  symbol: string;
+  mode: "live" | "replay" | "backfill";
+  strategy_id: string | null;
+  setup: string | null;
+  alert_price: number | null;
+  opened_ms: number;
+  closed_ms: number | null;
+  status: "open" | "closed";
+  data_source: string | null;
+  enriched_ms: number | null;
+  store_path: string;
+}
+
+/** One fill with TagDash's millisecond timing (epoch ms). */
+export interface ReviewFill {
+  fill_id: string;
+  trade_id: string;
+  /** Signed: + buy, − sell. */
+  quantity: number;
+  price: number;
+  filled_ms: number;
+  sent_ms: number | null;
+  ack_ms: number | null;
+  recv_ms: number | null;
+}
+
+/** Columnar session tape (see `review::store::SessionData`). */
+export interface ReviewSessionData {
+  trades_ts: number[];
+  trades_price: number[];
+  trades_size: number[];
+  /** 1 = a real print; other values = an aggregate (Massive second, synthetic). */
+  trades_prints: number[];
+  trades_exch: (string | null)[];
+  quotes_ts: number[];
+  quotes_bid: number[];
+  quotes_bid_size: (number | null)[];
+  quotes_ask: number[];
+  quotes_ask_size: (number | null)[];
+  /** [t (unix s), o, h, l, c, v] */
+  bars_1d: number[][];
+  bars_1m: number[][];
+  origins: string[];
+}
+
+export interface VoiceChunk {
+  start_ms: number;
+  offset: number;
+  samples: number;
+}
+
+export interface VoiceSubtitle {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+}
+
+export interface ReviewVoiceNote {
+  voice_id: string;
+  start_ms: number;
+  end_ms: number;
+  speed: number;
+  chunks: VoiceChunk[];
+  subtitles: VoiceSubtitle[];
+  text: string | null;
+  has_audio: boolean;
+}
+
+export interface ReviewDetail {
+  item: ReviewItem;
+  /** Raw TradeTally trade object (null for a missed trade). */
+  trade: Record<string, unknown> | null;
+  session: ReviewSession | null;
+  fills: ReviewFill[];
+  data: ReviewSessionData;
+  voices: ReviewVoiceNote[];
+  missed_note: string | null;
+  screenshots: string[];
+  reviews: { review_date: string; text: string }[];
+  sip_available: boolean;
+  needs_enrichment: boolean;
+  original_sl: number | null;
+}
+
+export interface OpenReviewSession {
+  session_id: string;
+  symbol: string;
+  opened_ms: number;
+}
+
+/** Settings ▸ Trades DB row — TradeTally mirror + TagDash enrichment + missed. */
+export interface ReviewTradeRow {
+  category: "taken" | "missed";
+  source: "tradetally" | "tagdash";
+  id: string;
+  symbol: string;
+  day: string;
+  side: string | null;
+  setup: string | null;
+  tags: string[];
+  quantity: number | null;
+  entry_price: number | null;
+  exit_price: number | null;
+  pnl: number | null;
+  r_value: number | null;
+  entry_ms: number | null;
+  exit_ms: number | null;
+  first_fill_ms: number | null;
+  first_sent_ms: number | null;
+  first_ack_ms: number | null;
+  first_recv_ms: number | null;
+  local_trade_ids: string[];
+  session_id: string | null;
+  data_source: string | null;
+  voice_notes: number;
+  screenshots: number;
+  has_note: boolean;
+  review_count: number;
+  last_review: string | null;
 }
 
 // ─── Speech-to-Text (offline dictée → trade notes / diary) ───────────────────────
@@ -1039,6 +1246,8 @@ export interface SttStatus {
   download_progress: number;
   recording: boolean;
   recording_kind: SttJobKind | null;
+  /** Ticker the in-progress recording is about. */
+  recording_symbol: string | null;
   worker_state: string;
   paused_reason: string | null;
   jobs: SttJob[];
@@ -1065,7 +1274,7 @@ export interface SttDiaryResult {
 }
 
 /** Which flat-files dataset: trades+quotes, minute bars, or daily bars. */
-export type FlatFilesKind = "trade" | "minute" | "daily";
+export type FlatFilesKind = "minute" | "daily";
 
 /** Background flat-files download progress (polled while running). */
 export interface FlatFilesStatus {
@@ -1338,6 +1547,29 @@ export interface BugReport {
   created_at: string;
 }
 
+// ─── Usage log (see lib/usageTracker) ─────────────────────────────────────────
+
+export type UsageSource = "click" | "change" | "hotkey" | "gamepad" | "key";
+
+/** One user action, as sent to the backend (`usage_events` table). */
+export interface UsageEvent {
+  /** Real clock, Unix milliseconds. */
+  ts_ms:         number;
+  /** The machine's UTC offset in minutes (east positive). */
+  tz_offset_min: number;
+  source:        UsageSource;
+  /** Command id (hotkey / gamepad) or the control's label (click). */
+  action:        string;
+  /** Where: region > dialog > tab > menu. */
+  context:       string;
+  /** How: element kind, key chord, pad layer and button. */
+  input:         string | null;
+  /** The control's tooltip, when it says more than its label. */
+  hint:          string | null;
+  view:          string;
+  window:        string;
+}
+
 // ─── Price alarms (persisted; triggering not wired yet) ───────────────────────
 
 export interface PriceAlarm {
@@ -1573,12 +1805,106 @@ export interface NewsDiagnostics {
  * replay/data.rs. "api" runs the ranked walk (SIP > Massive > flat files); the two
  * flat variants pin the session to that local dataset and never fall back.
  */
-export type ReplaySource = "api" | "flat_trades" | "flat_minutes";
+/** An ET window, minutes since midnight: [start_min, end_min). */
+export interface EtWindow {
+  start_min: number;
+  end_min: number;
+}
+
+/** A strategy whose replay data can be prepared (`replay_data_strategies`). */
+export interface ReplayStrategy {
+  id: string;
+  label: string;
+  sessions: EtWindow[];
+  fingerprint: string;
+  /** Its live Settings toggle. A replay prepared for it runs it either way. */
+  enabled: boolean;
+}
+
+/** Mirrors `replay_data::plan::DayState`. */
+export type ReplayDayState = "ready" | "incomplete" | "not_prepared" | "unavailable";
+
+export interface ReplayStrategyDayStatus {
+  strategy_id: string;
+  /** The stored scan matches the strategy's CURRENT settings. */
+  scanned: boolean;
+  /** A scan under the current settings is under way: its first hits are usable. */
+  partial: boolean;
+  /** Confirmed opportunities. */
+  hits: number;
+  symbols: number;
+  /** Tick time still to download (ms). */
+  missing_ms: number;
+}
+
+export interface ReplayOpportunity {
+  strategy_id: string;
+  symbol: string;
+  alert_ms: number;
+  score: number;
+  reason: string;
+}
+
+/** Mirrors `replay_data::plan::DayStatus`. */
+export interface ReplayDayStatus {
+  day: string;
+  state: ReplayDayState;
+  strategies: ReplayStrategyDayStatus[];
+  /** Empty in calendar listings; filled by `replay_data_day`. */
+  opportunities: ReplayOpportunity[];
+  missing_ms: number;
+  estimate_bytes: number;
+  estimate_requests: number;
+  bytes_on_disk: number;
+  /** Opportunities whose ticks are entirely on disk. */
+  ready_hits: number;
+  /** On a day not finished preparing: how far a replay can already run (UTC ms). */
+  ready_until_ms: number | null;
+  /** A replay can start now — the day is ready, or its first opportunities are
+   *  and the rest downloads while it runs. */
+  launchable: boolean;
+  /** Trades taken that day on a ticker these strategies' scanners own. */
+  trades: number;
+}
+
+/** Mirrors `commands::replay_data::ReplayDataBudget`. */
+export interface ReplayDataBudget {
+  /** "sip" (Algo Trader Plus) | "iex" (Basic, free). */
+  plan: "sip" | "iex";
+  requests_per_minute: number;
+}
+
+/** Mirrors `commands::replay_data::ReplayDiskUsage`. */
+export interface ReplayDiskUsage {
+  replay_bytes: number;
+  legacy_trade_bytes: number;
+  minute_bytes: number;
+  intraday_bytes: number;
+}
+
+/** Mirrors `replay_data::prepare::PrepareStatus`. */
+export interface ReplayPrepareStatus {
+  running: boolean;
+  state: "idle" | "running" | "done" | "cancelled" | "error";
+  day: string | null;
+  day_index: number;
+  day_total: number;
+  /** market | minutes | scan | ticks | news */
+  stage: string;
+  progress: number;
+  message: string | null;
+  error: string | null;
+  skipped: [string, string][];
+  /** Days still waiting, in the order they will be taken. */
+  queue: string[];
+  /** Seconds left for the day in progress and the queue, once a day was timed. */
+  eta_secs: number | null;
+}
 
 /** Mirrors ReplayStatus in replay/mod.rs (polled by the replay toolbar). */
 export interface ReplayStatus {
   active: boolean;
-  state: "idle" | "loading" | "playing" | "paused" | "ended" | "error";
+  state: "idle" | "loading" | "seeking" | "playing" | "paused" | "ended" | "error";
   /** ET date being replayed (YYYY-MM-DD). */
   day: string | null;
   /**
@@ -1591,7 +1917,7 @@ export interface ReplayStatus {
   source: string | null;
   /**
    * Where the day was loaded from, resolved with the same priority as the live
-   * feed: "alpaca_sip" | "massive" | "alpaca_iex" | "flat_files" | "daily_cache".
+   * "alpaca_sip" — a replay reads the day prepared from Alpaca SIP.
    */
   provider: string | null;
   sim_time: string | null;
@@ -1604,6 +1930,14 @@ export interface ReplayStatus {
   events_done: number;
   error: string | null;
   next_alert_armed: boolean;
+  /** The strategies the session was prepared for. */
+  strategies: string[];
+  /** On a day still being prepared: how far it can be replayed for now. */
+  ready_until: string | null;
+  /** Standing at `ready_until`, waiting for the download to get further. */
+  buffering: boolean;
+  /** One line for the toolbar (e.g. no opportunity left today). */
+  notice: string | null;
 }
 
 // ─── Tickers data table (mirrors TickerTableRow in company_intel/model.rs) ───────
@@ -1681,12 +2015,15 @@ export interface BrokerSelection {
 
 /** Auto-detected vs. manually-forced Massive subscription tier — mirrors
  *  src-tauri/src/commands/broker.rs::MassiveTierStatus. `"unlimited"` (Starter+,
- *  paid) is 15-minute delayed and disables the Alpaca broker; `"basic"` (free)
- *  is unaffected. */
+ *  paid) is 15-minute delayed; it only feeds the app (and locks the Alpaca broker)
+ *  when no Alpaca keys are set — see `drives_live_feed`. */
 export interface MassiveTierStatus {
   detected: "unlimited" | "basic" | null;
   override: "unlimited" | "basic" | null;
   effective: "unlimited" | "basic";
+  /** True only when Massive's delayed stream feeds the app — no Alpaca keys set.
+   *  The one case where the Alpaca broker is locked and prices lag 15 min. */
+  drives_live_feed: boolean;
 }
 
 export type BrokerOrderStatus = "open" | "held" | "filled" | "closed";
@@ -1795,4 +2132,106 @@ export interface ShortCostZone {
   break_even_price: number;
   costs_complete: boolean;
   locates: LocateRecord[];
+}
+
+// ─── Personal data (Réglages ▸ Mes données) — mirrors `user_data` in Rust ──────
+
+/** Headline numbers of a set of personal data (mirrors pack::Counts). */
+export interface DataCounts {
+  trades: number;
+  executions: number;
+  journal_notes: number;
+  review_sessions: number;
+  voice_notes: number;
+  screenshots: number;
+  drawings: number;
+  usage_events: number;
+  /** Outbound events not delivered yet (TradeTally queue + review outbox). */
+  pending_sync: number;
+  last_trade_at: string | null;
+}
+
+/** What a data pack says about itself (mirrors pack::Manifest). */
+export interface PackManifest {
+  format: string;
+  format_version: number;
+  schema_version: number;
+  app_version: string;
+  /** UTC, RFC 3339. */
+  created_at: string;
+  machine: string;
+  os: string;
+  includes_secrets: boolean;
+  counts: DataCounts;
+  files: number;
+  bytes: number;
+}
+
+/** A pack on disk (mirrors pack::FoundPack). */
+export interface FoundPack {
+  path: string;
+  file_name: string;
+  pack_bytes: number;
+  manifest: PackManifest;
+}
+
+/** Result of an export (mirrors pack::Exported). */
+export interface ExportedPack {
+  path: string;
+  pack_bytes: number;
+  manifest: PackManifest;
+}
+
+/** Personal data an import set aside (mirrors pack::Backup). */
+export interface DataBackup {
+  name: string;
+  /** Local time, `YYYY-MM-DD HH:MM`. */
+  set_aside_at: string;
+  bytes: number;
+  counts: DataCounts;
+}
+
+/** One line of the overview (mirrors user_data::Category). */
+export interface DataCategory {
+  id: string;
+  label: string;
+  detail: string;
+  bytes: number;
+  openable: boolean;
+}
+
+/** Pre-separation originals still kept in the market database. */
+export interface LegacyLeftovers {
+  tables: string[];
+  rows: number;
+  keys: number;
+  /** Personal tables that could not be moved out of the market database. */
+  unmoved: string[];
+}
+
+/** Everything Réglages ▸ Mes données shows (mirrors user_data::Overview). */
+export interface DataOverview {
+  machine: string;
+  user_dir: string;
+  cache_dir: string;
+  personal: DataCategory[];
+  personal_bytes: number;
+  cache: DataCategory[];
+  cache_bytes: number;
+  counts: DataCounts;
+  /** Local time of the last write, `YYYY-MM-DD HH:MM`. */
+  last_change: string | null;
+  /** A pack staged for the next launch. */
+  staged: PackManifest | null;
+  backups: DataBackup[];
+  legacy: LegacyLeftovers;
+  legacy_files: string[];
+}
+
+/** What feeds the dashboard (mirrors dashboard::DashboardAssets). */
+export interface DashboardAssets {
+  backgrounds: number;
+  mood_images: number;
+  short_phrases: string;
+  long_phrases: string;
 }

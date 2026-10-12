@@ -388,6 +388,19 @@ async fn session(
                                     LATENCY_WARN_MS,
                                     LATENCY_CRITICAL_MS,
                                 );
+                                // Review session copy. A second aggregate is NOT a
+                                // print: `prints` carries its trade count (0 when the
+                                // plan does not say), never 1 unless it truly was one.
+                                crate::review::capture::trade(
+                                    sym,
+                                    bar_time.timestamp_millis(),
+                                    c,
+                                    volume,
+                                    prints.unwrap_or(0),
+                                    None,
+                                    None,
+                                    "massive_live",
+                                );
                                 if focus.contains(sym) {
                                     ticks.insert(sym.to_string(), TickEvent {
                                         symbol: sym.to_string(),

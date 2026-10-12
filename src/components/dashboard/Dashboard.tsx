@@ -121,7 +121,7 @@ export function Dashboard() {
               onClick={() =>
                 api.exportDashboardDefault(JSON.stringify(layout)).catch(() => {})
               }
-              title="Écrit dashboard-default.json dans le dossier de l'app — à bundler comme disposition par défaut distribuée."
+              title="Écrit dashboard-default.json dans le dossier personnel (user/) — à bundler comme disposition par défaut distribuée."
             >
               <Save className="mr-2 h-4 w-4" />
               Définir comme disposition par défaut

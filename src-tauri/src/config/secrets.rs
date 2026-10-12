@@ -1,5 +1,5 @@
 // API secrets. Never exposed to the React frontend — only used by Rust modules.
-// Stored in tagdash.secrets.toml next to tagdash.toml.
+// Stored in <root>/user/secrets.toml, next to settings.toml (see `crate::paths`).
 // The frontend only ever receives a SecretsStatus (booleans — is each key set?).
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ pub struct Secrets {
     pub tradetally_email: Option<String>,
     pub tradetally_password: Option<String>,
     /// ntfy server base URL. Optional: unset means the public https://ntfy.sh.
-    /// Kept here rather than in `tagdash.toml` because it travels with the topic,
+    /// Kept here rather than in `settings.toml` because it travels with the topic,
     /// and a self-hosted URL is often as identifying as the topic itself.
     pub ntfy_server: Option<String>,
     /// ntfy topic to publish to. THIS IS A SECRET on the public server: anyone who
@@ -243,7 +243,7 @@ impl Secrets {
     }
 }
 
-/// Persist secrets to `<app_dir>/tagdash.secrets.toml`. Written by hand (Secrets is
+/// Persist secrets to `<root>/user/secrets.toml`. Written by hand (Secrets is
 /// deliberately NOT `Serialize`, so values can never be sent to the frontend by an
 /// accidental derive). Called when the user edits keys in Settings → API Keys.
 pub fn save(app_dir: &Path, s: &Secrets) -> Result<(), String> {
@@ -253,7 +253,10 @@ pub fn save(app_dir: &Path, s: &Secrets) -> Result<(), String> {
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
     }
-    let path = app_dir.join("tagdash.secrets.toml");
+    let path = crate::paths::secrets_file(app_dir);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let content = format!(
         "# TagDash — API secrets (managed from Settings → API Keys).\n\
          # NEVER sent to the frontend. Keep it out of version control.\n\n\
@@ -308,11 +311,14 @@ pub fn save(app_dir: &Path, s: &Secrets) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
-/// Load secrets from `<app_dir>/tagdash.secrets.toml`.
+/// Load secrets from `<root>/user/secrets.toml`.
 /// If the file is absent or unreadable, return empty defaults.
 /// Creates a template file on first run.
 pub fn load(app_dir: &Path) -> Secrets {
-    let path = app_dir.join("tagdash.secrets.toml");
+    let path = crate::paths::secrets_file(app_dir);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
 
     if !path.exists() {
         let template = r#"# TagDash — API secrets
@@ -608,7 +614,7 @@ mod persistence_tests {
 
         // And the count is pinned: adding a field to `Secrets` without adding it to
         // the list above (and therefore to `save`) fails here rather than in the wild.
-        let written = std::fs::read_to_string(dir.join("tagdash.secrets.toml")).unwrap();
+        let written = std::fs::read_to_string(crate::paths::secrets_file(&dir)).unwrap();
         let assignments = written
             .lines()
             .filter(|l| !l.trim_start().starts_with('#') && l.contains(" = "))

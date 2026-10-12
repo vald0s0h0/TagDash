@@ -15,13 +15,15 @@ use crate::startup::StartupState;
 use crate::types::{AlertEnrichment, AlertSignal, AttentionEntry, ScreenerMatch};
 
 pub struct AppState {
-    /// Directory where tagdash.toml, tagdash.secrets.toml and tagdash.db live.
+    /// The data root. Personal data lives in `user/` under it and re-downloadable
+    /// data in `cache/` — every path is built by `crate::paths`.
     pub app_dir: PathBuf,
     /// Runtime config. RwLock so reads never block each other.
     pub config: Arc<RwLock<AppConfig>>,
     /// API secrets. Never serialised to the frontend.
     pub secrets: Arc<RwLock<Secrets>>,
-    /// SQLite connection. Mutex because rusqlite::Connection is Send but not Sync.
+    /// SQLite connection: the cache database with the personal one attached as
+    /// `user` (see `local_db`). Mutex because rusqlite::Connection is Send but not Sync.
     pub db: Arc<Mutex<rusqlite::Connection>>,
     /// Startup pipeline progress (polled by the frontend).
     pub startup: Arc<RwLock<StartupState>>,
@@ -120,7 +122,14 @@ pub struct AppState {
     /// a cancel flag for the (single) background download task. See
     /// `crate::flat_files`.
     pub flat_files: Arc<crate::flat_files::FlatFilesShared>,
+    /// Replay data preparation: status polled by the day picker + cancel flag. See
+    /// `crate::replay_data`.
+    pub replay_data: Arc<crate::replay_data::prepare::ReplayDataShared>,
     /// Speech-to-Text dictée pipeline: recorder + persisted job queue drained by the
     /// single STT worker. See `crate::stt`.
     pub stt: Arc<crate::stt::SttShared>,
+    /// « Attention du marché », the detached second-monitor screen: its options,
+    /// what its engine last published and the trade « Revue » is showing. The
+    /// engine only polls while the window is enabled. See `crate::attention_map`.
+    pub attention_map: Arc<crate::attention_map::AttentionShared>,
 }

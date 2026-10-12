@@ -1,5 +1,5 @@
 // Whisper model lifecycle: download the ggml model on first use (into
-// `<app_dir>/models/`, written atomically), and cache the loaded WhisperContext so
+// `<root>/cache/models/`, written atomically), and cache the loaded WhisperContext so
 // the ~1 s load happens only once. CPU build everywhere; Metal on macOS (see
 // Cargo.toml). The model survives app auto-updates because it lives in app-data.
 

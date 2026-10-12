@@ -41,6 +41,7 @@
 // name, priority) — see `strategies::micro_pullback`.
 
 pub mod options;
+pub mod prescan;
 pub mod quality;
 
 #[cfg(test)]
@@ -311,16 +312,14 @@ impl Config {
 /// the final tape-rate watch is polled every second (see `Config::watch_*`).
 const LOOP_INTERVAL_SECS: u64 = 1;
 const FLOAT_REFRESH_SECS: u64 = 300;
-/// Active window in ET wall-clock minutes since midnight: 04:00–20:00, i.e. the
-/// whole extended trading day (premarket → pre-open → open → afterhours).
-///
-/// It used to be premarket only, matching the Alpaca `trades` broad tier. That tier
-/// is still premarket/afterhours only — see `alpaca::stream::broad_mode_at` — so
-/// during the regular session this engine sees 10s bars for the day's watch list
-/// rather than the whole market on that provider. On Massive the `A.*` wildcard
-/// covers the universe all day.
-const SESSION_START_MIN: u32 = 240;
-const SESSION_END_MIN: u32 = 1200;
+// Active window: `MicroPullbackOptions::session_start_min..session_end_min` (ET
+// minutes), 04:00–20:00 by default — the whole extended trading day. The same
+// window drives the replay data profile (`prescan`), so what is downloaded for a
+// replay is always what the engine trades.
+//
+// Note the Alpaca `trades` broad tier is premarket/afterhours only — see
+// `alpaca::stream::broad_mode_at` — so during the regular session this engine sees
+// 10s bars for the day's watch list rather than the whole market on that provider.
 /// Detection timeframe + bucket length.
 const BAR_TF: Timeframe = Timeframe::S10;
 const BAR_SECS: i64 = 10;
@@ -672,12 +671,8 @@ impl MicroPullbackEngine {
                         crate::ntfy::reset_sent();
                     }
                 }
-                let enabled = strategy_enabled
-                    .read()
-                    .unwrap()
-                    .get(STRATEGY_ID)
-                    .copied()
-                    .unwrap_or(true);
+                let enabled =
+                    crate::strategies::runs(&strategy_enabled.read().unwrap(), STRATEGY_ID);
                 if !enabled {
                     crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
                     continue;
@@ -711,7 +706,7 @@ impl MicroPullbackEngine {
                     crate::replay::clock::scaled_sleep(LOOP_INTERVAL_SECS * 1000).await;
                     continue;
                 };
-                if !in_active_session(now) {
+                if !opts.in_session(crate::time::et_minutes(now)) {
                     if !machines.is_empty() || !seeds.is_empty() {
                         machines.clear();
                         seeds.clear();
@@ -751,61 +746,15 @@ impl MicroPullbackEngine {
                 // later tempo can widen their depth list (stage 3 of `evaluate`), but
                 // only while that tracking window is open — after it closes they cost
                 // nothing again.
-                let inputs: Vec<Input> = {
-                    let ms = market.read().unwrap();
-                    ms.tickers
-                        .values()
-                        .filter_map(|t| {
-                            let price = t.last_price?;
-                            let float = floats.get(&t.symbol).copied();
-                            let profile = profiles.get(&t.symbol).copied().unwrap_or_default();
-                            if !gate1_tradeable(price, float, profile, &cfg) {
-                                return None;
-                            }
-                            if let Some(m) = machines.get(&t.symbol) {
-                                if m.locked && !m.tracking_depth(now) {
-                                    return None;
-                                }
-                            }
-                            let machine = machines.get(&t.symbol);
-                            let watching = machine.and_then(|m| m.watch).is_some();
-                            let latest = ms.latest_closed_bar_time(&t.symbol, BAR_TF)?;
-                            // Detection is defined on freshly-closed 10s bars. Avoid
-                            // cloning and de-duplicating the full ring on nine of ten
-                            // loop ticks where its watermark did not change. A live
-                            // liquidity watch still needs a lightweight input every
-                            // second, but stage 2 never reads its bars.
-                            if !watching && machine.and_then(|m| m.last_eval_bar) == Some(latest) {
-                                return None;
-                            }
-                            let bars = if watching {
-                                Vec::new()
-                            } else {
-                                let bars = ms.closed_bars(&t.symbol, BAR_TF);
-                                if bars.len() < MIN_CANDIDATE_BARS {
-                                    return None;
-                                }
-                                bars
-                            };
-                            let avg_vol = avg_volumes.get(&t.symbol).copied().filter(|v| *v > 0.0);
-                            Some(Input {
-                                symbol: t.symbol.clone(),
-                                bars,
-                                meta: Meta {
-                                    price,
-                                    bid: t.bid,
-                                    ask: t.ask,
-                                    spread: t.spread,
-                                    volume_day: t.volume_day,
-                                    change_day_pct: t.change_day_pct,
-                                    float_shares: float,
-                                    float_known: float.is_some(),
-                                    rvol: avg_vol.map(|a| t.volume_day as f64 / a),
-                                },
-                            })
-                        })
-                        .collect()
-                };
+                let inputs = snapshot_inputs(
+                    &market.read().unwrap(),
+                    &machines,
+                    &floats,
+                    &avg_volumes,
+                    &profiles,
+                    &cfg,
+                    now,
+                );
 
                 // ── 1-minute backfill: seed the baseline for active young names that
                 // don't yet have a full live window. Only once enough session history
@@ -821,7 +770,7 @@ impl MicroPullbackEngine {
                 let full_bars = full_live_bars(&cfg);
                 let seed_window_open = !crate::replay::clock::is_active()
                     && crate::time::et_minutes(now)
-                        >= SESSION_START_MIN + (BASELINE_WINDOW_SECS / 60) as u32;
+                        >= u32::from(opts.session_start_min) + (BASELINE_WINDOW_SECS / 60) as u32;
                 let seed_due = last_seed_attempt
                     .map(|t| t.elapsed() >= Duration::from_secs(SEED_ATTEMPT_INTERVAL_SECS))
                     .unwrap_or(true);
@@ -983,6 +932,72 @@ impl MicroPullbackEngine {
             }
         });
     }
+}
+
+/// One loop pass's candidates, read under the caller's lock: gate 1 (price band,
+/// float, issuer switches) and a freshly-closed 10s bar to evaluate. Shared with the
+/// replay fidelity harness so it drives the engine through the very same door.
+fn snapshot_inputs(
+    ms: &MarketState,
+    machines: &HashMap<String, Machine>,
+    floats: &HashMap<String, u64>,
+    avg_volumes: &HashMap<String, f64>,
+    profiles: &HashMap<String, IssuerProfile>,
+    cfg: &Config,
+    now: DateTime<Utc>,
+) -> Vec<Input> {
+    ms.tickers
+        .values()
+        .filter_map(|t| {
+            let price = t.last_price?;
+            let float = floats.get(&t.symbol).copied();
+            let profile = profiles.get(&t.symbol).copied().unwrap_or_default();
+            if !gate1_tradeable(price, float, profile, cfg) {
+                return None;
+            }
+            if let Some(m) = machines.get(&t.symbol) {
+                if m.locked && !m.tracking_depth(now) {
+                    return None;
+                }
+            }
+            let machine = machines.get(&t.symbol);
+            let watching = machine.and_then(|m| m.watch).is_some();
+            let latest = ms.latest_closed_bar_time(&t.symbol, BAR_TF)?;
+            // Detection is defined on freshly-closed 10s bars. Avoid
+            // cloning and de-duplicating the full ring on nine of ten
+            // loop ticks where its watermark did not change. A live
+            // liquidity watch still needs a lightweight input every
+            // second, but stage 2 never reads its bars.
+            if !watching && machine.and_then(|m| m.last_eval_bar) == Some(latest) {
+                return None;
+            }
+            let bars = if watching {
+                Vec::new()
+            } else {
+                let bars = ms.closed_bars(&t.symbol, BAR_TF);
+                if bars.len() < MIN_CANDIDATE_BARS {
+                    return None;
+                }
+                bars
+            };
+            let avg_vol = avg_volumes.get(&t.symbol).copied().filter(|v| *v > 0.0);
+            Some(Input {
+                symbol: t.symbol.clone(),
+                bars,
+                meta: Meta {
+                    price,
+                    bid: t.bid,
+                    ask: t.ask,
+                    spread: t.spread,
+                    volume_day: t.volume_day,
+                    change_day_pct: t.change_day_pct,
+                    float_shares: float,
+                    float_known: float.is_some(),
+                    rvol: avg_vol.map(|a| t.volume_day as f64 / a),
+                },
+            })
+        })
+        .collect()
 }
 
 /// Evaluate one ticker. Three stages:
@@ -1414,11 +1429,6 @@ fn median(v: &mut [f64]) -> f64 {
     } else {
         (v[n / 2 - 1] + v[n / 2]) / 2.0
     }
-}
-
-/// The engine's active window: the whole extended trading day, 04:00–20:00 ET.
-fn in_active_session(now: DateTime<Utc>) -> bool {
-    (SESSION_START_MIN..SESSION_END_MIN).contains(&crate::time::et_minutes(now))
 }
 
 /// Informational news tag (never required, never blocks): NEWS « headline » when a

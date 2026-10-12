@@ -5,6 +5,7 @@ import { ArrowUp, Mic, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/tauri";
 import { useSttStore } from "@/stores/sttStore";
+import { useAutoVoiceStore } from "@/stores/autoVoiceStore";
 import type { SttJobKind, SttSpectrum } from "@/types";
 
 // Inline voice-dictation control. The SAME button toggles: click to record (mic
@@ -13,6 +14,11 @@ import type { SttJobKind, SttSpectrum } from "@/types";
 // button with a live audio wave, a timer and a trash (cancel) button. The model
 // downloads in the background on first use; the transcription happens async in the
 // STT worker (this only captures + enqueues).
+//
+// On a chart (`autoSymbol` set) the button also drives the AUTO voice recorder: a
+// hover overlay toggles it on/off, it starts by itself when its ticker's review
+// session opens (see autoVoiceStore), and releasing the ticker (« Libérer », or the
+// zone switching ticker) stops the recording and SENDS it rather than dropping it.
 
 const BARS = 18;
 
@@ -28,10 +34,15 @@ interface Props {
   disabled?: boolean;
   /** Receives a toggle() the parent can fire (e.g. the Xbox gamepad). */
   onRegisterToggle?: (toggle: (() => void) | null) => void;
+  /** Chart mic: the ticker it records — enables the auto recorder (see header). */
+  autoSymbol?: string | null;
+  /** No trade on the ticker: the note goes to a missed trade (red icon). */
+  missed?: boolean;
 }
 
 export function MicDictate({
   mode, tradeId, symbol, variant = "card", className, title, disabled, onRegisterToggle,
+  autoSymbol, missed,
 }: Props) {
   const id = useId();
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -52,6 +63,22 @@ export function MicDictate({
   const liveRef = useRef<{ unlisten?: () => void; timer?: ReturnType<typeof setInterval> }>({});
   const recordingRef = useRef(false);
   useEffect(() => { recordingRef.current = recording; }, [recording]);
+  // Ticker the in-progress recording is about (captured at start).
+  const recSymbolRef = useRef<string | null>(null);
+
+  const autoEnabled = useAutoVoiceStore((s) => s.enabled);
+  const autoPending = useAutoVoiceStore((s) => s.pending);
+  const [hover, setHover] = useState(false);
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showOverlay = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    setRect(btnRef.current?.getBoundingClientRect() ?? null);
+    setHover(true);
+  };
+  const hideOverlay = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = setTimeout(() => setHover(false), 250);
+  };
 
   // Position the popover under the button, clamped to the viewport so it never
   // spills off the right (or bottom) edge — the chart toolbar buttons sit near the
@@ -85,6 +112,7 @@ export function MicDictate({
 
     try {
       await api.sttStartRecording(mode, tradeId ?? null, symbol ?? null);
+      recSymbolRef.current = symbol ?? null;
     } catch (e) {
       setError(String(e));
       release(id);
@@ -119,20 +147,55 @@ export function MicDictate({
     else start();
   };
 
-  // Expose toggle() to the parent (gamepad), and cancel a live recording on unmount
-  // so the backend recorder is never left wedged.
+  // Expose toggle() to the parent (gamepad), and end a live recording on unmount so
+  // the backend recorder is never left wedged. A chart mic SENDS it (the trader
+  // left the ticker — the note is his), any other mic drops it.
   useEffect(() => {
     onRegisterToggle?.(toggle);
     return () => {
       onRegisterToggle?.(null);
       if (recordingRef.current) {
         teardown();
-        api.sttCancelRecording().catch(() => {});
+        if (autoSymbol) {
+          api.sttStopRecording().catch(() => {});
+          if (recSymbolRef.current) useAutoVoiceStore.getState().released(recSymbolRef.current);
+        } else {
+          api.sttCancelRecording().catch(() => {});
+        }
         useSttStore.getState().release(id);
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Auto voice (chart mic only) ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!autoSymbol) return;
+    const store = useAutoVoiceStore.getState();
+    store.register(autoSymbol);
+    return () => useAutoVoiceStore.getState().unregister(autoSymbol);
+  }, [autoSymbol]);
+
+  // Start by itself when this ticker is the pending one and the mic is free.
+  useEffect(() => {
+    if (!autoSymbol || autoPending !== autoSymbol) return;
+    if (recordingRef.current || owner !== null || disabled) return;
+    useAutoVoiceStore.getState().consumed(autoSymbol);
+    start();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPending, autoSymbol, owner]);
+
+  // The ticker changed under a live recording (« Libérer », or the zone moved on):
+  // stop and send it, then let the recorder move to the most recent ticker.
+  useEffect(() => {
+    if (!autoSymbol && !recSymbolRef.current) return;
+    const was = recSymbolRef.current;
+    if (recordingRef.current && was && was !== (symbol ?? null)) {
+      finish(true);
+      useAutoVoiceStore.getState().released(was);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]);
 
   const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
   const ss = String(elapsed % 60).padStart(2, "0");
@@ -151,19 +214,52 @@ export function MicDictate({
         title={recording ? "Stop & envoyer" : title ?? "Dicter une note (micro)"}
         disabled={disabled || busy}
         onClick={toggle}
+        onMouseEnter={autoSymbol ? showOverlay : undefined}
+        onMouseLeave={autoSymbol ? hideOverlay : undefined}
         className={cn(
           sizeClass,
-          "transition-colors",
+          "relative transition-colors",
           recording
             ? "bg-red-600 text-white hover:bg-red-500"
             : disabled || busy
               ? "cursor-not-allowed text-muted-foreground/30"
-              : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              : missed
+                ? "text-red-400 hover:bg-red-950/40 hover:text-red-300"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground",
           className,
         )}
       >
         {recording ? <ArrowUp className={iconSize} /> : <Mic className={iconSize} />}
+        {autoSymbol && autoEnabled && !recording && (
+          <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        )}
       </button>
+
+      {autoSymbol && hover && rect &&
+        createPortal(
+          <div
+            style={{ position: "fixed", top: rect.top - 26, left: Math.max(8, rect.left + rect.width / 2 - 44) }}
+            className="z-[2001]"
+            onMouseEnter={showOverlay}
+            onMouseLeave={hideOverlay}
+          >
+            <button
+              type="button"
+              onClick={() => useAutoVoiceStore.getState().setEnabled(!autoEnabled)}
+              title="Enregistrement vocal automatique dès l'apparition d'un ticker revu (Settings ▸ Revue)"
+              className={cn(
+                "flex h-5 w-[88px] items-center justify-center gap-1 rounded-full border px-2 text-[10px] font-medium shadow-lg",
+                autoEnabled
+                  ? "border-emerald-700 bg-emerald-950 text-emerald-300"
+                  : "border-border bg-popover text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <span className={cn("h-1.5 w-1.5 rounded-full", autoEnabled ? "bg-emerald-400" : "bg-muted-foreground/50")} />
+              Auto {autoEnabled ? "ON" : "OFF"}
+            </button>
+          </div>,
+          document.body,
+        )}
 
       {recording &&
         createPortal(

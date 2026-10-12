@@ -223,12 +223,8 @@ pub fn start(
         let mut replay_gen = crate::replay::clock::generation();
 
         while running.load(Ordering::Relaxed) {
-            let enabled = strategy_enabled
-                .read()
-                .unwrap()
-                .get(STRATEGY_ID)
-                .copied()
-                .unwrap_or(true);
+            let enabled =
+                crate::strategies::runs(&strategy_enabled.read().unwrap(), STRATEGY_ID);
             if !enabled {
                 attention.write().unwrap().clear();
                 crate::replay::clock::scaled_sleep(LOOP_MS).await;

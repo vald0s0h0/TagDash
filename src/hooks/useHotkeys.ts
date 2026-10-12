@@ -1,12 +1,14 @@
 import { useEffect } from "react";
 import {
-  useHotkeyStore, bindingFromEvent, bindingsEqual,
-  getHoveredZone, setHoveredZone, dispatchToZone, isRecordingActive,
+  useHotkeyStore, bindingFromEvent, bindingsEqual, bindingLabel,
+  getHoveredZone, setHoveredZone, dispatchToZone, isRecordingActive, isReplayActive,
+  REPLAY_ACTIONS,
   type Binding, type HotkeyActionId,
 } from "@/stores/hotkeyStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useUiStore } from "@/stores/uiStore";
 import { api } from "@/lib/tauri";
+import { trackUsage } from "@/lib/usageTracker";
 
 // Global hotkey listener. Mounted once (App). Routes a matched chord to the zone
 // under the mouse cursor (its registered ChartZone dispatcher), falling back to
@@ -29,8 +31,14 @@ function aDialogIsOpen(): boolean {
   return !!document.querySelector('[role="dialog"][data-state="open"]');
 }
 
+/** The « Revue » tab shows no trading chart: its keys (space, arrows) drive the
+ *  replay, and a chord must never reach a trading chart hidden behind it. */
+function reviewIsOpen(): boolean {
+  return useUiStore.getState().activeView === "review";
+}
+
 function suppressed(target: EventTarget | null): boolean {
-  return isRecordingActive() || aDialogIsOpen() || isTypingTarget(target);
+  return isRecordingActive() || aDialogIsOpen() || isTypingTarget(target) || reviewIsOpen();
 }
 
 export function useHotkeys(): void {
@@ -64,18 +72,23 @@ export function useHotkeys(): void {
       const id = matchAction(b);
       if (!id) return;
       // Replay is global (no chart zone involved) — bypass the zone dispatch.
-      // The backend no-ops when no replay is active, so this is safe to fire
-      // unconditionally.
-      if (id === "replay_next_alert") {
+      // Outside a replay the chord is not ours: it is let through untouched.
+      if (REPLAY_ACTIONS.has(id)) {
+        if (!isReplayActive()) return;
         e.preventDefault();
         e.stopPropagation();
-        api.replayNextAlert().catch(() => {});
+        // A held key must not flip play / pause at the keyboard's repeat rate.
+        if ("repeat" in e && e.repeat) return;
+        trackUsage("hotkey", id, { input: bindingLabel(b) });
+        if (id === "replay_play_pause") api.replayTogglePlaying().catch(() => {});
+        else api.replayNextAlert().catch(() => {});
         return;
       }
       const zone = targetZone(e.target);
       if (!zone) return;
       e.preventDefault();
       e.stopPropagation();
+      trackUsage("hotkey", id, { context: "chart", input: bindingLabel(b) });
       dispatchToZone(zone, id);
     }
 
@@ -91,7 +104,8 @@ export function useHotkeys(): void {
     function onAuxClick(e: MouseEvent): void {
       if (suppressed(e.target)) return;
       const b = bindingFromEvent(e);
-      if (b && matchAction(b)) e.preventDefault();
+      const id = b && matchAction(b);
+      if (id && (isReplayActive() || !REPLAY_ACTIONS.has(id))) e.preventDefault();
     }
 
     window.addEventListener("keydown", handle, true);

@@ -48,10 +48,9 @@ pub const DEFAULT_WINDOW_DAYS: i64 = 180;
 /// it can cross a `spawn` boundary into the alert pre-warm task.
 #[derive(Debug, Clone)]
 pub enum Source {
-    /// Massive — preferred whenever Alpaca is on the free IEX plan.
+    /// Massive — only when no Alpaca key is configured.
     Massive(String),
-    /// Alpaca (key, secret) — used on SIP, and as the fallback when Massive is
-    /// unavailable.
+    /// Alpaca (key, secret) — the default: full SIP bars on every plan.
     Alpaca { key: String, secret: String },
 }
 
@@ -175,8 +174,10 @@ pub async fn fetch_window(
 ///
 /// Shared by the chart command (which asks for the window on screen) and the alert
 /// pre-warm (which asks for the default window the moment a ticker is alerted), so
-/// the two can never drift apart. Never call it during a replay or offline: it
-/// reaches the network unconditionally.
+/// the two can never drift apart. Never call it offline: it reaches the network
+/// unconditionally. During a replay the caller must bound `to_date` by the
+/// simulated clock — the provider windows are NOT clamped here, and only the
+/// premarket fold keeps a same-day fetch after 09:30 from carrying later bars.
 pub async fn ensure_cached(
     src: &Source,
     db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,

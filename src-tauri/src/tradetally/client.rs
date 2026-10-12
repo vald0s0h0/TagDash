@@ -101,12 +101,17 @@ impl TtClient {
     /// GET a JSON resource (Bearer token). Used by the dashboard to page through
     /// `/api/v1/trades`.
     pub async fn get_json(&self, endpoint: &str) -> Result<Value, String> {
+        self.get_json_within(endpoint, 20).await
+    }
+
+    /// `get_json` with its own timeout — for reads the UI waits on.
+    pub async fn get_json_within(&self, endpoint: &str, timeout_secs: u64) -> Result<Value, String> {
         let resp = self
             .inner
             .get(self.url(endpoint))
             .header("Authorization", self.auth_header())
             .header("Accept", "application/json")
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(timeout_secs))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -305,6 +310,46 @@ impl TtClient {
                     "TradeTally login returned no token".to_string()
                 }
             })
+    }
+
+    /// Session JWT, reused while fresh (a login per image would be slow).
+    async fn session_jwt(&self, fresh: bool) -> Result<String, String> {
+        static CACHE: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+        if !fresh {
+            if let Some((jwt, at)) = CACHE.lock().unwrap().clone() {
+                if at.elapsed() < Duration::from_secs(20 * 60) {
+                    return Ok(jwt);
+                }
+            }
+        }
+        let jwt = self.login_jwt().await?;
+        *CACHE.lock().unwrap() = Some((jwt.clone(), std::time::Instant::now()));
+        Ok(jwt)
+    }
+
+    /// Download a file of a trade's image gallery (`/api/trades/{id}/images/…`,
+    /// as listed in the trade's `attachment_urls`). Session auth, like the upload.
+    pub async fn get_image_session(&self, path: &str) -> Result<Vec<u8>, String> {
+        for fresh in [false, true] {
+            let jwt = self.session_jwt(fresh).await?;
+            let resp = self
+                .inner
+                .get(self.url(path))
+                .header("Authorization", format!("Bearer {jwt}"))
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if (status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN) && !fresh {
+                continue; // expired session: log in again once
+            }
+            if !status.is_success() {
+                return Err(format!("image HTTP {status}"));
+            }
+            return resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string());
+        }
+        Err("image refusée par TradeTally".into())
     }
 
     /// Upload a screenshot to a trade's image gallery.

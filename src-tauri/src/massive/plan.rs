@@ -152,16 +152,47 @@ pub fn effective_from_app_state(
     effective(detected, override_)
 }
 
+/// Whether Massive's delayed stream is what feeds the app live.
+///
+/// Only when NO Alpaca key pair is configured. With Alpaca keys, Alpaca always wins:
+/// its free Basic plan serves the full SIP history over REST (15 minutes back, the
+/// same delay as Massive Starter) and real-time IEX over the stream — Massive stays a
+/// reference source (float, short interest, security types, 5s/10s bars) and is never
+/// promoted over it.
+pub fn drives_live_feed(has_alpaca: bool, tier: Tier) -> bool {
+    !has_alpaca && matches!(tier, Tier::Unlimited)
+}
+
+/// Whether an Alpaca key pair is configured — the input `drives_live_feed` keys on.
+/// Deliberately blind to the offline switch: going offline stops every feed, it
+/// must not flip the broker gate as if Massive had taken over.
+pub fn has_alpaca_keys(sec: &crate::config::secrets::Secrets) -> bool {
+    let set = |o: &Option<String>| o.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    set(&sec.alpaca_key) && set(&sec.alpaca_secret)
+}
+
+/// `drives_live_feed` resolved from persisted state (keys + effective tier), for the
+/// broker gate and the settings UI.
+pub fn drives_live_feed_from_app_state(
+    secrets: &std::sync::RwLock<crate::config::secrets::Secrets>,
+    db: &std::sync::Mutex<rusqlite::Connection>,
+    config: &std::sync::RwLock<crate::config::AppConfig>,
+) -> bool {
+    let has_alpaca = has_alpaca_keys(&secrets.read().unwrap());
+    drives_live_feed(has_alpaca, effective_from_app_state(db, config))
+}
+
 /// Data differed by 15 minutes must never drive a real order sent to Alpaca. When
-/// the effective tier is `Unlimited` and the Alpaca broker is currently selected,
-/// force the internal TagDash broker instead and persist the change. Returns
-/// whether a switch actually happened, so the caller can warn the user.
+/// Massive's delayed stream feeds the app (`drives_live_feed`) and the Alpaca broker
+/// is currently selected, force the internal TagDash broker instead and persist the
+/// change. Returns whether a switch actually happened, so the caller can warn the
+/// user.
 pub fn enforce_broker_gate(
     config: &std::sync::Arc<std::sync::RwLock<crate::config::AppConfig>>,
     app_dir: &std::path::Path,
-    effective: Tier,
+    delayed_live: bool,
 ) -> bool {
-    if !matches!(effective, Tier::Unlimited) {
+    if !delayed_live {
         return false;
     }
     let mut cfg = config.write().unwrap();
@@ -228,6 +259,14 @@ mod tests {
     fn detected_wins_when_no_override() {
         assert_eq!(effective(Some(Tier::Unlimited), None), Tier::Unlimited);
         assert_eq!(effective(Some(Tier::Basic), None), Tier::Basic);
+    }
+
+    #[test]
+    fn alpaca_keys_always_win_over_massive() {
+        assert!(!drives_live_feed(true, Tier::Unlimited));
+        assert!(!drives_live_feed(true, Tier::Basic));
+        assert!(drives_live_feed(false, Tier::Unlimited));
+        assert!(!drives_live_feed(false, Tier::Basic));
     }
 
     #[test]

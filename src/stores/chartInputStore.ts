@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
-// Chart navigation tuning. Persisted to localStorage.
+// Chart navigation tuning. Persisted with the personal data (`userStorage`).
 //
 // Four independent sensitivity sliders, one per (device × physical wheel axis):
 //   - `mouseSensitivityX` / `mouseSensitivityY`       — a mouse wheel notch
@@ -54,6 +55,6 @@ export const useChartInput = create<ChartInputState>()(
       setZoomInvert:           (v) => set({ zoomInvert: v }),
       setScrollSwapAxes:       (v) => set({ scrollSwapAxes: v }),
     }),
-    { name: "tagdash-chart-input" },
+    { name: "tagdash-chart-input", storage: userStorage() },
   ),
 );

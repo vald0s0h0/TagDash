@@ -486,6 +486,8 @@ pub fn push_alert(
 ) {
     let session = alert.session;
     let symbol = alert.symbol.clone();
+    // What the review recorder needs, taken before the alert moves into the lists.
+    let review_key = (alert.strategy_id.clone(), alert.strategy_name.clone(), alert.price);
     let is_new = {
         let mut active = active_alerts.write().unwrap();
         // Micro Pullback deliberately republishes the same `alert_id` when its tempo
@@ -511,6 +513,10 @@ pub fn push_alert(
         }
     }
     if is_new {
+        // A reviewed strategy showing a ticker opens its review session. Only a NEW
+        // alert: Micro Pullback re-publishes the same id as its depth grows, and that
+        // must not reopen a session the trader closed with « Libérer ».
+        crate::review::on_alert(&symbol, &review_key.0, &review_key.1, review_key.2);
         // Just-in-time "capacité à diluer" collection for an alerted ticker
         // (premarket dilution readiness). Non-blocking; worker-side TTL still guards
         // other request sources.

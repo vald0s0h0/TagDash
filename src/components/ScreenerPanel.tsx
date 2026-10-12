@@ -356,6 +356,7 @@ function ScreenerCard({
 
   return (
     <div
+      data-track="Carte screener"
       className={cn(
         "group relative m-2 cursor-pointer rounded-md border border-border bg-card px-3 py-2 transition-colors hover:border-blue-700/60 hover:bg-accent/30",
         selected && "border-blue-600 bg-accent/40",

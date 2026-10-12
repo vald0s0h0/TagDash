@@ -14,6 +14,9 @@ export function useBarTooltip(
   candleRef:       MutableRefObject<ISeriesApi<"Candlestick"> | null>,
   volumeSeriesRef: MutableRefObject<ISeriesApi<"Histogram"> | null>,
   containerRef:    MutableRefObject<HTMLDivElement | null>,
+  /** Changes when the owner rebuilds its chart (the review replay does, per trade
+   *  and timeframe) — the tooltip re-attaches to the new one. */
+  rebuildKey?:     unknown,
 ) {
   useEffect(() => {
     const chart     = chartRef.current;
@@ -103,5 +106,5 @@ export function useBarTooltip(
       volEl.remove();
       pctEl.remove();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rebuildKey]); // eslint-disable-line react-hooks/exhaustive-deps
 }

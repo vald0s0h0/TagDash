@@ -1,7 +1,6 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from "react";
 import {
   createChart,
-  TickMarkType,
   type IChartApi,
   type ISeriesApi,
   type IPriceLine,
@@ -16,8 +15,7 @@ import type {
   DrawMode, ChartLine, ChartAnnotation, ChartAlarm, CtxTarget, DrawScope,
 } from "@/stores/chartStore";
 import type { CrosshairSync } from "@/lib/crosshairSync";
-import { nyTime, nyDateTime, nyDayMonth, nyMonth, nyYear } from "@/lib/nyTime";
-import { ExecutionsPrimitive } from "@/charts/executionsPrimitive";
+import { ExecutionsPrimitive, execTradeId } from "@/charts/executionsPrimitive";
 import { BollingerPrimitive } from "@/charts/bollingerPrimitive";
 import { GridPrimitive } from "@/charts/gridPrimitive";
 import { ShortCostPrimitive, type ShortCostBand } from "@/charts/shortCostPrimitive";
@@ -28,6 +26,10 @@ import { PremarketPrimitive } from "@/charts/premarketPrimitive";
 import { PremarketChip } from "@/components/PremarketChip";
 import { DrawingsPrimitive, hexToRgba } from "@/charts/drawingsPrimitive";
 import { useChartTheme, getChartTheme } from "@/stores/chartThemeStore";
+import {
+  DEFAULT_SCALE, DEFAULT_SCROLL, baseChartOptions, candleSeriesOptions, isSecondsTf, routeWheel,
+  zoomPriceAxis as zoomPriceAxisOf, zoomTimeAxis as zoomTimeAxisOf,
+} from "@/charts/chartDefaults";
 import { useChartInput } from "@/stores/chartInputStore";
 import {
   BACKFILL_THRESHOLD, toUTC,
@@ -74,28 +76,6 @@ const PM_RANGE_QUANTUM_SEC = 5 * 86_400;
 const HANDLE_HIT = 8;   // px radius to grab an endpoint handle
 const SEG_HIT    = 6;   // px distance to grab a segment body
 const PRICE_HIT  = 7;   // px to grab a horizontal price line
-
-// Default chart scale options, re-applied after a drag temporarily froze them.
-// `mouseWheel` is off: the main-wheel time zoom is driven by our `onWheel` handler
-// (which always pins the current/rightmost bar) — native wheel zoom anchors on
-// the cursor, which we don't want.
-const DEFAULT_SCALE = {
-  mouseWheel:           false,
-  pinch:                true,
-  axisPressedMouseMove: true,
-  axisDoubleClickReset: true,
-};
-
-// Scroll handling: the chart's OWN mouse-wheel scroll is disabled so the wheel is
-// driven entirely by our `onWheel` handler (2nd/horizontal wheel = vertical
-// price-axis zoom, main wheel = time zoom). Click-drag panning and touch dragging
-// stay enabled. Re-applied after an in-chart drag froze them.
-const DEFAULT_SCROLL = {
-  mouseWheel:       false,
-  pressedMouseMove: true,
-  horzTouchDrag:    true,
-  vertTouchDrag:    true,
-};
 
 // ─── Drag state ───────────────────────────────────────────────────────────────
 
@@ -195,6 +175,8 @@ interface Props {
   onEditAnnotation?: (id: string, text: string) => void;
   /** Right-click on a drawing / price line → open the context menu. */
   onContextMenu?: (target: CtxTarget, clientX: number, clientY: number) => void;
+  /** Click on an execution triangle (no tool armed) → the trade it belongs to. */
+  onExecutionClick?: (tradeId: string) => void;
   /** Tool placement was cancelled (e.g. text editor escaped) → reset drawMode. */
   onCancelTool?: () => void;
 }
@@ -249,6 +231,7 @@ export function LightweightChart({
   onEditAnnotation,
   onContextMenu,
   onCancelTool,
+  onExecutionClick,
 }: Props) {
   const containerRef  = useRef<HTMLDivElement>(null);
   const chartRef      = useRef<IChartApi | null>(null);
@@ -297,6 +280,7 @@ export function LightweightChart({
   const onTpDragEndRef  = useRef(onTpDragEnd);
   const onSlDblClickRef = useRef(onSlDblClick);
   const onCreateAnnotationRef = useRef(onCreateAnnotation);
+  const onExecutionClickRef = useRef(onExecutionClick);
   const drawModeRef     = useRef<DrawMode>(drawMode);
   const paneScopeRef    = useRef<DrawScope>(paneScope);
   const pendingEmojiRef = useRef<string | null>(pendingEmoji);
@@ -322,6 +306,9 @@ export function LightweightChart({
   useEffect(() => { onTpDragEndRef.current  = onTpDragEnd; });
   useEffect(() => { onSlDblClickRef.current = onSlDblClick; });
   useEffect(() => { onCreateAnnotationRef.current = onCreateAnnotation; });
+  useEffect(() => { onExecutionClickRef.current = onExecutionClick; });
+  // Triangles are only clickable (pointer cursor) where a click opens something.
+  useEffect(() => { if (execPrimRef.current) execPrimRef.current.clickable = !!onExecutionClick; });
   useEffect(() => { drawModeRef.current     = drawMode; });
   useEffect(() => { paneScopeRef.current    = paneScope; });
   useEffect(() => { pendingEmojiRef.current = pendingEmoji; });
@@ -449,52 +436,28 @@ export function LightweightChart({
   // nudging the price-scale margins symmetrically (smaller margins = taller candles).
   const zoomPriceAxis = useCallback((step: number) => {
     const candle = candleRef.current;
-    if (!candle) return;
-    const scale = candle.priceScale();
-    const m = scale.options().scaleMargins ?? { top: 0.08, bottom: 0.08 };
-    const clamp = (v: number) => Math.max(0, Math.min(0.45, v));
-    scale.applyOptions({ scaleMargins: { top: clamp(m.top + step), bottom: clamp(m.bottom + step) } });
+    if (candle) zoomPriceAxisOf(candle, step);
   }, []);
 
-  // Time-axis zoom. factor>1 = zoom in. Always keep the current/rightmost visible
-  // bar fixed and grow/shrink the range from the left. This deliberately avoids a
-  // cursor anchor so mouse wheels and vertical trackpad scrolling behave alike.
+  // Time-axis zoom. factor>1 = zoom in, pinned on the current/rightmost bar.
+  // The pin is the logical index of the last DISPLAYED candle, read off the time
+  // scale — not `bars.length`. The time scale is the union of every series' slots:
+  // in premarket-only mode the candles carry the premarket bars while indicators
+  // still carry `bars`, so the two counts need not match, and a wrong index made
+  // each wheel notch slide the view left instead of zooming on the last bar.
   const zoomTimeAxis = useCallback((factor: number) => {
     const chart = chartRef.current;
     const container = containerRef.current;
     if (!chart || !container) return;
-    const ts = chart.timeScale();
-    const logical = ts.getVisibleLogicalRange();
-    if (!logical) return;
-    const n = barsRef.current?.length ?? 0;
-    const lastIdx = n - 1;
-    const width = container.clientWidth;
-    if (n === 0 || logical.to >= lastIdx) {
-      // Keep the pixel gap past the last bar fixed while zooming, so the
-      // current bar's on-screen position doesn't drift. Derived entirely from
-      // the live visible logical range + measured container width, NOT from
-      // the timeScale's barSpacing/rightOffset options — those can lag behind
-      // a burst of wheel events (worse on HiDPI screens, where each redraw
-      // costs ~4x more to rasterize), and reading them back mid-burst made
-      // the "preserved" pixel gap balloon every tick instead of staying put.
-      const barsVisible = logical.to - logical.from;
-      if (barsVisible <= 0) return;
-      const spacing = width / barsVisible;
-      const gapBars = logical.to - lastIdx;
-      const pxOffset = gapBars * spacing;
-      const minSpacing = ts.options().minBarSpacing;
-      const nextSpacing = Math.max(minSpacing, Math.min(spacing * factor, 80));
-      const newBarsVisible = width / nextSpacing;
-      if (factor > 1 && newBarsVisible < width / 80) return;
-      const to = lastIdx + pxOffset / nextSpacing;
-      ts.setVisibleLogicalRange({ from: to - newBarsVisible, to });
-      return;
+    let count = barsRef.current?.length ?? 0;
+    const last = lastBarRef.current;
+    if (last) {
+      const ts = chart.timeScale();
+      const x = ts.timeToCoordinate(last.time);
+      const idx = x == null ? null : ts.coordinateToLogical(x);
+      if (idx != null) count = Math.round(idx) + 1;
     }
-    const inv  = 1 / factor;
-    const to   = logical.to;
-    const from = to - (to - logical.from) * inv;
-    if (factor > 1 && to - from < width / 80) return;
-    ts.setVisibleLogicalRange({ from, to });
+    zoomTimeAxisOf(chart, container.clientWidth, count, factor);
   }, []);
 
   const clearCursorLine = useCallback(() => {
@@ -547,66 +510,16 @@ export function LightweightChart({
     const container = containerRef.current;
     if (!container) return;
 
+    // TagDash's shared chart defaults (also the « Revue » replay's).
     const chart = createChart(container, {
+      ...baseChartOptions(isSecondsTf(timeframe)),
       width:  container.clientWidth,
       height: container.clientHeight,
-      layout: {
-        background:  { color: "#080808" },
-        textColor:   "#666",
-        fontSize:    10,
-        fontFamily:  "ui-monospace, monospace",
-      },
-      localization: {
-        timeFormatter: (t: Time) =>
-          nyDateTime(Number(t), timeframe === "5s" || timeframe === "10s"),
-      },
-      grid: {
-        // Native grid fully off: vertical lines removed; horizontal lines are
-        // drawn by GridPrimitive (snapped to round/half-dollar, never < $0.50).
-        vertLines: { visible: false },
-        horzLines: { visible: false },
-      },
-      // Colour + "horizontal line only" come from the theme (Settings → Apparence);
-      // a dedicated effect re-applies them on every edit (this setup runs once).
-      crosshair: crosshairOptions(getChartTheme()),
-      timeScale: {
-        borderColor:      "#1e1e1e",
-        timeVisible:      true,
-        secondsVisible:   timeframe === "5s" || timeframe === "10s",
-        rightOffset:      7, // bars of empty space past the latest bar (official option)
-        fixLeftEdge:      false,
-        fixRightEdge:     false,
-        tickMarkFormatter: (t: Time, tickMarkType: TickMarkType) => {
-          const sec = Number(t);
-          switch (tickMarkType) {
-            case TickMarkType.Year:            return nyYear(sec);
-            case TickMarkType.Month:           return nyMonth(sec);
-            case TickMarkType.DayOfMonth:      return nyDayMonth(sec);
-            case TickMarkType.TimeWithSeconds: return nyTime(sec, true);
-            default:                           return nyTime(sec, false);
-          }
-        },
-      },
-      rightPriceScale: {
-        borderColor:  "#1e1e1e",
-        scaleMargins: { top: 0.08, bottom: 0.08 },
-      },
-      handleScroll: { ...DEFAULT_SCROLL },
-      handleScale: { ...DEFAULT_SCALE },
     });
 
     // Seed candle colours from the live theme; a dedicated effect re-applies them
     // when the user edits the palette (this setup effect runs once).
-    const { up, down } = getChartTheme().candle;
-    const candle = chart.addCandlestickSeries({
-      upColor:          up,
-      downColor:        down,
-      borderUpColor:    up,
-      borderDownColor:  down,
-      wickUpColor:      up,
-      wickDownColor:    down,
-      priceLineVisible: false,
-    });
+    const candle = chart.addCandlestickSeries(candleSeriesOptions(getChartTheme()));
 
     chartRef.current  = chart;
     candleRef.current = candle;
@@ -631,6 +544,7 @@ export function LightweightChart({
     gridPrimRef.current = gridPrim;
 
     const execPrim = new ExecutionsPrimitive();
+    execPrim.clickable = !!onExecutionClickRef.current;
     candle.attachPrimitive(execPrim);
     execPrimRef.current = execPrim;
 
@@ -669,7 +583,13 @@ export function LightweightChart({
       }
 
       const mode = drawModeRef.current;
-      if (mode === "none") return;          // selection handled in onMouseDown
+      if (mode === "none") {
+        // An execution triangle → its trade's note. (Selection of drawings is
+        // handled in onMouseDown.)
+        const tradeId = execTradeId(param.hoveredObjectId);
+        if (tradeId) onExecutionClickRef.current?.(tradeId);
+        return;
+      }
       if (!param.point) return;
 
       const price = candle.coordinateToPrice(param.point.y);
@@ -767,40 +687,19 @@ export function LightweightChart({
     });
 
     const onWheel = (e: WheelEvent) => {
-      const absX = Math.abs(e.deltaX);
-      const absY = Math.abs(e.deltaY);
-      if (absX === 0 && absY === 0) return;
-
-      // Determine dominant scroll axis, then apply the swap-axes preference.
-      // Default: horizontal dominant → price-axis zoom, vertical dominant → time-axis zoom.
-      // swapAxes: flip that mapping (vertical → price, horizontal → time).
-      const hDominant = absX > absY;
-      const zoomPrice = scrollSwapRef.current ? !hDominant : hDominant;
-      const delta = hDominant ? e.deltaX : e.deltaY;
-      if (delta === 0) return;
-      e.preventDefault();
-
-      // Mouse-wheel notches produce large deltas (~100 px); trackpad frames are
-      // tiny. Sensitivity is picked by (device × physical wheel axis) — not by
-      // what that wheel controls — so it stays correct under scrollSwapAxes.
-      const absD  = Math.abs(delta);
-      const isMouse = absD >= 50;
-      const sens  = hDominant
-        ? (isMouse ? mouseSensXRef.current : trackpadSensXRef.current)
-        : (isMouse ? mouseSensYRef.current : trackpadSensYRef.current);
-
-      if (zoomPrice) {
-        const step = Math.min(absD * 0.0002 * sens, 0.05);
-        zoomPriceAxis(delta < 0 ? -step : step);
-        return;
-      }
-
-      // Time-axis (X) zoom.
-      const mag   = Math.min(absD * 0.001 * sens, 0.5);
-      let zoomIn  = delta < 0;
-      if (zoomInvertRef.current) zoomIn = !zoomIn;
-      const factor = zoomIn ? 1 + mag : 1 / (1 + mag);
-      zoomTimeAxis(factor);
+      routeWheel(
+        e,
+        {
+          mouseSensitivityX:    mouseSensXRef.current,
+          mouseSensitivityY:    mouseSensYRef.current,
+          trackpadSensitivityX: trackpadSensXRef.current,
+          trackpadSensitivityY: trackpadSensYRef.current,
+          zoomInvert:           zoomInvertRef.current,
+          scrollSwapAxes:       scrollSwapRef.current,
+        },
+        zoomPriceAxis,
+        zoomTimeAxis,
+      );
     };
     container.addEventListener("wheel", onWheel, { passive: false });
 

@@ -23,6 +23,20 @@ static SPEED_MILLI: AtomicU64 = AtomicU64::new(1000);
 /// Bumped on every state reset (backward seek, new day) — engines watch this.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// The strategies the replayed session was prepared for (valid only while ACTIVE):
+/// their engines run for the session whatever their live toggle says — see
+/// `strategies::runs`.
+static SESSION_STRATEGIES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+pub fn set_session_strategies(ids: Vec<String>) {
+    *SESSION_STRATEGIES.write().unwrap() = ids;
+}
+
+/// Whether the replay in progress was prepared for `strategy_id`.
+pub fn session_runs(strategy_id: &str) -> bool {
+    is_active() && SESSION_STRATEGIES.read().unwrap().iter().any(|s| s == strategy_id)
+}
+
 /// True while a market replay is running (or paused) — i.e. the app clock is
 /// the simulated one.
 pub fn is_active() -> bool {
@@ -52,6 +66,7 @@ pub fn activate(start: DateTime<Utc>) {
 pub fn deactivate() {
     ACTIVE.store(false, Ordering::Relaxed);
     SPEED_MILLI.store(1000, Ordering::Relaxed);
+    SESSION_STRATEGIES.write().unwrap().clear();
 }
 
 /// Current replay speed multiplier (1.0 when inactive).

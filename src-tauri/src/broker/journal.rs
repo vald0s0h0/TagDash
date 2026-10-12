@@ -209,6 +209,9 @@ impl BrokerJournal {
             size_pct: None,
             data_at: None,
         });
+        if let Some(f) = trade.fills.last() {
+            crate::review::timing::record_fill(conn, f, "alpaca");
+        }
         trade.position_qty = ev.position_qty;
         if let Some(avg) = venue_avg {
             trade.avg_entry_price = avg;

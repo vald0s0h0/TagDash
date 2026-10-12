@@ -7,6 +7,9 @@ import { ReplayToolbar } from "@/components/ReplayToolbar";
 import { TickerSpotlight } from "@/components/TickerSpotlight";
 import { Dashboard } from "@/components/dashboard/Dashboard";
 import { TradeTally } from "@/components/TradeTally";
+import { ReviewView } from "@/components/review/ReviewView";
+import { warmUp as warmUpReview } from "@/components/review/queue";
+import { useAutoVoiceSync } from "@/stores/autoVoiceStore";
 import { GamepadOverlays } from "@/components/GamepadOverlays";
 import { useUiStore } from "@/stores/uiStore";
 import { Notifications } from "@/components/Notifications";
@@ -19,7 +22,9 @@ import { useApexEvents } from "@/hooks/useApexEvents";
 import { useDipEvents } from "@/hooks/useDipEvents";
 import { useGamepad } from "@/hooks/useGamepad";
 import { useSttEvents } from "@/hooks/useSttEvents";
+import { useAttentionBridge } from "@/hooks/useAttentionBridge";
 import { api } from "@/lib/tauri";
+import { hasUserState } from "@/lib/userStorage";
 
 export default function App() {
   const activeView = useUiStore((s) => s.activeView);
@@ -36,6 +41,16 @@ export default function App() {
   // App-level OS notifications on every new scanner alert (opt-in in Settings).
   useAlertNotifications();
 
+  // Auto voice recorder: open review sessions → the chart mic of a new ticker.
+  useAutoVoiceSync();
+
+  // « Revue »: a trade is prepared (tape rebuilt, voice fetched) a little after
+  // launch, so the tab opens on it without waiting.
+  useEffect(() => {
+    const t = setTimeout(warmUpReview, 15_000);
+    return () => clearTimeout(t);
+  }, []);
+
   // Global chart hotkeys (keyboard chords / extra mouse buttons → the zone under
   // the cursor). User-configured in Settings → Hotkeys.
   useHotkeys();
@@ -47,13 +62,18 @@ export default function App() {
   useDipEvents();
 
   // Xbox-controller layer (auto-active when a pad is connected). Drives the active
-  // session's chart: stick zoom/cursor, D-pad ticker nav, face-button orders, R2
-  // armed sizing, TradeTally capture/tag, haptics. Configured in Settings → Hotkeys.
+  // session's chart: stick zoom/cursor, D-pad ticker nav, face-button levels, the
+  // LB / LT held sets (LT = armed sizing), TradeTally capture/tag, haptics.
+  // Configured in Settings → Manette Xbox.
   useGamepad();
 
   // Speech-to-Text events: refresh the queue mirror + apply finished diary dictées
   // to the dashboard journal card (works even when that tab is unmounted).
   useSttEvents();
+
+  // Detached « Attention du marché » screen: a ticker clicked twice there opens
+  // here, like any ticker opened by hand.
+  useAttentionBridge();
 
   // Hydrate today's pre-open screener dismissals from the DB so cards the user
   // removed stay hidden across restarts (until the next trading day).
@@ -77,7 +97,7 @@ export default function App() {
   // maintainer's arrangement). A user who already saved a layout keeps theirs —
   // the persisted key only exists once they've touched the board.
   useEffect(() => {
-    if (localStorage.getItem("tagdash-dashboard") !== null) return;
+    if (hasUserState("tagdash-dashboard")) return;
     api.getDefaultDashboard()
       .then((json) => {
         if (!json) return;
@@ -129,6 +149,9 @@ export default function App() {
         {activeView === "dashboard" ? (
           // KPI moodboard — full-bleed, no sidebar.
           <Dashboard />
+        ) : activeView === "review" ? (
+          // Trade review — its own sidebar (metrics, notes) + replay.
+          <ReviewView />
         ) : activeView === "tradetally" ? (
           // Embedded TradeTally web app — full-bleed, no sidebar.
           <TradeTally />
@@ -144,7 +167,7 @@ export default function App() {
         )}
         <TickerSpotlight />
       </div>
-      {/* Controller overlays: auto-tag picker, flash error, R2 armed-layer hint. */}
+      {/* Controller overlays: auto-tag picker, flash error, on-screen pad. */}
       <GamepadOverlays />
       {/* Transient order/broker notices — corner stack, never a modal. */}
       <Notifications />

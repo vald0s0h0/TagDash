@@ -52,6 +52,7 @@ src/                       Frontend React
   charts/                  Wrappers TradingView Lightweight Charts (à venir)
   types/                   Types partagés (miroir des types Rust)
   lib/                     utils + bridge Tauri
+  attention/               Écran détaché « Attention du marché » (fenêtre "attention", 2e moniteur)
 
 src-tauri/                 Backend Tauri (Rust)
   src/
@@ -69,6 +70,9 @@ src-tauri/                 Backend Tauri (Rust)
     strategies/            Stratégies Rust compilées (trait ScanStrategy)
     internal_trading/      Ordres internes, positions, fills simulés
     tradetally/            Client API TradeTally (queue résiliente)
+    review/                Revue : sessions par ticker (tape SIP, voix, notes), rejeu
+    attention_map/         Attention du marché : barres SIP 5 min (AH veille + pré-market),
+                           médianes 60 séances, météo, fenêtre détachée, instantané journal
     screenshot/            Capture zone graphique
     llm/                   Client Claude (strictement async)
     chart_payloads/        Préparation payloads chart pour le front

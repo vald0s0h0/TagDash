@@ -132,6 +132,7 @@ pub async fn fetch_daily_bars_since(
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
+            crate::alpaca::ratelimit::acquire().await;
             let resp = client
                 .get(&url)
                 .header("APCA-API-KEY-ID", key)
@@ -225,6 +226,7 @@ pub async fn fetch_minute_bars_since(
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
+            crate::alpaca::ratelimit::acquire().await;
             let resp = client
                 .get(&url)
                 .header("APCA-API-KEY-ID", key)
@@ -380,6 +382,7 @@ pub async fn fetch_recent_bars(
          &timeframe={timeframe}&start={start}&limit={limit}&sort=desc&adjustment=split"
     );
     push_end(&mut url, tf.seconds(), None); // replay guard: charts never see the future
+    crate::alpaca::ratelimit::acquire().await;
     let resp = client
         .get(&url)
         .header("APCA-API-KEY-ID", key)
@@ -448,6 +451,7 @@ pub async fn fetch_bars_before(
         "https://data.alpaca.markets/v2/stocks/bars?symbols={symbol}\
          &timeframe={timeframe}&end={end}&limit={limit}&sort=desc&adjustment=split"
     );
+    crate::alpaca::ratelimit::acquire().await;
     let resp = client
         .get(&url)
         .header("APCA-API-KEY-ID", key)
@@ -524,6 +528,7 @@ pub async fn fetch_bars_range(
         if let Some(tok) = &page_token {
             url.push_str(&format!("&page_token={tok}"));
         }
+        crate::alpaca::ratelimit::acquire().await;
         let resp = client
             .get(&url)
             .header("APCA-API-KEY-ID", key)

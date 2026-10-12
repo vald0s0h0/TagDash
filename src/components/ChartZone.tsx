@@ -136,7 +136,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
   // keeps the modal (and any in-progress notes) on the original trade instead
   // of reloading the newly-arrived ticker's entry.
   const [journalTarget, setJournalTarget] =
-    useState<{ tradeId: string; symbol: string; pending?: boolean } | null>(null);
+    useState<{ tradeId: string; symbol: string; pending?: boolean; missed?: boolean } | null>(null);
 
   // Inline voice-dictation toggle, registered by the toolbar MicDictate button so
   // the Xbox `journal_audio` button can start/stop the same recording.
@@ -182,16 +182,24 @@ export function ChartZone({ zone }: ChartZoneProps) {
   const linkedTradeIdRef = useRef<string | null>(null);
   linkedTradeIdRef.current = linkedTradeId;
 
-  // Snapshot the current trade and open the journal pinned to it.
+  // Snapshot the current trade and open the journal pinned to it. With no trade on
+  // the ticker the journal files a MISSED-trade note against the ticker's review
+  // session (TagDash only — see `crate::review`).
   const openJournal = useCallback(() => {
-    if (linkedTradeId && zone.symbol) {
+    if (!zone.symbol) return;
+    if (linkedTradeId) {
       setJournalTarget({
         tradeId: linkedTradeId,
         symbol: zone.symbol,
         pending: !tradeLink?.has_activity,
       });
+      return;
     }
-  }, [linkedTradeId, tradeLink?.has_activity, zone.symbol]);
+    const symbol = zone.symbol;
+    api.reviewEnsureSession(symbol, zone.strategy_id ?? null)
+      .then((sessionId) => setJournalTarget({ tradeId: sessionId, symbol, missed: true }))
+      .catch((e) => console.warn("session de revue indisponible:", e));
+  }, [linkedTradeId, tradeLink?.has_activity, zone.symbol, zone.strategy_id]);
 
   // Toggle the inline voice dictation for the current trade (gamepad path mirrors
   // the toolbar mic button).
@@ -1283,7 +1291,12 @@ export function ChartZone({ zone }: ChartZoneProps) {
       const dataUrl = canvas.toDataURL("image/png");
 
       const ts  = nyFilenameStamp(); // New York time
-      const tradeId = linkedTradeIdRef.current;
+      // No trade on the ticker → the capture belongs to its missed trade (the
+      // ticker's review session), kept in TagDash.
+      let tradeId = linkedTradeIdRef.current;
+      if (!tradeId && zone.symbol) {
+        tradeId = await api.reviewEnsureSession(zone.symbol, zone.strategy_id ?? null).catch(() => null);
+      }
       const filename = tradeId ? `${tradeId}_${ts}.png` : `capture_${ts}.png`;
 
       if (tradeId) {
@@ -1309,10 +1322,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
       setCaptureStatus("error");
       setTimeout(() => setCaptureStatus("idle"), 3000);
     }
-  }, [zone.zone_id]);
+  }, [zone.zone_id, zone.symbol, zone.strategy_id]);
 
   // ── Controller (gamepad) zone handlers ─────────────────────────────────────
-  // R1 cycles the focused pane; the cursor-layer buttons (A/B/Y, R2 up) drop
+  // By default RB cycles the focused pane; the base-set face buttons (A/B/Y) drop
   // SL/TP/alarm at the horizontal cursor's price — read live from the focused
   // pane's chart control, seeded at the current price if never moved. X clears the
   // ticker's resting orders + planned SL/TP (double-tap also clears its alarms).
@@ -1650,12 +1663,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
         : captureStatus === "success" ? "Capturé !"
         : captureStatus === "error" ? "Erreur capture"
         : hasTradeId ? `Capturer (lié au trade ${linkedTradeId})`
-        : "Capturer (enregistrer sous)"
+        : "Capture pour trade manqué (aucun trade sur ce ticker)"
       }
       onClick={captureStatus === "idle" ? handleCapture : undefined}
       className={
         captureStatus === "success" ? "text-emerald-400"
         : captureStatus === "error" ? "text-red-400"
+        : !hasTradeId ? "text-red-400 hover:bg-red-950/40 hover:text-red-300"
         : undefined
       }
     >
@@ -1673,13 +1687,13 @@ export function ChartZone({ zone }: ChartZoneProps) {
     <TBtn
       key="journal"
       title={
-        !hasTradeId ? "Aucun trade sur ce ticker (placer un SL ou un TP, ou entrer une position)"
+        !hasTradeId ? "Note pour trade manqué (aucun trade sur ce ticker)"
         : tradeLink?.open ? `Journal — trade en cours (${linkedTradeId})`
         : tradeLink?.source === "planned" ? `Journal — trade préparé (${linkedTradeId})`
         : `Journal — dernier trade (${linkedTradeId})`
       }
-      disabled={!hasTradeId}
       onClick={openJournal}
+      className={!hasTradeId ? "text-red-400 hover:bg-red-950/40 hover:text-red-300" : undefined}
     >
       <NotebookPen className="h-3 w-3" />
     </TBtn>
@@ -1692,11 +1706,12 @@ export function ChartZone({ zone }: ChartZoneProps) {
       mode="trade"
       tradeId={linkedTradeId ?? undefined}
       symbol={zone.symbol}
-      disabled={!hasTradeId}
+      autoSymbol={zone.symbol}
+      missed={!hasTradeId}
       title={
         hasTradeId
           ? `Dicter une note (micro) — ${linkedTradeId}`
-          : "Aucun trade sur ce ticker (placer un SL ou un TP, ou entrer une position)"
+          : "Dicter une note pour trade manqué (aucun trade sur ce ticker)"
       }
       onRegisterToggle={(t) => { audioToggleRef.current = t; }}
     />
@@ -1848,7 +1863,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={captureStatus === "idle" ? handleCapture : undefined}
-                  className="gap-2 text-xs"
+                  className={cn("gap-2 text-xs", !hasTradeId && "text-red-400")}
                 >
                   <Camera className="h-3 w-3" />
                   {captureStatus === "pending" ? "Capture…"
@@ -1856,11 +1871,10 @@ export function ChartZone({ zone }: ChartZoneProps) {
                    : "Capture"}
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  disabled={!hasTradeId}
                   onClick={openJournal}
-                  className="gap-2 text-xs"
+                  className={cn("gap-2 text-xs", !hasTradeId && "text-red-400")}
                 >
-                  <NotebookPen className="h-3 w-3" /> Journal
+                  <NotebookPen className="h-3 w-3" /> {hasTradeId ? "Journal" : "Note trade manqué"}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -2066,6 +2080,9 @@ export function ChartZone({ zone }: ChartZoneProps) {
                     onEditAnnotation={handleEditAnnotation}
                     onContextMenu={handleContextMenu}
                     onCancelTool={() => chartStore.setDrawMode(zone.zone_id, "none")}
+                    // A fill triangle opens the note of ITS trade — not the one the
+                    // toolbar button resolves (the open / last trade on the ticker).
+                    onExecutionClick={(tradeId) => setJournalTarget({ tradeId, symbol: paneSymbol })}
                   />
                 </div>
                 </Fragment>
@@ -2085,6 +2102,7 @@ export function ChartZone({ zone }: ChartZoneProps) {
           tradeId={journalTarget.tradeId}
           symbol={journalTarget.symbol}
           pending={journalTarget.pending}
+          missed={journalTarget.missed}
         />
       )}
 

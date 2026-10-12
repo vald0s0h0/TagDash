@@ -169,7 +169,7 @@ export function Sidebar() {
   }
 
   return (
-    <aside className="flex h-full w-72 flex-col border-r border-border bg-background">
+    <aside data-usage-area="sidebar" className="flex h-full w-72 flex-col border-r border-border bg-background">
       {/* Top section: live screener (pre-open) vs alert feed (premarket / open).
           The screener is "what's happening now" — tickers come and go in real
           time. The alert feed is "what just happened" — events accumulate. */}

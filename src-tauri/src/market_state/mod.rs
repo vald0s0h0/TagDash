@@ -660,6 +660,7 @@ impl MarketState {
             now,
             warn_ms,
             critical_ms,
+            true,
         );
         self.apex
             .on_print(symbol, price, size, 1, event_time.timestamp_millis(), None);
@@ -703,6 +704,7 @@ impl MarketState {
             now,
             warn_ms,
             critical_ms,
+            true,
         );
         if let Some(tc) = self.trade_counts.get_mut(symbol) {
             tc.amend_aggregate(event_time.timestamp(), open, high, low, close, vwap);
@@ -730,6 +732,8 @@ impl MarketState {
     /// for `prints` real trades (synthetic 10s slices built from minute bars
     /// carry the bar's `n` spread across the slices). `now` = the simulated
     /// instant (latency is meaningless in replay and reads as ~0).
+    /// `synthetic`: a slice synthesized from a minute bar, not a real print (see
+    /// `ingest_trade` — it stays out of the per-second tape).
     pub fn on_replay_trade(
         &mut self,
         symbol: &str,
@@ -737,6 +741,7 @@ impl MarketState {
         size: u64,
         prints: u64,
         event_time: DateTime<Utc>,
+        synthetic: bool,
     ) {
         self.ingest_trade(
             symbol,
@@ -747,6 +752,7 @@ impl MarketState {
             event_time,
             1_000,
             2_000,
+            !synthetic,
         );
         self.apex.on_print(
             symbol,
@@ -770,6 +776,7 @@ impl MarketState {
         now: DateTime<Utc>,
         warn_ms: u32,
         critical_ms: u32,
+        count_tape: bool,
     ) {
         self.ensure_ticker_buffers(symbol);
 
@@ -897,14 +904,20 @@ impl MarketState {
             self.premarket_daily.remove(symbol);
         }
 
-        let n = prints.min(u32::MAX as u64) as u32;
-        if let Some(tc) = self.trade_counts.get_mut(symbol) {
-            tc.record(event_time.timestamp(), n, size, price);
-        } else {
-            self.trade_counts
-                .entry(symbol.to_string())
-                .or_default()
-                .record(event_time.timestamp(), n, size, price);
+        // The per-second tape (prints/s, $/s) is what liquidity gates read. A replay's
+        // synthetic 10-second slices bunch a whole slice's prints into one instant —
+        // a rate no real tape had — so they move price, bars and volume but never
+        // count here: an alert can only be confirmed on real prints.
+        if count_tape {
+            let n = prints.min(u32::MAX as u64) as u32;
+            if let Some(tc) = self.trade_counts.get_mut(symbol) {
+                tc.record(event_time.timestamp(), n, size, price);
+            } else {
+                self.trade_counts
+                    .entry(symbol.to_string())
+                    .or_default()
+                    .record(event_time.timestamp(), n, size, price);
+            }
         }
 
         if let Some(w) = self.fill_windows.get_mut(symbol) {
@@ -1717,15 +1730,27 @@ mod tests {
         assert_eq!(ms.recent_news_count("AAA", t(60), 3600), 1);
     }
 
+    // A replay's synthetic slice moves the price but is not tape: liquidity gates
+    // must never confirm on it.
+    #[test]
+    fn synthetic_replay_slices_stay_out_of_the_tape() {
+        let mut ms = MarketState::new();
+        ms.on_replay_trade("AAA", 10.0, 5_000, 40, t(0), true);
+        assert_eq!(ms.tickers["AAA"].last_price, Some(10.0));
+        assert_eq!(ms.tape_window_stats("AAA", 5, t(0)).map_or(0, |w| w.prints), 0);
+        ms.on_replay_trade("AAA", 10.1, 100, 1, t(1), false);
+        assert_eq!(ms.tape_window_stats("AAA", 5, t(1)).map_or(0, |w| w.prints), 1);
+    }
+
     // Trades accumulate into a per-symbol window (range + extreme order) that the
     // trading loop drains; draining clears it so the next poll starts fresh.
     #[test]
     fn fill_window_tracks_range_and_low_first() {
         let mut ms = MarketState::new();
         // Up then down: high reached before low → low_first = false.
-        ms.on_replay_trade("AAA", 10.0, 100, 1, t(0));
-        ms.on_replay_trade("AAA", 11.0, 100, 1, t(1));
-        ms.on_replay_trade("AAA", 9.5, 100, 1, t(2));
+        ms.on_replay_trade("AAA", 10.0, 100, 1, t(0), false);
+        ms.on_replay_trade("AAA", 11.0, 100, 1, t(1), false);
+        ms.on_replay_trade("AAA", 9.5, 100, 1, t(2), false);
 
         let w = ms.drain_fill_windows();
         let aaa = w.get("AAA").expect("window for AAA");
@@ -1775,8 +1800,8 @@ mod tests {
         let _guard = ClockGuard;
 
         let mut ms = MarketState::new();
-        ms.on_replay_trade("AAA", 10.0, 100, 1, pm1);
-        ms.on_replay_trade("AAA", 11.0, 100, 1, pm2);
+        ms.on_replay_trade("AAA", 10.0, 100, 1, pm1, false);
+        ms.on_replay_trade("AAA", 11.0, 100, 1, pm2, false);
 
         // During premarket: one daily candle = the premarket bar.
         let daily = ms.get_bars("AAA", Timeframe::Daily);
@@ -1789,7 +1814,7 @@ mod tests {
 
         // At the open the premarket bar is dropped; the regular candle opens fresh.
         clock::set_sim(reg);
-        ms.on_replay_trade("AAA", 9.5, 50, 1, reg);
+        ms.on_replay_trade("AAA", 9.5, 50, 1, reg, false);
         let daily = ms.get_bars("AAA", Timeframe::Daily);
         assert_eq!(daily.len(), 1, "open: still one daily candle");
         assert_eq!(daily[0].open, 9.5, "regular open replaces premarket open");

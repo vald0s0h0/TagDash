@@ -116,14 +116,14 @@ export function BrokerTab({
         </div>
         <div className="space-y-2">
           {BROKERS.map((b) => {
-            const massiveLocked = b.id === "alpaca" && massiveTier?.effective === "unlimited";
+            const massiveLocked = b.id === "alpaca" && !!massiveTier?.drives_live_feed;
             return (
               <button
                 key={b.id}
                 disabled={busy || massiveLocked}
                 title={
                   massiveLocked
-                    ? "Massive Starter+ actif (données différées de 15 min) — repasse-le en Basic dans Diagnostics du flux pour réactiver Alpaca"
+                    ? "Massive Starter+ alimente le flux (pas de clés Alpaca, données différées de 15 min) — ajoute tes clés Alpaca pour réactiver Alpaca"
                     : undefined
                 }
                 onClick={() => apply(b.id, b.id === "tagdash" ? "paper" : sel.environment)}
@@ -143,7 +143,7 @@ export function BrokerTab({
                   <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{b.blurb}</p>
                   {massiveLocked && (
                     <p className="mt-0.5 text-[11px] leading-snug text-amber-400">
-                      Indisponible — Massive Starter+ actif (données différées de 15 min).
+                      Indisponible — Massive Starter+ alimente le flux (pas de clés Alpaca, données différées de 15 min).
                     </p>
                   )}
                 </div>
@@ -239,9 +239,10 @@ export function BrokerTab({
           <strong> redémarre TagDash</strong> pour l'appliquer partout.
         </p>
         <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">
-          Exception : le tier Massive (Réglages → Diagnostics du flux) DÉCIDE bien du
-          broker — Starter+ (payant, données différées de 15 min) désactive Alpaca et
-          force TagDash, pour qu'un ordre réel ne parte jamais sur un prix périmé.
+          Exception : sans clés Alpaca, un Massive Starter+ (payant, données différées
+          de 15 min) alimente seul le flux — Alpaca est alors désactivé et TagDash
+          forcé, pour qu'un ordre réel ne parte jamais sur un prix périmé. Avec des
+          clés Alpaca, c'est toujours Alpaca qui alimente le flux.
         </p>
       </div>
 

@@ -334,12 +334,12 @@ mod wiring_tests {
     fn replayed_prints_pushing_into_a_resistance_fire_short() {
         let (mut ms, mut rx) = market(Side::Short, 3.94, 4.00);
         for i in 0..30 {
-            ms.on_replay_trade(SYM, 3.80, 300, 1, at(i * 100));
+            ms.on_replay_trade(SYM, 3.80, 300, 1, at(i * 100), false);
         }
         for i in 1..=14 {
-            ms.on_replay_trade(SYM, 3.80 + 0.17 * (i as f64 / 14.0), 800, 1, at(3_000 + i * 100));
+            ms.on_replay_trade(SYM, 3.80 + 0.17 * (i as f64 / 14.0), 800, 1, at(3_000 + i * 100), false);
         }
-        ms.on_replay_trade(SYM, 3.95, 900, 1, at(4_500));
+        ms.on_replay_trade(SYM, 3.95, 900, 1, at(4_500), false);
         assert_eq!(entry(rx.try_recv().expect("flush")).side, Side::Short);
     }
 

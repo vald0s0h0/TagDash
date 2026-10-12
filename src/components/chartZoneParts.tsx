@@ -860,11 +860,17 @@ export function MicroPullbackQualityOverlay({
   const score = quality?.score ?? null;
   const tone = score != null ? microPullbackTone(score) : null;
   const flags = jsonList(quality?.red_flags ?? null).slice(0, 4);
+  // Nothing scored yet: the overlay is just the « Analyser (IA) » button, so no
+  // dark backdrop behind it — the chart stays visible around the button.
+  const bare = score == null && !quality?.verdict && !quality?.one_liner && flags.length === 0;
 
   return (
     <div
       data-capture-overlay
-      className="pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[280px] max-w-[68%] flex-col gap-1 rounded bg-black/55 px-2 py-1.5 backdrop-blur-[2px]"
+      className={cn(
+        "pointer-events-none absolute left-1.5 top-1.5 z-10 flex w-[280px] max-w-[68%] flex-col gap-1 rounded px-2 py-1.5",
+        bare ? "bg-transparent" : "bg-black/55 backdrop-blur-[2px]",
+      )}
     >
       <div className="flex items-center gap-2">
         {score != null ? (
@@ -882,7 +888,7 @@ export function MicroPullbackQualityOverlay({
             type="button"
             onClick={onScore}
             disabled={pending || autoEnabled}
-            className="pointer-events-auto flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-semibold text-sky-300 ring-1 ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-60"
+            className="pointer-events-auto flex items-center gap-1.5 rounded bg-transparent px-2 py-1 text-[11px] font-semibold text-sky-300 ring-1 ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-60"
           >
             {pending && <LoaderCircle className="h-3.5 w-3.5 animate-spin" />}
             {pending ? "analyse…" : "Analyser (IA)"}
@@ -951,7 +957,7 @@ export function BacksideOverlay({
           type="button"
           onClick={onAnalyze}
           disabled={pending}
-          className="pointer-events-auto flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-semibold text-sky-300 ring-1 ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-60"
+          className="pointer-events-auto flex items-center gap-1.5 rounded bg-transparent px-2 py-1 text-[11px] font-semibold text-sky-300 ring-1 ring-sky-500/40 hover:bg-sky-500/10 disabled:opacity-60"
         >
           {pending && <LoaderCircle className="h-3.5 w-3.5 animate-spin" />}
           {pending ? "analyse…" : "Analyser news"}

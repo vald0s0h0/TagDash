@@ -1,12 +1,11 @@
 // Flat files — on-disk, shareable, offline copies of a trading day's market data.
 //
-// Three KINDS of data are persisted side by side under `<app_dir>/flat_files/`,
+// Three KINDS of data are persisted side by side under `<root>/cache/flat_files/`,
 // because the strategies need very different granularities:
 //
 //   flat_files/
 //     daily/   daily.db                ← cumulative, mirror of `daily_cache`
 //     minute/  minute-YYYY-MM-DD.db    ← one file / ET day (top-2000 by volume)
-//     trade/   trade-YYYY-MM-DD.db     ← one file / ET day (Micro Pullback windows)
 //
 //   • DAILY  — daily OHLCV bars for the WHOLE US universe, appended into a single
 //     cumulative SQLite whose table is byte-identical to `local_db`'s `daily_cache`.
@@ -14,12 +13,11 @@
 //   • MINUTE — 1-minute bars 04:00→20:00 ET of the day's 2000 most-traded symbols,
 //     plus the 5 previous trading days as their own minute files (so opening a chart
 //     offline always has an intraday lead-in). Previous closes + news travel with
-//     each day's file so it stays self-contained / shareable. This is the broad
-//     replay source (synthetic 10-second slices, see `replay::data`).
-//   • TRADE  — real trades AND quotes, but only inside the [alert−1min, alert+10min]
-//     windows where a minute-resolution pre-scan says Micro Pullback would ignite, so
-//     the engine can replay on true tick data without storing the whole day's tape.
-//     Carries an as-of float snapshot (float is a filtering condition that drifts).
+//     each day's file so it stays self-contained / shareable. Feeds Dislocation's
+//     point-in-time RVOL profile and the offline intraday charts.
+//
+// Market Replay no longer reads these: it plays the days prepared by
+// `crate::replay_data` from what the strategies declare they need.
 //
 // Format choice mirrors `replay::tape`: SQLite, written atomically (to a `.tmp` then
 // renamed) so an interrupted download never leaves a file that reads as "complete".
@@ -29,7 +27,6 @@
 pub mod daily;
 pub mod intraday;
 pub mod minute;
-pub mod trade;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +36,6 @@ use chrono::NaiveDate;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::replay::data;
 
 /// Bumped if the on-disk schema ever changes.
 pub(crate) const SCHEMA_VERSION: &str = "2";
@@ -49,7 +45,6 @@ pub(crate) const SCHEMA_VERSION: &str = "2";
 /// The three independent flat-file datasets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    Trade,
     Minute,
     Daily,
     /// 1-minute bars filled on demand per (symbol, day), served at any intraday
@@ -60,7 +55,6 @@ pub enum Kind {
 impl Kind {
     pub fn from_str(s: &str) -> Option<Kind> {
         match s {
-            "trade" => Some(Kind::Trade),
             "minute" => Some(Kind::Minute),
             "daily" => Some(Kind::Daily),
             "intraday" => Some(Kind::Intraday),
@@ -69,7 +63,6 @@ impl Kind {
     }
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::Trade => "trade",
             Kind::Minute => "minute",
             Kind::Daily => "daily",
             Kind::Intraday => "intraday",
@@ -81,7 +74,7 @@ impl Kind {
 
 /// Root directory holding the three per-kind subfolders.
 pub fn flat_dir(app_dir: &Path) -> PathBuf {
-    app_dir.join("flat_files")
+    crate::paths::flat_files_dir(app_dir)
 }
 
 /// Subfolder for a given kind.
@@ -92,11 +85,6 @@ pub fn kind_dir(app_dir: &Path, kind: Kind) -> PathBuf {
 /// Final path of the minute file for one ET day (YYYY-MM-DD).
 pub fn minute_path(app_dir: &Path, day: &str) -> PathBuf {
     kind_dir(app_dir, Kind::Minute).join(format!("minute-{day}.db"))
-}
-
-/// Final path of the trade file for one ET day (YYYY-MM-DD).
-pub fn trade_path(app_dir: &Path, day: &str) -> PathBuf {
-    kind_dir(app_dir, Kind::Trade).join(format!("trade-{day}.db"))
 }
 
 /// The single cumulative daily file.
@@ -128,7 +116,7 @@ static LAYOUT: Once = Once::new();
 /// from every public entry point.
 pub fn ensure_layout(app_dir: &Path) {
     LAYOUT.call_once(|| {
-        for k in [Kind::Trade, Kind::Minute, Kind::Daily, Kind::Intraday] {
+        for k in [Kind::Minute, Kind::Daily, Kind::Intraday] {
             let _ = std::fs::create_dir_all(kind_dir(app_dir, k));
         }
         // Migrate legacy flat-*.db → minute/minute-*.db.
@@ -243,51 +231,9 @@ pub fn calendar(app_dir: &Path, kind: Kind) -> Vec<FlatFileDay> {
     ensure_layout(app_dir);
     match kind {
         Kind::Minute => minute::calendar(app_dir),
-        Kind::Trade => trade::calendar(app_dir),
         Kind::Daily => daily::calendar(app_dir),
         Kind::Intraday => intraday::calendar(app_dir),
     }
-}
-
-// ─── Reading (offline replay source) ────────────────────────────────────────────
-
-/// Rebuild a `DayData` from the stored flat files — the offline equivalent of
-/// `replay::data::load_day`'s "minutes" path. Reads the minute file (synthetic 10s
-/// slices + news + prev closes) and, when a trade file exists, overlays the real
-/// trades+quotes on the pre-scan windows (suppressing the synthetic slices there so
-/// the same minutes aren't counted twice) so Micro Pullback replays on true ticks.
-pub fn read_day(app_dir: &Path, day: &str) -> Result<data::DayData, String> {
-    ensure_layout(app_dir);
-    let overlay = trade::read_overlay(app_dir, day);
-    minute::read_day(app_dir, day, overlay)
-}
-
-/// Same read, but the trade overlay is REQUIRED — the « Flat Files Trades » replay
-/// mode. Refuses a day whose trade file is missing or incomplete instead of quietly
-/// serving the synthetic minute slices: that silent degradation is exactly what the
-/// explicit choice is there to rule out.
-pub fn read_day_trades(app_dir: &Path, day: &str) -> Result<data::DayData, String> {
-    ensure_layout(app_dir);
-    if !minute::has_day(app_dir, day) {
-        return Err(format!(
-            "aucun flat file minute pour le {day} (le mode Trades s'appuie dessus \
-             hors des fenêtres d'ignition)"
-        ));
-    }
-    let overlay = trade::read_overlay(app_dir, day)
-        .ok_or_else(|| format!("aucun flat file trade complet pour le {day}"))?;
-    minute::read_day(app_dir, day, Some(overlay))
-}
-
-/// Minute file alone, any trade file on disk ignored — the « Flat Files Minutes »
-/// replay mode. Useful to replay a day the way the broad scan saw it, and to compare
-/// a strategy's behaviour on synthetic slices against the same day on real prints.
-pub fn read_day_minutes(app_dir: &Path, day: &str) -> Result<data::DayData, String> {
-    ensure_layout(app_dir);
-    if !minute::has_day(app_dir, day) {
-        return Err(format!("aucun flat file minute pour le {day}"));
-    }
-    minute::read_day(app_dir, day, None)
 }
 
 // ─── SQLite meta helpers (shared by the writers) ───────────────────────────────
@@ -345,7 +291,6 @@ pub fn start_download(
     db: Arc<Mutex<Connection>>,
     key: String,
     secret: String,
-    massive_key: String,
     kind: Kind,
     start_day: String,
     end_day: String,
@@ -389,24 +334,9 @@ pub fn start_download(
                     &db,
                     &key,
                     &secret,
-                    &massive_key,
                     start,
                     end,
                     Kind::Minute,
-                )
-                .await
-            }
-            Kind::Trade => {
-                run_per_day(
-                    &shared,
-                    &app_dir,
-                    &db,
-                    &key,
-                    &secret,
-                    &massive_key,
-                    start,
-                    end,
-                    Kind::Trade,
                 )
                 .await
             }
@@ -444,7 +374,6 @@ async fn run_per_day(
     db: &Arc<Mutex<Connection>>,
     key: &str,
     secret: &str,
-    massive_key: &str,
     start: NaiveDate,
     end: NaiveDate,
     kind: Kind,
@@ -472,7 +401,6 @@ async fn run_per_day(
 
         let already = match kind {
             Kind::Minute => minute::has_day(app_dir, &day),
-            Kind::Trade => trade::has_day(app_dir, &day),
             Kind::Daily | Kind::Intraday => false,
         };
         if already {
@@ -483,9 +411,6 @@ async fn run_per_day(
             let res = match kind {
                 Kind::Minute => {
                     minute::write_day(shared, app_dir, db, key, secret, &day, true).await
-                }
-                Kind::Trade => {
-                    trade::write_day(shared, app_dir, db, key, secret, massive_key, &day).await
                 }
                 Kind::Daily | Kind::Intraday => unreachable!("dispatched before run_per_day"),
             };

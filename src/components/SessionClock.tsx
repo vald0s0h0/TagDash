@@ -3,7 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/tauri";
 import { nyTime, nyDayMonth } from "@/lib/nyTime";
 
-/** Delay applied to prices by Massive's Starter+ plan (see `massive::plan::Tier`).
+/** Delay applied to prices when Massive's Starter+ stream feeds the app (no Alpaca
+ *  keys — see `massive::plan::drives_live_feed`).
  *  Fixed by the plan, not measured: it has to tick smoothly once a second, and the
  *  observed lag of the last aggregate jitters with network and with how quietly a
  *  ticker trades. */
@@ -35,8 +36,9 @@ export function SessionClock() {
     refetchInterval: 1000,
   });
 
-  // Massive Starter+ tier: 15-minute delayed data, so the on-screen prices lag
-  // the clock. No need to poll fast — the tier rarely changes mid-session.
+  // Massive Starter+ feeding the app (no Alpaca keys): 15-minute delayed data, so
+  // the on-screen prices lag the clock. No need to poll fast — it rarely changes
+  // mid-session.
   const { data: massiveTier } = useQuery({
     queryKey: ["massive_tier_status"],
     queryFn:  () => api.getMassiveTierStatus(),
@@ -45,7 +47,7 @@ export function SessionClock() {
   const isReplay = !!replay?.active && !!replay.sim_time;
   // A replay feeds its own recorded day at its own clock — nothing about it is
   // delayed, so the badge and the shift belong to live sessions only.
-  const isDelayed = !isReplay && massiveTier?.effective === "unlimited";
+  const isDelayed = !isReplay && !!massiveTier?.drives_live_feed;
 
   const now = new Date();
   const instant: Date = isReplay

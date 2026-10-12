@@ -83,18 +83,10 @@ type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = SplitSink<Ws, Message>;
 
-/// Deserialize a field that is a number in some message types but a non-number
-/// in others, without failing the whole frame. Alpaca reuses the `c` key: it's a
-/// bar's CLOSE (number) but a trade/quote's CONDITIONS (array of strings). A
-/// plain `Option<f64>` makes serde reject every trade/quote frame (→ silently 0
-/// trades/quotes while bars work); this keeps the number and ignores anything else.
-fn de_lenient_f64<'de, D>(d: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v = Option::<serde_json::Value>::deserialize(d)?;
-    Ok(v.and_then(|v| v.as_f64()))
-}
+/// Alpaca reuses the `c` key: it's a bar's CLOSE (number) but a trade/quote's
+/// CONDITIONS (array of strings). A plain `Option<f64>` makes serde reject every
+/// trade/quote frame (→ silently 0 trades/quotes while bars work), so the raw value
+/// is kept and read both ways (`close`, `conditions`).
 
 /// One decoded message from the data stream. Unused fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -113,6 +105,17 @@ struct StreamMsg {
     bid_price: Option<f64>,
     #[serde(rename = "ap")]
     ask_price: Option<f64>,
+    #[serde(rename = "bs")]
+    bid_size: Option<u64>,
+    #[serde(rename = "as")]
+    ask_size: Option<u64>,
+    #[serde(rename = "bx")]
+    bid_exchange: Option<String>,
+    #[serde(rename = "ax")]
+    ask_exchange: Option<String>,
+    // trade exchange
+    #[serde(rename = "x")]
+    exchange: Option<String>,
     // bar (minute) — o/h/l/c/v/vw
     #[serde(rename = "o")]
     open: Option<f64>,
@@ -120,10 +123,10 @@ struct StreamMsg {
     high: Option<f64>,
     #[serde(rename = "l")]
     low: Option<f64>,
-    // `c` is the bar close (number) but the trade/quote conditions (array): parse
-    // leniently so a trade/quote frame doesn't fail to deserialize entirely.
-    #[serde(rename = "c", default, deserialize_with = "de_lenient_f64")]
-    close: Option<f64>,
+    // `c` is the bar close (number) but the trade/quote conditions (array) — see
+    // `close()` / `conditions()`.
+    #[serde(rename = "c", default)]
+    c_raw: Option<serde_json::Value>,
     #[serde(rename = "v")]
     bar_volume: Option<u64>,
     #[serde(rename = "vw")]
@@ -144,6 +147,20 @@ struct StreamMsg {
     sub_quotes: Option<Vec<String>>,
     #[serde(rename = "bars")]
     sub_bars: Option<Vec<String>>,
+}
+
+impl StreamMsg {
+    /// Bar close (the numeric reading of `c`).
+    fn close(&self) -> Option<f64> {
+        self.c_raw.as_ref().and_then(|v| v.as_f64())
+    }
+
+    /// Trade conditions (the array reading of `c`), concatenated ("@FI").
+    fn conditions(&self) -> Option<String> {
+        let arr = self.c_raw.as_ref()?.as_array()?;
+        let s: String = arr.iter().filter_map(|v| v.as_str()).collect();
+        (!s.is_empty()).then_some(s)
+    }
 }
 
 /// Tick pushed to the frontend for a displayed (focus) symbol.
@@ -272,6 +289,11 @@ async fn session(
     app: &AppHandle,
 ) -> Option<i64> {
     let (mut write, mut read) = ws.split();
+    // Origin label of what this socket delivers, for the review session copies.
+    let live_origin = match plan {
+        Plan::Sip => "sip_live",
+        Plan::Iex => "iex_live",
+    };
 
     // Authenticate.
     let auth = json!({ "action": "auth", "key": key, "secret": secret }).to_string();
@@ -389,7 +411,14 @@ async fn session(
                                         // Trade tape: fine-granularity record of the day so
                                         // it can be replayed tick-by-tick later (fire-and-
                                         // forget channel send — see replay::tape).
-                                        crate::replay::tape::record_trade(sym, price, m.size.unwrap_or(0), event_time);
+                                        let conds = m.conditions();
+                                        crate::replay::tape::record_trade(
+                                            sym, price, m.size.unwrap_or(0), m.exchange.as_deref(), conds.as_deref(), event_time,
+                                        );
+                                        crate::review::capture::trade(
+                                            sym, event_time.timestamp_millis(), price, m.size.unwrap_or(0), 1,
+                                            m.exchange.as_deref(), conds, live_origin,
+                                        );
                                         if focus.contains(sym) {
                                             ticks.insert(sym.to_string(), TickEvent {
                                                 symbol: sym.to_string(),
@@ -405,12 +434,19 @@ async fn session(
                                     {
                                         let event_time = parse_ts(m.timestamp.as_deref());
                                         ms.on_quote(sym, bid, ask, now, event_time);
-                                        crate::replay::tape::record_quote(sym, bid, ask, event_time);
+                                        crate::replay::tape::record_quote(
+                                            sym, bid, m.bid_size, ask, m.ask_size,
+                                            m.bid_exchange.as_deref(), m.ask_exchange.as_deref(), event_time,
+                                        );
+                                        crate::review::capture::quote(
+                                            sym, event_time.timestamp_millis(), bid, m.bid_size, ask, m.ask_size,
+                                            m.bid_exchange.as_deref(), m.ask_exchange.as_deref(), live_origin,
+                                        );
                                     }
                                 }
                                 "b" => {
                                     if let (Some(sym), Some(o), Some(h), Some(l), Some(c)) =
-                                        (m.symbol.as_deref(), m.open, m.high, m.low, m.close)
+                                        (m.symbol.as_deref(), m.open, m.high, m.low, m.close())
                                     {
                                         // Always ingest the 1-min bar — including for focus
                                         // symbols. The wildcard `bars` stream is the baseline
@@ -489,6 +525,9 @@ pub(crate) fn watch_set(
 ) -> HashSet<String> {
     let mut set = focus.clone();
     set.extend(strict_watch_symbols(internal_book, broker_mirror));
+    // A ticker with an open review session keeps its trades+quotes even when no
+    // chart shows it — the spread of the review replay depends on it.
+    set.extend(crate::review::open_live_symbols());
     set
 }
 

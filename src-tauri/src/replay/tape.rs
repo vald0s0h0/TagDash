@@ -4,7 +4,7 @@
 // trade prints (which the Micro Pullback engine consumes as 10-second candles)
 // cannot be re-downloaded later. This module records every trade (and the focus
 // symbols' quotes) streamed by the live feed into one small SQLite file per ET
-// trading day (`<app_dir>/tape/tape-YYYY-MM-DD.db`). A day recorded this way can
+// trading day (`<root>/cache/tape/tape-YYYY-MM-DD.db`). A day recorded this way can
 // then be replayed with full tick granularity; days without a tape fall back to
 // 1-minute bars (see `replay::data`).
 //
@@ -30,12 +30,18 @@ enum Rec {
         symbol: String,
         price: f64,
         size: u64,
+        exch: Option<String>,
+        cond: Option<String>,
     },
     Quote {
         ts_ms: i64,
         symbol: String,
         bid: f64,
+        bid_size: Option<u64>,
         ask: f64,
+        ask_size: Option<u64>,
+        bid_x: Option<String>,
+        ask_x: Option<String>,
     },
 }
 
@@ -43,7 +49,7 @@ static TX: OnceLock<mpsc::UnboundedSender<Rec>> = OnceLock::new();
 
 /// Directory holding the per-day tape files.
 pub fn tape_dir(app_dir: &Path) -> PathBuf {
-    app_dir.join("tape")
+    crate::paths::tape_dir(app_dir)
 }
 
 /// Path of the tape for one ET day (YYYY-MM-DD).
@@ -132,18 +138,34 @@ fn flush(app_dir: &Path, current: &mut Option<(String, Connection)>, batch: &mut
                     symbol,
                     price,
                     size,
+                    exch,
+                    cond,
                 } => conn.execute(
-                    "INSERT INTO trades (ts, symbol, price, size) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![ts_ms, symbol, price, *size as i64],
+                    "INSERT INTO trades (ts, symbol, price, size, exch, cond) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![ts_ms, symbol, price, *size as i64, exch, cond],
                 ),
                 Rec::Quote {
                     ts_ms,
                     symbol,
                     bid,
+                    bid_size,
                     ask,
+                    ask_size,
+                    bid_x,
+                    ask_x,
                 } => conn.execute(
-                    "INSERT INTO quotes (ts, symbol, bid, ask) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![ts_ms, symbol, bid, ask],
+                    "INSERT INTO quotes (ts, symbol, bid, ask, bid_size, ask_size, bid_x, ask_x)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        ts_ms,
+                        symbol,
+                        bid,
+                        ask,
+                        bid_size.map(|v| v as i64),
+                        ask_size.map(|v| v as i64),
+                        bid_x,
+                        ask_x
+                    ],
                 ),
             };
             if let Err(e) = res {
@@ -177,11 +199,38 @@ fn open_day(app_dir: &Path, day: &str) -> rusqlite::Result<Connection> {
          );
          CREATE INDEX IF NOT EXISTS idx_quotes_ts ON quotes(ts);",
     )?;
+    // Exchange / conditions / NBBO sizes (added for the trade review). Files from
+    // before simply gain the columns; their old rows keep NULLs.
+    if !has_extended_columns(&conn) {
+        for sql in [
+            "ALTER TABLE trades ADD COLUMN exch TEXT",
+            "ALTER TABLE trades ADD COLUMN cond TEXT",
+            "ALTER TABLE quotes ADD COLUMN bid_size INTEGER",
+            "ALTER TABLE quotes ADD COLUMN ask_size INTEGER",
+            "ALTER TABLE quotes ADD COLUMN bid_x TEXT",
+            "ALTER TABLE quotes ADD COLUMN ask_x TEXT",
+        ] {
+            let _ = conn.execute(sql, []);
+        }
+    }
     Ok(conn)
 }
 
+/// Does this tape file carry the exchange / conditions / size columns?
+pub fn has_extended_columns(conn: &Connection) -> bool {
+    conn.prepare("SELECT exch, cond FROM trades LIMIT 0").is_ok()
+        && conn.prepare("SELECT bid_size, ask_x FROM quotes LIMIT 0").is_ok()
+}
+
 /// Record one live trade print (no-op before init / during replay).
-pub fn record_trade(symbol: &str, price: f64, size: u64, event_time: DateTime<Utc>) {
+pub fn record_trade(
+    symbol: &str,
+    price: f64,
+    size: u64,
+    exch: Option<&str>,
+    cond: Option<&str>,
+    event_time: DateTime<Utc>,
+) {
     if super::clock::is_active() {
         return;
     }
@@ -191,12 +240,24 @@ pub fn record_trade(symbol: &str, price: f64, size: u64, event_time: DateTime<Ut
             symbol: symbol.to_string(),
             price,
             size,
+            exch: exch.map(str::to_string),
+            cond: cond.map(str::to_string),
         });
     }
 }
 
 /// Record one live quote (focus symbols only flow live; no-op during replay).
-pub fn record_quote(symbol: &str, bid: f64, ask: f64, event_time: DateTime<Utc>) {
+#[allow(clippy::too_many_arguments)]
+pub fn record_quote(
+    symbol: &str,
+    bid: f64,
+    bid_size: Option<u64>,
+    ask: f64,
+    ask_size: Option<u64>,
+    bid_x: Option<&str>,
+    ask_x: Option<&str>,
+    event_time: DateTime<Utc>,
+) {
     if super::clock::is_active() {
         return;
     }
@@ -205,7 +266,11 @@ pub fn record_quote(symbol: &str, bid: f64, ask: f64, event_time: DateTime<Utc>)
             ts_ms: event_time.timestamp_millis(),
             symbol: symbol.to_string(),
             bid,
+            bid_size,
             ask,
+            ask_size,
+            bid_x: bid_x.map(str::to_string),
+            ask_x: ask_x.map(str::to_string),
         });
     }
 }

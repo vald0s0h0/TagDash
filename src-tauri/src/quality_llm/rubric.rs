@@ -1,8 +1,8 @@
 // The rubrics as EDITABLE FILES, with the compiled-in texts as the seed and the
 // fallback.
 //
-//   <app data>/prompts/micro_pullback_news.txt
-//   <app data>/prompts/micro_pullback_deep.txt
+//   <root>/user/prompts/micro_pullback_news.txt
+//   <root>/user/prompts/micro_pullback_deep.txt
 //
 // WHY THIS DOES NOT BREAK THE FROZEN-RUBRIC CONTRACT. `prompt`'s whole discipline is
 // that two candidates scored a week apart must be comparable, which requires a
@@ -32,7 +32,7 @@ use super::Pass;
 
 /// Directory holding the editable rubrics.
 pub fn dir() -> PathBuf {
-    crate::config::app_dir().join("prompts")
+    crate::paths::prompts_dir(&crate::config::app_dir())
 }
 
 pub fn path(pass: Pass) -> PathBuf {

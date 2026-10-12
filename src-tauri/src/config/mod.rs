@@ -1,11 +1,10 @@
 // Runtime configuration.
-// Source of truth: <app_dir>/tagdash.toml.
+// Source of truth: <root>/user/settings.toml (see `crate::paths`).
 // Falls back to compiled defaults if the file is absent or malformed.
 // Writes a default file on first run so the user can find and edit it.
 
 pub mod secrets;
 
-use dirs::config_dir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -38,6 +37,89 @@ pub struct AppConfig {
     /// See `crate::stt`.
     #[serde(default)]
     pub stt: SttConfig,
+    /// Trade review (onglet Revue): which trades are drawn for review, and the
+    /// per-ticker session recorder behind the replay. See `crate::review`.
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+/// Trade review settings.
+///
+/// `tags` is matched, case-insensitively, against a TradeTally trade's tags AND its
+/// setup: TagDash files the strategy as the TradeTally `setup` ("Micro Pullback",
+/// "Apex", "Dip"), while hand-made tags ("fomo", "ennui") live in `tags`. The same
+/// list decides which scanner alerts open a recording session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    #[serde(default = "default_review_tags")]
+    pub tags: Vec<String>,
+    /// Start the voice recorder by itself when a reviewed ticker appears.
+    #[serde(default)]
+    pub auto_voice: bool,
+    /// Market data kept before the session opens (minutes).
+    #[serde(default = "default_review_pre_min")]
+    pub pre_window_min: i64,
+    /// Market data kept after the last exit when rebuilding from SIP (minutes).
+    #[serde(default = "default_review_post_min")]
+    pub post_window_min: i64,
+    /// Version of the window defaults this config was written with — the 10/10 min
+    /// of v0 became 9/2 min (the replay shows ≈ 8.5 min before, ≈ 1.7 min after).
+    #[serde(default)]
+    pub window_defaults: u8,
+}
+
+fn default_review_tags() -> Vec<String> {
+    vec!["Micro Pullback".into(), "Apex".into(), "Dip".into()]
+}
+fn default_review_pre_min() -> i64 {
+    9
+}
+fn default_review_post_min() -> i64 {
+    2
+}
+/// Current `window_defaults`.
+pub const REVIEW_WINDOW_DEFAULTS: u8 = 1;
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            tags: default_review_tags(),
+            auto_voice: false,
+            pre_window_min: default_review_pre_min(),
+            post_window_min: default_review_post_min(),
+            window_defaults: REVIEW_WINDOW_DEFAULTS,
+        }
+    }
+}
+
+impl ReviewConfig {
+    /// Move a config still on the old 10/10 min defaults to the current ones.
+    /// Returns true when something changed (the caller saves).
+    pub fn upgrade_window_defaults(&mut self) -> bool {
+        if self.window_defaults >= REVIEW_WINDOW_DEFAULTS {
+            return false;
+        }
+        if self.pre_window_min == 10 && self.post_window_min == 10 {
+            self.pre_window_min = default_review_pre_min();
+            self.post_window_min = default_review_post_min();
+        }
+        self.window_defaults = REVIEW_WINDOW_DEFAULTS;
+        true
+    }
+
+    /// Does this setup/tag name belong to the reviewed set?
+    pub fn matches(&self, name: &str) -> bool {
+        self.matched(name).is_some()
+    }
+
+    /// The configured spelling of the review tag `name` matches, if any.
+    pub fn matched(&self, name: &str) -> Option<String> {
+        let n = name.trim();
+        if n.is_empty() {
+            return None;
+        }
+        self.tags.iter().find(|t| t.trim().eq_ignore_ascii_case(n)).map(|t| t.trim().to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,7 +308,7 @@ impl Default for CompanyIntelConfig {
 /// it: no reachable API (no keys, no connection), and reproducible backtests — with
 /// the network in play, whether a given day's gap gets filled depends on the
 /// connection, so two passes over the same period would not be comparable.
-/// A pre-merge `mode = "api" | "flat_files"` in an existing tagdash.toml is simply
+/// A pre-merge `mode = "api" | "flat_files"` in an existing settings file is simply
 /// ignored (serde skips unknown keys) and dropped on the next save. It is
 /// deliberately NOT migrated to `offline = true`: the old flat-files mode mostly
 /// meant "Alpaca isn't reachable", and that case now handles itself — every network
@@ -308,7 +390,7 @@ impl BrokerConfig {
 }
 
 /// Speech-to-Text settings. The whisper model is downloaded on first use into
-/// `<app_dir>/models/`; `jargon` biases recognition toward trading terms (fed to
+/// `<root>/cache/models/`; `jargon` biases recognition toward trading terms (fed to
 /// whisper as the `initial_prompt`), and the two `pause_*` thresholds let the
 /// single STT worker step aside when the machine is busy or the cash open is
 /// intense, so transcription never competes with the trading hot path.
@@ -451,22 +533,23 @@ impl Default for AppConfig {
             data_source: DataSourceConfig::default(),
             broker: BrokerConfig::default(),
             stt: SttConfig::default(),
+            review: ReviewConfig::default(),
         }
     }
 }
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
-/// Returns `<system_config_dir>/tagdash/`, creating it if absent.
+/// The data root (`<system_config_dir>/tagdash/`, or `TAGDASH_HOME`), created if
+/// absent. Personal and cache data are two folders under it — see `crate::paths`.
 pub fn app_dir() -> PathBuf {
-    let base = config_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let dir = base.join("tagdash");
+    let dir = crate::paths::root();
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
 pub fn config_path(app_dir: &Path) -> PathBuf {
-    app_dir.join("tagdash.toml")
+    crate::paths::settings_file(app_dir)
 }
 
 // ─── Load / Save ────────────────────────────────────────────────────────────
@@ -491,7 +574,7 @@ pub fn load() -> (PathBuf, AppConfig) {
                 (dir, cfg)
             }
             Err(_) => {
-                eprintln!("[tagdash] tagdash.toml parse error, using defaults");
+                eprintln!("[tagdash] settings.toml parse error, using defaults");
                 (dir, AppConfig::default())
             }
         },
@@ -502,6 +585,9 @@ pub fn load() -> (PathBuf, AppConfig) {
 /// Persist config to disk. Called by update_local_config command.
 pub fn save(path: &Path, config: &AppConfig) -> Result<(), String> {
     let content = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     std::fs::write(path, content).map_err(|e| e.to_string())
 }
 
@@ -509,7 +595,7 @@ pub fn save(path: &Path, config: &AppConfig) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// An existing tagdash.toml still carries `mode = "api" | "flat_files"`. It must
+    /// An existing settings file still carries `mode = "api" | "flat_files"`. It must
     /// load without erroring, and it must leave the app ONLINE: the API is the
     /// default, and a missing key is what disables a provider now — not a mode.
     #[test]

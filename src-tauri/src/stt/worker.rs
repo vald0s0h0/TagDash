@@ -196,9 +196,17 @@ async fn process_job(
         Err(e) => return terminal_error(shared, app, job, format!("lecture audio: {e}")),
     };
 
-    // 3. VAD / trim. Pure silence → done (empty), nothing to send.
-    let Some(trimmed) = vad::trim_silence(&samples) else {
-        return finish_empty(shared, app, job);
+    // 3. VAD / trim. Pure silence → done (empty), nothing to send. A review-session
+    //    recording is already reduced to its voiced chunks, and its subtitle
+    //    timestamps are offsets into exactly that audio: trimming it again would
+    //    shift every one of them.
+    let trimmed = if job.voice_id.is_some() {
+        samples
+    } else {
+        let Some(t) = vad::trim_silence(&samples) else {
+            return finish_empty(shared, app, job);
+        };
+        t
     };
 
     // 4. Transcribe (blocking, off the async runtime).
@@ -211,7 +219,7 @@ async fn process_job(
         Ok(c) => c,
         Err(e) => return retry(shared, app, job, e).await,
     };
-    let text =
+    let (text, segments) =
         match tokio::task::spawn_blocking(move || transcribe(ctx, trimmed, lang, prompt)).await {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return retry(shared, app, job, e).await,
@@ -230,6 +238,21 @@ async fn process_job(
     // 5. Online cleanup (offline → passthrough).
     let cleaned = cleanup::clean(secrets, job.kind, &text).await;
     job.text = Some(cleaned.text.clone());
+
+    // 6a. Review session — two channels. The raw whisper segments become the
+    //     replay's subtitles; the cleaned text is copied onto every trade of the
+    //     session by the review sweeper (or stays on it as a missed-trade note).
+    if let Some(voice_id) = job.voice_id.clone() {
+        crate::review::voice_transcribed(&voice_id, &segments, &cleaned.text);
+        let _ = tokio::task::spawn_blocking(crate::review::dispatch::sweep_once).await;
+        let _ = app.emit("stt-trade-note-saved", json!({ "session_id": job.session_id }));
+        queue::delete_wav(&shared.app_dir, &job.id);
+        job.state = JobState::Done;
+        job.error = None;
+        shared.update_job(job);
+        emit_changed(app);
+        return;
+    }
 
     // 6. Dispatch by destination.
     match job.kind {
@@ -263,7 +286,7 @@ async fn process_job(
 
 /// Read the trade's existing note, append the new block (never overwrite), persist,
 /// and queue the TradeTally `note_updated` event.
-fn append_trade_note(
+pub(crate) fn append_trade_note(
     db: &Arc<Mutex<Connection>>,
     trade_id: &str,
     symbol: Option<&str>,
@@ -338,13 +361,14 @@ fn terminal_error(shared: &SttShared, app: &AppHandle, job: &mut SttJob, err: St
 }
 
 /// Run whisper on a 16 kHz mono clip. French forced, jargon fed as the initial
-/// prompt to bias recognition. Returns the joined segment text.
+/// prompt to bias recognition. Returns the joined segment text, and each segment as
+/// (start ms, end ms, text) — offsets into `samples`, used as replay subtitles.
 fn transcribe(
     ctx: Arc<WhisperContext>,
     samples: Vec<f32>,
     lang: String,
     prompt: String,
-) -> Result<String, String> {
+) -> Result<(String, Vec<(i64, i64, String)>), String> {
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(&lang));
@@ -360,13 +384,20 @@ fn transcribe(
     state.full(params, &samples).map_err(|e| e.to_string())?;
     let n = state.full_n_segments();
     let mut out = String::new();
+    let mut segments = Vec::new();
     for i in 0..n {
         if let Some(seg) = state.get_segment(i) {
             if let Ok(text) = seg.to_str_lossy() {
                 out.push_str(text.trim());
                 out.push(' ');
+                // whisper timestamps are centiseconds.
+                segments.push((
+                    seg.start_timestamp() * 10,
+                    seg.end_timestamp() * 10,
+                    text.trim().to_string(),
+                ));
             }
         }
     }
-    Ok(out.trim().to_string())
+    Ok((out.trim().to_string(), segments))
 }

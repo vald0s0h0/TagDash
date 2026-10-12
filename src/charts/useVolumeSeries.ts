@@ -2,7 +2,7 @@ import { useEffect, type MutableRefObject } from "react";
 import type { IChartApi, ISeriesApi } from "lightweight-charts";
 import type { Bar } from "@/types";
 import { toUTC } from "@/charts/chartOptions";
-import { hexToRgba } from "@/charts/drawingsPrimitive";
+import { addVolumeSeries, volumeColors } from "@/charts/chartDefaults";
 import type { ChartTheme } from "@/stores/chartThemeStore";
 
 /** Bottom-pinned volume histogram, drawn on every pane from the loaded bars (no
@@ -20,17 +20,8 @@ export function useVolumeSeries(
     const chart = chartRef.current;
     if (!chart) return;
     if (!bars?.length) return;
-    if (!volumeSeriesRef.current) {
-      volumeSeriesRef.current = chart.addHistogramSeries({
-        priceFormat:      { type: "volume" },
-        priceScaleId:     "", // overlay scale, pinned to the bottom below
-        priceLineVisible: false,
-        lastValueVisible: false,
-      });
-      volumeSeriesRef.current.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-    }
-    const up   = hexToRgba(theme.candle.up, theme.volume.upOpacity);
-    const down = hexToRgba(theme.candle.down, theme.volume.downOpacity);
+    if (!volumeSeriesRef.current) volumeSeriesRef.current = addVolumeSeries(chart);
+    const { up, down } = volumeColors(theme);
     const data = bars.map((b) => ({
       time:  toUTC(b.time),
       value: b.volume,

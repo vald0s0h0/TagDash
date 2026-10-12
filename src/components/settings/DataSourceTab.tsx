@@ -6,13 +6,16 @@
 // the gaps, the live feed for the present. The only switch left is "hors ligne",
 // which means "never touch the network", not "use another code path".
 //
-// Three datasets live side by side, each with its own download logic + calendar:
-//   • Trade  — real trades + quotes inside the [alert−1min, +10min] windows where a
-//     minute pre-scan says Micro Pullback would ignite (historical float aware).
+// Two datasets live side by side, each with its own download logic + calendar:
 //   • Minute — 1-minute bars of the day's 2000 most-traded symbols (04:00→20:00 ET),
-//     plus the 5 previous trading days for intraday chart history.
+//     plus the 5 previous trading days: Dislocation's point-in-time RVOL profile and
+//     the offline intraday charts.
 //   • Daily  — daily bars of the whole US universe, appended into a cumulative
 //     daily.db whose table is identical to the local database.
+//
+// Market Replay reads neither: its days are prepared from what the strategies
+// declare they need, in the « Préparer une séance » modal (`replay_data`). The disk
+// block below shows both and purges the legacy folders on an explicit click only.
 
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -44,23 +47,13 @@ const KIND_META: Record<
   FlatFilesKind,
   { label: string; blurb: string; unitSymbols: string; unitBars: string }
 > = {
-  trade: {
-    label: "Trade",
-    blurb:
-      "Trades + quotes réels autour des fenêtres où Micro Pullback se déclencherait " +
-      "(pré-scan minute), de −1 min à +10 min. Le float historique du jour est pris en " +
-      "compte. Un fichier SQLite par jour.",
-    unitSymbols: "tickers",
-    unitBars: "trades",
-  },
   minute: {
     label: "Minute",
     blurb:
       "Barres 1 minute (pré-marché + séance + post-marché) des 2000 actions les plus " +
       "échangées du jour, plus les 5 jours précédents pour l'historique intraday. " +
-      "Avec Massive Starter actif, ces minutes servent de couche de découverte puis " +
-      "les réveils sont rechargés en vraies secondes par l'API avant le replay. " +
-      "Un fichier par jour.",
+      "Servent au profil RVOL historique de Dislocation et aux graphiques hors ligne — " +
+      "pas au Market Replay, qui se prépare depuis sa propre modale. Un fichier par jour.",
     unitSymbols: "symboles",
     unitBars: "barres",
   },
@@ -86,6 +79,111 @@ function formatBytes(n: number): string {
   if (n <= 0) return "—";
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} Ko`;
   return `${(n / (1024 * 1024)).toFixed(1)} Mo`;
+}
+
+/** What replay and flat files take on disk, with explicit purges of the legacy
+ *  folders. Nothing here is ever deleted without a click and a confirmation. */
+function DiskUsage() {
+  const usage = useQuery({
+    queryKey: ["replay-disk-usage"],
+    queryFn: api.replayDataDiskUsage,
+  });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const u = usage.data;
+  if (!u) return null;
+
+  const purge = async (kind: "trade" | "minute" | "intraday", confirmText: string) => {
+    if (!window.confirm(confirmText)) return;
+    setBusy(kind);
+    setNote(null);
+    try {
+      const freed = await api.purgeFlatFiles(kind);
+      setNote(`${formatBytes(freed)} libérés`);
+    } catch (e) {
+      setNote(String(e));
+    } finally {
+      setBusy(null);
+      usage.refetch();
+    }
+  };
+
+  const rows: {
+    kind: "trade" | "minute" | "intraday" | null;
+    label: string;
+    hint: string;
+    bytes: number;
+    confirm?: string;
+  }[] = [
+    {
+      kind: null,
+      label: "Séances de replay préparées",
+      hint: "Données des stratégies, préparées depuis « Préparer une séance ».",
+      bytes: u.replay_bytes,
+    },
+    {
+      kind: "trade",
+      label: "Anciens fichiers trade",
+      hint: "Ancien format du replay — plus lu par rien.",
+      bytes: u.legacy_trade_bytes,
+      confirm: "Supprimer définitivement les anciens fichiers trade ? Ils ne sont plus utilisés.",
+    },
+    {
+      kind: "minute",
+      label: "Fichiers minute (top 2000)",
+      hint: "Profil RVOL historique de Dislocation et graphiques hors ligne. Sans eux, Dislocation revient à son RVOL glissant.",
+      bytes: u.minute_bytes,
+      confirm:
+        "Supprimer définitivement les fichiers minute ? Dislocation perdra son profil RVOL historique (repli sur le RVOL glissant) et les graphiques hors ligne n'auront plus d'intraday.",
+    },
+    {
+      kind: "intraday",
+      label: "Cache intraday des graphiques",
+      hint: "Rechargé à la demande à l'ouverture d'un graphique.",
+      bytes: u.intraday_bytes,
+      confirm: "Vider le cache intraday des graphiques ? Il se reconstruit à la demande.",
+    },
+  ];
+
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="mb-1.5 text-sm font-medium">Espace disque</div>
+      <div className="space-y-1">
+        {rows.map((r) => (
+          <div key={r.label} className="flex items-center gap-2 text-xs">
+            <div className="min-w-0 flex-1">
+              <div>{r.label}</div>
+              <div className="text-[10px] text-muted-foreground">{r.hint}</div>
+            </div>
+            <span className="w-16 text-right tabular-nums text-muted-foreground">
+              {formatBytes(r.bytes)}
+            </span>
+            {r.kind ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 w-20 text-[11px]"
+                disabled={busy !== null || r.bytes <= 0}
+                onClick={() => purge(r.kind!, r.confirm!)}
+              >
+                {busy === r.kind ? <Loader2 className="h-3 w-3 animate-spin" /> : "Supprimer"}
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 w-20 text-[11px]"
+                onClick={() => api.openReplayDataFolder().catch(() => {})}
+              >
+                <FolderOpen className="h-3 w-3" />
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+      {note && <p className="mt-1.5 text-[11px] text-muted-foreground">{note}</p>}
+    </div>
+  );
 }
 
 export function DataSourceTab() {
@@ -231,7 +329,9 @@ export function DataSourceTab() {
           </p>
         </div>
 
-        {/* ── Sub-tabs: Trade / Minute / Daily ── */}
+        <DiskUsage />
+
+        {/* ── Sub-tabs: Minute / Daily ── */}
         <div className="flex overflow-hidden rounded-md border border-border">
           {(Object.keys(KIND_META) as FlatFilesKind[]).map((k) => (
             <button

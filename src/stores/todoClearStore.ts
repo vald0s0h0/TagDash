@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
 // Trade ids the user cleared out of the sidebar's "À faire" list.
 //
@@ -7,7 +8,7 @@ import { persist } from "zustand/middleware";
 // journal), so "Vider" has nothing it could delete: it only records which trades
 // to stop nagging about. The executions, the journal entries and the trade rows
 // are untouched — TradesDbTab still shows them, and a cleared trade reappears
-// nowhere. Persisted to localStorage so a clear survives a reload/restart.
+// nowhere. Persisted with the personal data (`userStorage`) so a clear survives a restart.
 
 interface TodoClearState {
   cleared: string[];
@@ -23,6 +24,6 @@ export const useTodoClearStore = create<TodoClearState>()(
       cleared: [],
       clearAll: (tradeIds) => set({ cleared: tradeIds }),
     }),
-    { name: "tagdash-todo-cleared", version: 1 },
+    { name: "tagdash-todo-cleared", version: 1, storage: userStorage() },
   ),
 );

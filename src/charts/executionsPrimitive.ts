@@ -37,6 +37,20 @@ interface RenderTarget {
 const TRI_W = 7; // triangle horizontal size (CSS px)
 const TRI_H = 8; // triangle height (CSS px)
 
+// A click on a triangle opens its trade's note: the primitive reports the trade
+// under the pointer through lightweight-charts' hit test, as the hovered-object id
+// of the click (`execTradeId` reads it back). A few pixels of slop, the triangle
+// being smaller than a fingertip's worth of trackpad.
+const HIT_PREFIX = "exec:";
+const HIT_SLOP = 3; // CSS px
+
+/** Trade id behind a click's `hoveredObjectId`, when it landed on a fill triangle. */
+export function execTradeId(hovered: unknown): string | null {
+  return typeof hovered === "string" && hovered.startsWith(HIT_PREFIX)
+    ? hovered.slice(HIT_PREFIX.length)
+    : null;
+}
+
 // Sizing label ("25" / "50" / "100") sitting just left of an entry triangle, on
 // a tight black badge.
 // Deliberately about as tall as the triangle itself: it annotates the marker, it
@@ -262,6 +276,9 @@ export class ExecutionsPrimitive implements ISeriesPrimitive<Time> {
   series?: ISeriesApi<SeriesType>;
   trades:  TradeExecutions[] = [];
   barTimes: number[] = []; // sorted bar times (sec) for snapping fills to bars
+  /** Triangles answer the hit test (pointer cursor, click → trade id). Off on the
+   *  charts where a click on a fill has nothing to open. */
+  clickable = false;
   private readonly views: ExecutionsPaneView[];
   private requestUpdate?: () => void;
 
@@ -292,4 +309,42 @@ export class ExecutionsPrimitive implements ISeriesPrimitive<Time> {
 
   /** Force a redraw (e.g. after a theme edit — colours are read at draw time). */
   redraw(): void { this.requestUpdate?.(); }
+
+  /** lightweight-charts hit test (pane CSS px): the trade of the triangle under the
+   *  pointer, reported as `exec:<trade_id>`. */
+  hitTest(x: number, y: number): { externalId: string; zOrder: "top"; cursorStyle: string } | null {
+    if (!this.clickable) return null;
+    const trade = this.tradeAt(x, y);
+    return trade == null ? null : { externalId: HIT_PREFIX + trade, zOrder: "top", cursorStyle: "pointer" };
+  }
+
+  /** Trade whose triangle sits under (x, y), the nearest one when several overlap
+   *  (a daily bar stacks every fill of the day). */
+  private tradeAt(x: number, y: number): string | null {
+    const chart = this.chart;
+    const series = this.series;
+    if (!chart || !series) return null;
+    const ts = chart.timeScale();
+    let best: string | null = null;
+    let bestDist = Infinity;
+    for (const trade of this.trades) {
+      for (const f of trade.fills) {
+        const snapped = snapToBar(this.barTimes, toSecNum(f.time));
+        if (snapped == null) continue;
+        const xc = ts.timeToCoordinate(snapped as Time);
+        const yc = series.priceToCoordinate(f.price);
+        if (xc == null || yc == null) continue;
+        // The body lies behind the tip: left of it for ▶, right of it for ◀.
+        const cx = f.increase ? xc - TRI_W / 2 : xc + TRI_W / 2;
+        const dx = Math.abs(x - cx);
+        const dy = Math.abs(y - yc);
+        if (dx > TRI_W / 2 + HIT_SLOP || dy > TRI_H / 2 + HIT_SLOP) continue;
+        if (dx + dy < bestDist) {
+          bestDist = dx + dy;
+          best = trade.trade_id;
+        }
+      }
+    }
+    return best;
+  }
 }

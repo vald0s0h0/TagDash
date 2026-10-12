@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { SessionClock } from "@/components/SessionClock";
+import { AttentionToggle } from "@/components/AttentionToggle";
 import { useStrategies, useSetStrategyEnabled } from "@/queries/useScanner";
 
 /** Custom OS title bar (native window decorations are disabled in tauri.conf.json).
@@ -47,6 +48,7 @@ export function TitleBar() {
   return (
     <div
       data-tauri-drag-region
+      data-usage-area="title-bar"
       className={cn(
         "relative z-50 flex h-9 shrink-0 select-none items-center border-b border-border bg-card",
         // Decorative children fall through to the drag region; buttons stay clickable.
@@ -91,6 +93,8 @@ export function TitleBar() {
 
       {/* ── Right: NY session clock + window controls ── */}
       <div className="ml-auto flex items-center">
+        {/* Detached « Attention du marché » screen (second monitor) — on / off. */}
+        <AttentionToggle />
         <div className="px-2">
           <SessionClock />
         </div>

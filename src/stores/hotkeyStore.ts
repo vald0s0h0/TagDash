@@ -1,11 +1,12 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 import type { Timeframe } from "@/types";
 
 // User-configurable hotkeys (keyboard chords or extra mouse buttons) bound to the
 // per-zone chart actions. A hotkey is global but acts on the zone under the mouse
 // cursor (its left/interactive pane), falling back to the active tab's first zone.
-// Bindings persist to localStorage (same pattern as the drawing prefs); the
+// Bindings persist with the personal data (same pattern as the drawing prefs); the
 // command dispatch itself lives in each mounted ChartZone, registered here by
 // zone_id so the global listener can route an action to the right zone.
 
@@ -22,7 +23,7 @@ export type HotkeyActionId =
   | "premarket_cycle"
   | "tf_5s" | "tf_10s" | "tf_1m" | "tf_2m" | "tf_5m" | "tf_15m" | "tf_daily"
   // Replay (global — not tied to a chart zone, special-cased in useHotkeys)
-  | "replay_next_alert";
+  | "replay_next_alert" | "replay_play_pause";
 
 export type HotkeyGroup = "Toolbar" | "Ordres" | "Analyse" | "Timeframes" | "Replay";
 
@@ -66,8 +67,13 @@ export const HOTKEY_ACTIONS: HotkeyActionDef[] = [
   { id: "tf_15m",   label: "Timeframe 15m",   group: "Timeframes" },
   { id: "tf_daily", label: "Timeframe daily", group: "Timeframes" },
 
+  { id: "replay_play_pause", label: "Replay : lecture / pause",  group: "Replay" },
   { id: "replay_next_alert", label: "Replay : prochaine alerte", group: "Replay" },
 ];
+
+/** Global actions — not tied to a chart zone, and only live while a replay runs. */
+export const REPLAY_ACTIONS: ReadonlySet<HotkeyActionId> =
+  new Set<HotkeyActionId>(["replay_play_pause", "replay_next_alert"]);
 
 export const HOTKEY_GROUPS: HotkeyGroup[] = ["Toolbar", "Ordres", "Analyse", "Timeframes", "Replay"];
 
@@ -151,7 +157,9 @@ export function bindingLabel(b: Binding): string {
  *  laid with G: one key, no chord, because the move each one anticipates is seconds
  *  away. B and T then tune that band one notch thinner / thicker, and they sit next
  *  to G on the same hand. P cycles the daily pane's premarket bars — a look you
- *  flip through while reading a chart, not a trade action, so it costs one key too. */
+ *  flip through while reading a chart, not a trade action, so it costs one key too.
+ *  Space plays / pauses a Market Replay, as it does any player; outside a replay
+ *  the key is left alone (see `useHotkeys`). */
 const bare = (code: string): Binding =>
   ({ kind: "key", code, ctrl: false, alt: false, shift: false, meta: false });
 
@@ -161,6 +169,7 @@ const DEFAULT_BINDINGS: Partial<Record<HotkeyActionId, Binding>> = {
   dip_thinner: bare("KeyB"),
   dip_thicker: bare("KeyT"),
   premarket_cycle: bare("KeyP"),
+  replay_play_pause: bare("Space"),
 };
 
 interface HotkeyState {
@@ -193,13 +202,15 @@ export const useHotkeyStore = create<HotkeyState>()(
     }),
     {
       name: "tagdash-hotkeys",
-      version: 3,
+      storage: userStorage(),
+      version: 4,
       // Each version hands existing installs the defaults it introduced — but only
       // where the user has not spoken. A key they bound themselves always wins, and
       // the new action simply stays unassigned (Réglages → Clavier shows it as such).
       //   v0 → v1: Apex (V).
       //   v1 → v2: Dip (G, and B / T for its thickness).
       //   v2 → v3: the daily premarket bars (P).
+      //   v3 → v4: replay play / pause (Space).
       migrate: (persisted, version) => {
         const state = (persisted ?? { bindings: {} }) as { bindings: Partial<Record<HotkeyActionId, Binding>> };
         const bindings = { ...(state.bindings ?? {}) };
@@ -212,6 +223,7 @@ export const useHotkeyStore = create<HotkeyState>()(
         if (version < 1) seed("apex_arm");
         if (version < 2) { seed("dip_place"); seed("dip_thinner"); seed("dip_thicker"); }
         if (version < 3) seed("premarket_cycle");
+        if (version < 4) seed("replay_play_pause");
         return { ...state, bindings } as HotkeyState;
       },
     },
@@ -242,3 +254,10 @@ export function getHoveredZone(): string | null { return hoveredZoneId; }
  *  doesn't fire an action for the very key/button being assigned. */
 export function setRecordingActive(v: boolean): void { recordingActive = v; }
 export function isRecordingActive(): boolean { return recordingActive; }
+
+/** Whether a Market Replay is running, as the replay toolbar last saw it. The
+ *  replay shortcuts only take their key while one is: Space must stay Space (a
+ *  focused button, a scroll) the rest of the time. */
+let replayActive = false;
+export function setReplayActive(v: boolean): void { replayActive = v; }
+export function isReplayActive(): boolean { return replayActive; }

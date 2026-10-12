@@ -1,18 +1,19 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
 // User-tunable chart appearance: candle/volume colours, pre/post-market shading,
 // grid, indicators (colour + opacity), execution markers, split markers and the
 // SL/TP/alarm price-line colours. Read live by the chart hooks/primitives so an
 // edit in Settings → Apparence reflects immediately on every open pane.
 //
-// Persisted to localStorage (same pattern as the hotkeys / drawing-prefs stores).
+// Persisted with the personal data (same pattern as the hotkeys / drawing-prefs stores).
 //
 // IMPORTANT — "my settings = the defaults that ship":
 // `DEFAULT_CHART_THEME` below IS the value new installs get. It is seeded with the
 // app's current look. To make YOUR tuned palette the shipped default, open
 // Settings → Apparence, click "Copier le thème (JSON)", and paste the object over
-// `DEFAULT_CHART_THEME` here, then commit. The on-disk (localStorage) value only
+// `DEFAULT_CHART_THEME` here, then commit. The saved value only
 // affects the local machine; the constant is what distributions inherit.
 
 // ─── Shape ──────────────────────────────────────────────────────────────────
@@ -157,6 +158,7 @@ export const useChartThemeStore = create<ChartThemeState>()(
     }),
     {
       name: "tagdash-chart-theme",
+      storage: userStorage(),
       // Persist only the palette; merge forward over the latest defaults.
       partialize: (s) => ({ theme: s.theme }),
       merge: (persisted, current) => ({

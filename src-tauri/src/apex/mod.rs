@@ -305,7 +305,7 @@ mod tests {
         let (mut ms, mut rx) = market();
         ms.on_quote(SYM, 3.00, 3.02, at(0), at(0));
         for i in 0..12 {
-            ms.on_replay_trade(SYM, 3.00, 800, 1, at(10 + i * 30));
+            ms.on_replay_trade(SYM, 3.00, 800, 1, at(10 + i * 30), false);
         }
         assert_eq!(entry(rx.try_recv().expect("flush")).side, Side::Short);
     }

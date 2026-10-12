@@ -214,12 +214,18 @@ pub async fn run_pipeline(
     );
 
     // Data differed by 15 minutes must never drive a real order sent to Alpaca —
-    // force the internal TagDash broker instead of failing silently later.
-    if crate::massive::plan::enforce_broker_gate(&config, &app_dir, effective_massive_tier) {
+    // force the internal TagDash broker instead of failing silently later. Only when
+    // Massive actually feeds the app, i.e. there are no Alpaca keys: with them,
+    // Alpaca serves the live feed and Massive is a reference source only.
+    let massive_drives_live = crate::massive::plan::drives_live_feed(
+        crate::massive::plan::has_alpaca_keys(&sec),
+        effective_massive_tier,
+    );
+    if crate::massive::plan::enforce_broker_gate(&config, &app_dir, massive_drives_live) {
         push_warning(
             &state,
-            "Massive Starter+ actif (données différées de 15 min) — courtier basculé \
-             automatiquement sur TagDash, Alpaca désactivé",
+            "Massive Starter+ alimente le flux (pas de clés Alpaca, données différées \
+             de 15 min) — courtier basculé automatiquement sur TagDash, Alpaca désactivé",
         );
     }
 
@@ -232,7 +238,7 @@ pub async fn run_pipeline(
         Some(if offline {
             "config loaded — hors ligne (flat files uniquement)"
         } else {
-            "config loaded from tagdash.toml"
+            "config loaded from settings.toml"
         }),
     );
     let _ = log(&db, "info", "startup: config loaded");
@@ -689,34 +695,24 @@ pub async fn run_pipeline(
     }
 
     // ── Step 17: load_replay_day ──────────────────────────────────────────────
-    // Informational in both cases: which downloaded day Market Replay can open. When
-    // there is no live feed to watch (offline, or no Alpaca keys), `lib.rs` parks it
-    // paused so charts populate on launch.
+    // Informational: the latest day prepared for Market Replay (`replay_data`).
     set_step(&state, "load_replay_day", StepStatus::Running, None);
-    match crate::flat_files::minute::latest_complete_day(&app_dir) {
+    let prepared = crate::replay_data::store::days_on_disk(&app_dir);
+    match prepared.last() {
         Some(day) => set_step(
             &state,
             "load_replay_day",
             StepStatus::Success,
-            Some(&format!("dernier jour disponible : {day}")),
+            Some(&format!(
+                "{} séance(s) préparée(s), dernière : {day}",
+                prepared.len()
+            )),
         ),
-        None if offline || !has_alpaca => {
-            push_warning(
-                &state,
-                "aucun jour minute téléchargé — ouvrez « Source de données »",
-            );
-            set_step(
-                &state,
-                "load_replay_day",
-                StepStatus::Warning,
-                Some("aucun jour téléchargé"),
-            );
-        }
         None => set_step(
             &state,
             "load_replay_day",
             StepStatus::Success,
-            Some("aucun jour téléchargé — le replay se chargera via l'API"),
+            Some("aucune séance préparée — Market Replay → « Préparer une séance »"),
         ),
     }
 

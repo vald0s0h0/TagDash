@@ -18,9 +18,13 @@ interface Props {
    *  kept locally and posted the moment the trade is created upstream — saying so
    *  is the difference between "waiting" and the silent loss this used to be. */
   pending?: boolean;
+  /** Missed trade: `tradeId` is the ticker's review session. The note stays in
+   *  TagDash; if a trade is taken on the ticker later in the session, the review
+   *  sweeper copies it onto that trade. */
+  missed?: boolean;
 }
 
-export function JournalModal({ open, onClose, tradeId, symbol, pending }: Props) {
+export function JournalModal({ open, onClose, tradeId, symbol, pending, missed }: Props) {
   const [notes,      setNotes]      = useState("");
   const [confidence, setConfidence] = useState<number>(5);
   const [tags,       setTags]       = useState<string[]>([]);
@@ -79,13 +83,19 @@ export function JournalModal({ open, onClose, tradeId, symbol, pending }: Props)
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <NotebookPen className="h-4 w-4 text-muted-foreground" />
-            Journal — {symbol}
+            <NotebookPen className={cn("h-4 w-4", missed ? "text-red-400" : "text-muted-foreground")} />
+            {missed ? `Trade manqué — ${symbol}` : `Journal — ${symbol}`}
           </DialogTitle>
         </DialogHeader>
 
         <p className="font-mono text-[10px] text-muted-foreground truncate">{tradeId}</p>
-        {pending && (
+        {missed && (
+          <p className="text-[10px] text-red-400/90">
+            Aucun trade sur ce ticker — la note est gardée dans TagDash (trades manqués,
+            onglet Revue). Si un trade est pris ensuite sur ce ticker, elle y sera copiée.
+          </p>
+        )}
+        {pending && !missed && (
           <p className="text-[10px] text-amber-400/90">
             Trade pas encore exécuté — la note est gardée ici et envoyée à TradeTally
             dès l'entrée.
@@ -216,7 +226,7 @@ export function JournalModal({ open, onClose, tradeId, symbol, pending }: Props)
         <div className="flex items-center justify-between pt-1">
           {savedAt ? (
             <p className="text-[10px] text-muted-foreground">
-              Sauvegardé · TT sync pending
+              {missed ? "Sauvegardé dans TagDash" : "Sauvegardé · TT sync pending"}
             </p>
           ) : (
             <span />

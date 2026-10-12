@@ -3,23 +3,39 @@ use std::collections::HashMap;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 
-// ─── App-config key/value (small persisted markers) ──────────────────────────
+// ─── Key/value bag (small persisted markers and settings) ─────────────────────
+//
+// One API, two tables. A cache marker (a fetch date, a probed data plan) lives in
+// `app_config` in the cache database; a personal setting (strategy switches, an
+// engine's options, the simulated book) lives in `user.user_config`. The key
+// decides — see `schema::USER_CONFIG_KEYS` — so no call site has to.
 
-/// Read a value from the `app_config` key/value table.
+fn meta_table(key: &str) -> &'static str {
+    if super::schema::USER_CONFIG_KEYS.contains(&key) {
+        "user.user_config"
+    } else {
+        "app_config"
+    }
+}
+
+/// Read a value from the key/value bag.
 pub fn get_app_meta(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row(
-        "SELECT value FROM app_config WHERE key=?1",
+        &format!("SELECT value FROM {} WHERE key=?1", meta_table(key)),
         params![key],
         |r| r.get::<_, String>(0),
     )
     .ok()
 }
 
-/// Upsert a value into the `app_config` key/value table.
+/// Upsert a value into the key/value bag.
 pub fn set_app_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO app_config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        &format!(
+            "INSERT INTO {} (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            meta_table(key)
+        ),
         params![key, value],
     )?;
     Ok(())

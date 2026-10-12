@@ -5,9 +5,9 @@ import { api } from "@/lib/tauri";
 type Modal = "settings" | "startup" | "bug-report" | null;
 
 /** Top-level view: the trading workspace (sessions + charts + sidebar), the
- *  standalone KPI dashboard (moodboard, no sidebar), or the embedded TradeTally
- *  web app (no sidebar). */
-export type View = "trading" | "dashboard" | "tradetally";
+ *  standalone KPI dashboard (moodboard, no sidebar), the trade review (replay of
+ *  past trades, its own sidebar), or the embedded TradeTally web app (no sidebar). */
+export type View = "trading" | "dashboard" | "review" | "tradetally";
 
 interface UiState {
   /** Which top-level view is shown. The dashboard (Moon, first in the rail) hides

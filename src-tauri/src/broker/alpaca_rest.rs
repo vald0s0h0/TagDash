@@ -449,15 +449,23 @@ pub async fn submit(creds: &Creds, req: &OrderRequest) -> Result<Vec<BrokerOrder
         .clone()
         .unwrap_or_else(|| format!("tagdash-{}", uuid_like()));
     let body = submit_body(req, &coid);
+    let sent_ms = crate::time::now().timestamp_millis();
     let resp = request(creds, reqwest::Method::POST, "/v2/orders")
         .json(&body)
         .send()
         .await
         .map_err(|e| format!("Alpaca injoignable à l'envoi de l'ordre : {e}"))?;
     let text = check(resp, "ordre").await?;
+    let ack_ms = crate::time::now().timestamp_millis();
     let raw: RawOrder =
         serde_json::from_str(&text).map_err(|e| format!("réponse d'ordre illisible : {e}"))?;
-    Ok(flatten(raw))
+    let orders = flatten(raw);
+    // Send → ack latency of the order itself (the parent). Bracket legs trigger
+    // later on their own; their fills keep no send time.
+    if let Some(parent) = orders.first() {
+        crate::review::timing::order_acked(&parent.id, Some(sent_ms), ack_ms);
+    }
+    Ok(orders)
 }
 
 /// Attach venue-owned OCO exits to an already-open position during RTH.

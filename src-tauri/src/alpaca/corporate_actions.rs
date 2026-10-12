@@ -118,6 +118,7 @@ pub async fn fetch_splits(
             url.push_str(&format!("&page_token={tok}"));
         }
 
+        crate::alpaca::ratelimit::acquire().await;
         let resp = client
             .get(&url)
             .header("APCA-API-KEY-ID", key)
@@ -192,6 +193,7 @@ pub async fn fetch_recent_split_symbols(
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
+            crate::alpaca::ratelimit::acquire().await;
             let resp = client
                 .get(&url)
                 .header("APCA-API-KEY-ID", key)
@@ -269,6 +271,7 @@ pub async fn fetch_all_splits(
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&page_token={tok}"));
             }
+            crate::alpaca::ratelimit::acquire().await;
             let resp = client
                 .get(&url)
                 .header("APCA-API-KEY-ID", key)
@@ -310,6 +313,66 @@ pub async fn fetch_all_splits(
                 Some(tok) if !tok.is_empty() => page_token = Some(tok),
                 _ => break,
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Every split whose ex-date is `date` (YYYY-MM-DD), market-wide — no symbol list,
+/// so the whole answer is one request (plus pages on a busy day). Used by the
+/// attention map to put the previous session's prices and the morning's on the
+/// same basis.
+pub async fn fetch_splits_on_date(
+    key: &str,
+    secret: &str,
+    date: &str,
+) -> Result<Vec<SplitEvent>, String> {
+    let client = crate::http::client();
+    let mut out: Vec<SplitEvent> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut url = format!(
+            "https://data.alpaca.markets/v1/corporate-actions\
+             ?types=forward_split,reverse_split&start={date}&end={date}&limit=1000"
+        );
+        if let Some(tok) = &page_token {
+            url.push_str(&format!("&page_token={tok}"));
+        }
+        crate::alpaca::ratelimit::acquire().await;
+        let resp = client
+            .get(&url)
+            .header("APCA-API-KEY-ID", key)
+            .header("APCA-API-SECRET-KEY", secret)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Alpaca corporate-actions HTTP {status}: {body}"));
+        }
+        let parsed: CorporateActionsResponse = resp.json().await.map_err(|e| e.to_string())?;
+        if let Some(ca) = parsed.corporate_actions {
+            for s in ca.forward_splits.into_iter().chain(ca.reverse_splits) {
+                let ex = s.ex_date.clone().or_else(|| s.process_date.clone());
+                let (Some(symbol), Some(ex)) = (s.symbol.clone(), ex) else {
+                    continue;
+                };
+                if ex.get(..10) != Some(date) {
+                    continue;
+                }
+                out.push(SplitEvent {
+                    symbol,
+                    date: date.to_string(),
+                    from: s.old_rate.unwrap_or(1.0),
+                    to: s.new_rate.unwrap_or(1.0),
+                    label: split_label(s.new_rate, s.old_rate),
+                });
+            }
+        }
+        match parsed.next_page_token {
+            Some(tok) if !tok.is_empty() => page_token = Some(tok),
+            _ => break,
         }
     }
     Ok(out)

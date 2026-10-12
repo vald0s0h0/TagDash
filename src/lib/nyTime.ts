@@ -115,3 +115,10 @@ export function nyDayStamp(input: TimeInput): { day: string; minutes: number } {
     minutes: Number(p.hour) * 60 + Number(p.minute),
   };
 }
+
+/** "HHMMSSmmm" in NY time from epoch MILLISECONDS — execution timestamps (review). */
+export function nyHmsMillis(ms: number): string {
+  const p = nyParts(new Date(ms));
+  const milli = String(((ms % 1000) + 1000) % 1000).padStart(3, "0");
+  return `${p.hour}${p.minute}${p.second}${milli}`;
+}

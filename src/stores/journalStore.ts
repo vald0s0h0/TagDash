@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
 // The "journal du jour". TradeTally holds the entry (one per calendar day,
 // updated in place); this store is the editing buffer in front of it.
@@ -11,7 +12,7 @@ import { persist } from "zustand/middleware";
 // every keystroke and cleared by a successful send, and `hydrate` only writes into
 // the buffer while it is false.
 //
-// The buffer persists to localStorage so it survives the dashboard tab unmounting
+// The buffer persists with the personal data (`userStorage`) so it survives the dashboard tab unmounting
 // (it re-mounts on every visit) and app restarts, and auto-resets the next day at
 // midnight America/New_York.
 
@@ -59,6 +60,7 @@ export const useJournalStore = create<JournalState>()(
     }),
     {
       name: "tagdash-journal",
+      storage: userStorage(),
       version: 2,
       // v1 had no `dirty` flag. Without a migration zustand discards the stored
       // state on a version bump, which would drop an unsent draft; carry the text

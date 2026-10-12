@@ -349,7 +349,10 @@ async fn dispatch(
                 .get("localPath")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            client.upload_images_session(endpoint, local_path).await?;
+            // The queue keeps the path as the database does (relative to the
+            // user folder), so a queued upload survives the data moving.
+            let file = crate::paths::from_stored(local_path);
+            client.upload_images_session(endpoint, &file.to_string_lossy()).await?;
             Ok(None)
         }
         other => Err(format!("unknown event_type: {other}")),

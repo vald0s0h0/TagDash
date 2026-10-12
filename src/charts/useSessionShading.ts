@@ -1,8 +1,8 @@
 import { useEffect, type MutableRefObject } from "react";
 import type { Bar, Timeframe } from "@/types";
 import { toUTC } from "@/charts/chartOptions";
-import { nyDayStamp, nySessionOfMinutes } from "@/lib/nyTime";
-import type { SessionBandsPrimitive, SessionMark } from "@/charts/sessionBandsPrimitive";
+import { sessionMarks } from "@/charts/chartDefaults";
+import type { SessionBandsPrimitive } from "@/charts/sessionBandsPrimitive";
 
 /** Per-bar session marks for the backdrop primitive: which NY session each bar
  *  belongs to (pre / regular / post) and where a new NY calendar day starts.
@@ -22,13 +22,6 @@ export function useSessionShading(
       prim.setData([]);
       return;
     }
-    let prevDay = "";
-    const marks: SessionMark[] = bars.map((b, i) => {
-      const { day, minutes } = nyDayStamp(b.time);
-      const dayStart = i > 0 && day !== prevDay;
-      prevDay = day;
-      return { time: toUTC(b.time) as number, session: nySessionOfMinutes(minutes), dayStart };
-    });
-    prim.setData(marks);
+    prim.setData(sessionMarks(bars.map((b) => toUTC(b.time) as number)));
   }, [bars, timeframe]);
 }

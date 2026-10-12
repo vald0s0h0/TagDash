@@ -8,8 +8,10 @@ import {
   Gauge,
   KeyRound,
   Keyboard,
+  LayoutDashboard,
   LineChart,
   ListChecks,
+  Clapperboard,
   Mic,
   Newspaper,
   Palette,
@@ -21,6 +23,7 @@ import {
   ServerCog,
   Table2,
   Tag,
+  UserRound,
   X,
   XCircle,
   type LucideIcon,
@@ -52,10 +55,13 @@ import {
 } from "@/stores/hotkeyStore";
 import { GamepadSettings } from "@/components/GamepadSettings";
 import { BrokerTab } from "@/components/settings/BrokerTab";
+import { DashboardTab } from "@/components/settings/DashboardTab";
 import { DataSourceTab } from "@/components/settings/DataSourceTab";
+import { DataTab } from "@/components/settings/DataTab";
 import { TickersDbTab } from "@/components/settings/TickersDbTab";
 import { TradesDbTab } from "@/components/settings/TradesDbTab";
 import { DicteeTab } from "@/components/settings/DicteeTab";
+import { ReviewTab } from "@/components/settings/ReviewTab";
 import { SyncTab } from "@/components/settings/SyncTab";
 import { StartupTab } from "@/components/settings/StartupTab";
 import { FeedDiagnosticsTab } from "@/components/settings/FeedDiagnosticsTab";
@@ -152,7 +158,7 @@ function NtfyTestButton({ hasTopic }: { hasTopic: boolean }) {
 /** Editable API-key fields shown in Settings → API Keys (order = display order). The
  *  tradetally_* keys are rendered in a dedicated "TradeTally" subsection below the rest. */
 const SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
-  { key: "massive_api_key",     label: "Massive API key (float · short interest · tier)" },
+  { key: "massive_api_key",     label: "Massive API key (référentiel : float · short interest · types · barres 5 s/10 s)" },
   { key: "sec_api_key",         label: "sec-api.io key (pays · industrie)" },
   { key: "fmp_api_key",         label: "FMP API key (fallback)" },
   { key: "claude_api_key",      label: "Claude API key" },
@@ -176,7 +182,7 @@ const ALPACA_ACCOUNT_FIELDS: { key: SecretKey; label: string; type?: string }[] 
 ];
 
 /** ntfy push — the "my phone must ring" path for Micro Pullback alerts.
- *  Only the topic is required. It lives with the secrets rather than in tagdash.toml
+ *  Only the topic is required. It lives with the secrets rather than in settings.toml
  *  because on the public server a topic name IS the access control: anyone who knows
  *  it can read it and publish to it. */
 const NTFY_SECRET_FIELDS: { key: SecretKey; label: string; type?: string }[] = [
@@ -815,10 +821,10 @@ function AppearanceTab() {
 // ─── Sidebar: tabs grouped by category ──────────────────────────────────────
 
 type TabId =
-  | "broker" | "trading" | "strategies"
-  | "apparence" | "keyboard" | "gamepad" | "notifs"
+  | "broker" | "trading" | "strategies" | "review"
+  | "apparence" | "dashboard" | "keyboard" | "gamepad" | "notifs"
   | "data-source" | "latency" | "feed-diagnostics" | "news-debug"
-  | "tickers-db" | "trades-db" | "dictee" | "tags"
+  | "data" | "tickers-db" | "trades-db" | "dictee" | "tags"
   | "secrets" | "sync" | "startup" | "logs" | "update";
 
 interface TabDef { id: TabId; label: string; icon: LucideIcon }
@@ -831,12 +837,14 @@ const TAB_GROUPS: TabGroup[] = [
       { id: "broker",     label: "Broker",     icon: ServerCog },
       { id: "trading",    label: "Trading",    icon: LineChart },
       { id: "strategies", label: "Stratégies", icon: ListChecks },
+      { id: "review",     label: "Revue",      icon: Clapperboard },
     ],
   },
   {
     label: "Interface",
     tabs: [
       { id: "apparence", label: "Apparence",     icon: Palette },
+      { id: "dashboard", label: "Tableau de bord", icon: LayoutDashboard },
       { id: "keyboard",  label: "Clavier",       icon: Keyboard },
       { id: "gamepad",   label: "Manette Xbox",  icon: Gamepad2 },
       { id: "notifs",    label: "Notifications", icon: Bell },
@@ -854,6 +862,7 @@ const TAB_GROUPS: TabGroup[] = [
   {
     label: "Données stockées",
     tabs: [
+      { id: "data",       label: "Mes données",   icon: UserRound },
       { id: "tickers-db", label: "Tickers (DB)",  icon: Table2 },
       { id: "trades-db",  label: "Trades (DB)",   icon: Receipt },
       { id: "dictee",     label: "Dictée vocale", icon: Mic },
@@ -1096,6 +1105,11 @@ export function SettingsModal({ open, onClose }: Props) {
                 <AppearanceTab />
               </TabsContent>
 
+              {/* ── Tableau de bord (backgrounds, mood, phrases, cards) ── */}
+              <TabsContent value="dashboard" className="mt-0">
+                <DashboardTab />
+              </TabsContent>
+
               {/* ── Clavier / Souris — chord recorder ── */}
               <TabsContent value="keyboard" className="mt-0 space-y-3">
                 <p className="text-xs text-muted-foreground">
@@ -1311,6 +1325,11 @@ export function SettingsModal({ open, onClose }: Props) {
                 <NewsDebugTab />
               </TabsContent>
 
+              {/* ── Mes données (personal folder, data pack, backups, cache) ── */}
+              <TabsContent value="data" className="mt-0">
+                <DataTab />
+              </TabsContent>
+
               {/* ── Tickers (DB) ── */}
               <TabsContent value="tickers-db" className="mt-0 h-full">
                 <TickersDbTab />
@@ -1322,6 +1341,9 @@ export function SettingsModal({ open, onClose }: Props) {
               </TabsContent>
 
               {/* ── Dictée vocale (config + mic test + queue) ── */}
+              <TabsContent value="review" className="mt-0">
+                <ReviewTab />
+              </TabsContent>
               <TabsContent value="dictee" className="mt-0">
                 <DicteeTab />
               </TabsContent>
@@ -1370,7 +1392,7 @@ export function SettingsModal({ open, onClose }: Props) {
                   Saisis tes clés ci-dessous puis <strong>Enregistrer les clés</strong> —
                   elles sont écrites dans{" "}
                   <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                    tagdash.secrets.toml
+                    user/secrets.toml
                   </code>
                   . Un champ laissé vide conserve la clé existante. Les valeurs ne sont
                   jamais relues par l'interface (seul l'état configuré/non est affiché).

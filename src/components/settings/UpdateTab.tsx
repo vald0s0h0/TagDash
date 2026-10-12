@@ -180,6 +180,13 @@ export function UpdateTab() {
       <p className="break-all font-mono text-[9px] text-muted-foreground/60">
         endpoint : {UPDATE_ENDPOINT}
       </p>
+      {/* Required by the Lightweight Charts licence once the in-chart logo is off. */}
+      <p className="text-[10px] text-muted-foreground/70">
+        Graphiques : TradingView Lightweight Charts™ — Copyright © 2025 TradingView, Inc.{" "}
+        <a href="https://www.tradingview.com/" target="_blank" rel="noreferrer" className="underline hover:text-foreground">
+          https://www.tradingview.com/
+        </a>
+      </p>
     </div>
   );
 }

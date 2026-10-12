@@ -67,13 +67,13 @@ export interface ZoneGamepad {
   getFocusedPaneId: () => string;
   /** R1: move focus to the next pane of the zone (wraps; no-op if single pane). */
   cycleFocus: () => void;
-  /** Cursor/order layer (R2 not held). */
+  /** Levels at the cursor. */
   placeSl:    () => void;
   placeTp:    () => void;
   placeAlarm: () => void;
   removeOrders: () => void;
   removeOrdersAndAlarms: () => void;
-  /** Armed layer (R2 held). */
+  /** Position sizing / exit. */
   order: (percent: 25 | 50 | 100) => void;
   close: () => void;
   confirmHod?: () => void;
@@ -105,9 +105,9 @@ export function getZoneGamepad(zoneId: string | null): ZoneGamepad | undefined {
 }
 
 // ─── Recorder lock ────────────────────────────────────────────────────────────
-// Set while the Settings binding recorder is reading the pad, so the global loop
-// doesn't fire an action for the very button/axis being assigned (mirrors the
-// keyboard recorder's `setRecordingActive`).
+// Set while the Settings axis recorder is reading the pad, so the global loop
+// doesn't act on the very stick being assigned (mirrors the keyboard recorder's
+// `setRecordingActive`).
 
 let capturing = false;
 export function setGamepadCapturing(v: boolean): void { capturing = v; }

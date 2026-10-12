@@ -6,6 +6,7 @@ import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { fmtCompact } from "@/components/chartZoneParts";
 import { cn } from "@/lib/utils";
+import { trackUsage } from "@/lib/usageTracker";
 
 const MAX_RESULTS = 50;
 
@@ -43,6 +44,7 @@ export function TickerSpotlight() {
         setQuery(e.key.toUpperCase());
         setHighlight(0);
         setOpen(true);
+        trackUsage("key", "spotlight_open");
         e.preventDefault();
       }
     };

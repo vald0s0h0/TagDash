@@ -1,4 +1,4 @@
-// Persisted STT job queue. Each queued dictée is two files under `<app_dir>/stt_jobs/`:
+// Persisted STT job queue. Each queued dictée is two files under `<root>/user/stt_jobs/`:
 //   <id>.wav   — the captured audio, already resampled to 16 kHz mono f32.
 //   <id>.json  — the SttJob metadata (kind, destination, state, attempts…).
 // The queue is reloaded at startup so a dictée left mid-flight (e.g. the worker was

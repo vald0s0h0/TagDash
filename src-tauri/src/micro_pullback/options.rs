@@ -30,6 +30,9 @@ pub const TEMPO_SECS: [i64; 6] = [10, 20, 40, 60, 120, 300];
 
 pub const APP_META_KEY: &str = "micro_pullback_v1_options";
 
+/// See `MicroPullbackOptions::replay_pads_version`.
+const REPLAY_PADS_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MicroPullbackOptions {
@@ -98,6 +101,29 @@ pub struct MicroPullbackOptions {
     pub tempo_1m: bool,
     pub tempo_2m: bool,
     pub tempo_5m: bool,
+
+    // ── Créneau ────────────────────────────────────────────────────────────────
+    /// Active window, ET minutes since midnight, [start, end). Read by the live
+    /// engine AND by the replay data profile, so the day scanned and downloaded for a
+    /// replay is always the window the engine actually trades. Default 04:00–20:00,
+    /// the whole extended day; 04:00–09:30 for premarket-only trading.
+    pub session_start_min: u16,
+    pub session_end_min: u16,
+
+    // ── Données replay ─────────────────────────────────────────────────────────
+    /// Real ticks kept around each pre-scan hit: minutes before (the ignition's
+    /// start) and after (the trade's management). Outside, the replay synthesizes
+    /// 10-second slices from the minute bars.
+    pub replay_before_min: u16,
+    pub replay_after_min: u16,
+    /// Cap on symbols whose ticks are downloaded for one day, strongest first.
+    pub replay_max_symbols: u16,
+    /// Version of the replay pad defaults this blob was written under. Absent (0)
+    /// in a blob from before the 5 / 15 min defaults: `load` then moves the old
+    /// 2 / 10 defaults forward once, so a trader who never touched them gets the
+    /// real tape around the whole of what a 10 s chart shows.
+    #[serde(default)] // 0 when absent — not the struct default, or nothing migrates
+    pub replay_pads_version: u8,
 }
 
 impl Default for MicroPullbackOptions {
@@ -131,6 +157,14 @@ impl Default for MicroPullbackOptions {
             tempo_1m: true,
             tempo_2m: true,
             tempo_5m: true,
+
+            session_start_min: 240,
+            session_end_min: 1200,
+
+            replay_before_min: 5,
+            replay_after_min: 15,
+            replay_max_symbols: 150,
+            replay_pads_version: REPLAY_PADS_VERSION,
         }
     }
 }
@@ -151,6 +185,11 @@ impl MicroPullbackOptions {
             .zip(flags)
             .filter_map(|(secs, on)| on.then_some(*secs))
             .collect()
+    }
+
+    /// Whether `et_min` (ET minutes since midnight) falls in the active window.
+    pub fn in_session(&self, et_min: u32) -> bool {
+        (u32::from(self.session_start_min)..u32::from(self.session_end_min)).contains(&et_min)
     }
 
     /// Longest active tempo, used to size the baseline backfill. None when the user
@@ -219,6 +258,18 @@ impl MicroPullbackOptions {
             self.llm_budget_per_5min = d.llm_budget_per_5min;
         }
         self.llm_budget_per_5min = self.llm_budget_per_5min.clamp(1, 20);
+
+        // The extended day is 04:00–20:00; an empty or inverted window would mute
+        // the strategy without saying so.
+        self.session_start_min = self.session_start_min.clamp(240, 1199);
+        self.session_end_min = self.session_end_min.clamp(241, 1200);
+        if self.session_end_min <= self.session_start_min {
+            self.session_start_min = d.session_start_min;
+            self.session_end_min = d.session_end_min;
+        }
+        self.replay_before_min = self.replay_before_min.min(30);
+        self.replay_after_min = self.replay_after_min.clamp(1, 120);
+        self.replay_max_symbols = self.replay_max_symbols.clamp(1, 500);
         self
     }
 
@@ -226,8 +277,22 @@ impl MicroPullbackOptions {
     pub fn load(conn: &rusqlite::Connection) -> Self {
         crate::local_db::cache_repository::get_app_meta(conn, APP_META_KEY)
             .and_then(|json| serde_json::from_str::<Self>(&json).ok())
+            .map(Self::migrated)
             .unwrap_or_default()
             .sanitized()
+    }
+
+    /// Bring an older blob's untouched defaults forward (see `replay_pads_version`).
+    /// A value the trader chose is kept.
+    fn migrated(mut self) -> Self {
+        if self.replay_pads_version < REPLAY_PADS_VERSION {
+            if (self.replay_before_min, self.replay_after_min) == (2, 10) {
+                self.replay_before_min = 5;
+                self.replay_after_min = 15;
+            }
+            self.replay_pads_version = REPLAY_PADS_VERSION;
+        }
+        self
     }
 
     /// Persist the blob. Returns the rusqlite error as a string for the command layer.
@@ -303,6 +368,38 @@ mod tests {
         assert!(!o.tempo_5m, "valeur stockée conservée");
         assert_eq!(o.ratios_required, 2, "champ inconnu à l'époque → défaut");
         assert_eq!(o.watch_fast_rate_per_sec, 5.0);
+    }
+
+    #[test]
+    fn old_pad_defaults_move_forward_but_chosen_values_stay() {
+        let old: MicroPullbackOptions =
+            serde_json::from_str(r#"{"replay_before_min":2,"replay_after_min":10}"#).unwrap();
+        let m = old.migrated();
+        assert_eq!((m.replay_before_min, m.replay_after_min), (5, 15));
+        let chosen: MicroPullbackOptions =
+            serde_json::from_str(r#"{"replay_before_min":3,"replay_after_min":20}"#).unwrap();
+        let m = chosen.migrated();
+        assert_eq!((m.replay_before_min, m.replay_after_min), (3, 20));
+        assert_eq!(m.replay_pads_version, REPLAY_PADS_VERSION);
+    }
+
+    #[test]
+    fn an_inverted_session_falls_back_to_the_whole_day() {
+        let o = MicroPullbackOptions {
+            session_start_min: 600,
+            session_end_min: 570,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!((o.session_start_min, o.session_end_min), (240, 1200));
+        let pm = MicroPullbackOptions {
+            session_start_min: 240,
+            session_end_min: 570,
+            ..Default::default()
+        }
+        .sanitized();
+        assert!(pm.in_session(240) && pm.in_session(569));
+        assert!(!pm.in_session(570) && !pm.in_session(239));
     }
 
     #[test]

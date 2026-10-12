@@ -79,7 +79,7 @@ pub fn platform_available() -> bool {
 // ─── Paths ────────────────────────────────────────────────────────────────────
 
 pub fn models_dir(app_dir: &Path) -> PathBuf {
-    app_dir.join("models")
+    crate::paths::models_dir(app_dir)
 }
 
 pub fn model_path(app_dir: &Path, model: &str) -> PathBuf {
@@ -87,7 +87,7 @@ pub fn model_path(app_dir: &Path, model: &str) -> PathBuf {
 }
 
 pub fn jobs_dir(app_dir: &Path) -> PathBuf {
-    app_dir.join("stt_jobs")
+    crate::paths::stt_jobs_dir(app_dir)
 }
 
 // ─── Job model ──────────────────────────────────────────────────────────────────
@@ -135,6 +135,13 @@ pub struct SttJob {
     #[serde(default)]
     pub text: Option<String>,
     pub created_at: String,
+    /// Review session the dictée belongs to (see `crate::review`). Its audio is
+    /// archived for the replay, its transcript timed as subtitles, and the cleaned
+    /// text copied onto every trade of the session by the review sweeper.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub voice_id: Option<String>,
 }
 
 /// Destination context of the in-progress recording — turned into an `SttJob` when
@@ -144,6 +151,11 @@ pub struct PendingRecording {
     pub kind: JobKind,
     pub trade_id: Option<String>,
     pub symbol: Option<String>,
+    /// Review session + where the recording starts on the market clock (and the
+    /// replay speed then), so the archived voice lines up with the replayed tape.
+    pub session_id: Option<String>,
+    pub start_ms: i64,
+    pub speed: f64,
 }
 
 // ─── Worker / status views ──────────────────────────────────────────────────────
@@ -167,6 +179,8 @@ pub struct SttStatus {
     pub download_progress: f32,
     pub recording: bool,
     pub recording_kind: Option<JobKind>,
+    /// Ticker the in-progress recording is about (auto voice / per-chart mic).
+    pub recording_symbol: Option<String>,
     pub worker_state: String,
     pub paused_reason: Option<String>,
     pub jobs: Vec<SttJob>,
@@ -247,7 +261,10 @@ impl SttShared {
     pub fn status(&self, cfg: &crate::config::SttConfig) -> SttStatus {
         let model_present = model_path(&self.app_dir, &cfg.model).exists();
         let ws = self.worker_state.lock().unwrap().clone();
-        let recording_kind = self.pending.lock().unwrap().as_ref().map(|p| p.kind);
+        let (recording_kind, recording_symbol) = {
+            let p = self.pending.lock().unwrap();
+            (p.as_ref().map(|p| p.kind), p.as_ref().and_then(|p| p.symbol.clone()))
+        };
         SttStatus {
             enabled: cfg.enabled,
             platform_available: platform_available(),
@@ -257,6 +274,7 @@ impl SttShared {
             download_progress: *self.download_progress.lock().unwrap(),
             recording: self.is_recording(),
             recording_kind,
+            recording_symbol,
             worker_state: ws.state,
             paused_reason: ws.paused_reason,
             jobs: self.jobs.lock().unwrap().iter().cloned().collect(),
@@ -309,12 +327,36 @@ pub fn start_recording(
     }
     *shared.pending.lock().unwrap() = None;
 
+    // A dictée on a ticker belongs to the ticker's review session when it has one
+    // (it then reaches every trade of the session), and opens one when there is no
+    // trade to file it against (a missed trade). A plain trade note on a ticker with
+    // no session keeps the old direct path.
+    let session_id = match (kind, symbol.as_deref()) {
+        (JobKind::Trade, Some(sym)) if !sym.trim().is_empty() => {
+            crate::review::open_session_for(&sym.trim().to_uppercase()).or_else(|| {
+                if trade_id.as_deref().map_or(true, str::is_empty) {
+                    crate::review::ensure_session(sym, None)
+                } else {
+                    None
+                }
+            })
+        }
+        _ => None,
+    };
+
     let rec = Recorder::start(app.clone(), device, kind)?;
     *shared.recorder.lock().unwrap() = Some(rec);
     *shared.pending.lock().unwrap() = Some(PendingRecording {
         kind,
         trade_id,
         symbol,
+        session_id,
+        start_ms: crate::time::now().timestamp_millis(),
+        speed: if crate::replay::clock::is_active() {
+            crate::replay::clock::speed()
+        } else {
+            1.0
+        },
     });
     let _ = app.emit(EV_CHANGED, ());
     Ok(())
@@ -339,6 +381,27 @@ pub fn stop_recording(shared: &Arc<SttShared>, app: AppHandle) -> Result<String,
     let (samples, rate) = rec.stop();
     let pcm = vad::resample_to_16k(&samples, rate);
     let id = format!("stt-{}", Utc::now().timestamp_millis());
+
+    // Review session: archive the voiced audio for the replay; whisper then works on
+    // exactly that audio so its timestamps map back through the same chunk table.
+    let mut voice_id = None;
+    let pcm = match pending.session_id.as_deref() {
+        Some(sid) => {
+            let vid = format!("{sid}~{id}");
+            match crate::review::voice_archive_recording(sid, &vid, &pcm, pending.start_ms, pending.speed)? {
+                Some(voiced) => {
+                    voice_id = Some(vid);
+                    voiced
+                }
+                None => {
+                    // Nothing was said: no archive, no job.
+                    let _ = app.emit(EV_CHANGED, ());
+                    return Ok(id);
+                }
+            }
+        }
+        None => pcm,
+    };
     queue::write_wav(&shared.app_dir, &id, &pcm)?;
 
     shared.enqueue(SttJob {
@@ -351,6 +414,8 @@ pub fn stop_recording(shared: &Arc<SttShared>, app: AppHandle) -> Result<String,
         error: None,
         text: None,
         created_at: Utc::now().to_rfc3339(),
+        session_id: if voice_id.is_some() { pending.session_id } else { None },
+        voice_id,
     });
     let _ = app.emit(EV_CHANGED, ());
     Ok(id)

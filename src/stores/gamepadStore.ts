@@ -1,194 +1,261 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
-// Xbox-controller bindings + tuning, persisted to localStorage (same pattern as
+// Xbox-controller layout + tuning, persisted with the personal data (same pattern as
 // hotkeyStore). The whole point of persisting is that the maintainer's chosen
-// layout/sensitivities become the bundled distribution defaults (DEFAULT_BINDINGS
-// below = the layout described in the spec). The controller is auto-active the
-// moment the OS enumerates it (Web Gamepad API over USB-C or Bluetooth) — the
-// `enabled` switch is just an opt-out.
+// layout/sensitivities become the bundled distribution defaults (DEFAULT_LAYOUT
+// below). The controller is auto-active the moment the OS enumerates it (Web
+// Gamepad API over USB-C or Bluetooth) — the `enabled` switch is just an opt-out.
 //
-// Two command kinds, matching the two parts of the spec:
+// Two command kinds:
 //   • digital — a single button press (edge-triggered, like a keyboard chord).
 //   • analog  — a stick AXIS returning a continuous −1..+1 value (zoom / cursor).
-// A digital command can only bind to a button, an analog command only to an axis;
-// the Settings recorder rejects the mismatch with an explanatory message.
+//
+// Digital commands live in LAYERS, exactly like keyboard modifiers: LB and LT are
+// never commands themselves — held, each one swaps the whole pad for another set
+// of buttons (Ctrl / Alt style). So a layout is `layer → button → command`, and a
+// command may sit on several layers at once. Layers are strict: while a modifier
+// is held only that layer's buttons fire, an empty slot does nothing — what the
+// on-screen overlay shows is exactly what the pad does.
 
 // ─── Bindable commands ────────────────────────────────────────────────────────
 
-export type GamepadActionId =
-  // Navigation (digital)
+export type GamepadAxisId = "zoom_time" | "zoom_price" | "cursor_move";
+
+export type GamepadCommandId =
+  // Navigation
   | "ticker_prev" | "ticker_next" | "ticker_release"
   | "tab_prev" | "tab_next" | "focus_cycle"
-  // Cursor / order layer — R2 NOT held (digital)
+  // Levels at the cursor
   | "cursor_sl" | "cursor_alarm" | "cursor_tp" | "remove_orders"
-  // Armed layer — R2 held (digital)
-  | "r2_modifier" | "order_25" | "order_50" | "order_100" | "close_position"
+  // Position
+  | "order_25" | "order_50" | "order_100" | "close_position"
   | "confirm_hod" | "invert_hod"
-  // Journal / TradeTally (digital)
+  // Journal / TradeTally
   | "capture" | "share_tag" | "journal_audio"
-  // Replay (digital, global — not tied to a zone)
-  | "replay_next_alert"
-  // Analog axes
-  | "zoom_time" | "zoom_price" | "cursor_move";
+  // Replay (global — not tied to a zone)
+  | "replay_next_alert" | "replay_play_pause";
 
-export type GamepadActionKind = "digital" | "analog";
+export type GamepadActionId = GamepadCommandId | GamepadAxisId;
 
 export type GamepadGroup =
-  | "Navigation" | "Curseur / Ordres" | "Position armée"
-  | "Journal / TradeTally" | "Replay" | "Axes (analogique)";
+  | "Navigation" | "Curseur / Ordres" | "Position"
+  | "Journal / TradeTally" | "Replay";
 
-export interface GamepadActionDef {
-  id: GamepadActionId;
+export interface GamepadCommandDef {
+  id: GamepadCommandId;
+  /** Full name (Settings palette, tooltips). */
   label: string;
+  /** Default text on the key cap — short enough for the on-screen overlay. */
+  short: string;
   group: GamepadGroup;
-  kind: GamepadActionKind;
-  /** Belongs to the R2-held armed layer (its binding may share a button with a
-   *  cursor-layer command — the modifier disambiguates at dispatch time). */
-  armed?: boolean;
-  /** Reserved for a future feature (journal audio / Whisper): bindable + shown,
-   *  but the dispatch ignores it for now. */
-  reserved?: boolean;
 }
 
-export const GAMEPAD_ACTIONS: GamepadActionDef[] = [
+export const GAMEPAD_COMMANDS: GamepadCommandDef[] = [
   // Navigation
-  { id: "ticker_prev",    label: "Ticker précédent",         group: "Navigation", kind: "digital" },
-  { id: "ticker_next",    label: "Ticker suivant",           group: "Navigation", kind: "digital" },
-  { id: "ticker_release", label: "Libérer / supprimer",      group: "Navigation", kind: "digital" },
-  { id: "tab_prev",       label: "Onglet précédent",         group: "Navigation", kind: "digital" },
-  { id: "tab_next",       label: "Onglet suivant",           group: "Navigation", kind: "digital" },
-  { id: "focus_cycle",    label: "Changer le focus du chart", group: "Navigation", kind: "digital" },
+  { id: "ticker_prev",    label: "Ticker précédent",          short: "Précédent",    group: "Navigation" },
+  { id: "ticker_next",    label: "Ticker suivant",            short: "Suivant",      group: "Navigation" },
+  { id: "ticker_release", label: "Libérer / supprimer",       short: "Libérer",      group: "Navigation" },
+  { id: "tab_prev",       label: "Onglet précédent",          short: "Onglet −",     group: "Navigation" },
+  { id: "tab_next",       label: "Onglet suivant",            short: "Onglet +",     group: "Navigation" },
+  { id: "focus_cycle",    label: "Changer le focus du chart", short: "Focus",        group: "Navigation" },
 
-  // Cursor / order layer (R2 not held)
-  { id: "cursor_sl",     label: "Stop Loss au curseur",   group: "Curseur / Ordres", kind: "digital" },
-  { id: "cursor_alarm",  label: "Alarme au curseur",      group: "Curseur / Ordres", kind: "digital" },
-  { id: "cursor_tp",     label: "Take Profit au curseur", group: "Curseur / Ordres", kind: "digital" },
-  { id: "remove_orders", label: "Retirer les ordres (double = + alarmes)", group: "Curseur / Ordres", kind: "digital" },
+  // Levels at the cursor (right stick)
+  { id: "cursor_sl",     label: "Stop Loss au curseur",   short: "Stop Loss",   group: "Curseur / Ordres" },
+  { id: "cursor_alarm",  label: "Alarme au curseur",      short: "Alarme",      group: "Curseur / Ordres" },
+  { id: "cursor_tp",     label: "Take Profit au curseur", short: "Take Profit", group: "Curseur / Ordres" },
+  { id: "remove_orders", label: "Retirer les ordres (double = + alarmes)", short: "Retirer", group: "Curseur / Ordres" },
 
-  // Armed layer (R2 held)
-  { id: "r2_modifier",   label: "Maintenir = position armée", group: "Position armée", kind: "digital" },
-  { id: "order_25",      label: "Position 25 %",  group: "Position armée", kind: "digital", armed: true },
-  { id: "order_50",      label: "Position 50 %",  group: "Position armée", kind: "digital", armed: true },
-  { id: "order_100",     label: "Position 100 %", group: "Position armée", kind: "digital", armed: true },
-  { id: "close_position", label: "Clôturer la position", group: "Position armée", kind: "digital", armed: true },
-  { id: "confirm_hod",   label: "Confirmer HOD Drive",   group: "Position armée", kind: "digital", armed: true },
-  { id: "invert_hod",    label: "Inverser HOD Drive (short)", group: "Position armée", kind: "digital", armed: true },
+  // Position
+  { id: "order_25",       label: "Position 25 %",              short: "25 %",      group: "Position" },
+  { id: "order_50",       label: "Position 50 %",              short: "50 %",      group: "Position" },
+  { id: "order_100",      label: "Position 100 %",             short: "100 %",     group: "Position" },
+  { id: "close_position", label: "Clôturer la position",       short: "Clôturer",  group: "Position" },
+  { id: "confirm_hod",    label: "Confirmer HOD Drive",        short: "HOD Drive", group: "Position" },
+  { id: "invert_hod",     label: "Inverser HOD Drive (short)", short: "HOD short", group: "Position" },
 
   // Journal / TradeTally
-  { id: "capture",       label: "Capture TradeTally",          group: "Journal / TradeTally", kind: "digital" },
-  { id: "share_tag",     label: "Ajouter un tag (TradeTally)", group: "Journal / TradeTally", kind: "digital" },
-  { id: "journal_audio", label: "Note audio (dictée trade)",   group: "Journal / TradeTally", kind: "digital" },
+  { id: "capture",       label: "Capture TradeTally",          short: "Capture",    group: "Journal / TradeTally" },
+  { id: "share_tag",     label: "Ajouter un tag (TradeTally)", short: "Tag",        group: "Journal / TradeTally" },
+  { id: "journal_audio", label: "Note audio (dictée trade)",   short: "Note audio", group: "Journal / TradeTally" },
 
   // Replay (global — pas de zone ciblée)
-  { id: "replay_next_alert", label: "Replay : prochaine alerte", group: "Replay", kind: "digital" },
-
-  // Analog axes
-  { id: "zoom_time",   label: "Zoom horizontal (temps)", group: "Axes (analogique)", kind: "analog" },
-  { id: "zoom_price",  label: "Zoom vertical (prix)",    group: "Axes (analogique)", kind: "analog" },
-  { id: "cursor_move", label: "Curseur horizontal",      group: "Axes (analogique)", kind: "analog" },
+  { id: "replay_play_pause", label: "Replay : lecture / pause",  short: "Lecture",  group: "Replay" },
+  { id: "replay_next_alert", label: "Replay : prochaine alerte", short: "Alerte +", group: "Replay" },
 ];
 
 export const GAMEPAD_GROUPS: GamepadGroup[] = [
-  "Navigation", "Curseur / Ordres", "Position armée", "Journal / TradeTally", "Replay", "Axes (analogique)",
+  "Navigation", "Curseur / Ordres", "Position", "Journal / TradeTally", "Replay",
 ];
 
-export function actionDef(id: GamepadActionId): GamepadActionDef | undefined {
-  return GAMEPAD_ACTIONS.find((a) => a.id === id);
+export function commandDef(id: GamepadCommandId): GamepadCommandDef | undefined {
+  return GAMEPAD_COMMANDS.find((c) => c.id === id);
 }
 
-// ─── Binding model ────────────────────────────────────────────────────────────
+export const GAMEPAD_AXES: { id: GamepadAxisId; label: string }[] = [
+  { id: "zoom_time",   label: "Zoom horizontal (temps)" },
+  { id: "zoom_price",  label: "Zoom vertical (prix)" },
+  { id: "cursor_move", label: "Curseur horizontal" },
+];
 
-export type GamepadBinding =
-  | { kind: "button"; index: number }
-  | { kind: "axis"; index: number };
+// ─── Buttons & layers ─────────────────────────────────────────────────────────
+// W3C "standard" mapping (native Gamepad API): A=0 B=1 X=2 Y=3 · LB=4 RB=5 LT=6
+// RT=7 · View=8 Menu=9 L3=10 R3=11 · D-pad 12↑/13↓/14←/15→ · Guide=16 Share=17 ·
+// axes LX=0 LY=1 RX=2 RY=3. PS names map to Xbox: L1=LB L2=LT R1=RB R2=RT.
 
-export function bindingsEqual(a: GamepadBinding, b: GamepadBinding): boolean {
-  return a.kind === b.kind && a.index === b.index;
+export const PAD = {
+  A: 0, B: 1, X: 2, Y: 3,
+  LB: 4, RB: 5, LT: 6, RT: 7,
+  VIEW: 8, MENU: 9, L3: 10, R3: 11,
+  UP: 12, DOWN: 13, LEFT: 14, RIGHT: 15,
+} as const;
+
+export type GamepadLayer = "base" | "lb" | "lt";
+export type GamepadModLayer = Exclude<GamepadLayer, "base">;
+
+export const GAMEPAD_LAYERS: GamepadLayer[] = ["base", "lb", "lt"];
+
+/** The button that, held, switches the pad to a layer. Not assignable. */
+export const LAYER_MODIFIER: Record<GamepadModLayer, number> = { lb: PAD.LB, lt: PAD.LT };
+
+export function isModifierButton(index: number): boolean {
+  return index === PAD.LB || index === PAD.LT;
 }
 
-// Index → label for the W3C "standard" gamepad mapping (the webview's native
-// Gamepad API). The recorder writes raw indices, so an unusual pad/OS just shows
-// the fallback ("Bouton N" / "Axe N") until rebound.
-const BUTTON_LABELS: Record<number, string> = {
-  0: "A", 1: "B", 2: "X", 3: "Y",
-  4: "LB (L1)", 5: "RB (R1)", 6: "LT (L2)", 7: "RT (R2)",
-  8: "View", 9: "Menu", 10: "L3", 11: "R3",
-  12: "D-pad ↑", 13: "D-pad ↓", 14: "D-pad ←", 15: "D-pad →",
-  16: "Guide", 17: "Share",
-};
 const AXIS_LABELS: Record<number, string> = {
   0: "Stick gauche ↔", 1: "Stick gauche ↕",
   2: "Stick droit ↔",  3: "Stick droit ↕",
 };
 
-/** Every command maps to a binding or to `undefined` (= left for the user to
- *  assign). Spelling the key out with an explicit `undefined` rather than making
- *  it optional keeps DEFAULT_BINDINGS exhaustive: adding a command still fails to
- *  compile until it's listed, deliberately unbound or not. */
-export type GamepadBindings = Record<GamepadActionId, GamepadBinding | undefined>;
-
-export function bindingLabel(b: GamepadBinding | undefined): string {
-  if (!b) return "non assigné";
-  return b.kind === "button"
-    ? (BUTTON_LABELS[b.index] ?? `Bouton ${b.index}`)
-    : (AXIS_LABELS[b.index] ?? `Axe ${b.index}`);
+export function axisLabel(index: number | undefined): string {
+  if (index === undefined) return "non assigné";
+  return AXIS_LABELS[index] ?? `Axe ${index}`;
 }
 
-// ─── Default layout (the spec; = distribution defaults) ───────────────────────
-// W3C "standard" mapping (native Gamepad API): A=0 B=1 X=2 Y=3 · LB=4 RB=5 LT=6
-// RT=7 · View=8 Menu=9 L3=10 R3=11 · D-pad 12↑/13↓/14←/15→ · Guide=16 Share=17 ·
-// axes LX=0 LY=1 RX=2 RY=3. Auto-tag on D-pad → (Xbox One/360 have no Share);
-// D-pad → also carries confirm_hod as its R2-armed twin (share_tag isn't
-// needed while aiming/firing a trade, mirroring how A/B/X/Y double up below).
-// PS names map to Xbox: L1=LB L2=LT R1=RB R2=RT.
+// ─── Layout model ─────────────────────────────────────────────────────────────
 
-export const DEFAULT_BINDINGS: GamepadBindings = {
-  // Navigation
-  ticker_prev:    { kind: "button", index: 12 }, // D-pad ↑
-  ticker_next:    { kind: "button", index: 13 }, // D-pad ↓
-  ticker_release: { kind: "button", index: 14 }, // D-pad ←
-  tab_prev:       { kind: "button", index: 4 },  // L1 / LB
-  tab_next:       { kind: "button", index: 6 },  // L2 / LT
-  focus_cycle:    { kind: "button", index: 5 },  // R1 / RB
+/** `layer → button index → command`. A missing key is an empty slot. */
+export type GamepadLayout = Record<GamepadLayer, Partial<Record<number, GamepadCommandId>>>;
+/** `undefined` = left for the user to assign. */
+export type GamepadAxes = Record<GamepadAxisId, number | undefined>;
 
-  // Cursor / order layer (R2 up)
-  cursor_sl:     { kind: "button", index: 0 }, // A
-  cursor_alarm:  { kind: "button", index: 1 }, // B
-  cursor_tp:     { kind: "button", index: 3 }, // Y
-  remove_orders: { kind: "button", index: 2 }, // X
+/** How a command is drawn on its key cap (overlay + Settings). Per command, so it
+ *  follows the command wherever it's moved. Every field falls back to the default
+ *  in `gamepadIcons` (the interface's own icon) / the command's `short` text. */
+export interface GamepadDisplay {
+  mode?: "both" | "icon" | "text";
+  text?: string;
+  /** Icon name from the `PAD_ICONS` registry. */
+  icon?: string;
+}
 
-  // Armed layer (R2 held) — share the face buttons
-  r2_modifier:    { kind: "button", index: 7 },  // R2 / RT
-  order_25:       { kind: "button", index: 0 },  // A
-  order_50:       { kind: "button", index: 1 },  // B
-  order_100:      { kind: "button", index: 3 },  // Y
-  close_position: { kind: "button", index: 2 },  // X
-  confirm_hod:    { kind: "button", index: 15 }, // D-pad → (armed twin of share_tag)
-  // Deliberately unbound: the free armed-layer buttons all double as something
-  // else, and firing a short by accident is the worst possible misbind — the user
-  // picks the button themselves in Settings ▸ Hotkeys ▸ Xbox.
-  invert_hod:     undefined,
+// ─── Default layout (= distribution defaults) ─────────────────────────────────
+// LT held is the "armed" set: the face buttons become the position sizes, so an
+// order can never fire from a bare press. LB held carries the session tabs.
 
-  // Journal / TradeTally
-  capture:       { kind: "button", index: 8 },  // View / Back
-  share_tag:     { kind: "button", index: 15 }, // D-pad → (no Share on this pad)
-  journal_audio: { kind: "button", index: 9 },  // Menu / Start (reserved no-op)
-
-  // Replay
-  replay_next_alert: { kind: "button", index: 11 }, // R3 (right stick click)
-
-  // Analog axes
-  zoom_time:   { kind: "axis", index: 0 }, // left stick X
-  zoom_price:  { kind: "axis", index: 1 }, // left stick Y
-  cursor_move: { kind: "axis", index: 3 }, // right stick Y
+export const DEFAULT_LAYOUT: GamepadLayout = {
+  base: {
+    [PAD.UP]:    "ticker_prev",
+    [PAD.DOWN]:  "ticker_next",
+    [PAD.LEFT]:  "ticker_release",
+    [PAD.RIGHT]: "share_tag",
+    [PAD.A]: "cursor_sl",
+    [PAD.B]: "cursor_alarm",
+    [PAD.Y]: "cursor_tp",
+    [PAD.X]: "remove_orders",
+    [PAD.VIEW]: "capture",
+    [PAD.MENU]: "journal_audio",
+    [PAD.RB]: "focus_cycle",
+    [PAD.RT]: "tab_next",
+    [PAD.R3]: "replay_next_alert",
+    [PAD.L3]: "replay_play_pause",
+  },
+  lb: {
+    [PAD.LEFT]:  "tab_prev",
+    [PAD.RIGHT]: "tab_next",
+  },
+  // invert_hod is deliberately left out: firing a short by accident is the worst
+  // possible misbind — the user drops it on a button themselves in Settings.
+  lt: {
+    [PAD.A]: "order_25",
+    [PAD.B]: "order_50",
+    [PAD.Y]: "order_100",
+    [PAD.X]: "close_position",
+    [PAD.RIGHT]: "confirm_hod",
+  },
 };
+
+export const DEFAULT_AXES: GamepadAxes = {
+  zoom_time:   0, // left stick X
+  zoom_price:  1, // left stick Y
+  cursor_move: 3, // right stick Y
+};
+
+export const DEFAULT_LAYER_NAMES: Record<GamepadModLayer, string> = {
+  lb: "Navigation",
+  lt: "Position armée",
+};
+
+function cloneLayout(l: GamepadLayout): GamepadLayout {
+  return { base: { ...l.base }, lb: { ...l.lb }, lt: { ...l.lt } };
+}
+
+// ─── Migration from the pre-layer model (persist v ≤ 4) ───────────────────────
+// Before v5 a binding was `command → button`, with R2/RT as the single held
+// modifier ("armed" commands). Custom layouts are carried over: armed commands go
+// to the LT layer, the rest to the base layer. LB/LT themselves are modifiers now,
+// so whatever sat on them is dropped (the session tabs get their new defaults).
+
+type LegacyBinding = { kind: "button" | "axis"; index: number } | undefined;
+const LEGACY_ARMED: GamepadCommandId[] = [
+  "order_25", "order_50", "order_100", "close_position", "confirm_hod", "invert_hod",
+];
+
+function migrateLegacy(bindings: Record<string, LegacyBinding>): { layout: GamepadLayout; axes: GamepadAxes } {
+  const layout: GamepadLayout = { base: {}, lb: { ...DEFAULT_LAYOUT.lb }, lt: {} };
+  for (const c of GAMEPAD_COMMANDS) {
+    const b = bindings[c.id];
+    if (!b || b.kind !== "button" || isModifierButton(b.index)) continue;
+    const layer = LEGACY_ARMED.includes(c.id) ? layout.lt : layout.base;
+    if (layer[b.index] === undefined) layer[b.index] = c.id; // first command wins, as before
+  }
+  // RT was the modifier, so it's free: give it its new default.
+  if (layout.base[PAD.RT] === undefined) layout.base[PAD.RT] = DEFAULT_LAYOUT.base[PAD.RT];
+  // …and L3 gets replay play / pause when nothing was carried onto it.
+  if (layout.base[PAD.L3] === undefined) layout.base[PAD.L3] = DEFAULT_LAYOUT.base[PAD.L3];
+  const axes = { ...DEFAULT_AXES };
+  for (const a of GAMEPAD_AXES) {
+    const b = bindings[a.id];
+    if (b?.kind === "axis") axes[a.id] = b.index;
+  }
+  return { layout, axes };
+}
 
 // ─── Persisted store ──────────────────────────────────────────────────────────
 
+export const OVERLAY_SCALE_MIN = 0.7;
+export const OVERLAY_SCALE_MAX = 2;
+
+export function clampOverlayScale(v: number): number {
+  return Math.min(OVERLAY_SCALE_MAX, Math.max(OVERLAY_SCALE_MIN, v));
+}
+
 interface GamepadState {
   enabled: boolean;
-  bindings: GamepadBindings;
+  layout: GamepadLayout;
+  axes: GamepadAxes;
+  display: Partial<Record<GamepadCommandId, GamepadDisplay>>;
+  /** Titles shown on the overlay while LB / LT is held. */
+  layerNames: Record<GamepadModLayer, string>;
+  /** On-screen pad overlay while the controller is active. */
+  showOverlay: boolean;
+  overlayOpacity: number; // 0.4 … 1
+  /** Where the user dragged the overlay: its centre, as fractions of the window
+   *  (so it keeps its place across window sizes). Null = bottom centre. */
+  overlayPos: { x: number; y: number } | null;
+  /** Overlay size multiplier (OVERLAY_SCALE_MIN … OVERLAY_SCALE_MAX). */
+  overlayScale: number;
   /** Stick speed multipliers (0.2 = slow … 3 = fast). */
   leftSensitivity:  number; // zoom (left stick)
   rightSensitivity: number; // cursor (right stick)
@@ -196,22 +263,38 @@ interface GamepadState {
   invertZoomPrice: boolean;
   invertCursor:    boolean;
 
-  setEnabled:      (v: boolean) => void;
-  /** `undefined` clears the binding (the ✕ on a command that ships unbound). */
-  setBinding:      (id: GamepadActionId, b: GamepadBinding | undefined) => void;
+  setEnabled: (v: boolean) => void;
+  /** Put a command on a slot (replacing what's there); `undefined` empties it. */
+  assign: (layer: GamepadLayer, button: number, cmd: GamepadCommandId | undefined) => void;
+  /** Move a slot's command onto another slot of the same layer; swaps if occupied. */
+  moveSlot: (layer: GamepadLayer, from: number, to: number) => void;
+  setDisplay: (cmd: GamepadCommandId, patch: GamepadDisplay | undefined) => void;
+  setLayerName: (layer: GamepadModLayer, name: string) => void;
+  setAxis: (id: GamepadAxisId, index: number | undefined) => void;
+  setShowOverlay: (v: boolean) => void;
+  setOverlayOpacity: (v: number) => void;
+  setOverlayPos: (p: { x: number; y: number } | null) => void;
+  setOverlayScale: (v: number) => void;
   setLeftSensitivity:  (v: number) => void;
   setRightSensitivity: (v: number) => void;
   setInvertZoomTime:  (v: boolean) => void;
   setInvertZoomPrice: (v: boolean) => void;
   setInvertCursor:    (v: boolean) => void;
-  resetDefaults:   () => void;
+  resetDefaults: () => void;
 }
 
 export const useGamepadStore = create<GamepadState>()(
   persist(
     (set) => ({
       enabled: true,
-      bindings: { ...DEFAULT_BINDINGS },
+      layout: cloneLayout(DEFAULT_LAYOUT),
+      axes: { ...DEFAULT_AXES },
+      display: {},
+      layerNames: { ...DEFAULT_LAYER_NAMES },
+      showOverlay: true,
+      overlayOpacity: 0.9,
+      overlayPos: null,
+      overlayScale: 1,
       leftSensitivity:  1,
       rightSensitivity: 1,
       invertZoomTime:  false,
@@ -219,42 +302,88 @@ export const useGamepadStore = create<GamepadState>()(
       invertCursor:    false,
 
       setEnabled: (v) => set({ enabled: v }),
-      setBinding: (id, b) => set((s) => ({ bindings: { ...s.bindings, [id]: b } })),
+      assign: (layer, button, cmd) => set((s) => {
+        if (isModifierButton(button)) return s;
+        const slots = { ...s.layout[layer] };
+        if (cmd) slots[button] = cmd; else delete slots[button];
+        return { layout: { ...s.layout, [layer]: slots } };
+      }),
+      moveSlot: (layer, from, to) => set((s) => {
+        if (from === to || isModifierButton(to)) return s;
+        const slots = { ...s.layout[layer] };
+        const a = slots[from];
+        const b = slots[to];
+        if (a) slots[to] = a; else delete slots[to];
+        if (b) slots[from] = b; else delete slots[from];
+        return { layout: { ...s.layout, [layer]: slots } };
+      }),
+      setDisplay: (cmd, patch) => set((s) => {
+        const display = { ...s.display };
+        if (patch) display[cmd] = { ...display[cmd], ...patch }; else delete display[cmd];
+        return { display };
+      }),
+      setLayerName: (layer, name) => set((s) => ({ layerNames: { ...s.layerNames, [layer]: name } })),
+      setAxis: (id, index) => set((s) => ({ axes: { ...s.axes, [id]: index } })),
+      setShowOverlay: (v) => set({ showOverlay: v }),
+      setOverlayOpacity: (v) => set({ overlayOpacity: v }),
+      setOverlayPos: (p) => set({ overlayPos: p }),
+      setOverlayScale: (v) => set({ overlayScale: clampOverlayScale(v) }),
       setLeftSensitivity:  (v) => set({ leftSensitivity:  v }),
       setRightSensitivity: (v) => set({ rightSensitivity: v }),
       setInvertZoomTime:  (v) => set({ invertZoomTime:  v }),
       setInvertZoomPrice: (v) => set({ invertZoomPrice: v }),
       setInvertCursor:    (v) => set({ invertCursor:    v }),
-      resetDefaults: () => set({ bindings: { ...DEFAULT_BINDINGS } }),
+      resetDefaults: () => set({
+        layout: cloneLayout(DEFAULT_LAYOUT),
+        axes: { ...DEFAULT_AXES },
+        display: {},
+        layerNames: { ...DEFAULT_LAYER_NAMES },
+      }),
     }),
     {
       name: "tagdash-gamepad",
+      storage: userStorage(),
       // v3: back to the W3C "standard" mapping (native Gamepad API) after the gilrs
       // polyfill detour — any older persisted indices are meaningless, so reset.
       // v4: confirm_hod's shipped default (L3, button 10) was an unfinished
       // placeholder that never worked well two-handed with R2 — moved to D-pad →.
-      version: 4,
+      // v5: layers. LB / LT become held modifiers (RT no longer is one); the flat
+      // `bindings` map is converted to `layout` + `axes`.
+      // v6: replay play / pause, on L3 — where that slot is still free and the
+      // command not placed elsewhere (a layout the user arranged is theirs).
+      version: 6,
       migrate: (persisted, version) => {
-        const p = (persisted ?? {}) as Partial<GamepadState>;
-        if (version < 3) return { ...p, bindings: { ...DEFAULT_BINDINGS } };
-        if (version < 4) {
-          const b = p.bindings?.confirm_hod;
-          // Only replace it if the user never rebound it away from the old
-          // placeholder themselves — an intentional rebind is left alone.
-          if (b && b.kind === "button" && b.index === 10) {
-            return { ...p, bindings: { ...p.bindings, confirm_hod: DEFAULT_BINDINGS.confirm_hod } };
-          }
+        const { bindings, ...p } = (persisted ?? {}) as Partial<GamepadState> & {
+          bindings?: Record<string, LegacyBinding>;
+        };
+        if (version === 5 && p.layout) {
+          const placed = GAMEPAD_LAYERS.some((l) =>
+            Object.values(p.layout?.[l] ?? {}).includes("replay_play_pause"));
+          if (placed || p.layout.base?.[PAD.L3] !== undefined) return p;
+          return { ...p, layout: { ...p.layout, base: { ...p.layout.base, [PAD.L3]: "replay_play_pause" } } };
         }
-        return p;
+        if (version >= 5) return p;
+        if (version < 3 || !bindings) return p; // no usable layout → defaults (merge)
+        const b = { ...bindings };
+        // The v4 step, for a blob that skipped it: only replace the old placeholder
+        // if the user never rebound it themselves.
+        if (version < 4 && b.confirm_hod?.kind === "button" && b.confirm_hod.index === 10) {
+          b.confirm_hod = { kind: "button", index: PAD.RIGHT };
+        }
+        return { ...p, ...migrateLegacy(b) };
       },
-      // Fill in any newly-added default bindings the persisted blob predates, so
-      // adding a command later doesn't leave it unbound.
+      // Fill in whatever the persisted blob predates. The layout itself is taken
+      // as-is (an empty slot is a choice, not a missing default).
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<GamepadState>;
         return {
           ...current,
           ...p,
-          bindings: { ...DEFAULT_BINDINGS, ...(p.bindings ?? {}) },
+          layout: p.layout
+            ? { base: { ...p.layout.base }, lb: { ...p.layout.lb }, lt: { ...p.layout.lt } }
+            : current.layout,
+          axes: { ...DEFAULT_AXES, ...(p.axes ?? {}) },
+          layerNames: { ...DEFAULT_LAYER_NAMES, ...(p.layerNames ?? {}) },
         };
       },
     },

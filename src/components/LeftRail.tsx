@@ -2,6 +2,7 @@ import {
   Activity,
   Bug,
   CircleDot,
+  Clapperboard,
   History,
   Moon,
   Orbit,
@@ -43,7 +44,7 @@ export function LeftRail() {
 
   return (
     <>
-      <aside className="flex h-full w-14 flex-col items-center justify-between border-r border-border bg-card py-3">
+      <aside data-usage-area="left-rail" className="flex h-full w-14 flex-col items-center justify-between border-r border-border bg-card py-3">
         {/* Tabs: Dashboard (Moon, first) + trading sessions */}
         <div className="flex flex-col items-center gap-2">
           {/* Dashboard — standalone KPI moodboard (no sidebar). */}
@@ -56,6 +57,18 @@ export function LeftRail() {
             )}
           >
             <Moon className="h-5 w-5" />
+          </button>
+
+          {/* Revue — replay of past trades, one at a time. */}
+          <button
+            onClick={() => setActiveView("review")}
+            title="Revue"
+            className={cn(
+              "flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
+              activeView === "review" && "bg-accent text-foreground"
+            )}
+          >
+            <Clapperboard className="h-5 w-5" />
           </button>
 
           {/* TradeTally — embedded web app (no sidebar). */}

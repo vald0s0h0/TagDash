@@ -153,6 +153,55 @@ export function Num({
   );
 }
 
+/** "HH:MM" ↔ ET minutes since midnight. */
+const toHm = (m: number) =>
+  `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const fromHm = (s: string): number | null => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s.trim());
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+};
+
+/** An ET wall-clock time that commits on blur or Enter. */
+function Hm({
+  label,
+  value,
+  disabled,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  disabled?: boolean;
+  onCommit: (minutes: number) => void;
+}) {
+  const [draft, setDraft] = useState(toHm(value));
+  useEffect(() => setDraft(toHm(value)), [value]);
+  const commit = () => {
+    const m = fromHm(draft);
+    if (m === null) setDraft(toHm(value));
+    else if (m !== value) onCommit(m);
+  };
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="w-[8.5rem] shrink-0 text-[10px] text-muted-foreground">{label}</span>
+      <Input
+        type="time"
+        step={60}
+        min="04:00"
+        max="20:00"
+        value={draft}
+        disabled={disabled}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+        className="h-6 w-24 text-xs tabular-nums"
+      />
+      <span className="text-[10px] text-muted-foreground/70">ET</span>
+    </div>
+  );
+}
+
 export function MicroPullbackPanel() {
   const { data: options } = useMicroPullbackOptions();
   const setOptions = useSetMicroPullbackOptions();
@@ -269,6 +318,64 @@ export function MicroPullbackPanel() {
           hint="Chine (Hong Kong compris), Îles Caïmans, Îles Vierges britanniques. Une domiciliation jamais collectée n'est jamais signalée, donc jamais exclue : on bannit sur ce qu'on sait."
           onChange={(v) => patch({ exclude_risk_domicile: v })}
         />
+      </div>
+
+      {/* ── Session window + replay data. One window for both on purpose: what a
+             replay downloads is exactly what the engine trades. ── */}
+      <div className="space-y-1.5 border-t border-border/40 pt-2">
+        <div className="text-[11px] font-medium">Créneau</div>
+        <Hm
+          label="Début"
+          value={options.session_start_min}
+          disabled={busy}
+          onCommit={(m) => patch({ session_start_min: m })}
+        />
+        <Hm
+          label="Fin"
+          value={options.session_end_min}
+          disabled={busy}
+          onCommit={(m) => patch({ session_end_min: m })}
+        />
+        <div className="text-[10px] leading-snug text-muted-foreground/70">
+          La stratégie ne détecte que dans ce créneau, en direct comme en replay. Le
+          téléchargement des données de replay ne cherche des opportunités que là :
+          04:00–09:30 pour ne trader que le premarket réduit d'autant ce qui est
+          téléchargé.
+        </div>
+        <div className="pt-1 text-[11px] font-medium">Données replay</div>
+        <Num
+          label="Ticks avant le signal"
+          value={String(options.replay_before_min)}
+          suffix="min"
+          min={0}
+          max={30}
+          disabled={busy}
+          onCommit={num("replay_before_min", (n) => Math.round(n))}
+        />
+        <Num
+          label="Ticks après le signal"
+          value={String(options.replay_after_min)}
+          suffix="min"
+          min={1}
+          max={120}
+          disabled={busy}
+          onCommit={num("replay_after_min", (n) => Math.round(n))}
+        />
+        <Num
+          label="Tickers max / jour"
+          value={String(options.replay_max_symbols)}
+          suffix="les plus forts d'abord"
+          min={1}
+          max={500}
+          disabled={busy}
+          onCommit={num("replay_max_symbols", (n) => Math.round(n))}
+        />
+        <div className="text-[10px] leading-snug text-muted-foreground/70">
+          Prints et quotes SIP réels autour de chaque opportunité détectée sur les
+          minutes ; ailleurs, le replay découpe les barres 1 min en tranches de 10 s.
+          Changer un réglage de cette stratégie marque les jours déjà préparés « à
+          compléter » : seul le complément est téléchargé.
+        </div>
       </div>
 
       {/* ── Tempos ── */}

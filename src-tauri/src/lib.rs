@@ -1,5 +1,6 @@
 pub mod alpaca;
 pub mod apex;
+pub mod attention_map;
 pub mod broker;
 pub mod chart_payloads;
 pub mod chart_state;
@@ -25,10 +26,13 @@ pub mod notify;
 pub mod ntfy;
 pub mod panic_llm;
 pub mod panic_watchlist;
+pub mod paths;
 pub mod perfect_pullback;
 pub mod premarket;
 pub mod quality_llm;
 pub mod replay;
+pub mod replay_data;
+pub mod review;
 pub mod scanner;
 pub mod scoring;
 pub mod screenshot;
@@ -42,6 +46,7 @@ pub mod time;
 pub mod tradetally;
 pub mod types;
 pub mod universe;
+pub mod user_data;
 pub mod websearch;
 
 use state::AppState;
@@ -50,6 +55,12 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Data root: personal data and cache each in their own folder ───────
+    // Before anything is read or opened: sorts a pre-separation root into
+    // `user/` + `cache/`, and puts a staged data pack in place.
+    let layout = user_data::layout::prepare(&config::app_dir())
+        .unwrap_or_else(|e| panic!("[tagdash] dossier de données inutilisable : {e}"));
+
     // ── Load config + secrets ─────────────────────────────────────────────
     let (app_dir, cfg) = config::load();
     let secrets = {
@@ -66,6 +77,10 @@ pub fn run() {
 
     // ── Seed initial log ──────────────────────────────────────────────────
     let _ = local_db::insert_log(&db, "info", "TagDash started");
+    for (level, line) in layout.log_lines() {
+        eprintln!("[tagdash] {line}");
+        let _ = local_db::insert_log(&db, level, &line);
+    }
 
     // ── Strategy on/off map: compiled defaults + persisted runtime overrides ──
     let strategy_enabled: std::collections::HashMap<String, bool> = {
@@ -122,6 +137,16 @@ pub fn run() {
         m
     };
 
+    // ── Alpaca data plan: the one probed last run paces the data API from the
+    // first request (replay downloads included); the live feed's probe and the
+    // downloader's own then confirm or correct it. ──
+    if let Some(plan) = local_db::cache_repository::get_app_meta(&db, alpaca::plan::PLAN_META_KEY)
+        .as_deref()
+        .and_then(alpaca::plan::Plan::from_meta)
+    {
+        alpaca::ratelimit::set_plan(plan);
+    }
+
     // ── Micro Pullback options: defaults + the persisted blob ────────────────
     // Strategy-specific (active tempos, Qualité A+ and its sub-settings), unlike the
     // two maps above which are generic across strategies. See
@@ -164,6 +189,13 @@ pub fn run() {
     // live feed tick-streams them on top of the broad surveillance tier.
     let (focus_symbols_tx, _) = tokio::sync::watch::channel::<Vec<String>>(Vec::new());
 
+    // « Attention du marché » (detached screen): thresholds + whether the window was
+    // on at the last exit, so the engine starts in the state the window will be in.
+    let attention_shared = Arc::new(attention_map::AttentionShared::new(
+        attention_map::AttentionOptions::load(&db),
+        attention_map::window::load(&db).enabled,
+    ));
+
     // Speech-to-Text shared handle (recorder + persisted job queue). Built before the
     // struct so it can borrow `app_dir` before the field shorthand below moves it.
     let stt_shared = Arc::new(stt::SttShared::new(app_dir.clone()));
@@ -204,7 +236,9 @@ pub fn run() {
         focus_symbols_tx,
         replay: Arc::new(replay::ReplayShared::default()),
         flat_files: Arc::new(flat_files::FlatFilesShared::default()),
+        replay_data: Arc::new(replay_data::prepare::ReplayDataShared::default()),
         stt: stt_shared,
+        attention_map: attention_shared,
     };
 
     // ── Start Tauri ───────────────────────────────────────────────────────
@@ -281,6 +315,20 @@ pub fn run() {
             //     focus quotes) into one SQLite file per ET day, so the day can
             //     later be replayed tick-by-tick by the Market Replay module.
             replay::tape::init(state.app_dir.clone());
+
+            // 0c. Trade review recorder (onglet Revue): per-ticker sessions, their
+            //     tape copy, voice notes, and the sweeper that files what was left on
+            //     a ticker onto each of its trades. See `crate::review`.
+            review::init(review::Deps {
+                app_dir: state.app_dir.clone(),
+                db: db.clone(),
+                config: config.clone(),
+                secrets: secrets.clone(),
+                market: state.market.clone(),
+            });
+            // Session files: pack the old row format, trim the SIP rebuilds to the
+            // current windows (once, in the background).
+            commands::review::spawn_store_upgrade(state.app_dir.clone(), db.clone(), config.clone());
 
             // 1. TradeTally background sync worker.
             {
@@ -583,7 +631,26 @@ pub fn run() {
                 state.market.clone(),
             );
 
+            // 7. « Attention du marché » — the detached second-monitor screen. Its
+            //    engine idles until the window is enabled (no window, no request);
+            //    the window itself reopens where it was if it was on at the last exit.
+            attention_map::engine::start(attention_map::engine::Deps {
+                shared: state.attention_map.clone(),
+                db: state.db.clone(),
+                secrets: state.secrets.clone(),
+                config: state.config.clone(),
+                history_cap: None,
+            });
+            attention_map::window::restore(app.handle());
+
             Ok(())
+        })
+        // Closing the main window quits TagDash: the detached screen must not be
+        // left behind as the app's last window (it stays "on" for the next launch).
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                attention_map::window::on_main_closed(window.app_handle());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // Status
@@ -617,6 +684,8 @@ pub fn run() {
             commands::add_bug_report,
             commands::delete_bug_report,
             commands::clear_bug_reports,
+            // Usage log
+            commands::record_usage_events,
             // Price alarms (persisted)
             commands::create_alarm,
             commands::get_alarms_for_symbol,
@@ -760,6 +829,7 @@ pub fn run() {
             commands::replay_start,
             commands::replay_stop,
             commands::replay_set_playing,
+            commands::replay_toggle_playing,
             commands::replay_set_speed,
             commands::replay_seek_relative,
             commands::replay_seek_clock,
@@ -769,6 +839,16 @@ pub fn run() {
             commands::get_replay_status,
             // Flat files (download / calendar / open folder)
             commands::flat_files_download,
+            commands::replay_data::replay_data_strategies,
+            commands::replay_data::replay_data_calendar,
+            commands::replay_data::replay_data_day,
+            commands::replay_data::replay_data_prepare,
+            commands::replay_data::replay_data_status,
+            commands::replay_data::replay_data_budget,
+            commands::replay_data::replay_data_cancel,
+            commands::replay_data::open_replay_data_folder,
+            commands::replay_data::replay_data_disk_usage,
+            commands::replay_data::purge_flat_files,
             commands::flat_files_cancel,
             commands::get_flat_files_status,
             commands::get_flat_files_calendar,
@@ -781,8 +861,53 @@ pub fn run() {
             commands::stt_cancel_recording,
             commands::stt_cancel_job,
             commands::stt_retry_job,
+            // Trade review (onglet Revue)
+            commands::review::get_review_config,
+            commands::review::set_review_config,
+            commands::review::review_ensure_session,
+            commands::review::review_open_sessions,
+            commands::review::review_next,
+            commands::review::review_load,
+            commands::review::review_voice_audio,
+            commands::review::review_screenshot,
+            commands::review::review_tt_image,
+            commands::review::review_enrich,
+            commands::review::review_get_notes,
+            commands::review::review_save_notes,
+            commands::review::review_complete,
+            commands::review::review_outbox_status,
+            commands::review::review_outbox_flush,
+            commands::review::review_outbox_discard,
+            commands::review::get_review_trades_db,
+            commands::review::review_delete_missed,
             commands::stt_list_input_devices,
             commands::stt_test_microphone,
+            // Attention du marché (écran détaché)
+            commands::attention::attention_window_set,
+            commands::attention::attention_window_state,
+            commands::attention::get_attention_options,
+            commands::attention::set_attention_options,
+            commands::attention::get_attention_map,
+            commands::attention::get_attention_detail,
+            commands::attention::attention_propagate,
+            commands::attention::attention_set_review,
+            commands::attention::get_attention_snapshot_days,
+            // Personal data: interface state, overview, data pack, dashboard assets
+            commands::user_data::get_ui_state,
+            commands::user_data::set_ui_state,
+            commands::user_data::remove_ui_state,
+            commands::user_data::user_data_overview,
+            commands::user_data::user_data_open,
+            commands::user_data::user_data_export,
+            commands::user_data::user_data_find_packs,
+            commands::user_data::user_data_inspect,
+            commands::user_data::user_data_stage_import,
+            commands::user_data::user_data_cancel_import,
+            commands::user_data::user_data_restore_backup,
+            commands::user_data::user_data_delete_backup,
+            commands::user_data::user_data_purge_legacy,
+            commands::user_data::get_dashboard_assets,
+            commands::user_data::save_mood_phrases,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -13,7 +13,12 @@ import type {
   HodDriveOverlay,
   ChartDrawing,
   DailyBackground,
+  DashboardAssets,
   DashboardTrade,
+  DataOverview,
+  ExportedPack,
+  FoundPack,
+  PackManifest,
   DiaryEntry,
   FeedDiagnostics,
   FlatFileDay,
@@ -30,14 +35,25 @@ import type {
   Position,
   PrevDayLevels,
   PriceAlarm,
-  ReplaySource,
+  ReplayDataBudget,
+  ReplayDayStatus,
+  ReplayDiskUsage,
+  ReplayPrepareStatus,
   ReplayStatus,
+  ReplayStrategy,
   MicTestResult,
   ScreenerMatch,
   SecretsStatus,
   SecretsUpdate,
   SplitMarker,
   SttJobKind,
+  ReviewConfig,
+  OpenReviewSession,
+  NextReview,
+  ReviewRef,
+  ReviewOutboxStatus,
+  ReviewDetail,
+  ReviewTradeRow,
   SttStatus,
   NewsMarker,
   StartupState,
@@ -73,6 +89,7 @@ import type {
   MicroQualityBoard,
   MicroPullbackQualityRow,
   TradeSyncReport,
+  UsageEvent,
 } from "@/types";
 
 export const api = {
@@ -161,6 +178,10 @@ export const api = {
   deleteBugReport: (id: string) =>
     invoke<BugReport[]>("delete_bug_report", { id }),
   clearBugReports: () => invoke<BugReport[]>("clear_bug_reports"),
+
+  // Usage log (written by lib/usageTracker)
+  recordUsageEvents: (events: UsageEvent[]) =>
+    invoke<void>("record_usage_events", { events }),
 
   // Price alarms (persisted; triggering not wired yet)
   createAlarm: (id: string, symbol: string, strategy_id: string | null, price: number) =>
@@ -364,11 +385,12 @@ export const api = {
     invoke<void>("update_alarm_price", { id, price }),
 
   // Market Replay
-  replayStart: (day: string, start_hm: string, source: ReplaySource = "api") =>
-    invoke<void>("replay_start", { day, start_hm, source }),
+  replayStart: (day: string, start_hm: string, strategies?: string[]) =>
+    invoke<void>("replay_start", { day, start_hm, strategies }),
   replayStop:       () => invoke<void>("replay_stop"),
   replaySetPlaying: (playing: boolean) =>
     invoke<void>("replay_set_playing", { playing }),
+  replayTogglePlaying: () => invoke<void>("replay_toggle_playing"),
   replaySetSpeed:   (speed: number) =>
     invoke<void>("replay_set_speed", { speed }),
   replaySeekRelative: (delta_secs: number) =>
@@ -379,6 +401,22 @@ export const api = {
   replayNextBar:   () => invoke<void>("replay_next_bar"),
   replayNextDay:   () => invoke<void>("replay_next_day"),
   getReplayStatus: () => invoke<ReplayStatus>("get_replay_status"),
+
+  // Replay data — prepared per day from what the strategies declare they need.
+  replayDataStrategies: () => invoke<ReplayStrategy[]>("replay_data_strategies"),
+  replayDataCalendar: (month: string, strategies: string[]) =>
+    invoke<ReplayDayStatus[]>("replay_data_calendar", { month, strategies }),
+  replayDataDay: (day: string, strategies: string[]) =>
+    invoke<ReplayDayStatus>("replay_data_day", { day, strategies }),
+  replayDataPrepare: (days: string[], strategies: string[], scan_only: boolean, priority = false) =>
+    invoke<void>("replay_data_prepare", { days, strategies, scan_only, priority }),
+  replayDataBudget: () => invoke<ReplayDataBudget>("replay_data_budget"),
+  replayDataStatus: () => invoke<ReplayPrepareStatus>("replay_data_status"),
+  replayDataCancel: () => invoke<void>("replay_data_cancel"),
+  openReplayDataFolder: () => invoke<void>("open_replay_data_folder"),
+  replayDataDiskUsage: () => invoke<ReplayDiskUsage>("replay_data_disk_usage"),
+  purgeFlatFiles: (kind: "trade" | "minute" | "intraday") =>
+    invoke<number>("purge_flat_files", { kind }),
 
   // Flat files (offline market-data download for Market Replay)
   flatFilesDownload: (kind: FlatFilesKind, start_day: string, end_day: string) =>
@@ -426,4 +464,45 @@ export const api = {
   sttRetryJob:         (id: string) => invoke<void>("stt_retry_job", { id }),
   sttListInputDevices: () => invoke<string[]>("stt_list_input_devices"),
   sttTestMicrophone:   () => invoke<MicTestResult>("stt_test_microphone"),
+
+  // Trade review (onglet Revue)
+  getReviewConfig:     () => invoke<ReviewConfig>("get_review_config"),
+  setReviewConfig:     (review: ReviewConfig) => invoke<void>("set_review_config", { review }),
+  reviewEnsureSession: (symbol: string, strategy_id?: string | null) =>
+    invoke<string>("review_ensure_session", { symbol, strategy_id: strategy_id ?? null }),
+  reviewOpenSessions:  () => invoke<OpenReviewSession[]>("review_open_sessions"),
+  reviewNext:          (exclude: string[], current: string | null) =>
+    invoke<NextReview>("review_next", { exclude, current }),
+  reviewLoad:          (target: ReviewRef, with_data = true) =>
+    invoke<ReviewDetail>("review_load", { target, with_data }),
+  reviewEnrich:        (target: ReviewRef) => invoke<void>("review_enrich", { target }),
+  reviewVoiceAudio:    (voice_id: string) => invoke<ArrayBuffer>("review_voice_audio", { voice_id }),
+  reviewScreenshot:    (path: string) => invoke<ArrayBuffer>("review_screenshot", { path }),
+  reviewTtImage:       (path: string) => invoke<ArrayBuffer>("review_tt_image", { path }),
+  reviewGetNotes:      (target: ReviewRef) => invoke<string>("review_get_notes", { target }),
+  reviewSaveNotes:     (target: ReviewRef, notes: string) =>
+    invoke<void>("review_save_notes", { target, notes }),
+  reviewComplete:      (target: ReviewRef, text: string) =>
+    invoke<string>("review_complete", { target, text }),
+  reviewOutboxStatus:  () => invoke<ReviewOutboxStatus>("review_outbox_status"),
+  reviewOutboxFlush:   () => invoke<ReviewOutboxStatus>("review_outbox_flush"),
+  reviewOutboxDiscard: (tt_id: string) => invoke<void>("review_outbox_discard", { tt_id }),
+  getReviewTradesDb:   () => invoke<ReviewTradeRow[]>("get_review_trades_db"),
+  reviewDeleteMissed:  (session_id: string) => invoke<void>("review_delete_missed", { session_id }),
+
+  // Personal data (Réglages ▸ Mes données) + dashboard assets
+  userDataOverview:      () => invoke<DataOverview>("user_data_overview"),
+  userDataOpen:          (target: string) => invoke<void>("user_data_open", { target }),
+  userDataExport:        (include_secrets: boolean) =>
+    invoke<ExportedPack>("user_data_export", { include_secrets }),
+  userDataFindPacks:     () => invoke<FoundPack[]>("user_data_find_packs"),
+  userDataInspect:       (path: string) => invoke<FoundPack>("user_data_inspect", { path }),
+  userDataStageImport:   (path: string) => invoke<PackManifest>("user_data_stage_import", { path }),
+  userDataCancelImport:  () => invoke<void>("user_data_cancel_import"),
+  userDataRestoreBackup: (name: string) => invoke<void>("user_data_restore_backup", { name }),
+  userDataDeleteBackup:  (name: string) => invoke<void>("user_data_delete_backup", { name }),
+  userDataPurgeLegacy:   () => invoke<number>("user_data_purge_legacy"),
+  getDashboardAssets:    () => invoke<DashboardAssets>("get_dashboard_assets"),
+  saveMoodPhrases:       (kind: "short" | "long", content: string) =>
+    invoke<void>("save_mood_phrases", { kind, content }),
 };

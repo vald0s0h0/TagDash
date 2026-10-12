@@ -5,22 +5,27 @@ import { useUiStore } from "@/stores/uiStore";
 import { useLayoutStore } from "@/stores/layoutStore";
 import { useAlertStatusStore } from "@/stores/alertStatusStore";
 import { useChartStore } from "@/stores/chartStore";
-import { useGamepadStore, GAMEPAD_ACTIONS, type GamepadActionId } from "@/stores/gamepadStore";
-import { useGamepadUiStore } from "@/stores/gamepadUiStore";
+import {
+  useGamepadStore, isModifierButton, type GamepadCommandId, type GamepadLayer,
+} from "@/stores/gamepadStore";
+import { useGamepadUiStore, type GamepadPadState } from "@/stores/gamepadUiStore";
 import { getZoneGamepad, getChartControl, isGamepadCapturing } from "@/lib/gamepadBus";
-import { axisSpeed, buttonHeld, resolveAction, isBoundToButton, pickGamepad } from "@/lib/gamepadActions";
+import { axisSpeed, heldLayer, resolveAction, pickGamepad, pressedMask } from "@/lib/gamepadActions";
 import { matchToAlert } from "@/components/ScreenerPanel";
 import { api } from "@/lib/tauri";
+import { trackUsage } from "@/lib/usageTracker";
 import type { AlertSignal, ScreenerMatch, Session } from "@/types";
 
 // Global Xbox-controller loop. Mounted once (App). A requestAnimationFrame poll
 // reads navigator.getGamepads() every frame: button edges fire the digital
-// commands (through the R2 layer) and the sticks drive the focused chart's
-// zoom/cursor continuously. Everything acts on the ACTIVE session's chart zone —
-// the same target the alert sidebar drives. Settings/Journal dialogs and the
-// binding recorder suppress the loop so it never double-fires.
+// commands of the current layer (LB / LT held = another set of buttons) and the
+// sticks drive the focused chart's zoom/cursor continuously. Everything acts on
+// the ACTIVE session's chart zone — the same target the alert sidebar drives.
+// Settings/Journal dialogs and the axis recorder suppress the loop so it never
+// double-fires; the live pad state (layer, pressed buttons) is still published
+// for the on-screen overlay and the Settings preview.
 
-// Trading sessions the L1/L2 tab navigation cycles (wrap-around).
+// Trading sessions the tab navigation cycles (wrap-around).
 const TRADING_SESSIONS: Session[] = ["premarket", "pre_open", "open"];
 // Window within which a second "remove orders" press means "+ alarms too".
 const DOUBLE_TAP_MS = 350;
@@ -35,7 +40,7 @@ function vibrate(pad: Gamepad | null, ms: number, strong: number, weak: number):
 }
 
 /** A Radix dialog (Settings, Journal, …) sits over the chart → suppress the loop.
- *  Our own controller overlays (tag picker, flash, armed) aren't role=dialog, so
+ *  Our own controller overlays (tag picker, flash, pad) aren't role=dialog, so
  *  they don't trip this and the pad keeps driving them. */
 function aRadixDialogOpen(): boolean {
   return !!document.querySelector('[role="dialog"][data-state="open"]');
@@ -55,8 +60,16 @@ export function useGamepad(): void {
   useEffect(() => {
     let raf = 0;
     let prev: boolean[] = [];
-    let prevR2 = false;
+    let layer: GamepadLayer = "base";
     let lastRemove = 0;
+    // Last state published to the UI store — it's only written on a change.
+    let shown: GamepadPadState = { connected: false, active: false, layer: "base", pressed: 0 };
+    const publish = (next: GamepadPadState): void => {
+      if (next.connected === shown.connected && next.active === shown.active
+        && next.layer === shown.layer && next.pressed === shown.pressed) return;
+      shown = next;
+      useGamepadUiStore.getState().setPad(next);
+    };
 
     // The active session's chart zone id (only when it shows a ticker).
     const activeZoneId = (): string | null => {
@@ -130,7 +143,7 @@ export function useGamepad(): void {
       useGamepadUiStore.getState().openTagPicker(tradeId, symbol);
     };
 
-    const fire = (id: GamepadActionId): void => {
+    const fire = (id: GamepadCommandId): void => {
       const zone = getZoneGamepad(activeZoneId());
       switch (id) {
         case "ticker_prev":    navTicker(-1); break;
@@ -159,7 +172,7 @@ export function useGamepad(): void {
         case "journal_audio": if (zone?.hasTradeId()) zone.journalAudio(); break;
         // Global — not tied to a zone; backend no-ops when no replay is active.
         case "replay_next_alert": api.replayNextAlert().catch(() => {}); break;
-        case "r2_modifier":   break; // handled as a held modifier, not an edge
+        case "replay_play_pause": api.replayTogglePlaying().catch(() => {}); break;
       }
     };
 
@@ -171,21 +184,21 @@ export function useGamepad(): void {
       const st = useGamepadStore.getState();
 
       // W3C Gamepad API axis convention: right = +1, **up = −1** (down is positive).
-      const zt = st.bindings.zoom_time;
-      if (zt?.kind === "axis") {
-        let v = axisSpeed(pad.axes[zt.index] ?? 0, st.leftSensitivity);
+      const zt = st.axes.zoom_time;
+      if (zt !== undefined) {
+        let v = axisSpeed(pad.axes[zt] ?? 0, st.leftSensitivity);
         if (st.invertZoomTime) v = -v;
         if (v !== 0) ctl.zoomTime(1 + 0.022 * v); // stick right (+) → zoom in
       }
-      const zp = st.bindings.zoom_price;
-      if (zp?.kind === "axis") {
-        let v = axisSpeed(pad.axes[zp.index] ?? 0, st.leftSensitivity);
+      const zp = st.axes.zoom_price;
+      if (zp !== undefined) {
+        let v = axisSpeed(pad.axes[zp] ?? 0, st.leftSensitivity);
         if (st.invertZoomPrice) v = -v;
         if (v !== 0) ctl.zoomPrice(0.01 * v); // stick up (−) → tighter margins → zoom in
       }
-      const cm = st.bindings.cursor_move;
-      if (cm?.kind === "axis") {
-        let v = axisSpeed(pad.axes[cm.index] ?? 0, st.rightSensitivity);
+      const cm = st.axes.cursor_move;
+      if (cm !== undefined) {
+        let v = axisSpeed(pad.axes[cm] ?? 0, st.rightSensitivity);
         if (st.invertCursor) v = -v;
         if (v !== 0) ctl.nudgeCursor(-0.018 * v); // stick up (−) → cursor up (higher price)
       }
@@ -204,25 +217,36 @@ export function useGamepad(): void {
         const blocked = !pad || !st.enabled || isGamepadCapturing()
           || useUiStore.getState().activeView !== "trading" || aRadixDialogOpen();
 
-        if (pad && !blocked) {
-          const r2Held = buttonHeld(pad, st.bindings.r2_modifier);
-          if (r2Held !== prevR2) { useGamepadUiStore.getState().setArmed(r2Held); prevR2 = r2Held; }
+        // LB / LT held → another set of buttons. Tracked even while blocked, so
+        // the Settings preview follows the pad.
+        layer = pad ? heldLayer(pad, layer) : "base";
+        publish({
+          connected: !!pad,
+          active: !!pad && !blocked,
+          layer,
+          pressed: pad ? pressedMask(pad) : 0,
+        });
 
+        if (pad && !blocked) {
           const picker = useGamepadUiStore.getState().tag;
           for (let i = 0; i < pad.buttons.length; i++) {
             if (!(pad.buttons[i].pressed && !prev[i])) continue; // edge only
+            if (isModifierButton(i)) continue;                   // LB / LT only switch layers
+            const action = resolveAction(st.layout, layer, i);
             if (picker) {
               // While the auto-tag picker is open, only Share matters (advance it).
-              if (isBoundToButton(st.bindings, "share_tag", i)) useGamepadUiStore.getState().bumpTagAdvance();
+              if (action === "share_tag") {
+                trackUsage("gamepad", action, { context: "tag-picker", input: `${layer}:b${i}` });
+                useGamepadUiStore.getState().bumpTagAdvance();
+              }
               continue;
             }
-            const action = resolveAction(st.bindings, i, r2Held);
-            if (action) { try { fire(action); } catch (e) { console.error("gamepad action error:", action, e); } }
+            if (action) {
+              trackUsage("gamepad", action, { context: "chart", input: `${layer}:b${i}` });
+              try { fire(action); } catch (e) { console.error("gamepad action error:", action, e); }
+            }
           }
           if (!picker) handleAxes(pad);
-        } else if (prevR2) {
-          useGamepadUiStore.getState().setArmed(false);
-          prevR2 = false;
         }
 
         prev = pad ? pad.buttons.map((b) => b.pressed) : [];

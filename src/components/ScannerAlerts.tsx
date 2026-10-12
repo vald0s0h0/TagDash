@@ -109,6 +109,7 @@ function AlertRow({ alert: a, state, position, live, onOpen, onRelease }: AlertR
 
   return (
     <li
+      data-track="Carte alerte scanner"
       className="group relative cursor-pointer"
       onClick={() => onOpen(a)}
     >

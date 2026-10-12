@@ -1,9 +1,10 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 import type { LineStyleName } from "@/stores/chartStore";
 
 // Last-used drawing style → becomes the default for the next drawing of that
-// kind. Persisted to localStorage so the user's taste survives restarts. The
+// kind. Persisted with the personal data so the user's taste survives restarts. The
 // right-click settings panel writes here on every change.
 
 export interface LineStyle {
@@ -44,7 +45,7 @@ export const useDrawingPrefs = create<DrawingPrefsState>()(
       setText:  (p) => set((s) => ({ text:  { ...s.text,  ...p } })),
       setEmoji: (p) => set((s) => ({ emoji: { ...s.emoji, ...p } })),
     }),
-    { name: "tagdash-drawing-prefs" },
+    { name: "tagdash-drawing-prefs", storage: userStorage() },
   ),
 );
 

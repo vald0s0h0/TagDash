@@ -3,10 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// Decode base64 PNG data and write it to `<app_dir>/screenshots/<filename>`.
+/// Decode base64 PNG data and write it to `<root>/user/screenshots/<filename>`.
 /// Returns the absolute path of the saved file.
 pub fn save_to_disk(app_dir: &Path, filename: &str, image_base64: &str) -> Result<String, String> {
-    let screenshots_dir = app_dir.join("screenshots");
+    let screenshots_dir = crate::paths::screenshots_dir(app_dir);
     std::fs::create_dir_all(&screenshots_dir)
         .map_err(|e| format!("cannot create screenshots dir: {e}"))?;
 

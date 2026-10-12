@@ -7,4 +7,5 @@ pub mod corporate_actions;
 pub mod news;
 pub mod news_stream;
 pub mod plan;
+pub mod ratelimit;
 pub mod stream;

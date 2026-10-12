@@ -76,10 +76,11 @@ const TIER_LABEL: Record<"unlimited" | "basic", string> = {
   basic:     "Basic (gratuit) — ~5 requêtes/min",
 };
 
-/** Detected vs. manually-forced Massive tier. Starter+ ("unlimited") disables the
- *  Alpaca broker (see BrokerTab) because its data is 15-minute delayed — the
- *  override here exists only to correct a wrong detection, not to opt back into
- *  trading on stale data. */
+/** Detected vs. manually-forced Massive tier. With Alpaca keys, Alpaca always feeds
+ *  the app (SIP history on every plan) and Massive is a reference source only
+ *  (float, short interest, security types, 5s/10s bars). Only without Alpaca keys
+ *  does a Starter+ tier feed the app — and lock the Alpaca broker (see BrokerTab),
+ *  its data being 15-minute delayed. */
 function MassiveTierRow() {
   const qc = useQueryClient();
   const { data: t } = useQuery({
@@ -103,6 +104,14 @@ function MassiveTierRow() {
           <span className={t.effective === "unlimited" ? "text-amber-300" : undefined}>
             {TIER_LABEL[t.effective]}
           </span>
+        }
+      />
+      <Row
+        label="Rôle"
+        value={
+          t.drives_live_feed
+            ? <span className="text-amber-300">flux live (pas de clés Alpaca) — différé 15 min</span>
+            : "référentiel : float, short interest, types de titres, barres 5 s/10 s"
         }
       />
       <Row

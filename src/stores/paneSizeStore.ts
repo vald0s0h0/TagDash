@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
 // Per-layout pane sizing for chart zones. A zone's layout (columns of vertically
 // stacked panes) is fixed by its strategy card, so sizes are keyed by a layout
@@ -7,7 +8,7 @@ import { persist } from "zustand/middleware";
 // shares the user's split, and a card whose shape changes simply gets fresh
 // defaults. Values are flex-grow ratios (all 1 by default); dragging an internal
 // gutter redistributes grow between the two adjacent items only, so the rest of the
-// layout is untouched. Persisted to localStorage. Outer chart edges are never
+// layout is untouched. Persisted with the personal data. Outer chart edges are never
 // resized here — only the gutters between panes / columns.
 
 interface LayoutSizes {
@@ -42,6 +43,6 @@ export const usePaneSizeStore = create<PaneSizeState>()(
           return { byLayout: { ...s.byLayout, [key]: { cols: prev.cols, rows: nextRows } } };
         }),
     }),
-    { name: "tagdash-pane-sizes" },
+    { name: "tagdash-pane-sizes", storage: userStorage() },
   ),
 );

@@ -15,8 +15,12 @@
 // and a new command without one reintroduces the freeze.
 
 pub mod apex;
+pub mod attention;
 pub mod dip;
+pub mod replay_data;
+pub mod review;
 pub mod broker;
+pub mod user_data;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
@@ -35,7 +39,7 @@ use crate::local_db::{
     alarm_repository, book_repository, bug_repository, cache_repository, company_meta_repository,
     dashboard_repository, drawing_repository, execution_repository, get_recent_logs,
     journal_repository, premarket_repository, screener_repository, tradetally_queue_repository,
-    universe_repository,
+    universe_repository, usage_repository,
     BugReport, JournalEntry, LocalLogEntry, PriceAlarm, SyncQueueStatus,
 };
 use crate::market_state::{
@@ -90,9 +94,14 @@ pub async fn update_local_config(
     config: AppConfig,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let path = state.app_dir.join("tagdash.toml");
+    let path = config::config_path(&state.app_dir);
     let cfg_arc = state.config.clone();
     tokio::task::spawn_blocking(move || {
+        // The review section is owned by `set_review_config` (Settings ▸ Revue, the
+        // Auto switch on the chart mic). A Settings draft loaded before such a change
+        // must not write its stale copy back.
+        let mut config = config;
+        config.review = cfg_arc.read().unwrap().review.clone();
         config::save(&path, &config).map_err(|e| e.to_string())?;
         *cfg_arc.write().unwrap() = config;
         Ok(())
@@ -114,7 +123,7 @@ pub async fn get_secrets_status(
 }
 
 /// Set/replace API secrets from Settings → API Keys and persist them to
-/// `tagdash.secrets.toml`. Only non-empty fields are applied (blank inputs leave
+/// `user/secrets.toml`. Only non-empty fields are applied (blank inputs leave
 /// the existing value), so the user types just what they want to change. Returns
 /// the refreshed status (booleans only — secret values never leave Rust).
 #[tauri::command(rename_all = "snake_case")]
@@ -138,7 +147,7 @@ pub async fn update_secrets(
     .map_err(|e| e.to_string())?
 }
 
-// ─── Journal tags (user-defined, stored in tagdash.toml) ──────────────────────
+// ─── Journal tags (user-defined, stored in settings.toml) ─────────────────────
 
 #[tauri::command(rename_all = "snake_case", async)]
 pub fn get_journal_tags(state: tauri::State<'_, AppState>) -> Vec<String> {
@@ -390,6 +399,8 @@ pub fn save_screenshot_local(
 ) -> Result<String, String> {
     // Decode + write to disk
     let local_path = crate::screenshot::save_to_disk(&state.app_dir, &filename, &image_base64)?;
+    // What the database and the upload queue keep: relative to the user folder.
+    let stored_path = crate::paths::to_stored(std::path::Path::new(&local_path));
 
     // The screenshot is always saved locally. It is additionally uploaded to
     // TradeTally only when (a) session credentials are configured (the /images
@@ -441,13 +452,13 @@ pub fn save_screenshot_local(
             rusqlite::params![
                 &filename,
                 &trade_id,
-                &local_path,
+                &stored_path,
                 if tt.is_some() { 1 } else { 0 }
             ],
         )
         .map_err(|e| e.to_string())?;
         if let Some((tid, symbol)) = &tt {
-            tradetally::enqueue_chart_updated(&db, tid, symbol, &local_path);
+            tradetally::enqueue_chart_updated(&db, tid, symbol, &stored_path);
         }
     }
 
@@ -729,6 +740,22 @@ pub fn clear_bug_reports(state: tauri::State<'_, AppState>) -> Result<Vec<BugRep
     Ok(vec![])
 }
 
+// ─── Usage log (which controls and commands are used, and when) ──────────────
+
+/// Append a batch of user actions collected by the frontend tracker.
+#[tauri::command(rename_all = "snake_case", async)]
+pub fn record_usage_events(
+    events: Vec<usage_repository::UsageEventInput>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let replay = crate::replay::clock::is_active();
+    // The released version (tauri.conf.json) — the crate version is not bumped.
+    let version = app.package_info().version.to_string();
+    let db = state.db.lock().unwrap();
+    usage_repository::insert_batch(&db, &events, replay, &version).map_err(|e| e.to_string())
+}
+
 // ─── Price alarms (persisted; level-crossing watcher lives in the scanner) ────
 
 #[tauri::command(rename_all = "snake_case", async)]
@@ -920,17 +947,29 @@ pub fn spawn_live_feed(
         return Err("hors ligne — flux live désactivé".into());
     }
 
-    let (key, secret) = {
+    // Alpaca always wins when its keys are set: SIP on the paid plan, real-time IEX
+    // on the free Basic plan (whose REST history is full SIP anyway). Massive's
+    // 15-minute-delayed stream is only the feed of last resort, for a setup with no
+    // Alpaca keys at all — see `massive::plan::drives_live_feed`.
+    let alpaca_keys = {
         let s = secrets.read().unwrap();
-        match (s.alpaca_key.clone(), s.alpaca_secret.clone()) {
-            (Some(k), Some(sec)) if !k.is_empty() && !sec.is_empty() => (k, sec),
-            _ => return Err("Alpaca keys not configured".into()),
-        }
+        crate::massive::plan::has_alpaca_keys(&s)
+            .then(|| (s.alpaca_key.clone().unwrap_or_default(), s.alpaca_secret.clone().unwrap_or_default()))
     };
-    // Only consulted when the Alpaca plan turns out to be free (IEX) — see below.
     let massive_key = {
         let s = secrets.read().unwrap();
-        s.massive_api_key.clone().filter(|k| !k.is_empty())
+        s.massive_api_key.clone().filter(|k| !k.trim().is_empty())
+    };
+    let massive_live = massive_key.clone().filter(|_| {
+        crate::massive::plan::drives_live_feed(
+            alpaca_keys.is_some(),
+            crate::massive::plan::effective_from_app_state(&db, &config),
+        )
+    });
+    let (key, secret) = match (alpaca_keys, &massive_live) {
+        (Some(ks), _) => ks,
+        (None, Some(_)) => (String::new(), String::new()),
+        (None, None) => return Err("Alpaca keys not configured".into()),
     };
 
     let (configured_feed, warn_ms, critical_ms) = {
@@ -977,6 +1016,35 @@ pub fn spawn_live_feed(
 
     running.store(true, Ordering::Relaxed);
     tokio::spawn(async move {
+        // No Alpaca keys: Massive Starter+ is the only feed there is (delayed 15 min;
+        // the broker gate has already locked Alpaca orders out).
+        if let Some(m_key) = massive_live {
+            eprintln!("[tagdash] flux live : pas de clés Alpaca — Massive Starter+ (différé 15 min)");
+            // Micro Pullback follows the feed's market-event watermark, so its
+            // windows stay causal; surface the mode because alerts and simulated
+            // fills intentionally arrive ~15m late.
+            if let Ok(conn) = db.lock() {
+                let _ = crate::local_db::insert_log(
+                    &conn,
+                    "warn",
+                    "micro_pullback: flux Massive Starter différé — horloge stratégie pilotée par le watermark marché",
+                );
+            }
+            crate::massive::stream::run(
+                market,
+                db,
+                internal_book,
+                broker_mirror,
+                strategy_enabled,
+                m_key,
+                running,
+                focus_rx,
+                app,
+            )
+            .await;
+            return;
+        }
+
         // Probe the live subscription before connecting: it decides both the
         // endpoint and whether the stream may use the `*` wildcard. Awaited here
         // rather than at boot so a slow answer never delays the window.
@@ -1002,49 +1070,7 @@ pub fn spawn_live_feed(
                 fallback
             }
         };
-
-        // SIP is always the best available feed — never overridden by Massive.
-        // Only on the free IEX plan do we ask whether Massive Starter+ is a better
-        // fallback than IEX: unlimited per-second bars (but no trades/quotes, and
-        // 15-minute delayed) vs. real-time trades+quotes capped at 30 symbols. The
-        // tier here mirrors the same resolution the startup pipeline and the broker
-        // safety gate already use — see `crate::massive::plan`.
-        let massive_tier = if matches!(plan, crate::alpaca::plan::Plan::Iex) {
-            massive_key
-                .as_ref()
-                .map(|_| crate::massive::plan::effective_from_app_state(&db, &config))
-        } else {
-            None
-        };
-
-        if let (Some(crate::massive::plan::Tier::Unlimited), Some(m_key)) =
-            (massive_tier, massive_key)
-        {
-            eprintln!("[tagdash] flux live : Massive Starter+ détecté — bascule depuis Alpaca IEX");
-            // Massive Starter is delayed. Micro Pullback v2 follows the feed's
-            // market-event watermark, so its windows stay causal; surface the mode
-            // because alerts and simulated fills intentionally arrive ~15m late.
-            if let Ok(conn) = db.lock() {
-                let _ = crate::local_db::insert_log(
-                    &conn,
-                    "warn",
-                    "micro_pullback v2: flux Massive Starter différé — horloge stratégie pilotée par le watermark marché",
-                );
-            }
-            crate::massive::stream::run(
-                market,
-                db,
-                internal_book,
-                broker_mirror,
-                strategy_enabled,
-                m_key,
-                running,
-                focus_rx,
-                app,
-            )
-            .await;
-            return;
-        }
+        crate::alpaca::ratelimit::set_plan(plan);
 
         // The plan dictates the endpoint: a free key authenticating against /v2/sip
         // is rejected outright. The configured feed only gets a say among the
@@ -1205,9 +1231,15 @@ pub async fn get_ticker_bars(
 /// at startup) into a chart `Bar`, anchored at 00:00:00 UTC of its date. `None`
 /// when the OHLC is incomplete (a NULL-padded cache row).
 fn daily_cache_to_bar(d: cache_repository::DailyBar) -> Option<Bar> {
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use chrono::NaiveDate;
     let nd = NaiveDate::parse_from_str(d.date.get(..10)?, "%Y-%m-%d").ok()?;
-    let time = Utc.from_utc_datetime(&nd.and_hms_opt(0, 0, 0)?);
+    // Stamped at NY midnight — the stamp both providers' live daily bars carry and
+    // the one the premarket ghost uses (`premarket_repository::to_bar`). 00:00 UTC
+    // here put every replay/offline daily candle on a different time-scale slot
+    // than its ghost: the overlay never found its column, and the union of the two
+    // slot sets doubled the time scale. Noon UTC is inside that NY day whatever
+    // the DST offset, so `et_midnight_utc` resolves the right stamp from it.
+    let time = crate::time::et_midnight_utc(nd.and_hms_opt(12, 0, 0)?.and_utc());
     Some(Bar {
         time,
         open: d.open?,
@@ -1348,30 +1380,21 @@ async fn intraday_bars(
 }
 
 /// The Massive key to use for THIS historical bar request, when Massive should be
-/// preferred over Alpaca — Alpaca is NOT on the paid SIP plan (whose REST bars
-/// already cover the full consolidated tape, nothing to gain) AND the Massive tier
-/// is confirmed `Unlimited`. On a free Alpaca (IEX) plan, historical REST bars only
-/// reflect IEX's own prints — a few percent of total volume (see `crate::alpaca::
-/// plan`'s module doc) — so real gaps appear on less-liquid names, which
-/// `load_older_bars` used to read as "reached the start of history" and disable
-/// further back-fill permanently. `None` = today's Alpaca-only behaviour, unchanged
-/// (the safe default when nothing is confirmed).
+/// preferred over Alpaca — only for the timeframes Alpaca cannot serve at all (5s /
+/// 10s), and only once the Massive tier is confirmed `Unlimited` (second aggregates
+/// are a Starter+ feature).
+///
+/// Every timeframe of a minute or more goes to Alpaca, whatever its plan: the bars
+/// endpoint defaults to `feed=sip`, and the free Basic plan serves the full SIP
+/// history up to 15 minutes back — the same delay as Massive Starter, so Massive has
+/// nothing to add there. `None` = Alpaca.
 fn preferred_massive_bars_key(
     state: &tauri::State<'_, AppState>,
     tf: crate::market_state::aggregators::Timeframe,
 ) -> Option<String> {
     if crate::alpaca::bars::alpaca_timeframe(tf).is_some() {
-        let alpaca_sip = {
-            let conn = state.db.lock().unwrap();
-            cache_repository::get_app_meta(&conn, crate::alpaca::plan::PLAN_META_KEY)
-                .and_then(|s| crate::alpaca::plan::Plan::from_meta(&s))
-        } == Some(crate::alpaca::plan::Plan::Sip);
-        if alpaca_sip {
-            return None;
-        }
+        return None;
     }
-    // Either Alpaca can't serve this timeframe at all (5s/10s), or it's on the free
-    // IEX plan — Massive is preferred once its tier is confirmed Unlimited.
     let tier = crate::massive::plan::effective_from_app_state(&state.db, &state.config);
     if !matches!(tier, crate::massive::plan::Tier::Unlimited) {
         return None;
@@ -1635,7 +1658,6 @@ pub async fn load_older_bars(
         let order: &[HistoryStep] = match provider.as_deref() {
             Some("alpaca_sip") => &[HistoryStep::Alpaca, HistoryStep::Massive, HistoryStep::Flat],
             Some("massive") => &[HistoryStep::Massive, HistoryStep::Flat, HistoryStep::Alpaca],
-            Some("alpaca_iex") => &[HistoryStep::Flat, HistoryStep::Alpaca],
             _ => &[HistoryStep::Flat],
         };
         for step in order {
@@ -1791,21 +1813,20 @@ pub async fn load_older_bars(
 }
 
 /// Which provider serves the intraday bars a premarket candle is folded from.
-/// Mirrors the rule the rest of the chart already follows
-/// (`preferred_massive_bars_key`): Massive whenever Alpaca is on the free IEX plan
-/// and a paid Massive key is present, Alpaca otherwise.
-///
-/// The IEX case matters more here than anywhere else: premarket volume is thin, so
-/// a range built from IEX's own prints alone can be wildly narrower than the real
-/// session. That is precisely why Massive comes first when it is available.
+/// Alpaca first — its bars default to the full SIP tape on every plan, which is what
+/// a thin premarket range needs — and Massive only when no Alpaca key is set.
 fn premarket_source(state: &tauri::State<'_, AppState>) -> Option<crate::premarket::Source> {
-    if let Some(key) = preferred_massive_bars_key(state, crate::premarket::FOLD_TF) {
-        return Some(crate::premarket::Source::Massive(key));
-    }
     let s = state.secrets.read().unwrap();
-    let key = s.alpaca_key.clone().filter(|k| !k.is_empty())?;
-    let secret = s.alpaca_secret.clone().filter(|k| !k.is_empty())?;
-    Some(crate::premarket::Source::Alpaca { key, secret })
+    if crate::massive::plan::has_alpaca_keys(&s) {
+        return Some(crate::premarket::Source::Alpaca {
+            key: s.alpaca_key.clone().unwrap_or_default(),
+            secret: s.alpaca_secret.clone().unwrap_or_default(),
+        });
+    }
+    s.massive_api_key
+        .clone()
+        .filter(|k| !k.trim().is_empty())
+        .map(crate::premarket::Source::Massive)
 }
 
 /// Premarket (04:00–09:30 ET) daily candles for `symbol` from `from_date`
@@ -1825,8 +1846,13 @@ fn premarket_source(state: &tauri::State<'_, AppState>) -> Option<crate::premark
 ///   • from the 09:30 open onward — the session is final, so it is folded and
 ///     cached exactly once like any closed day.
 ///
-/// Replay / offline never reaches the network: the cache answers, clamped to the
-/// simulated day, and the replayed RAM bar supplies a simulated premarket.
+/// Offline never reaches the network: the cache answers alone. A replay DOES
+/// fetch — exactly like the daily pane it sits on — because the tickers replayed
+/// are mostly ones never alerted live, so their cache is empty and the ghost would
+/// never show. It cannot leak the future: every range is bounded by the simulated
+/// clock (`closed_to` is the simulated yesterday, or the simulated day once its
+/// premarket is over), the read is clamped to the simulated day, and the replayed
+/// RAM bar supplies the simulated forming premarket.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn load_premarket_daily(
     symbol: String,
@@ -1839,7 +1865,7 @@ pub async fn load_premarket_daily(
     if from_date.is_empty() || from_date.as_str() > today.as_str() {
         return Ok(vec![]);
     }
-    let historical = intraday_is_historical(&state);
+    let offline = state.config.read().unwrap().data_source.offline;
 
     // Today's premarket is FINAL from the 09:30 open onward (09:30 ET = 570
     // minutes), so from then on it caches like any closed day. Before the open it
@@ -1853,7 +1879,7 @@ pub async fn load_premarket_daily(
     };
 
     // ── Fill whatever part of the window the cache does not already cover ──
-    if !historical {
+    if !offline {
         if let Some(src) = premarket_source(&state) {
             let db = state.db.clone();
             crate::premarket::ensure_cached(&src, &db, &symbol, &from_date, &closed_to).await;
@@ -2243,7 +2269,9 @@ pub fn start_alert_enrichment(
     // means the series is already there when the pane asks — instead of the user
     // watching it appear. Idempotent by construction: `ensure_cached` fetches only
     // what the coverage table says is missing, so a re-alert costs one SELECT.
-    if !intraday_is_historical(&state) {
+    // Replay included (dates below are on the simulated clock, so nothing past the
+    // replayed day is fetched) — only offline stays off the network.
+    if !state.config.read().unwrap().data_source.offline {
         if let Some(src) = premarket_source(&state) {
             let db = state.db.clone();
             let sym = symbol.clone();
@@ -3259,6 +3287,11 @@ pub fn clear_zone_context(
     // bracket, not by what is on screen.
     apex::disarm_on_release(&app, &state, &zone_id, symbol.as_deref());
     dip::disarm_on_release(&app, &state, &zone_id, symbol.as_deref());
+    // « Libérer » ends the ticker's review session (the voice recorder is stopped
+    // by the chart's mic button on the same release).
+    if let Some(sym) = symbol.as_deref() {
+        crate::review::close_session(sym);
+    }
     Ok(())
 }
 
@@ -3613,6 +3646,15 @@ fn sync_fill(
     // Snapshot the post-fill trade state under the book read lock.
     let (all_fills, position, side, sl, tp, strategy_id, mae, mfe) = {
         let book = internal_book.read().unwrap();
+        // Millisecond timing: the internal broker acknowledges synchronously, so the
+        // order's creation is both its send and its ack. A market order that fills
+        // on the spot never rests in the book — its send is the fill instant.
+        let sent_ms = book
+            .orders
+            .get(&fill.order_id)
+            .map(|o| o.created_at.timestamp_millis())
+            .unwrap_or_else(|| fill.filled_at.timestamp_millis());
+        crate::review::timing::order_acked(&fill.order_id, Some(sent_ms), sent_ms);
         let Some(lc) = book.get_trade_lifecycle(&fill.trade_id) else {
             return;
         };
@@ -3646,6 +3688,7 @@ fn sync_fill(
         // Persist the execution for the chart's per-ticker markers (survives
         // restarts / multi-day trades).
         let _ = execution_repository::insert_fill(&db, fill);
+        crate::review::timing::record_fill(&db, fill, "tagdash");
         if all_fills.len() == 1 {
             // Stamp the launch-time SL/TP once (never overwritten by later moves)
             // so the chart can draw the original-SL / original-TP segments for the
@@ -4239,24 +4282,25 @@ pub fn delete_drawing(id: String, state: tauri::State<'_, AppState>) -> Result<(
 /// ("04:00" | "07:00" | "09:30"). Stops the live feeds, switches the app clock
 /// to simulated time and loads the day's data (progress via get_replay_status).
 ///
-/// `source` is the day-picker toggle — "api" (ranked walk, the default when the
-/// argument is absent), "flat_trades" or "flat_minutes". An unknown value is an
-/// error rather than a silent fallback to the API: a replay run on a source the
-/// user did not pick is a wrong answer, not a degraded one.
+/// The day must have been prepared (`replay_data_prepare`) — at least its first
+/// opportunities: a replay reads only what is on disk, and a day left unfinished
+/// keeps downloading while it runs. `strategies`: the ones the session was prepared
+/// for (every preparable one when absent); they run for the session whatever their
+/// live toggle.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn replay_start(
     day: String,
     start_hm: String,
-    source: Option<String>,
+    strategies: Option<Vec<String>>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let start_min = parse_hm(&start_hm)?;
-    let choice = match source.as_deref() {
-        None => crate::replay::data::SourceChoice::default(),
-        Some(s) => crate::replay::data::SourceChoice::from_str(s)
-            .ok_or_else(|| format!("source de replay inconnue : {s}"))?,
-    };
+    let prepared = crate::replay_data::store::DayStore::open_existing(&state.app_dir, &day)
+        .is_some_and(|s| s.has_market());
+    if !prepared {
+        return Err(format!("le {day} n'est pas préparé — préparez-le d'abord"));
+    }
     let deps = crate::replay::ReplayDeps {
         app_dir: state.app_dir.clone(),
         market: state.market.clone(),
@@ -4273,11 +4317,13 @@ pub async fn replay_start(
         focus_rx_restart: state.focus_symbols_tx.subscribe(),
         active_alerts: state.active_alerts.clone(),
         alert_history: state.alert_history.clone(),
+        replay_data: state.replay_data.clone(),
         app,
     };
     let replay = state.replay.clone();
+    let strategies = strategies.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
-        crate::replay::start(replay, deps, day, start_min, choice)
+        crate::replay::start(replay, deps, day, start_min, strategies)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -4305,6 +4351,13 @@ pub fn replay_set_playing(playing: bool, state: tauri::State<'_, AppState>) -> R
     } else {
         crate::replay::ReplayCmd::Pause
     })
+}
+
+/// Lecture ↔ pause, for the keyboard / mouse / gamepad shortcut (which does not
+/// know which of the two the replay is in).
+#[tauri::command(rename_all = "snake_case", async)]
+pub fn replay_toggle_playing(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.replay.send(crate::replay::ReplayCmd::Toggle)
 }
 
 #[tauri::command(rename_all = "snake_case", async)]
@@ -4336,7 +4389,9 @@ pub fn replay_seek_clock(hm: String, state: tauri::State<'_, AppState>) -> Resul
         .send(crate::replay::ReplayCmd::SeekClock { minutes })
 }
 
-/// Avance en accéléré jusqu'à la prochaine alerte scanner, puis met en pause.
+/// Passe à la prochaine opportunité préparée (saut direct, puis lecture) ; sans
+/// opportunité préparée, avance en accéléré jusqu'à la prochaine alerte. Dans les
+/// deux cas la lecture continue une fois l'alerte tombée.
 #[tauri::command(rename_all = "snake_case", async)]
 pub fn replay_next_alert(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.replay.send(crate::replay::ReplayCmd::NextAlert)
@@ -4366,8 +4421,8 @@ pub async fn get_replay_status(
 
 // ─── Flat files (offline market-data download for Market Replay) ────────────────
 
-/// Download flat files of `kind` ("trade" | "minute" | "daily") over [start_day,
-/// end_day], persisting them under `<app_dir>/flat_files/<kind>/`. Runs in the
+/// Download flat files of `kind` ("minute" | "daily") over [start_day,
+/// end_day], persisting them under `<root>/cache/flat_files/<kind>/`. Runs in the
 /// background — poll `get_flat_files_status`. Errors if a download is already running
 /// or the Alpaca keys are missing. (Daily ignores the day granularity and writes the
 /// cumulative `daily.db`; for it, start/end is just the bar range.)
@@ -4380,12 +4435,11 @@ pub fn flat_files_download(
 ) -> Result<(), String> {
     let kind = crate::flat_files::Kind::from_str(&kind)
         .ok_or_else(|| format!("type de flat file inconnu: {kind}"))?;
-    let (key, secret, massive_key) = {
+    let (key, secret) = {
         let s = state.secrets.read().unwrap();
         (
             s.alpaca_key.clone().unwrap_or_default(),
             s.alpaca_secret.clone().unwrap_or_default(),
-            s.massive_api_key.clone().unwrap_or_default(),
         )
     };
     crate::flat_files::start_download(
@@ -4394,7 +4448,6 @@ pub fn flat_files_download(
         state.db.clone(),
         key,
         secret,
-        massive_key,
         kind,
         start_day,
         end_day,
@@ -4511,6 +4564,10 @@ pub async fn sync_tradetally_trades(
 ) -> Result<TradeSyncReport, String> {
     let client = tradetally_client(&state)?;
 
+    // Review edits made offline go up first, so the snapshot below (which rewrites
+    // the cached notes) already carries them.
+    crate::review::outbox::flush().await;
+
     // Stamped before the fetch: any mapping created after this instant belongs to a
     // trade pushed while the fetch was in flight, which the fetch cannot have seen.
     let fetch_started_at = Utc::now()
@@ -4573,7 +4630,7 @@ pub struct TradeSyncReport {
 }
 
 /// Build the TradeTally client the same way the background worker does.
-fn tradetally_client(state: &tauri::State<'_, AppState>) -> Result<tradetally::TtClient, String> {
+pub(crate) fn tradetally_client(state: &tauri::State<'_, AppState>) -> Result<tradetally::TtClient, String> {
     let (base_url, token, tt_email, tt_password) = {
         let cfg = state.config.read().unwrap();
         let sec = state.secrets.read().unwrap();
@@ -4691,7 +4748,7 @@ pub fn get_daily_background(
 /// Open the backgrounds folder in the OS file manager.
 #[tauri::command(rename_all = "snake_case", async)]
 pub fn open_backgrounds_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    crate::dashboard::open_folder(&state.app_dir.join("backgrounds"))
+    crate::dashboard::open_folder(&crate::paths::backgrounds_dir(&state.app_dir))
 }
 
 /// A fresh random mood pick (image + short + long phrase) from the user's `mood/`
@@ -4720,7 +4777,7 @@ pub fn get_default_dashboard(app: tauri::AppHandle) -> Option<String> {
     crate::dashboard::read_default_dashboard(&dir)
 }
 
-/// Save the current dashboard layout to `<app_dir>/dashboard-default.json`, so the
+/// Save the current dashboard layout to `<root>/user/dashboard-default.json`, so the
 /// maintainer can capture their arrangement and bundle it as the new shipped
 /// default. Returns the written file path. (Maintainer affordance.)
 #[tauri::command(rename_all = "snake_case", async)]
@@ -4728,12 +4785,8 @@ pub fn export_dashboard_default(
     layout_json: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    crate::dashboard::write_dashboard_export(&state.app_dir, &layout_json)?;
-    Ok(state
-        .app_dir
-        .join("dashboard-default.json")
-        .to_string_lossy()
-        .to_string())
+    crate::dashboard::write_dashboard_export(&state.app_dir, &layout_json)
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 // ─── Embedded TradeTally web app ──────────────────────────────────────────────
@@ -4755,7 +4808,7 @@ pub fn export_dashboard_default(
 //     WKWebView / WebKitGTK), unchanged.
 //
 // Isolated storage: the webview gets its OWN WebView2/WKWebView data directory
-// (`<app_dir>/tradetally-webview`), separate from the main app's. So TradeTally's
+// (`<root>/cache/tradetally-webview`), separate from the main app's. So TradeTally's
 // cookies/cache/localStorage can't corrupt (or be corrupted by) the app's own
 // localStorage (dashboard layout, hotkeys…), and "clear cache & cookies" only
 // wipes TradeTally — never the app. Cookies persist across the destroy/recreate.
@@ -4769,6 +4822,115 @@ pub fn export_dashboard_default(
 // deadlocking the caller.
 
 const TRADETALLY_LABEL: &str = "tradetally";
+
+/// Scheme the in-page right-click menu navigates to; `tt_on_navigation` swallows
+/// it and runs the action natively (the external page has no Tauri IPC).
+const TT_ACTION_SCHEME: &str = "tagdash-tt";
+
+/// Injected before any page content: a dark background (so the gap between
+/// webview creation and TradeTally's CSS is not white), and the right-click menu —
+/// Recharger / Page d'accueil / Vider cache & cookies. The menu has to live INSIDE
+/// the page: the native webview paints above the app's DOM, so a React menu would
+/// be hidden behind it. It is drawn in a closed shadow root so TradeTally's CSS
+/// cannot restyle it. Editable fields and text selections keep the native menu
+/// (copy / paste).
+const TT_INIT_SCRIPT: &str = r#"
+document.documentElement.style.backgroundColor = '#0d0d0d';
+(function () {
+  if (window.__tagdashTtMenu) return;
+  window.__tagdashTtMenu = true;
+  var host = null;
+  function close() {
+    if (host) { host.remove(); host = null; }
+  }
+  function go(action) {
+    close();
+    window.location.href = 'tagdash-tt://' + action;
+  }
+  function editable(el) {
+    for (; el && el.nodeType === 1; el = el.parentElement) {
+      var t = el.tagName;
+      if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || el.isContentEditable) return true;
+    }
+    return false;
+  }
+  window.addEventListener('contextmenu', function (e) {
+    var sel = window.getSelection && String(window.getSelection());
+    if (editable(e.target) || sel) return;
+    e.preventDefault();
+    e.stopPropagation();
+    close();
+    host = document.createElement('div');
+    host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;';
+    var root = host.attachShadow({ mode: 'closed' });
+    root.innerHTML =
+      '<style>' +
+      '.m{position:fixed;min-width:190px;padding:4px;background:#18181b;border:1px solid #27272a;' +
+      'border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.5);' +
+      'font:12px ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#fafafa;user-select:none}' +
+      '.i{display:block;width:100%;text-align:left;padding:6px 8px;border:0;border-radius:4px;' +
+      'background:transparent;color:inherit;font:inherit;cursor:default}' +
+      '.i:hover{background:#27272a}' +
+      '.d{color:#f87171}.d:hover{background:rgba(127,29,29,.35)}' +
+      '.s{height:1px;margin:4px 2px;background:#27272a}' +
+      '</style>' +
+      '<div class="m">' +
+      '<button class="i" data-a="reload">Recharger</button>' +
+      '<button class="i" data-a="home">Page d’accueil</button>' +
+      '<div class="s"></div>' +
+      '<button class="i d" data-a="clear">Vider cache &amp; cookies…</button>' +
+      '</div>';
+    var menu = root.querySelector('.m');
+    host.addEventListener('mousedown', function (ev) {
+      if (ev.composedPath()[0] === host) close();
+    });
+    host.addEventListener('contextmenu', function (ev) { ev.preventDefault(); close(); });
+    menu.addEventListener('click', function (ev) {
+      var b = ev.target.closest('[data-a]');
+      if (!b) return;
+      var a = b.getAttribute('data-a');
+      if (a === 'clear' && !b.dataset.armed) {
+        // Two-step: this logs TradeTally out and resets its light/dark theme.
+        b.dataset.armed = '1';
+        b.textContent = 'Confirmer (déconnecte TradeTally)';
+        return;
+      }
+      go(a);
+    });
+    (document.body || document.documentElement).appendChild(host);
+    var w = menu.offsetWidth, h = menu.offsetHeight;
+    menu.style.left = Math.max(4, Math.min(e.clientX, window.innerWidth - w - 4)) + 'px';
+    menu.style.top = Math.max(4, Math.min(e.clientY, window.innerHeight - h - 4)) + 'px';
+  }, true);
+  window.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); }, true);
+  window.addEventListener('blur', close);
+  window.addEventListener('resize', close);
+})();
+"#;
+
+/// Navigation filter for the TradeTally webview: lets every real page load
+/// through, and turns the menu's `tagdash-tt://<action>` URLs into native actions
+/// (never a navigation). Runs off the callback — it fires on the UI thread, and
+/// the webview calls below round-trip through it.
+fn tt_on_navigation(app: &tauri::AppHandle, url: &tauri::Url) -> bool {
+    if url.scheme() != TT_ACTION_SCHEME {
+        return true;
+    }
+    let app = app.clone();
+    let action = url.host_str().unwrap_or_default().to_string();
+    tauri::async_runtime::spawn(async move {
+        let res = match action.as_str() {
+            "reload" => tradetally_reload(app).await,
+            "home" => tradetally_home(app).await,
+            "clear" => tradetally_clear_data(app).await,
+            other => Err(format!("unknown action {other}")),
+        };
+        if let Err(e) = res {
+            eprintln!("[tagdash] tradetally menu action failed: {e}");
+        }
+    });
+    false
+}
 
 /// The TradeTally site URL (the configured base; the SPA routes to /dashboard or
 /// /login itself). Same base as the REST client, so it can't carry a path.
@@ -4789,7 +4951,7 @@ fn tradetally_url(app: &tauri::AppHandle) -> Result<tauri::Url, String> {
 /// from the app's own (and from any cache corruption).
 fn tradetally_data_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
     use tauri::Manager;
-    app.state::<AppState>().app_dir.join("tradetally-webview")
+    crate::paths::tradetally_webview_dir(&app.state::<AppState>().app_dir)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -4824,6 +4986,7 @@ fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> 
         .ok_or("main window not found")?;
     let parent = main.hwnd().map_err(|e| e.to_string())?;
     let app_evt = app.clone();
+    let app_nav = app.clone();
 
     match tauri::WebviewWindowBuilder::new(app, TRADETALLY_LABEL, tauri::WebviewUrl::External(url))
         .parent_raw(parent)
@@ -4835,9 +4998,9 @@ fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> 
         .resizable(false)
         .position(x, y)
         .inner_size(width, height)
-        // Dark background injected before any page content so the brief window
-        // between WebView2 creation and TradeTally's CSS loading is dark (not white).
-        .initialization_script("document.documentElement.style.backgroundColor='#0d0d0d'")
+        // Dark background + right-click menu, before any page content.
+        .initialization_script(TT_INIT_SCRIPT)
+        .on_navigation(move |url| tt_on_navigation(&app_nav, url))
         // Tell the React placeholder the page finished loading (status dot → ready).
         // Full-document loads only — SPA route changes don't fire this.
         .on_page_load(move |_w, payload| {
@@ -4880,10 +5043,12 @@ fn tt_place(app: &tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) -> 
     let url = tradetally_url(app)?;
     let window = app.get_window("main").ok_or("main window not found")?;
     let app_evt = app.clone();
+    let app_nav = app.clone();
     let builder =
         tauri::webview::WebviewBuilder::new(TRADETALLY_LABEL, tauri::WebviewUrl::External(url))
             .data_directory(tradetally_data_dir(app))
-            .initialization_script("document.documentElement.style.backgroundColor='#0d0d0d'")
+            .initialization_script(TT_INIT_SCRIPT)
+            .on_navigation(move |url| tt_on_navigation(&app_nav, url))
             .on_page_load(move |_wv, payload| {
                 if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                     use tauri::Emitter;
@@ -4921,7 +5086,23 @@ pub async fn tradetally_close(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Soft reload of the embedded page (toolbar → Recharger). Keeps cache, cookies
+/// Back to TradeTally's home (the configured base URL; the SPA routes to
+/// /dashboard or /login itself). Right-click menu → Page d'accueil.
+pub async fn tradetally_home(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let url = tradetally_url(&app)?;
+    #[cfg(windows)]
+    if let Some(ww) = app.get_webview_window(TRADETALLY_LABEL) {
+        ww.navigate(url).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    if let Some(wv) = app.get_webview(TRADETALLY_LABEL) {
+        wv.navigate(url).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Soft reload of the embedded page (right-click menu → Recharger). Keeps cache, cookies
 /// and the current session — the first thing to try when the page looks stuck.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tradetally_reload(app: tauri::AppHandle) -> Result<(), String> {

@@ -1,9 +1,10 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { userStorage } from "@/lib/userStorage";
 
 // The dashboard grid is a fixed, invisible 20×12 board. Cards are placed and sized
 // in whole grid cells (0-indexed x/y, 1-based span via CSS grid). Layout +
-// visibility + per-card surface persist to localStorage so the user's arrangement
+// visibility + per-card surface persist with the personal data so the arrangement
 // survives restarts.
 
 export const GRID_COLS = 20;
@@ -91,6 +92,7 @@ export const useDashboardStore = create<DashboardState>()(
     }),
     {
       name: "tagdash-dashboard",
+      storage: userStorage(),
       // v2: grid doubled to 20×12 and per-card `surface` added.
       version: 2,
       // Old v1 layouts were authored on the 10×6 grid with no surface — scale

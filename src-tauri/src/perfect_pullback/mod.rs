@@ -216,12 +216,8 @@ impl PerfectPullbackEngine {
                     }
                 }
                 // Respect the Settings on/off toggle (compiled default if absent).
-                let enabled = strategy_enabled
-                    .read()
-                    .unwrap()
-                    .get(STRATEGY_ID)
-                    .copied()
-                    .unwrap_or(true);
+                let enabled =
+                    crate::strategies::runs(&strategy_enabled.read().unwrap(), STRATEGY_ID);
                 if !enabled {
                     crate::replay::clock::scaled_sleep(2_000).await;
                     continue;

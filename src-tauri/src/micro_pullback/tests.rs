@@ -997,3 +997,152 @@ fn the_universe_settings_reach_the_engine() {
     assert_eq!(cfg.watch_fast_rate_per_sec, 12.0);
     assert_eq!(cfg.watch_min_dollar_per_sec, 500.0);
 }
+
+/// A PREPARED day through the engine, the way a replay feeds it: the day's events
+/// injected into a `MarketState` in clock steps, then one loop pass per step
+/// (`snapshot_inputs` + `evaluate`). Prints the alerts next to the pre-scan's
+/// confirmed hits, per step size — 1 s is normal playback, 12 s is what a ×120
+/// fast-forward advances per engine tick, and 0 is « prochaine alerte »: a jump to
+/// `replay::NEXT_ALERT_LEAD_MS` before each hit, then 1 s steps until it fires.
+/// Ignored by default:
+///   TAGDASH_E2E_APP=<data root, holding cache/replay/day-*.db> TAGDASH_E2E_DB=<cache.db>
+///   TAGDASH_E2E_DAY=YYYY-MM-DD [TAGDASH_E2E_STEPS=1,12,0]
+///   cargo test --lib replay_fidelity -- --ignored --nocapture
+#[test]
+#[ignore]
+fn replay_fidelity() {
+    use crate::replay::data::Event;
+    let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} manquant"));
+    let app = std::path::PathBuf::from(env("TAGDASH_E2E_APP"));
+    let day = env("TAGDASH_E2E_DAY");
+    let conn = crate::local_db::open_harness(std::path::Path::new(&env("TAGDASH_E2E_DB")));
+    let opts = MicroPullbackOptions::load(&conn);
+    let cfg = Config::DEFAULT.with_options(&opts);
+    let db = Arc::new(Mutex::new(conn));
+    let (floats, avg_volumes, profiles) = load_universe_meta(&db);
+    let steps: Vec<i64> = std::env::var("TAGDASH_E2E_STEPS")
+        .unwrap_or_else(|_| "1,12,0".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    let dd = crate::replay_data::read::read_day(&app, &day).unwrap();
+    let hm = |t: DateTime<Utc>| {
+        let m = crate::time::et_minutes(t);
+        format!("{:02}:{:02}:{:02}", m / 60, m % 60, t.timestamp() % 60)
+    };
+    let store = crate::replay_data::store::DayStore::open_existing(&app, &day).unwrap();
+    println!("pré-scan ({} hits) :", store.hits(STRATEGY_ID).len());
+    for (sym, h) in store.hits(STRATEGY_ID) {
+        println!("   {} {sym}", hm(DateTime::from_timestamp_millis(h.alert_ms).unwrap()));
+    }
+
+    let noon = crate::replay::data::noon_utc(chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").unwrap());
+    let at = |min: u16| crate::time::et_clock_utc(noon, u32::from(min) / 60, u32::from(min) % 60);
+    let (start, end) = (at(opts.session_start_min), at(opts.session_end_min));
+    let shape = TapeShape {
+        kind: TapeKind::Prints,
+        counts_trades: true,
+    };
+
+    for step in steps {
+        let market = RwLock::new(MarketState::new());
+        {
+            let mut ms = market.write().unwrap();
+            ms.set_tape_kind(TapeKind::Prints);
+            for (sym, close) in &dd.prev_closes {
+                ms.set_previous_close(sym, *close, start);
+            }
+        }
+        let mut machines: HashMap<String, Machine> = HashMap::new();
+        let mut session_key: Option<String> = None;
+        let mut cursor = 0usize;
+        let mut fired: Vec<(DateTime<Utc>, String)> = Vec::new();
+        let mut now = start;
+        let hits: Vec<i64> = store.hits(STRATEGY_ID).iter().map(|(_, h)| h.alert_ms).collect();
+        let (mut target, mut seen): (Option<i64>, usize) = (None, 0);
+        while now < end {
+            {
+                let mut ms = market.write().unwrap();
+                while cursor < dd.events.len() && dd.events[cursor].ts_ms <= now.timestamp_millis() {
+                    let te = &dd.events[cursor];
+                    let t = DateTime::from_timestamp_millis(te.ts_ms).unwrap();
+                    match &te.ev {
+                        Event::Trade { symbol, price, size, prints, synthetic } => {
+                            ms.on_replay_trade(symbol, *price, *size, *prints, t, *synthetic)
+                        }
+                        Event::Quote { symbol, bid, ask } => ms.on_quote(symbol, *bid, *ask, t, t),
+                        Event::News(h) => ms.on_news(h.clone()),
+                    }
+                    cursor += 1;
+                }
+            }
+            let key = format!("{}#{:?}", crate::time::et_date(now), crate::time::session_at(now));
+            if session_key.as_deref() != Some(key.as_str()) {
+                machines.clear();
+                session_key = Some(key);
+            }
+            let inputs = snapshot_inputs(
+                &market.read().unwrap(),
+                &machines,
+                &floats,
+                &avg_volumes,
+                &profiles,
+                &cfg,
+                now,
+            );
+            for inp in &inputs {
+                let m = machines.entry(inp.symbol.clone()).or_insert_with(Machine::new);
+                let tape_fn = |secs: i64| {
+                    let s = market
+                        .read()
+                        .unwrap()
+                        .tape_window_stats(&inp.symbol, secs, now)
+                        .unwrap_or_default();
+                    TapeWindow {
+                        prints: s.prints,
+                        active_seconds: s.active_seconds,
+                        dollars: s.dollars,
+                        max_second_dollars: s.max_second_dollars,
+                    }
+                };
+                if let Some(Outcome::Fired(a)) =
+                    evaluate(m, inp, &cfg, now, None, shape, &tape_only, &tape_fn)
+                {
+                    fired.push((now, a.symbol));
+                }
+            }
+            machines.retain(|_, m| {
+                m.locked
+                    || m.watch.is_some()
+                    || m.last_eval_bar
+                        .map(|t| (now - t).num_seconds() <= MACHINE_STALE_SECS)
+                        .unwrap_or(true)
+            });
+            if step > 0 {
+                now += ChronoDuration::seconds(step);
+                continue;
+            }
+            // « Prochaine alerte »: once the hit being approached has fired (or its
+            // tail has run out), jump to the lead of the next one.
+            let done = fired.len() > seen
+                || target.is_some_and(|h| now.timestamp_millis() > h + crate::replay::NEXT_ALERT_TAIL_MS);
+            if target.is_none() || done {
+                seen = fired.len();
+                let after = target.unwrap_or(i64::MIN).max(now.timestamp_millis());
+                let Some(h) = hits.iter().copied().find(|h| *h > after) else {
+                    break;
+                };
+                target = Some(h);
+                let lead = DateTime::from_timestamp_millis(h - crate::replay::NEXT_ALERT_LEAD_MS).unwrap();
+                now = now.max(lead);
+            } else {
+                now += ChronoDuration::seconds(1);
+            }
+        }
+        println!("pas {step} s → {} alertes :", fired.len());
+        for (t, sym) in &fired {
+            println!("   {} {sym}", hm(*t));
+        }
+    }
+}

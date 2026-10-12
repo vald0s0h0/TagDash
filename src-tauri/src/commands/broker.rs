@@ -70,6 +70,14 @@ pub struct MassiveTierStatus {
     #[serde(rename = "override")]
     pub override_: Option<String>,
     pub effective: String,
+    /// True only when Massive's delayed stream feeds the app (no Alpaca keys) —
+    /// the one case where the Alpaca broker is locked. See
+    /// `massive::plan::drives_live_feed`.
+    pub drives_live_feed: bool,
+}
+
+fn massive_drives_live(state: &tauri::State<'_, AppState>) -> bool {
+    crate::massive::plan::drives_live_feed_from_app_state(&state.secrets, &state.db, &state.config)
 }
 
 fn effective_massive_tier(state: &tauri::State<'_, AppState>) -> crate::massive::plan::Tier {
@@ -96,13 +104,14 @@ pub fn get_massive_tier_status(
         detected,
         override_,
         effective: effective.as_str().into(),
+        drives_live_feed: massive_drives_live(&state),
     })
 }
 
 /// Force the Massive tier, overriding auto-detection (e.g. when the probe gets it
 /// wrong). `tier` must be `"unlimited"`, `"basic"`, or `None` to go back to
 /// automatic. Re-applies the broker safety gate immediately, since forcing
-/// "unlimited" must disable Alpaca just as detecting it would.
+/// "unlimited" without Alpaca keys must disable Alpaca just as detecting it would.
 #[tauri::command(rename_all = "snake_case", async)]
 pub fn set_massive_tier_override(
     tier: Option<String>,
@@ -119,8 +128,11 @@ pub fn set_massive_tier_override(
         let path = crate::config::config_path(&state.app_dir);
         crate::config::save(&path, &cfg)?;
     }
-    let effective = effective_massive_tier(&state);
-    crate::massive::plan::enforce_broker_gate(&state.config, &state.app_dir, effective);
+    crate::massive::plan::enforce_broker_gate(
+        &state.config,
+        &state.app_dir,
+        massive_drives_live(&state),
+    );
     get_massive_tier_status(state)
 }
 
@@ -142,18 +154,13 @@ pub fn set_broker_selection(
         return Err(format!("environnement inconnu : {environment}"));
     }
     // Massive Starter+ data is 15-minute delayed — never let it drive a real order
-    // sent to Alpaca. `startup::run_pipeline` already forces TagDash the moment the
-    // tier is detected; this is the second door, for a manual switch attempted
+    // sent to Alpaca. `startup::run_pipeline` already forces TagDash when Massive
+    // feeds the app; this is the second door, for a manual switch attempted
     // afterwards in the same session.
-    if broker_id == "alpaca"
-        && matches!(
-            effective_massive_tier(&state),
-            crate::massive::plan::Tier::Unlimited
-        )
-    {
+    if broker_id == "alpaca" && massive_drives_live(&state) {
         return Err(
-            "Alpaca indisponible tant que Massive Starter+ est actif (données \
-             différées de 15 min) — repasse le tier Massive en Basic dans \
+            "Alpaca indisponible tant que Massive Starter+ alimente le flux (pas de \
+             clés Alpaca, données différées de 15 min) — ajoute tes clés Alpaca dans \
              Réglages pour réactiver Alpaca"
                 .into(),
         );

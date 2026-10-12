@@ -1,12 +1,11 @@
 import {
-  GAMEPAD_ACTIONS, type GamepadActionId, type GamepadBinding, type GamepadBindings,
+  LAYER_MODIFIER,
+  type GamepadCommandId, type GamepadLayer, type GamepadLayout,
 } from "@/stores/gamepadStore";
 
 // Pure (React-free) helpers shared by the gamepad loop. Stateful dispatch
 // (navigation, zone calls, query data) lives in useGamepad where the React data
-// is available; this file is just the binding/axis math so it stays testable.
-
-type Bindings = GamepadBindings;
+// is available; this file is just the layer/axis math so it stays testable.
 
 /** Choose the actual game controller among ALL devices navigator.getGamepads()
  *  exposes. Other HID gear (3Dconnexion SpaceMouse, flight gear, …) also shows up
@@ -35,33 +34,35 @@ export function axisSpeed(raw: number, sensitivity: number): number {
   return Math.sign(raw) * t * t * sensitivity;
 }
 
-/** A trigger/button treated as a held modifier (R2): pressed or analog > 0.5. */
-export function buttonHeld(pad: Gamepad, b: GamepadBinding | undefined): boolean {
-  if (!b || b.kind !== "button") return false;
-  const btn = pad.buttons[b.index];
+/** A bumper/trigger treated as a held modifier: pressed or analog > 0.5. */
+export function buttonHeld(pad: Gamepad, index: number): boolean {
+  const btn = pad.buttons[index];
   return !!btn && (btn.pressed || btn.value > 0.5);
 }
 
-/** Is `id` bound to button `idx`? */
-export function isBoundToButton(bindings: Bindings, id: GamepadActionId, idx: number): boolean {
-  const b = bindings[id];
-  return b?.kind === "button" && b.index === idx;
+/** The layer the pad is on. The modifier held FIRST keeps its layer until it's
+ *  released (pressing the other one on top changes nothing), so a set of buttons
+ *  never swaps under the thumb mid-gesture. */
+export function heldLayer(pad: Gamepad, prev: GamepadLayer): GamepadLayer {
+  if (prev !== "base" && buttonHeld(pad, LAYER_MODIFIER[prev])) return prev;
+  if (buttonHeld(pad, LAYER_MODIFIER.lt)) return "lt";
+  if (buttonHeld(pad, LAYER_MODIFIER.lb)) return "lb";
+  return "base";
 }
 
-/** Resolve the command a just-pressed button drives, honouring the R2 layer: when
- *  R2 is held an armed-layer command on that button wins over its cursor-layer
- *  twin; otherwise the first non-armed, non-reserved command bound to it fires.
- *  (Navigation buttons have no armed twin, so they keep working under R2.) */
+/** The command a just-pressed button drives on `layer`. Layers are strict: an
+ *  empty slot fires nothing — there is no fall-through to the base set. */
 export function resolveAction(
-  bindings: Bindings, idx: number, r2Held: boolean,
-): GamepadActionId | null {
-  if (r2Held) {
-    for (const a of GAMEPAD_ACTIONS) {
-      if (a.kind === "digital" && a.armed && isBoundToButton(bindings, a.id, idx)) return a.id;
-    }
-  }
-  for (const a of GAMEPAD_ACTIONS) {
-    if (a.kind === "digital" && !a.armed && !a.reserved && isBoundToButton(bindings, a.id, idx)) return a.id;
-  }
-  return null;
+  layout: GamepadLayout, layer: GamepadLayer, idx: number,
+): GamepadCommandId | null {
+  return layout[layer]?.[idx] ?? null;
+}
+
+/** Pressed buttons as a bitmask (bit i = button i) — one cheap value the UI can
+ *  subscribe to for press feedback. */
+export function pressedMask(pad: Gamepad): number {
+  let mask = 0;
+  const n = Math.min(pad.buttons.length, 31);
+  for (let i = 0; i < n; i++) if (pad.buttons[i].pressed) mask |= 1 << i;
+  return mask;
 }
